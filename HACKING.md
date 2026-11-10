@@ -35,10 +35,11 @@ overflow checks and debug assertions. `--release` turns those off.
 
     cargo fmt --all
     cargo fmt --all --check
+    rustfmt --check --edition 2021 verify/lib.rs
 
 The code is formatted with rustfmt. rustfmt.toml sets the line width to
 120 columns. `cargo fmt --all` formats the code, and `--check` checks
-it.
+it. verify/lib.rs belongs to no package, so rustfmt checks it directly.
 
 ## Lints
 
@@ -77,3 +78,28 @@ tests/exhaustive.rs checks the layout computation, the time conversion
 and the name handling over large ranges of inputs. It takes about a
 minute on 16 cores. Its tests are ignored by default, so a plain
 `cargo test` skips them.
+
+## Kani proofs
+
+The pure modules contain proofs for the Kani model checker in
+`#[cfg(kani)]` blocks. verify/lib.rs is a crate root that holds only
+these modules. Install Kani with:
+
+    cargo install --locked kani-verifier
+    cargo kani setup
+
+Then run:
+
+    verify/run.sh
+    HARNESS=layout::proofs::compute_fixed_params_any_total verify/run.sh
+    SLOW=1 verify/run.sh
+    DIR=1 verify/run.sh
+
+`HARNESS=` runs one harness. `SLOW=1` adds the harnesses that take longer
+than half an hour. `DIR=1` adds the harness of the directory index, which
+has not finished yet.
+
+Up to four harnesses run at the same time. `KANI_JOBS=` changes that.
+`KANI_VERBOSE=1` runs them one after the other and prints every check.
+Some harnesses need more memory than a laptop has. The default set takes
+about half an hour on a 512 core machine with `KANI_JOBS=24`.
