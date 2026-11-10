@@ -14,8 +14,9 @@ use crate::sys;
 use crate::Result;
 
 /// Writes one record of the JSON text sequence: the record separator, the
-/// object with its keys sorted and without whitespace, a newline. Each
-/// record goes out in one write.
+/// object with its keys sorted and without whitespace, a newline. The host
+/// tree generator and the volume writer frame their records here, so both
+/// write what `systemd-manifest` writes. Each record goes out in one write.
 pub(crate) fn write_record(out: &mut dyn Write, mut o: Object) -> io::Result<()> {
     o.sort();
     let record = format!("{}{}\n", char::from(RECORD_SEPARATOR), Value::Object(o));

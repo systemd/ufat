@@ -398,3 +398,38 @@ fn sys_mkfifo(path: &Path) {
     // SAFETY: a valid NUL terminated path; mkfifo touches nothing else.
     assert_eq!(unsafe { mkfifo(c.as_ptr(), 0o600) }, 0);
 }
+
+/// assemble, populate and describe write the UAPI.16 manifest of what the
+/// file system holds on request, one that builds the same content again.
+#[test]
+fn manifests_of_what_was_written() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: UFAT not set");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    let t = root.join("tree");
+    let t = t.to_str().unwrap();
+    let a = root.join("a.img");
+    let a = a.to_str().unwrap();
+    let written = root.join("written.manifest");
+    let w = written.to_str().unwrap();
+    ok(&bin, &["assemble", "--create", "--write-manifest", w, a, t]);
+    let described = root.join("described.manifest");
+    let d = described.to_str().unwrap();
+    ok(&bin, &["describe", "--write-manifest", d, a]);
+    assert_eq!(fs::read(&written).unwrap(), fs::read(&described).unwrap());
+    let text = String::from_utf8_lossy(&fs::read(&written).unwrap()).into_owned();
+    assert!(text.contains("\"EFI/Linux/linux.efi\""), "{}", text);
+    // The manifest builds the same files from the tree.
+    let b = root.join("b.img");
+    let b = b.to_str().unwrap();
+    ok(&bin, &["assemble", "--create", "--manifest", w, b, t]);
+    assert_eq!(ok(&bin, &["cat", b, "/EFI/Linux/linux.efi"]), "kernel");
+    let populated = root.join("populated.manifest");
+    let p = populated.to_str().unwrap();
+    ok(&bin, &["populate", "--path", "/more", "--write-manifest", p, b, t]);
+    assert!(String::from_utf8_lossy(&fs::read(&populated).unwrap()).contains("\"more/EFI/Linux/linux.efi\""));
+}

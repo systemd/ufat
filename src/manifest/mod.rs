@@ -35,6 +35,7 @@ mod fields;
 mod generate;
 #[cfg(test)]
 mod tests;
+pub mod volume;
 
 pub use assemble::{AssembleOptions, AssembleReport, ContentSource, DirectorySource, StreamSource};
 pub use fields::{base64_decode, valid_name};
