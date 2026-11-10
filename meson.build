@@ -38,6 +38,7 @@ crate_roots = []
 
 subdir('json')
 subdir('src')
+subdir('varlink')
 
 # meson links with -Cdefault-linker-libraries, which makes a crt-static
 # binary dynamically linked again.

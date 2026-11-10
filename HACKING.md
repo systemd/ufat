@@ -33,13 +33,14 @@ it is linked statically.
 
 `meson test` runs:
 
-- the unit tests of the library and of the json crate,
+- the unit tests of the library and of the json and varlink crates,
 - the integration tests in tests/,
 - the crash consistency harness.
 
 Set `TMPDIR` to a directory with a short path that is not a symbolic
-link. One test compares the targets of /proc/self/fd with paths below
-`TMPDIR`.
+link. Some tests create Unix sockets below it, and socket paths are
+limited to 108 bytes. One test compares the targets of
+/proc/self/fd with paths below `TMPDIR`.
 
 `meson test` runs several test binaries at the same time. `-j 1` runs
 one at a time. `RUST_TEST_THREADS=` limits how many tests of one binary

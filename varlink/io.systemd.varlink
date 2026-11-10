@@ -1,0 +1,23 @@
+interface io.systemd
+
+# Local error if a Varlink connection is disconnected (this never crosses the wire and is synthesized locally only).
+error Disconnected()
+
+# A method call time-out has been reached (also synthesized locally, does not cross wire)
+error TimedOut()
+
+# Some form of protocol error (also synthesized locally, does not cross wire)
+error Protocol()
+
+# A generic Linux system error ("errno"s).
+error System(
+	# The origin of this system error, typically 'linux' to indicate Linux error numbers.
+	origin: ?string,
+	# The Linux error name, i.e. ENOENT, EHWPOISON or similar.
+	errnoName: ?string,
+	# The numeric Linux error number. Typically the name is preferable, if specified.
+	errno: ?int
+)
+
+# The method is implemented, but the requested operation is not supported.
+error OperationNotSupported()
