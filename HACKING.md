@@ -25,8 +25,10 @@ With rustup, `cargo +1.85.0` selects rustc 1.85:
 
     cargo test --locked
 
-`cargo test` runs the unit tests of the library and of the json
-crate.
+`cargo test` runs:
+
+- the unit tests of the library and of the json crate,
+- the integration tests in tests/.
 
 The tests build with the dev profile, which is optimized and keeps the
 overflow checks and debug assertions. `--release` turns those off.
@@ -34,6 +36,10 @@ overflow checks and debug assertions. `--release` turns those off.
 Set `TMPDIR` to a directory with a short path that is not a symbolic
 link. One test compares the targets of /proc/self/fd with paths below
 `TMPDIR`.
+
+`cargo test` runs the test binaries one after the other.
+`RUST_TEST_THREADS=` limits how many tests of one binary run at the
+same time.
 
 ## Formatting
 
