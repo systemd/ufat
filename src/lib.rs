@@ -25,3 +25,4 @@ mod bytes;
 pub mod errno;
 pub mod fat;
 pub mod layout;
+pub mod time;
