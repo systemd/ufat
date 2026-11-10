@@ -10,7 +10,7 @@
 
 use std::fmt;
 
-use crate::errno::{EINVAL, EIO, ENOMEM};
+use crate::errno::{EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOMEM, ENOTDIR, ENOTEMPTY};
 
 /// What is wrong with a name inside a volume.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +171,9 @@ impl CorruptPlace {
 /// What an error is about, for a program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Detail {
+    /// The path inside the volume the error is about: it does not exist,
+    /// exists already, is or is not a directory, is not empty.
+    Path(String),
     /// A name inside the volume is not valid.
     Name {
         /// The name, or the path when the problem is with a path.
@@ -271,6 +274,27 @@ impl Error {
     #[must_use]
     pub fn with(mut self, detail: Detail) -> Self {
         self.0.detail = Some(detail);
+        self
+    }
+
+    /// Names the path inside the volume the error is about, where the
+    /// detail has room for one and none is set yet: the file that did not
+    /// fit, the entry that is too large, the directory found damaged, or
+    /// the path of an error that is about nothing but a path so far.
+    #[must_use]
+    pub fn at_path(mut self, path: &str) -> Self {
+        let inner = &mut *self.0;
+        match &mut inner.detail {
+            Some(
+                Detail::NoSpace { path: p, .. } | Detail::TooLarge { path: p, .. } | Detail::Corrupt { path: p, .. },
+            ) if p.is_none() => {
+                *p = Some(path.to_string());
+            }
+            None if matches!(inner.errno, ENOENT | EEXIST | ENOTDIR | EISDIR | ENOTEMPTY) => {
+                inner.detail = Some(Detail::Path(path.to_string()));
+            }
+            _ => {}
+        }
         self
     }
 

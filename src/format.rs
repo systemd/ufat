@@ -142,6 +142,13 @@ pub fn encode_label(label: &str) -> Result<[u8; 11]> {
     Ok(out)
 }
 
+/// The label `raw` as text, without its padding. The code page is
+/// unknown, so bytes outside ASCII are taken as Latin-1.
+pub fn decode_label(raw: &[u8; 11]) -> String {
+    let label: String = raw.iter().map(|&b| char::from(b)).collect();
+    label.trim_end().to_string()
+}
+
 /// Validates an OEM name and returns its space padded on-disk form: up to
 /// eight printable ASCII characters.
 pub fn encode_oem_name(name: &str) -> Result<[u8; 8]> {
