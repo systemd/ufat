@@ -20,7 +20,7 @@ integration_env = {
         'UFAT_FIXTURES' : meson.current_source_dir() / 'fixtures',
 }
 
-foreach name : ['fixtures', 'cli']
+foreach name : ['fixtures', 'cli', 'reference']
         exe = executable(
                 'test-' + name,
                 name + '.rs',

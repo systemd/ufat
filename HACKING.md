@@ -102,3 +102,10 @@ Up to four harnesses run at the same time. `KANI_JOBS=` changes that.
 `KANI_VERBOSE=1` runs them one after the other and prints every check.
 Some harnesses need more memory than a laptop has. The default set takes
 about half an hour on a 512 core machine with `KANI_JOBS=24`.
+
+## Reference tests
+
+tests/reference.rs compares ufat with mkfs.fat, fsck.fat, mtools and
+sha256sum. A test whose tool is not installed is skipped.
+`UFAT_MTOOLS=` points at a directory with mtools binaries, for example a
+local build.
