@@ -1,0 +1,2 @@
+# The width the code was written to; everything else is rustfmt's default.
+max_width = 120
