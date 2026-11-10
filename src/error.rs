@@ -261,6 +261,52 @@ impl ManifestProblem {
     }
 }
 
+/// How a file below the source directory fails to be what the manifest
+/// describes, found before anything is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceProblem {
+    /// The file is not there.
+    Missing,
+    /// It is not a regular file.
+    NotRegular,
+    /// Its size is not what the manifest says, or too short for the
+    /// offset and size asked for.
+    Size,
+}
+
+impl SourceProblem {
+    /// The value as the Varlink interface spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourceProblem::Missing => "missing",
+            SourceProblem::NotRegular => "notRegular",
+            SourceProblem::Size => "size",
+        }
+    }
+}
+
+/// How file contents fail to match the manifest while being copied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentProblem {
+    /// Not as many bytes as the manifest says.
+    Size,
+    /// Not the SHA-256 hash the manifest says.
+    Hash,
+    /// The stream ended before the file was complete.
+    StreamEnded,
+}
+
+impl ContentProblem {
+    /// The value as the Varlink interface spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContentProblem::Size => "size",
+            ContentProblem::Hash => "hash",
+            ContentProblem::StreamEnded => "streamEnded",
+        }
+    }
+}
+
 /// What a manifest asks for that cannot be done.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnsupportedKind {
@@ -385,6 +431,29 @@ pub enum Detail {
         name: Option<String>,
         /// The field, when the problem is with one.
         field: Option<String>,
+    },
+    /// A file the manifest names is not below the source directory as the
+    /// manifest describes it, found before anything is written.
+    Source {
+        /// The entry's path as the manifest names it.
+        name: String,
+        /// What is wrong.
+        problem: SourceProblem,
+        /// The size found, when sizes are the problem.
+        size: Option<u64>,
+        /// The size the manifest says, when sizes are the problem.
+        expected: Option<u64>,
+    },
+    /// File contents do not match the manifest.
+    Content {
+        /// The entry's path as the manifest names it.
+        name: String,
+        /// What is wrong.
+        problem: ContentProblem,
+        /// The size found, when sizes are the problem.
+        size: Option<u64>,
+        /// The size the manifest says, when sizes are the problem.
+        expected: Option<u64>,
     },
     /// The manifest asks for something that cannot be done.
     Unsupported {

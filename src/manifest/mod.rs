@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-//! UAPI.16 file manifests: reading them.
+//! UAPI.16 file manifests: reading them and assembling a volume from one.
 //!
 //! A manifest is an RFC 7464 JSON text sequence: each object is preceded by
 //! an ASCII record separator (0x1E). The first object describes the manifest
@@ -11,6 +11,13 @@
 //! Signatures are recognised but not verified: that needs an X.509 stack.
 //! Callers who need authenticated manifests must verify them before handing
 //! them over.
+//!
+//! Assembling a volume turns `dir` objects into directories and `reg`
+//! objects into files whose contents come from a [`ContentSource`]: either
+//! the files next to the manifest, or one stream carrying the contents of
+//! every file in manifest order. Everything FAT cannot store (symlinks,
+//! device nodes, FIFOs, sockets) is refused unless the caller asks for it to
+//! be skipped.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -23,10 +30,12 @@ use crate::sha256::{self, DIGEST_SIZE};
 use crate::volume::MAX_FILE_SIZE;
 use crate::{Detail, ManifestProblem, Result, UnsupportedKind, ValidityProblem};
 
+mod assemble;
 mod fields;
 #[cfg(test)]
 mod tests;
 
+pub use assemble::{AssembleOptions, AssembleReport, ContentSource, DirectorySource, StreamSource};
 pub use fields::{base64_decode, valid_name};
 
 use fields::{

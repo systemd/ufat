@@ -18,8 +18,8 @@ compile_error!("ufat supports Linux only");
 #[macro_use]
 mod error;
 pub use error::{
-    Context, CorruptPlace, Detail, Error, IdentifierProblem, LabelProblem, ManifestProblem, NameProblem, NoSpaceReason,
-    NotFat32Reason, Result, UnsupportedKind, ValidityProblem,
+    ContentProblem, Context, CorruptPlace, Detail, Error, IdentifierProblem, LabelProblem, ManifestProblem,
+    NameProblem, NoSpaceReason, NotFat32Reason, Result, SourceProblem, UnsupportedKind, ValidityProblem,
 };
 
 pub mod boot;
