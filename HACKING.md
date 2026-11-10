@@ -170,3 +170,48 @@ The results go to `target/fuzz`. `FUZZ_OUT=` changes that. Every crash,
 hang or unexpected exit is stored under `out/findings` together with the
 input that caused it. tests/fuzz/repro/ holds checks for defects found
 earlier.
+
+## Benchmarks
+
+    cargo build --release --locked -p ufat -p bench
+    bench/run.sh
+    BENCH_CASES='^populate|^fsck' bench/run.sh
+
+bench/run.sh generates an ESP of 270 MB and trees of 10000 files. It
+times ufat against mkfs.fat, mcopy, fsck.fat and sha256sum on them, and
+checks that `ufat assemble` and `mkfs.fat` write the same bytes.
+`BENCH_CASES=` selects cases by a regular expression. The other settings
+are described at the top of bench/run.sh. The results are in
+`$BENCH_DIR/out/summary.txt`.
+
+bench/compare.sh compares two ufat binaries, BASE and HEAD:
+
+    cargo build --release --locked -p ufat -p bench
+    bench/compare.sh BASE HEAD
+    bench/compare.py "$BENCH_DIR/out"
+
+It runs ten small workloads: assemble, populate, check and manifest with
+trees of 10000 files and with an ESP, and two Varlink calls. Every
+workload runs once under cachegrind, which counts the instructions, and
+once under strace, which counts the system calls. Then it runs nine
+times with each binary, alternating, for the wall time, the peak RSS and
+the bytes read and written. It needs valgrind and strace.
+
+bench/compare.py prints the results of HEAD and their change from BASE.
+It fails when HEAD exceeds BASE on a workload by more than a limit:
+
+| Metric | Limit |
+|---|---|
+| Instructions | 3% and 1 million |
+| System calls | 2% and 20 |
+| Bytes written, bytes read | 1% and 4 KiB |
+| Peak RSS | 10% and 1 MiB |
+| Wall time | 50% and 20 ms |
+
+A commit that makes a workload slower on purpose names the workload in a
+`Perf-regression:` trailer. Glob patterns work:
+
+    Perf-regression: populate/* varlink/Populate-wide
+
+`bench/compare.py --accept FILE` reads such names from FILE and reports
+those regressions without failing.

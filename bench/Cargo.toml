@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+[package]
+name = "bench"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The two helpers of run.sh.
+[[bin]]
+name = "genfile"
+path = "genfile.rs"
+
+[[bin]]
+name = "measure"
+path = "measure.rs"
+
+[dependencies]
+json.workspace = true
+libc.workspace = true
+varlink.workspace = true
+
+[lints]
+workspace = true
