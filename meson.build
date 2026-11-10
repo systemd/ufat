@@ -53,6 +53,7 @@ crate_roots += files('src/bin/ufat/main.rs')
 subdir('tools')
 subdir('tests')
 subdir('verify')
+subdir('bench')
 
 rustfmt = find_program('rustfmt', required : false)
 if rustfmt.found()

@@ -149,3 +149,15 @@ The results go to `build/fuzz`. `FUZZ_OUT=` changes that. Every crash,
 hang or unexpected exit is stored under `out/findings` together with the
 input that caused it. tests/fuzz/repro/ holds checks for defects found
 earlier.
+
+## Benchmarks
+
+    meson compile -C build bench
+    BENCH_CASES='^populate|^fsck' meson compile -C build bench
+
+bench/run.sh generates an ESP of 270 MB and trees of 10000 files. It
+times ufat against mkfs.fat, mcopy, fsck.fat and sha256sum on them, and
+checks that `ufat assemble` and `mkfs.fat` write the same bytes.
+`BENCH_CASES=` selects cases by a regular expression. The other settings
+are described at the top of bench/run.sh. The results are in
+`$BENCH_DIR/out/summary.txt`.
