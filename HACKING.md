@@ -50,3 +50,13 @@ use a build directory set up with rustc 1.85:
 `update-fold-table` regenerates the table. `check-fold-table` compares
 it with a fresh one. Moving to another Unicode version changes which
 names ufat tells apart. Do it on purpose and in a commit of its own.
+
+## Exhaustive sweeps
+
+    meson configure build -Dslow-tests=true
+    meson test -C build --suite slow
+
+tests/exhaustive.rs checks the layout computation, the time conversion
+and the name handling over large ranges of inputs. It takes about a
+minute on 16 cores. It is built and run only when the `slow-tests`
+option is set.
