@@ -21,8 +21,8 @@ compile_error!("ufat supports Linux with glibc only");
 #[macro_use]
 mod error;
 pub use error::{
-    Context, CorruptPlace, Detail, Error, IdentifierProblem, LabelProblem, NameProblem, NoSpaceReason, NotFat32Reason,
-    Result,
+    Context, CorruptPlace, Detail, Error, IdentifierProblem, LabelProblem, ManifestProblem, NameProblem, NoSpaceReason,
+    NotFat32Reason, Result, UnsupportedKind, ValidityProblem,
 };
 
 pub mod boot;
@@ -36,6 +36,7 @@ pub mod format;
 pub mod fsck;
 pub mod host;
 pub mod layout;
+pub mod manifest;
 pub mod name;
 mod path;
 pub mod plan;
