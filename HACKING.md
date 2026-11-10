@@ -171,6 +171,20 @@ hang or unexpected exit is stored under `out/findings` together with the
 input that caused it. tests/fuzz/repro/ holds checks for defects found
 earlier.
 
+## Coverage
+
+    tools/coverage.sh
+
+tools/coverage.sh builds everything with coverage instrumentation in
+`target/coverage` and runs `cargo test` with the arguments it was given.
+It then merges the profiles of the test run and prints the line
+coverage of every file. The report is saved in
+`target/coverage/report.txt`.
+
+The report needs llvm-profdata and llvm-cov at least as new as the LLVM
+in rustc. `rustup component add llvm-tools` installs matching ones, and
+the script uses them. `LLVM_PROFDATA=` and `LLVM_COV=` select others.
+
 ## Benchmarks
 
     cargo build --release --locked -p ufat -p bench
