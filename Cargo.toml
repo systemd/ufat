@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 [workspace]
-members = [".", "json", "tools"]
+members = [".", "json", "tools", "tests/crash"]
 # A plain `cargo build` or `cargo test` leaves out the case folding table
 # generator.
-default-members = [".", "json"]
+default-members = [".", "json", "tests/crash"]
 # cargo update picks dependency versions that support rust-version.
 resolver = "3"
 
@@ -27,7 +27,7 @@ sha2 = { version = "0.11.0", default-features = false }
 [workspace.lints.rust]
 unreachable_pub = "warn"
 unused_qualifications = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(ufat_trace)"] }
 
 [package]
 name = "ufat"

@@ -33,7 +33,8 @@ With rustup, `cargo +1.85.0` selects rustc 1.85:
 `cargo test` runs:
 
 - the unit tests of the library and of the json crate,
-- the integration tests in tests/.
+- the integration tests in tests/,
+- the crash consistency harness.
 
 The tests build with the dev profile, which is optimized and keeps the
 overflow checks and debug assertions. `--release` turns those off.
@@ -125,3 +126,24 @@ tests/reference.rs compares ufat with mkfs.fat, fsck.fat, mtools and
 sha256sum. A test whose tool is not installed is skipped.
 `UFAT_MTOOLS=` points at a directory with mtools binaries, for example a
 local build.
+
+## Crash consistency
+
+tests/crash/crash.rs records the writes of a test scenario. It uses a
+copy of the library built with `--cfg ufat_trace`, the ufat-trace
+package. It then builds every state a crash could leave on the device
+and checks each one with fsck and against the expected files. Three
+models of the device are checked:
+
+- Every sector is written whole, and writes land in order.
+- A write of several sectors can stop at any sector boundary.
+- Between two flushes, the device can keep any subset of the writes.
+
+The harness runs as part of `cargo test`. For its full output, run it
+on its own:
+
+    cargo test --locked -p ufat-trace -- --nocapture
+    UFAT_CRASH_FULL=1 cargo test --locked -p ufat-trace -- --nocapture
+
+`UFAT_CRASH_FULL=1` checks every subset of the writes between two
+flushes instead of a sample.

@@ -58,7 +58,8 @@ impl Drop for Temp {
 }
 
 /// The ufat binary under test, which cargo builds for the integration
-/// tests of the ufat package.
+/// tests of the ufat package. The crash harness lives in a package without
+/// it.
 pub fn ufat() -> Option<PathBuf> {
     option_env!("CARGO_BIN_EXE_ufat")
         .map(PathBuf::from)

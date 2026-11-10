@@ -100,3 +100,12 @@ dependencies = [
  "libc",
  "sha2",
 ]
+
+[[package]]
+name = "ufat-trace"
+version = "0.0.0"
+dependencies = [
+ "json",
+ "libc",
+ "sha2",
+]
