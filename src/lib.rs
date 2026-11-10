@@ -21,9 +21,14 @@ pub use error::{Context, CorruptPlace, Detail, Error, NameProblem, NoSpaceReason
 
 pub mod boot;
 mod bytes;
+pub mod device;
 pub mod dirent;
 pub mod errno;
 pub mod fat;
+pub mod host;
 pub mod layout;
 pub mod name;
+mod sys;
+#[cfg(test)]
+mod test_util;
 pub mod time;
