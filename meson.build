@@ -36,6 +36,7 @@ add_test_setup('default',
 crate_roots = []
 
 subdir('src')
+subdir('tools')
 
 rustfmt = find_program('rustfmt', required : false)
 if rustfmt.found()
