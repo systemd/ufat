@@ -192,6 +192,12 @@ pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
+/// Converts microseconds since the epoch, as Varlink carries times, to a
+/// system time.
+pub fn from_usec(usec: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_micros(usec)
+}
+
 /// Converts a system time to microseconds since the epoch, saturating at
 /// both ends.
 pub fn to_usec(t: SystemTime) -> u64 {

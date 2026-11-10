@@ -28,6 +28,7 @@ use super::generate::{time_nsec, write_record};
 use super::{valid_name, FILENAME, MEDIA_TYPE, TRAILER_MEDIA_TYPE};
 use crate::dirent::ATTR_READ_ONLY;
 use crate::errno::*;
+use crate::progress::Progress;
 use crate::sha256::{self, Sha256, DIGEST_SIZE};
 use crate::volume::Volume;
 use crate::{CorruptPlace, Detail, Result};
@@ -154,6 +155,17 @@ pub struct WriteReport {
     pub omitted: u64,
 }
 
+impl WriteReport {
+    /// What the manifest covers so far, as a progress callback hears it.
+    fn progress(&self) -> Progress {
+        Progress {
+            files: self.files,
+            directories: self.directories,
+            bytes: self.bytes,
+        }
+    }
+}
+
 /// Writes the UAPI.16 manifest of everything the volume holds to `out`:
 /// the root object, one object per entry, the trailer. `root_time` is the
 /// time the root object carries when `fields.mtime` is on: the root
@@ -175,6 +187,18 @@ pub fn write(
     fields: Fields,
     out: &mut dyn Write,
 ) -> Result<WriteReport> {
+    write_with_progress(volume, root_time, fields, out, &mut |_| {})
+}
+
+/// [`write`], telling `progress` what the manifest covers so far after
+/// every entry and every chunk of a file it reads for the hash.
+pub fn write_with_progress(
+    volume: &Volume,
+    root_time: Option<SystemTime>,
+    fields: Fields,
+    out: &mut dyn Write,
+    progress: &mut dyn FnMut(&Progress),
+) -> Result<WriteReport> {
     let root = volume.metadata("/")?;
     let mut writer = Writer {
         volume,
@@ -183,6 +207,7 @@ pub fn write(
         report: WriteReport::default(),
         buf: vec![0u8; volume.layout().cluster_size() as usize],
         seen: HashSet::from([root.first_cluster]),
+        progress,
     };
     let mut top = Object::new();
     top.insert("mediaType", MEDIA_TYPE);
@@ -219,6 +244,7 @@ struct Writer<'a> {
     /// directory reached twice is a cross-linked or looping tree; without
     /// the check a loop would run until the path limit.
     seen: HashSet<u32>,
+    progress: &'a mut dyn FnMut(&Progress),
 }
 
 impl Writer<'_> {
@@ -272,6 +298,7 @@ impl Writer<'_> {
                 }
                 write_record(self.out, o)?;
                 self.report.directories += 1;
+                (self.progress)(&self.report.progress());
                 self.directory(&path, &name)?;
             } else {
                 if self.fields.size {
@@ -283,6 +310,7 @@ impl Writer<'_> {
                 write_record(self.out, o)?;
                 self.report.files += 1;
                 self.report.bytes += md.size;
+                (self.progress)(&self.report.progress());
             }
         }
         Ok(())
@@ -292,12 +320,15 @@ impl Writer<'_> {
     fn hash(&mut self, path: &str) -> Result<[u8; DIGEST_SIZE]> {
         let mut file = self.volume.begin_read(path)?;
         let mut hasher = Sha256::new();
+        let mut done = self.report.progress();
         loop {
             let n = self.volume.read_file_data(&mut file, &mut self.buf)?;
             if n == 0 {
                 return Ok(hasher.finalize());
             }
             hasher.update(&self.buf[..n]);
+            done.bytes += n as u64;
+            (self.progress)(&done);
         }
     }
 }

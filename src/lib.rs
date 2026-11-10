@@ -39,6 +39,7 @@ pub mod name;
 mod path;
 pub mod plan;
 pub mod populate;
+pub mod progress;
 pub mod sha256;
 pub mod sha512;
 mod sys;

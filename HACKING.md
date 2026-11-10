@@ -46,6 +46,9 @@ limited to 108 bytes. One test compares the targets of
 one at a time. `RUST_TEST_THREADS=` limits how many tests of one binary
 run at the same time.
 
+tests/varlink.rs also drives the service with `varlinkctl` when it is
+installed.
+
 ## Formatting
 
     meson compile -C build rustfmt

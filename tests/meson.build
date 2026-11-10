@@ -20,11 +20,11 @@ integration_env = {
         'UFAT_FIXTURES' : meson.current_source_dir() / 'fixtures',
 }
 
-foreach name : ['fixtures', 'cli', 'reference']
+foreach name : ['fixtures', 'cli', 'reference', 'varlink']
         exe = executable(
                 'test-' + name,
                 name + '.rs',
-                link_with : libufat,
+                link_with : [libufat, libvarlink, libjson],
                 rust_args : ['--test'] + test_rust_args)
         test('test-' + name,
              exe,

@@ -7,13 +7,14 @@
 //! everything else is reported as skipped.
 
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::errno::*;
 use crate::host::{walk_tree, FromStart};
+use crate::progress::Progress;
 use crate::sys;
 use crate::volume::{Volume, MAX_FILE_SIZE};
 use crate::Detail;
@@ -90,6 +91,34 @@ fn source_mtime(md: &fs::Metadata) -> SystemTime {
     md.modified().unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
+impl CopyReport {
+    /// What the copy has done so far, as a progress callback hears it.
+    fn progress(&self) -> Progress {
+        Progress {
+            files: self.files,
+            directories: self.directories,
+            bytes: self.bytes,
+        }
+    }
+}
+
+/// A source that tells `progress` after every read how many bytes it
+/// handed out, on top of what `done` counts.
+struct Counted<'a> {
+    inner: &'a mut dyn Read,
+    done: Progress,
+    progress: &'a mut dyn FnMut(&Progress),
+}
+
+impl Read for Counted<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.done.bytes += n as u64;
+        (self.progress)(&self.done);
+        Ok(n)
+    }
+}
+
 impl Volume {
     /// Copies the contents of `source` into a new file at `dest` and returns
     /// how many bytes it copied.
@@ -135,6 +164,31 @@ impl Volume {
     /// with positional reads, so its file position is neither used nor
     /// changed.
     pub fn copy_file(&mut self, source: BorrowedFd<'_>, dest: &str, options: &CopyOptions) -> Result<u64> {
+        self.copy_file_with_progress(source, dest, options, &mut |_| {})
+    }
+
+    /// [`Volume::copy_file`], telling `progress` how many bytes it copied so
+    /// far after every read of the source.
+    pub fn copy_file_with_progress(
+        &mut self,
+        source: BorrowedFd<'_>,
+        dest: &str,
+        options: &CopyOptions,
+        progress: &mut dyn FnMut(&Progress),
+    ) -> Result<u64> {
+        self.copy_counted(source, dest, options, Progress::default(), progress)
+    }
+
+    /// Copies a file as [`Volume::copy_file`] does and tells `progress`
+    /// about its bytes on top of what `done` counts.
+    fn copy_counted(
+        &mut self,
+        source: BorrowedFd<'_>,
+        dest: &str,
+        options: &CopyOptions,
+        done: Progress,
+        progress: &mut dyn FnMut(&Progress),
+    ) -> Result<u64> {
         let md = sys::fstat(source)?;
         if !md.is_file() {
             bail!(EINVAL, "the source of '{}' is not a regular file", dest);
@@ -153,7 +207,12 @@ impl Volume {
             );
         }
         let time = options.times.resolve(source_mtime(&md));
-        self.write_file(dest, &mut FromStart::new(source), time, options.replace)
+        let mut counted = Counted {
+            inner: &mut FromStart::new(source),
+            done,
+            progress,
+        };
+        self.write_file(dest, &mut counted, time, options.replace)
     }
 
     /// Copies the tree below the open directory `source` into the directory
@@ -164,6 +223,18 @@ impl Volume {
     /// up by path again. The skipped entries are reported relative to
     /// `source`.
     pub fn copy_tree(&mut self, source: BorrowedFd<'_>, dest: &str, options: &CopyOptions) -> Result<CopyReport> {
+        self.copy_tree_with_progress(source, dest, options, &mut |_| {})
+    }
+
+    /// [`Volume::copy_tree`], telling `progress` what it copied so far after
+    /// every directory, every file and every read of a file.
+    pub fn copy_tree_with_progress(
+        &mut self,
+        source: BorrowedFd<'_>,
+        dest: &str,
+        options: &CopyOptions,
+        progress: &mut dyn FnMut(&Progress),
+    ) -> Result<CopyReport> {
         let md = sys::fstat(source).with_context(|| "failed to stat the source directory")?;
         if !md.is_dir() {
             bail!(ENOTDIR, "the source is not a directory");
@@ -180,13 +251,15 @@ impl Volume {
                     Err(e) => return Err(e),
                 }
                 report.directories += 1;
+                progress(&report.progress());
                 Ok(true)
             } else if entry.is_file() {
                 let file = entry.open_file()?;
                 report.bytes += self
-                    .copy_file(file.as_fd(), target, options)
+                    .copy_counted(file.as_fd(), target, options, report.progress(), progress)
                     .map_err(|e| e.at_path(target).context(format!("copying {}", entry.path.display())))?;
                 report.files += 1;
+                progress(&report.progress());
                 Ok(false)
             } else {
                 report.skipped.push(entry.path.clone());

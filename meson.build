@@ -45,7 +45,7 @@ subdir('varlink')
 ufat = executable(
         'ufat',
         'src/bin/ufat/main.rs',
-        link_with : libufat,
+        link_with : [libufat, libvarlink, libjson],
         rust_args : get_option('static') ? ['-Ctarget-feature=+crt-static', '-Cdefault-linker-libraries=no'] : [],
         install : true)
 crate_roots += files('src/bin/ufat/main.rs')

@@ -31,6 +31,7 @@ use crate::name::{
     fold_str, join_long_name, parse_long_name_entry, short_name_to_string, valid_short_char, LongNameEntry,
     LFN_MAX_ENTRIES, LONG_NAME_INVALID, MAX_LONG_NAME,
 };
+use crate::progress::Progress;
 use crate::volume::DeviceStore;
 use crate::{Detail, NotFat32Reason, Result};
 
@@ -935,12 +936,20 @@ struct Checker<'a> {
     /// The label entry of the root directory, if there is one.
     root_label: Option<[u8; 11]>,
     report: RefCell<Report>,
+    progress: RefCell<&'a mut dyn FnMut(&Progress)>,
 }
 
 /// Checks the FAT32 volume on `device`. I/O errors and a device that does
 /// not hold FAT32 at all are returned as errors; everything else lands in
 /// the report.
 pub fn check(device: &Device) -> Result<Report> {
+    check_with_progress(device, &mut |_| {})
+}
+
+/// [`check`], telling `progress` how many files and directories it went
+/// through so far after every one of them, and after every chunk of the
+/// FAT copies it compares.
+pub fn check_with_progress(device: &Device, progress: &mut dyn FnMut(&Progress)) -> Result<Report> {
     let mut report = Report::default();
     if device.len() < BOOT_SECTOR_SIZE as u64 {
         bail!(
@@ -993,6 +1002,7 @@ pub fn check(device: &Device) -> Result<Report> {
         dir_path: RefCell::new(None),
         root_label: None,
         report: RefCell::new(report),
+        progress: RefCell::new(progress),
     };
     c.check_reserved_area()?;
     c.check_fats()?;
@@ -1022,6 +1032,20 @@ impl<'a> Checker<'a> {
             device: self.device,
             layout: self.layout,
         }
+    }
+
+    /// Tells the progress callback how many files and directories the
+    /// check went through so far.
+    fn tick(&self) {
+        let done = {
+            let report = self.report.borrow();
+            Progress {
+                files: report.files,
+                directories: report.directories,
+                bytes: 0,
+            }
+        };
+        (self.progress.borrow_mut())(&done);
     }
 
     fn is_claimed(&self, cluster: u32) -> bool {
@@ -1271,6 +1295,7 @@ impl<'a> Checker<'a> {
                     self.device.read_at(self.layout.fat_offset(i) + done, &mut other[..n])?;
                     differing += first[..n].iter().zip(&other[..n]).filter(|(a, b)| a != b).count();
                     done += n as u64;
+                    self.tick();
                 }
                 if differing > 0 {
                     // Linux and EDK2 read the first copy and never the
@@ -1432,6 +1457,7 @@ impl<'a> Checker<'a> {
         while let Some(mut dir) = stack.pop() {
             if dir.at != ROOT_AT {
                 self.report.borrow_mut().directories += 1;
+                self.tick();
             }
             let cs = self.layout.cluster_size() as usize;
             // Read no more than a directory can hold; the chain itself may
@@ -1654,6 +1680,7 @@ impl<'a> Checker<'a> {
                 });
             } else {
                 self.report.borrow_mut().files += 1;
+                self.tick();
                 self.check_file(at, &name, &short);
             }
         }
@@ -1925,6 +1952,25 @@ mod tests {
         (img, v)
     }
 
+    /// The check tells its progress callback how far it got after every
+    /// file and directory, and ends at what the report counts.
+    #[test]
+    fn check_reports_progress() {
+        let (img, v) = populated();
+        v.close().unwrap();
+        let mut seen = Vec::new();
+        let report = check_with_progress(&img.device(), &mut |p| seen.push(*p)).unwrap();
+        assert!(
+            seen.windows(2)
+                .all(|w| w[0].files <= w[1].files && w[0].directories <= w[1].directories),
+            "{:?}",
+            seen
+        );
+        let last = seen.last().unwrap();
+        assert_eq!((last.files, last.directories), (report.files, report.directories));
+        assert_eq!((report.files, report.directories), (4, 2));
+    }
+
     #[test]
     fn clean_volume() {
         let (img, v) = populated();
@@ -2191,6 +2237,42 @@ mod tests {
             r.problems
         );
         assert!(!about_short_names(&r), "{:?}", r.problems);
+    }
+
+    /// The class names are the `ProblemClass` enum of the interface, in
+    /// its order.
+    #[test]
+    fn classes_match_the_interface() {
+        use ProblemClass::*;
+        const CLASSES: [ProblemClass; 14] = [
+            Superblock,
+            Allocation,
+            Directory,
+            Name,
+            Timestamp,
+            Label,
+            Chain,
+            CrossLink,
+            LostSpace,
+            Dirty,
+            Checksum,
+            Journal,
+            Interoperability,
+            Other,
+        ];
+        let idl = include_str!("../docs/org.uapi-group.FileSystem.varlink");
+        let line = idl
+            .lines()
+            .find(|l| l.starts_with("type ProblemClass("))
+            .expect("the IDL defines ProblemClass");
+        let names: Vec<&str> = line
+            .trim_start_matches("type ProblemClass(")
+            .trim_end_matches(')')
+            .split(',')
+            .map(str::trim)
+            .collect();
+        let ours: Vec<&str> = CLASSES.iter().map(|c| c.as_str()).collect();
+        assert_eq!(ours, names);
     }
 
     /// Every kind has a class, none falls back to `other`, and none needs

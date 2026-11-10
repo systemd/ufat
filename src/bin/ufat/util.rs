@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-//! Helpers of the command line interface.
+//! Helpers shared by the command line interface and the Varlink service.
 
 use std::io::Read;
 use std::path::Path;
@@ -176,8 +176,9 @@ impl FitError {
 }
 
 /// Sizes, formats and opens a file system that fits what `add` puts into
-/// the plan: the one way mkfs --fit and assemble make a volume. The image
-/// is opened once; a block device
+/// the plan: the one way mkfs --fit and assemble make a volume, and what
+/// the Varlink Assemble method does in two steps with [`plan_fit`] and
+/// [`format_fit`]. The image is opened once; a block device
 /// is planned for its logical block size, a regular image file is grown,
 /// never shrunk, to the size given or to the fit, and created first when
 /// `create` is set. Everything that can go wrong before the first write,
@@ -191,7 +192,7 @@ pub(crate) fn fit_and_format(
     add: &mut dyn FnMut(&mut Plan) -> Result<()>,
 ) -> std::result::Result<(Volume, Estimate), FitError> {
     let mut device = open_target(target)?;
-    let (estimate, size) = match plan_fit(&mut device, target.offset, target.size, options, add) {
+    let (estimate, size) = match plan_fit(&mut device, target.offset, target.size, options, false, add) {
         Ok(fit) => fit,
         Err(e) => {
             // Nothing has been written. The error of the removal, if any,
@@ -206,16 +207,25 @@ pub(crate) fn fit_and_format(
 /// Plans the content and decides the size of the file system: the size
 /// given, or the smallest that fits. Nothing is written; the image is only
 /// asked for its type, block size and length, so that content that does
-/// not fit is reported while the image is as it was.
-fn plan_fit(
+/// not fit is reported while the image is as it was. `device` covers the
+/// whole image, a descriptor the service was handed or the file the
+/// command line tool opened or created; the file system goes to `offset`
+/// and takes `size` bytes, or what fits when there is no size. With
+/// `label_slot` the root directory is planned with a volume label entry
+/// whether or not a label is given, for a caller that stamps the root's
+/// time on one afterwards ([`Volume::set_root_time`]).
+pub(crate) fn plan_fit(
     device: &mut Device,
     offset: u64,
     size: Option<u64>,
     options: &mut FormatOptions,
+    label_slot: bool,
     add: &mut dyn FnMut(&mut Plan) -> Result<()>,
 ) -> std::result::Result<(Estimate, u64), FitError> {
     let block_size = device.logical_block_size()?;
-    let mut plan = Plan::new(PlanOptions::from_format_options(options, block_size)?);
+    let mut plan_options = PlanOptions::from_format_options(options, block_size)?;
+    plan_options.label |= label_slot;
+    let mut plan = Plan::new(plan_options);
     add(&mut plan)?;
     let estimate = plan.estimate()?;
     estimate.apply(options);
@@ -236,8 +246,9 @@ fn plan_fit(
     Ok((estimate, size))
 }
 
-/// Sizes the image for a planned file system, formats it and opens it.
-fn format_fit(
+/// Sizes the image for a planned file system, formats it and opens it:
+/// the second step of [`fit_and_format`], after [`plan_fit`].
+pub(crate) fn format_fit(
     mut device: Device,
     offset: u64,
     size: u64,
