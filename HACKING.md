@@ -25,7 +25,8 @@ With rustup, `cargo +1.85.0` selects rustc 1.85:
 
     cargo test --locked
 
-`cargo test` runs the unit tests of the library.
+`cargo test` runs the unit tests of the library and of the json
+crate.
 
 The tests build with the dev profile, which is optimized and keeps the
 overflow checks and debug assertions. `--release` turns those off.
