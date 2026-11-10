@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+[workspace]
+# cargo update picks dependency versions that support rust-version.
+resolver = "3"
+
+[workspace.package]
+edition = "2021"
+# ufat has to keep building with this rustc.
+rust-version = "1.85"
+license = "LGPL-2.1-or-later"
+publish = false
+
+[workspace.dependencies]
+libc = "0.2.191"
+
+[workspace.lints.rust]
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[package]
+name = "ufat"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true
+
+# cargo build and cargo test run optimized, with the overflow checks and
+# debug assertions of the dev profile.
+[profile.dev]
+opt-level = 2
