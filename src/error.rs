@@ -12,6 +12,37 @@ use std::fmt;
 
 use crate::errno::{EINVAL, EIO, ENOMEM};
 
+/// What is wrong with a name inside a volume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameProblem {
+    /// The name is empty.
+    Empty,
+    /// "." or "..", as a name or as a path component.
+    DotComponent,
+    /// A control character, U+FFFF or one of `" * / : < > ? \ |`.
+    InvalidCharacter,
+    /// The name starts with a space.
+    LeadingSpace,
+    /// The name ends with a space or a dot.
+    TrailingSpaceOrDot,
+    /// More than 255 UTF-16 units, or a path longer than PATH_MAX.
+    TooLong,
+}
+
+impl NameProblem {
+    /// The value as the Varlink interface spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NameProblem::Empty => "empty",
+            NameProblem::DotComponent => "dotComponent",
+            NameProblem::InvalidCharacter => "invalidCharacter",
+            NameProblem::LeadingSpace => "leadingSpace",
+            NameProblem::TrailingSpaceOrDot => "trailingSpaceOrDot",
+            NameProblem::TooLong => "tooLong",
+        }
+    }
+}
+
 /// What a volume ran out of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoSpaceReason {
@@ -90,6 +121,13 @@ impl CorruptPlace {
 /// What an error is about, for a program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Detail {
+    /// A name inside the volume is not valid.
+    Name {
+        /// The name, or the path when the problem is with a path.
+        name: String,
+        /// What is wrong with it.
+        problem: NameProblem,
+    },
     /// A file or a volume is larger than FAT32 allows.
     TooLarge {
         /// The path inside the volume, for a file.

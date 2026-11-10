@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 [workspace]
+members = [".", "tools"]
 # cargo update picks dependency versions that support rust-version.
 resolver = "3"
 

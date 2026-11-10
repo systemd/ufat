@@ -18,7 +18,7 @@ compile_error!("ufat supports Linux only");
 
 #[macro_use]
 mod error;
-pub use error::{Context, CorruptPlace, Detail, Error, NoSpaceReason, NotFat32Reason, Result};
+pub use error::{Context, CorruptPlace, Detail, Error, NameProblem, NoSpaceReason, NotFat32Reason, Result};
 
 pub mod boot;
 mod bytes;
@@ -26,4 +26,5 @@ pub mod dirent;
 pub mod errno;
 pub mod fat;
 pub mod layout;
+pub mod name;
 pub mod time;
