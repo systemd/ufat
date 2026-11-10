@@ -1,0 +1,681 @@
+# Making, filling, checking and inspecting a filesystem in an image file or
+# on a block device, the same way for every filesystem, without the caller
+# mounting anything.
+# The interface is what a filesystem's user-space tool offers to systemd
+# (systemd-repart, systemd-makefs, systemd-homed) and to mkosi instead of a
+# command line: one call shape for vfat, ext4, xfs, btrfs, f2fs, erofs,
+# squashfs and exfat, with the differences between them declared by
+# GetCapabilities and carried in typed per-filesystem option structs
+# rather than in argv strings.
+#
+# Every file, device and directory on the host reaches the service as a file
+# descriptor passed along with the call (SCM_RIGHTS), never as a path. An int
+# field named ...FileDescriptor is the index of such a descriptor among those
+# passed with the message, counting from 0. Descriptors must be opened
+# without O_PATH and with no flags beyond the access mode (O_NONBLOCK is
+# accepted on an image, O_DIRECTORY on a directory); everything the service
+# reads from is open read-only, the image is open read-write for the methods
+# that write. Descriptors no parameter names are closed when the call is
+# answered.
+#
+# Nothing the service answers is text meant for a person: every error is a
+# name with typed fields and every finding of Check is a kind with its facts;
+# the client renders them in its own language.
+#
+# An implementation serves one filesystem type and is found the way mkfs
+# tools are found today: the executable mkfs.<type> speaks this interface
+# when it is started with a socket passed as LISTEN_FDS, so that
+# sd_varlink_connect_exec() and `varlinkctl call ./mkfs.vfat ...` reach it.
+# A service that serves several types takes the type in fileSystemType.
+interface org.uapi-group.FileSystem
+
+# Where a filesystem lives: an image file or block device and the byte range
+# inside it. A block device written to is claimed exclusively while the call
+# runs, the way a mount claims it; a mounted device is refused with ImageBusy. A
+# regular file is grown to the size the filesystem needs when the call makes
+# one and no size is given; it is never shrunk.
+type Image(
+	# Index of the descriptor of the image file or block device
+	fileDescriptor: int,
+	# Byte offset of the filesystem inside the image, 0 by default
+	offset: ?int,
+	# Size of the filesystem in bytes, the rest of the image by default; with
+	# content and no size the filesystem is sized to fit when the
+	# implementation can (Capabilities.sizeToFit), else SizeRequired
+	size: ?int
+)
+
+# What kind of identifier a filesystem carries.
+type IdentifierKind(
+	# None at all (squashfs)
+	none,
+	# A 128 bit UUID, written as RFC 4122 text (ext4, xfs, btrfs, f2fs, erofs)
+	uuid,
+	# A 32 bit serial number, written as XXXX-XXXX (vfat, exfat)
+	serial
+)
+
+# How the length of a label or a name is counted.
+type LengthUnit(bytes, utf16Units)
+
+# What a label may contain.
+type LabelCharset(
+	# Any bytes but NUL (ext4, btrfs, f2fs, erofs)
+	bytes,
+	# UTF-8 text (xfs; f2fs and exfat store it as UTF-16)
+	utf8,
+	# The FAT rules: the ASCII subset mkfs.fat accepts, stored upper case
+	fat
+)
+
+# The rules a label follows.
+type LabelRules(
+	lengthMax: int,
+	unit: LengthUnit,
+	charset: LabelCharset
+)
+
+# How well plan finds the smallest filesystem for given content.
+type SizeToFit(
+	# An estimate that holds the content with room to spare (ext4, xfs)
+	estimate,
+	# The exact size, the filesystem full to the last block (vfat, erofs,
+	# squashfs, btrfs)
+	exact
+)
+
+# A feature the filesystem can be made with or without, by its name in the
+# filesystem's own vocabulary.
+type Feature(
+	name: string,
+	default: bool
+)
+
+# What timestamps the filesystem keeps.
+type TimeRules(
+	# Granularity of a modification time in nanoseconds (vfat 2 s, exfat
+	# 10 ms, ext4 1 ns in 256 byte inodes, squashfs 1 s)
+	resolutionNSec: int,
+	# The earliest and latest representable instants
+	minUSec: int,
+	maxUSec: int,
+	# Which times exist: modification always; the others when kept
+	created: bool,
+	accessed: bool,
+	changed: bool,
+	# Whether times are interpreted as UTC (vfat, exfat with offset)
+	utc: bool
+)
+
+# What a caller can ask for and a filesystem may not have. Assemble, Describe
+# and GetCapabilities always exist and are not listed. Capabilities.operations is the
+# set the implementation supports; OperationNotSupported names what was
+# asked for and is not in it. A set is an array of an enum because Varlink
+# has no flags type.
+type Operation(
+	# Assemble with mode plan (Capabilities.sizeToFit says how exactly)
+	plan,
+	# Content at Assemble time
+	assembleWithContent,
+	# Populate, Remove and List on an existing filesystem
+	populate,
+	remove,
+	list,
+	# Check; repair is Check with repair preen or full
+	check,
+	repair,
+	# Options a filesystem may have no notion of, or the caller does not
+	# control (discard on erofs)
+	label,
+	identifier,
+	features,
+	discard,
+	# Identical input, identifier and timestamp give identical bytes
+	reproducible,
+	# A UAPI.16 manifest as content
+	manifest,
+	# A UAPI.16 manifest of what was written or of what is there, through
+	# ManifestSink
+	writeManifest
+)
+
+# What of a host tree's entries the filesystem can keep. What is not kept
+# is either turned into something it can hold (a hard link becomes a copy,
+# a symbolic link is followed below the source, a hole is filled) or
+# dropped and counted under UnsupportedPolicy skip (a special file, an
+# inode flag).
+type EntryAttribute(
+	# uid and gid
+	ownership,
+	# permission bits
+	modes,
+	# extended attributes
+	extendedAttributes,
+	# hard links stored as links
+	hardlinks,
+	# symbolic links stored as links
+	symlinks,
+	# device nodes, fifos, sockets
+	specialFiles,
+	# holes in files
+	sparse,
+	# the DOS attributes read-only, hidden, system and archive, which FAT,
+	# exFAT and NTFS store per entry
+	dosAttributes,
+	# the Linux inode flags of chattr(1); Capabilities.inodeFlags says which
+	inodeFlags
+)
+
+# A DOS attribute, as FAT, exFAT and NTFS store it per entry. UAPI.16
+# carries readOnly as its generic readOnly field and the others as
+# flagHidden, flagSystem and flagArchive.
+type DosAttribute(readOnly, hidden, system, archive)
+
+# A Linux inode flag of chattr(1), FS_IOC_SETFLAGS. UAPI.16 carries them as
+# flagAppendOnly, flagImmutable, flagNoAtime, flagNoCow and flagNoDump.
+type InodeFlag(appendOnly, immutable, noAtime, noCow, noDump)
+
+# What an implementation and its filesystem can do, so that a caller can
+# decide its flow before touching an image: whether to size by plan,
+# whether content has to come with Assemble, whether Populate works afterwards.
+type Capabilities(
+	# The filesystem type as the kernel names it (vfat, ext4, xfs, btrfs,
+	# f2fs, erofs, squashfs, exfat)
+	fileSystemType: string,
+	# The implementation and its version, as identifiers
+	implementation: string,
+	version: string,
+	# The kernel mounts the filesystem read-only (erofs, squashfs)
+	readOnly: bool,
+	# What a caller can ask for; anything else is OperationNotSupported
+	operations: []Operation,
+	# Whether plan answers exactly or estimates; absent without plan
+	sizeToFit: ?SizeToFit,
+	# The smallest and largest filesystem the implementation makes, and the
+	# granularity sizes are rounded to
+	minimalSizeBytes: int,
+	maximalSizeBytes: ?int,
+	sizeGranularityBytes: int,
+	# Sector sizes the filesystem can be made for, and block (cluster) sizes
+	sectorSizes: []int,
+	blockSizes: []int,
+	# The rules behind the label and identifier operations; label is absent
+	# when the filesystem has none (squashfs)
+	label: ?LabelRules,
+	identifier: IdentifierKind,
+	# What of a host tree survives
+	preserves: []EntryAttribute,
+	# The inode flags that survive, absent unless inodeFlags is among
+	# preserves
+	inodeFlags: ?[]InodeFlag,
+	times: TimeRules,
+	caseSensitive: bool,
+	nameLengthMax: int,
+	nameUnit: LengthUnit,
+	fileSizeMaxBytes: int,
+	# Features that can be turned on or off, if any
+	features: ?[]Feature
+)
+
+# How copied files get their timestamps: the source's, the given time, or
+# the source's clamped to the given time (SOURCE_DATE_EPOCH semantics).
+type TimePolicy(preserve, fixed, clamp)
+
+# What to do with content the filesystem cannot hold: an entry type it has
+# no notion of, a name it cannot store, metadata it cannot keep.
+type UnsupportedPolicy(
+	# Leave it out and count it in skipped
+	skip,
+	# Fail the call with ContentNotSupported
+	fail
+)
+
+# A per-file field of a manifest written back (ManifestSink.fields):
+# systemd-manifest's vocabulary, as its --field= and repart's
+# --manifest-fields= take it. The inode type is always written; the default
+# set is mode, uid, gid, size, hash, symlink, device, hardlink and
+# userXattr, mtime and the names are opt-in.
+type ManifestField(
+	mode,
+	uid,
+	gid,
+	size,
+	hash,
+	symlink,
+	device,
+	hardlink,
+	mtime,
+	userXattr,
+	userName,
+	groupName
+)
+
+# A UAPI.16 manifest as content, read from a regular file or a pipe to its
+# end as a JSON text sequence. The files it names come from the source
+# directory, or back to back in manifest order from the source stream.
+type Manifest(
+	# Index of the descriptor, open read-only
+	fileDescriptor: int,
+	# Refuse entries that are revoked or outside their validity window, true
+	# by default
+	checkValidity: ?bool
+)
+
+# Where a UAPI.16 manifest is written: of the whole filesystem as an Assemble
+# or Populate call leaves it, or as Describe finds it, in the stored form,
+# entries sorted by name with a directory's entries right after it. Only
+# where writeManifest is among Capabilities.operations.
+type ManifestSink(
+	# Index of the descriptor open for writing that receives the manifest
+	fileDescriptor: int,
+	# The fields the manifest carries, the default set when absent. A field
+	# the filesystem has no notion of is left out and not counted as omitted.
+	fields: ?[]ManifestField
+)
+
+# What goes into a filesystem. The source descriptor's type decides what it
+# is: a directory is a tree, a regular file is one file (Populate only) or, with
+# a manifest, the contents of its files back to back, a pipe is such a
+# stream. With a manifest the tree is what the manifest describes: every
+# file it names is resolved below the source directory, symbolic links
+# followed and never leaving it, checked to be present with the size the
+# manifest says before anything is written, and its contents verified
+# against the manifest's sizes and SHA-256 hashes while copying. The root
+# directory takes the source directory's owner, mode and time where the
+# filesystem keeps them.
+type Content(
+	# Index of the descriptor of the source: a directory, a regular file or
+	# a pipe, open read-only
+	sourceFileDescriptor: ?int,
+	# A UAPI.16 manifest describing the content, instead of or beside the tree
+	manifest: ?Manifest,
+	# Timestamp handling, preserve by default
+	times: ?TimePolicy,
+	# What to do with what cannot be stored, skip by default
+	unsupported: ?UnsupportedPolicy,
+	# Replace files that exist, true by default
+	replace: ?bool,
+	# Copy extended attributes where the filesystem keeps them, true by default
+	extendedAttributes: ?bool,
+	# Store every entry with this owner instead of the source's
+	uid: ?int,
+	gid: ?int,
+	# The UAPI.16 manifest of what was written, if wanted
+	manifestSink: ?ManifestSink
+)
+
+# Which step a long call is in, in the intermediate replies of a call made
+# with the more flag.
+type Phase(preparing, planning, formatting, populating, measuring, shrinking, checking, reading, removing)
+
+# vfat: the FAT32 parameters beyond the generic ones.
+type VfatOptions(
+	# Reserved sectors before the first FAT, 32 by default
+	reservedSectors: ?int,
+	# FAT copies, 2 by default
+	fats: ?int,
+	# OEM name in the boot sector, up to 8 printable ASCII characters
+	oemName: ?string,
+	# The hidden sectors field, the partition's start by default
+	hiddenSectors: ?int,
+	# Reproduce mkfs.fat's layout quirks exactly
+	mkfsFatCompatible: ?bool
+)
+
+# Parameters for making a filesystem. The generic ones every implementation
+# understands or refuses with OperationNotSupported when the filesystem has
+# no such thing (Capabilities.operations says which); the per-filesystem
+# structs are honoured by their own implementation and refused by every
+# other.
+type FormatOptions(
+	# The volume label, within Capabilities.label
+	label: ?string,
+	# The UUID or serial, as Capabilities.identifier says; random by default
+	identifier: ?string,
+	# The filesystem's time: stamped where the filesystem has one creation
+	# time or root time, and the fixed or clamping time for content; the
+	# current time by default
+	timestampUSec: ?int,
+	# The logical sector size the filesystem is made for: the device's by
+	# default, 512 for an image file
+	sectorSize: ?int,
+	# The block or cluster size, the filesystem's default for the size by default
+	blockSize: ?int,
+	# Discard the device before writing, false by default
+	discard: ?bool,
+	# Zero the whole data area, false by default
+	zero: ?bool,
+	# Make the bytes a function of the inputs alone: requires identifier and
+	# timestampUSec and pins everything else the implementation knows to
+	# vary (seeds, worker counts, walk order)
+	reproducible: ?bool,
+	# Features to turn on or off, by the names Capabilities.features lists
+	enableFeatures: ?[]string,
+	disableFeatures: ?[]string,
+	vfat: ?VfatOptions
+)
+
+# The algorithm of Assemble's imageHash, systemd's ManifestHash names. The
+# hashes inside a manifest are SHA-256, the one algorithm UAPI.16 defines.
+type HashAlgorithm(sha256, sha512)
+
+# What Assemble does.
+type AssembleMode(
+	# Write the filesystem (default)
+	assemble,
+	# Compute what assemble would write and write nothing
+	plan
+)
+
+# A filesystem as it is or as it would be.
+type Description(
+	fileSystemType: string,
+	label: ?string,
+	identifier: ?string,
+	sectorSize: int,
+	blockSize: int,
+	# The filesystem's size in bytes
+	sizeBytes: int,
+	# Free space, absent when the filesystem is read-only
+	freeBytes: ?int,
+	# The smallest size the content needs, when content was given
+	minimalSizeBytes: ?int
+)
+
+# A directory entry; the type takes the inode type names of UAPI.16.
+type EntryType(reg, dir, lnk, chr, blk, fifo, sock, other)
+
+type Entry(
+	name: string,
+	type: EntryType,
+	sizeBytes: int,
+	modifiedUSec: ?int,
+	createdUSec: ?int,
+	accessedUSec: ?int,
+	mode: ?int,
+	uid: ?int,
+	gid: ?int,
+	# A symbolic link's target
+	target: ?string,
+	# A second name the entry answers to, the 8.3 name on FAT
+	alternateName: ?string,
+	# DOS attributes and Linux inode flags, where the filesystem has them
+	dosAttributes: ?[]DosAttribute,
+	inodeFlags: ?[]InodeFlag
+)
+
+# How serious a finding of Check is: errors make readers fail or refuse the
+# filesystem or put data at risk, warnings are recoverable.
+type ProblemSeverity(error, warning)
+
+# What a finding is about, the same for every filesystem; the kind says
+# which finding in the implementation's own vocabulary.
+type ProblemClass(superblock, allocation, directory, name, timestamp, label, chain, crossLink, lostSpace, dirty, checksum, journal, interoperability, other)
+
+# A finding of Check: its class and kind and the facts about it, each set
+# when the kind has it. Kinds are identifiers the implementation documents
+# (ufat: chainLoop, orphanedLongName, ...); block stands for the
+# filesystem's allocation unit, a cluster on FAT.
+type Problem(
+	severity: ProblemSeverity,
+	class: ProblemClass,
+	kind: string,
+	path: ?string,
+	otherPath: ?string,
+	slot: ?int,
+	slots: ?int,
+	block: ?int,
+	blocks: ?int,
+	blocksNeeded: ?int,
+	sizeBytes: ?int,
+	value: ?int,
+	expected: ?int,
+	name: ?string,
+	otherName: ?string,
+	field: ?string,
+	copy: ?int,
+	count: ?int,
+	# Whether Check repaired it
+	repaired: ?bool
+)
+
+# How much Check may change.
+type RepairMode(
+	# Nothing: verify only (default)
+	none,
+	# What is safe without a decision, like fsck -p
+	preen,
+	# Everything it knows how to, like fsck -y
+	full
+)
+
+# What this implementation can do for a filesystem type.
+method GetCapabilities(
+	# The type asked about, for a service that serves several; absent, the
+	# one type the service serves
+	fileSystemType: ?string
+) -> (
+	capabilities: Capabilities
+)
+
+# Lays out a filesystem and reports it. With mode assemble the image is
+# written: formatted, and filled with the content when there is one, in one
+# step, which is the only way for a read-only filesystem. With mode plan
+# nothing is written: the geometry, the size the content needs and whether
+# that size is exact are computed, from the content and the options, and
+# from the image's size when one is given. A regular image file without a
+# size is grown to the fit when content is given. The reply carries what was
+# written: the label and identifier as stored, never as asked.
+# [Supports 'more' flag]: intermediate replies carry the phase and the
+# counts so far.
+method Assemble(
+	fileSystemType: ?string,
+	# The image; absent only with mode plan, when the content gives the size
+	image: ?Image,
+	mode: ?AssembleMode,
+	options: ?FormatOptions,
+	content: ?Content,
+	# Hash the whole image window as it is after the call: the written bytes
+	# and the rest, which the implementation knows to be zero when the call
+	# sized or zeroed the image, and reads back otherwise
+	imageHash: ?HashAlgorithm
+) -> (
+	# The step in progress, in intermediate replies only
+	phase: ?Phase,
+	description: ?Description,
+	# Whether the size is the exact minimum (plan, or assemble sized to fit)
+	exact: ?bool,
+	# What was written, when content was given
+	files: ?int,
+	directories: ?int,
+	bytes: ?int,
+	skipped: ?int,
+	# Metadata the filesystem keeps that the written manifest could not record
+	omitted: ?int,
+	# The hash asked for, in lowercase hex
+	imageHash: ?string
+)
+
+# Reads the filesystem that is in the image and reports it: type, label,
+# identifier, geometry, size and free space. NotFileSystem when the image
+# holds none of this type. With manifestSink the UAPI.16 manifest of what
+# the filesystem holds is written as well, which reads
+# every file for the hashes and takes as long as a copy; only where
+# writeManifest is among Capabilities.operations.
+# [Supports 'more' flag]: intermediate replies carry the phase.
+method Describe(
+	image: Image,
+	# The UAPI.16 manifest of what the filesystem holds, if wanted
+	manifestSink: ?ManifestSink
+) -> (
+	phase: ?Phase,
+	description: ?Description,
+	# What the manifest covers, when one was written
+	files: ?int,
+	directories: ?int,
+	bytes: ?int,
+	omitted: ?int
+)
+
+# Puts content into an existing filesystem at path: a tree, one file, a
+# manifest's content, or an empty directory when the content has no source.
+# Only where populate is among Capabilities.operations.
+# [Supports 'more' flag]: intermediate replies carry the phase and the
+# counts so far.
+method Populate(
+	image: Image,
+	# The path inside the filesystem; for a tree the directory its entries
+	# go below, created when missing; for one file the file's path; for a
+	# manifest "/", as a manifest names its paths from the root
+	path: string,
+	content: ?Content,
+	# Create missing parent directories, and accept an existing directory at path
+	parents: ?bool,
+	# Time of a directory created without content, the current time by default
+	timestampUSec: ?int
+) -> (
+	phase: ?Phase,
+	files: ?int,
+	directories: ?int,
+	bytes: ?int,
+	skipped: ?int,
+	# Metadata the filesystem keeps that the written manifest could not record
+	omitted: ?int
+)
+
+# Removes a file or a directory; a directory has to be empty unless recursive
+# is set, which removes everything below it first. The root directory itself
+# stays. Only where remove is among Capabilities.operations.
+# [Supports 'more' flag]: intermediate replies carry the phase and the
+# counts so far.
+method Remove(
+	image: Image,
+	path: string,
+	recursive: ?bool
+) -> (
+	phase: ?Phase,
+	# What was removed
+	files: ?int,
+	directories: ?int
+)
+
+# Lists a directory, one entry per reply, which needs the more flag; without
+# it the call fails with org.varlink.service.ExpectedMore, as
+# io.systemd.Machine.List does when it enumerates. A path naming a file
+# answers that one entry in a single reply. Only where list is among
+# Capabilities.operations.
+# [Supports 'more' flag]
+method List(
+	image: Image,
+	# The directory, the root by default, or a file
+	path: ?string
+) -> (
+	# Absent only in the reply that ends the listing of an empty directory
+	entry: ?Entry
+)
+
+# Checks the filesystem, by default without changing it; with a repair mode
+# it is repaired as far as that mode allows, and the findings say what was
+# repaired. The image is opened read-write only with a repair mode.
+# [Supports 'more' flag]: intermediate replies carry the phase and batches
+# of findings; without it the list is capped and dropped counts the rest.
+method Check(
+	image: Image,
+	repair: ?RepairMode
+) -> (
+	phase: ?Phase,
+	problems: ?[]Problem,
+	errors: ?int,
+	warnings: ?int,
+	repaired: ?int,
+	# Findings beyond the reported ones, counted but not listed
+	dropped: ?int,
+	# Nothing left that an error class finding describes
+	clean: ?bool
+)
+
+# A descriptor passed with the call is not usable as the parameter names it.
+type DescriptorProblem(oPath, flags, writeOnly, notReadOnly, notReadWrite, notWritable, wrongType)
+error BadFileDescriptor(parameter: string, reason: DescriptorProblem, flags: ?int)
+
+# The service does not serve this filesystem type.
+error FileSystemTypeNotSupported(fileSystemType: string)
+
+# What was asked for is not among Capabilities.operations: populate on a
+# read-only filesystem, plan where the size has to be given, or a label the
+# filesystem has no notion of.
+error OperationNotSupported(operation: Operation)
+
+# A read-only filesystem is made with its content, and none was given.
+error ContentRequired()
+
+# The filesystem cannot be sized to fit and no size was given.
+error SizeRequired()
+
+# The image holds no filesystem of this type.
+type NotFileSystemReason(blank, otherFileSystem, sectorSize, tooSmall, unknown)
+error NotFileSystem(reason: NotFileSystemReason, found: ?string, sectorSize: ?int)
+
+# The filesystem is damaged where the operation needed it sound.
+type CorruptPlace(superblock, allocation, chain, directory, journal, checksum)
+error Corrupt(where: CorruptPlace, field: ?string, path: ?string, block: ?int)
+
+# The filesystem has no room left.
+type NoSpaceReason(blocks, directoryEntries, names, inodes, volume)
+error NoSpaceLeft(reason: NoSpaceReason, path: ?string)
+
+# The image is smaller than the content needs.
+error TooSmall(minimalSizeBytes: int, sizeBytes: int)
+
+# A file or the filesystem is larger than the filesystem allows.
+error TooLarge(path: ?string, sizeBytes: int, sizeMaxBytes: int)
+
+# Paths inside the filesystem.
+error NoSuchFile(path: string)
+error FileExists(path: string)
+error NotADirectory(path: string)
+error IsADirectory(path: string)
+error DirectoryNotEmpty(path: string)
+
+# A name inside the filesystem is not valid for it.
+type NameProblem(empty, dotComponent, invalidCharacter, leadingSpace, trailingSpaceOrDot, tooLong, caseCollision)
+error InvalidName(name: string, reason: NameProblem)
+
+# The label does not fit the filesystem's rules.
+type LabelProblem(tooLong, invalidCharacter, notSupported)
+error InvalidLabel(label: string, reason: LabelProblem)
+
+# The identifier is not of the kind the filesystem carries or not well formed.
+type IdentifierProblem(malformed, wrongKind, notSupported, reserved)
+error InvalidIdentifier(identifier: string, reason: IdentifierProblem)
+
+# The manifest cannot be parsed or is inconsistent.
+type ManifestProblem(notJson, notObject, notUtf8, nulByte, recordSeparator, recordTooLarge, empty, noTrailer, dataAfterTrailer, fileAfterSignature, mediaType, firstHasName, firstNotDirectory, noName, invalidName, duplicateName, unknownType, fieldType, fieldRange, fieldNotPermitted, contradiction, contents, signature, extendedAttributes, noSize)
+error InvalidManifest(reason: ManifestProblem, record: ?int, name: ?string, field: ?string)
+
+# A file the manifest names is not below the source as described.
+type SourceProblem(missing, notRegular, size)
+error SourceMismatch(name: string, reason: SourceProblem, sizeBytes: ?int, expectedSizeBytes: ?int)
+
+# Contents do not match the manifest.
+type ContentProblem(size, hash, streamEnded)
+error ContentMismatch(name: string, reason: ContentProblem, sizeBytes: ?int, expectedSizeBytes: ?int)
+
+# Content the filesystem cannot hold, with UnsupportedPolicy fail.
+type UnsupportedKind(url, encoding, offset, transport, subManifest, inodeType, ownership, extendedAttribute, hardlink, sparse, dosAttribute, inodeFlag, name, timestamp)
+error ContentNotSupported(name: ?string, what: UnsupportedKind, value: ?string)
+
+# A manifest entry is revoked or outside its validity window.
+type ValidityProblem(revoked, notYetValid, expired)
+error EntryNotValid(name: string, reason: ValidityProblem)
+
+# The image is in use: mounted, or claimed by another process.
+error ImageBusy()
+
+# The implementation drives a tool that failed without saying more than this.
+error ToolFailed(executable: string, exitStatus: int)
+
+# Reproducible output was asked for but cannot be given: identifier or
+# timestamp missing, or the filesystem's tool leaves something random.
+type ReproducibilityProblem(identifierRequired, timestampRequired, toolRandomness)
+error NotReproducible(reason: ReproducibilityProblem)
