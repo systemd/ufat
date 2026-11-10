@@ -42,6 +42,7 @@ mod path;
 pub mod plan;
 pub mod populate;
 pub mod sha256;
+pub mod sha512;
 mod sys;
 #[cfg(test)]
 mod test_util;
