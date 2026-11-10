@@ -25,12 +25,18 @@ tests.
 
     meson test -C build
 
-`meson test` runs the unit tests of the library and of the json
-crate.
+`meson test` runs:
+
+- the unit tests of the library and of the json crate,
+- the integration tests in tests/.
 
 Set `TMPDIR` to a directory with a short path that is not a symbolic
 link. One test compares the targets of /proc/self/fd with paths below
 `TMPDIR`.
+
+`meson test` runs several test binaries at the same time. `-j 1` runs
+one at a time. `RUST_TEST_THREADS=` limits how many tests of one binary
+run at the same time.
 
 ## Formatting
 
