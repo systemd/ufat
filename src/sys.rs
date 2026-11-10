@@ -23,7 +23,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use crate::errno::{EBADF, EINVAL, ELOOP, ENODEV, ENOENT, ENOSYS, ENOTTY, ENXIO, EOPNOTSUPP};
+use crate::errno::{EBADF, EINVAL, EIO, ELOOP, ENODEV, ENOENT, ENOSYS, ENOTTY, ENXIO, EOPNOTSUPP};
 
 // The open(2) flags. libc has the values of each architecture: alpha,
 // arm, arm64, m68k, mips, parisc, powerpc and sparc number some of them
@@ -51,6 +51,20 @@ const NAME_MAX: usize = libc::NAME_MAX as usize;
 
 fn errno(code: i32) -> io::Error {
     io::Error::from_raw_os_error(code)
+}
+
+/// Makes a system call until no signal interrupts it, and turns a negative
+/// return into the error in errno.
+fn retry(mut call: impl FnMut() -> isize) -> io::Result<usize> {
+    loop {
+        if let Ok(n) = usize::try_from(call()) {
+            return Ok(n);
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
 }
 
 fn cstring(bytes: &[u8]) -> io::Result<CString> {
@@ -245,6 +259,25 @@ pub(crate) fn fs_kind(fd: BorrowedFd<'_>) -> io::Result<FsKind> {
     } else {
         FsKind::Other
     })
+}
+
+/// Fills `buf` from the kernel's random number generator, getrandom(2),
+/// going on after a short read or a signal. There is no reason to open
+/// /dev/urandom for this, systemd's random_bytes() doesn't either.
+pub(crate) fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        let rest = &mut buf[done..];
+        let n = retry(|| {
+            // SAFETY: getrandom writes at most rest.len() bytes into rest.
+            unsafe { libc::getrandom(rest.as_mut_ptr().cast(), rest.len(), 0) }
+        })?;
+        if n == 0 {
+            return Err(errno(EIO));
+        }
+        done += n;
+    }
+    Ok(())
 }
 
 /// Takes a BSD lock on `fd` without waiting: shared for reading, exclusive
@@ -508,6 +541,16 @@ mod tests {
         symlink("elsewhere", dir.join("dangling")).unwrap();
         assert_eq!(code(create_file_at(d.as_fd(), b"dangling", 0o644).unwrap_err()), EEXIST);
         assert!(!dir.join("elsewhere").exists());
+    }
+
+    #[test]
+    fn random_bytes_fills_the_buffer() {
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        random_bytes(&mut a).unwrap();
+        random_bytes(&mut b).unwrap();
+        assert_ne!(a, b);
+        random_bytes(&mut []).unwrap();
     }
 
     #[test]
