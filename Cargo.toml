@@ -23,6 +23,7 @@ lexopt = "0.3.2"
 libc = "0.2.191"
 # 0.11.1 and later need rustc 1.88.
 sha2 = { version = "0.11.0", default-features = false }
+varlink = { path = "varlink" }
 
 [workspace.lints.rust]
 unreachable_pub = "warn"
@@ -41,6 +42,7 @@ json.workspace = true
 lexopt.workspace = true
 libc.workspace = true
 sha2.workspace = true
+varlink.workspace = true
 
 [lints]
 workspace = true

@@ -4,6 +4,7 @@
 use super::Volume;
 use crate::errno::*;
 use crate::path::{components, join};
+use crate::progress::Progress;
 use crate::Detail;
 use crate::Result;
 
@@ -14,6 +15,17 @@ pub struct RemoveReport {
     pub files: u64,
     /// Directories removed, the one named included.
     pub directories: u64,
+}
+
+impl RemoveReport {
+    /// What the removal has done so far, as a progress callback hears it.
+    fn progress(&self) -> Progress {
+        Progress {
+            files: self.files,
+            directories: self.directories,
+            bytes: 0,
+        }
+    }
 }
 
 /// A directory on the walk: entered, with its contents still to be listed,
@@ -32,6 +44,16 @@ impl Volume {
     /// clusters. The root directory is refused with EINVAL; a path that
     /// does not exist fails the way [`Volume::metadata`] fails for it.
     pub fn remove_tree(&mut self, path: &str) -> Result<RemoveReport> {
+        self.remove_tree_with_progress(path, &mut |_| {})
+    }
+
+    /// [`Volume::remove_tree`], telling `progress` what it removed so far
+    /// after every file and directory.
+    pub fn remove_tree_with_progress(
+        &mut self,
+        path: &str,
+        progress: &mut dyn FnMut(&Progress),
+    ) -> Result<RemoveReport> {
         if components(path)?.is_empty() {
             bail!(
                 EINVAL,
@@ -61,12 +83,14 @@ impl Volume {
                         } else {
                             self.remove_file(&p)?;
                             report.files += 1;
+                            progress(&report.progress());
                         }
                     }
                 }
                 Step::Leave(dir) => {
                     self.remove_dir(&dir)?;
                     report.directories += 1;
+                    progress(&report.progress());
                 }
             }
         }

@@ -422,6 +422,11 @@ impl Volume {
         self.fat.free_count()
     }
 
+    /// Free space in bytes.
+    pub fn free_bytes(&self) -> u64 {
+        u64::from(self.fat.free_count()) * u64::from(self.layout.cluster_size())
+    }
+
     /// The volume label, from the root directory entry or else from the
     /// boot sector. None when the volume has no label: `NO NAME` and a
     /// blank label mean none, to us as to blkid and mtools.

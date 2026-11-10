@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 use super::*;
+use crate::populate::CopyOptions;
+use crate::progress::Progress;
 use crate::test_util::{volume, TempDir, TempImage};
 use crate::volume::Volume;
 use std::os::fd::AsFd;
@@ -684,4 +686,93 @@ fn times_outside_mtime_nsec_have_none() {
     assert_eq!(generate::time_nsec(last), Some(u64::MAX));
     assert_eq!(generate::time_nsec(last + Duration::from_nanos(1)), None);
     assert_eq!(generate::time_nsec(UNIX_EPOCH - Duration::from_secs(1)), None);
+}
+
+/// Checks the progress a long operation reported: the counts only grow
+/// and end at what its report says.
+fn reported(seen: &[Progress], last: Progress) {
+    assert!(
+        seen.windows(2)
+            .all(|w| w[0].files <= w[1].files && w[0].directories <= w[1].directories && w[0].bytes <= w[1].bytes),
+        "{:?}",
+        seen
+    );
+    assert_eq!(seen.last(), Some(&last));
+}
+
+/// The long operations tell their progress callback what they did so far,
+/// after every entry and every chunk of a file: a copy, the manifest of
+/// what was copied, an assembly from a manifest and a removal.
+#[test]
+fn long_operations_report_progress() {
+    let tmp = TempDir::new("progress");
+    let tree = tmp.path().join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("big"), vec![0x5au8; 3 << 20]).unwrap();
+    std::fs::write(tree.join("sub/small"), b"small").unwrap();
+    let source = crate::host::open_dir(&tree).unwrap();
+    let mut seen = Vec::new();
+
+    let (_img, mut v) = volume(64 << 20, 512, 4096);
+    let r = v
+        .copy_tree_with_progress(source.as_fd(), "/tree", &CopyOptions::default(), &mut |p| seen.push(*p))
+        .unwrap();
+    // The big file reports its bytes in chunks, before it is done.
+    assert!(seen.iter().any(|p| p.files == 0 && p.bytes > 0), "{:?}", seen);
+    reported(
+        &seen,
+        Progress {
+            files: r.files,
+            directories: r.directories,
+            bytes: r.bytes,
+        },
+    );
+
+    seen.clear();
+    let w = volume::write_with_progress(&v, None, volume::Fields::default(), &mut Vec::new(), &mut |p| {
+        seen.push(*p)
+    })
+    .unwrap();
+    assert!(seen.iter().any(|p| p.files == 0 && p.bytes > 0), "{:?}", seen);
+    reported(
+        &seen,
+        Progress {
+            files: w.files,
+            directories: w.directories,
+            bytes: w.bytes,
+        },
+    );
+
+    seen.clear();
+    let manifest = parse(&generated(&tree)).unwrap();
+    let (_img2, mut v2) = volume(64 << 20, 512, 4096);
+    let a = v2
+        .assemble_with_progress(
+            &manifest,
+            &mut dir_source(&tree),
+            &AssembleOptions::default(),
+            &mut |p| seen.push(*p),
+        )
+        .unwrap();
+    assert!(seen.iter().any(|p| p.files == 0 && p.bytes > 0), "{:?}", seen);
+    reported(
+        &seen,
+        Progress {
+            files: a.files,
+            directories: a.directories,
+            bytes: a.bytes,
+        },
+    );
+
+    seen.clear();
+    let removed = v.remove_tree_with_progress("/tree", &mut |p| seen.push(*p)).unwrap();
+    reported(
+        &seen,
+        Progress {
+            files: removed.files,
+            directories: removed.directories,
+            bytes: 0,
+        },
+    );
+    assert_eq!((removed.files, removed.directories), (2, 2));
 }

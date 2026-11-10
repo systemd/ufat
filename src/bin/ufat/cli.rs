@@ -21,6 +21,7 @@ use ufat::time::civil_from_days;
 use ufat::volume::Volume;
 use ufat::{bail, err, Context, Result};
 
+use crate::service;
 use crate::util;
 
 const USAGE: &str = "\
@@ -36,9 +37,13 @@ Commands:
   list [-l] IMAGE [PATH]                 List a directory
   describe [OPTIONS] IMAGE               Show a file system's geometry
   check IMAGE                            Check a file system
+  capabilities                           Print what ufat supports, as JSON
   cat IMAGE PATH                         Print a file
   manifest DIR                           Write a UAPI.16 manifest of a directory
                                          tree
+
+The commands are the methods of the org.uapi-group.FileSystem Varlink
+interface that ufat serves; cat and manifest have no method.
 
 assemble without a SOURCE creates an empty file system of the size of IMAGE or
 --size, or sized to hold the --fit directories or what --manifest describes.
@@ -77,6 +82,8 @@ Options for assemble:
                         needs --size, --fit or --manifest for that)
   --fit DIR             Size IMAGE to the smallest file system holding DIR
                         and leave it empty (no SOURCE; repeatable)
+  --hash ALGORITHM      Print the sha256 or sha512 hash of the file system
+                        written
   --verbose             Report the geometry chosen
 
 Options for assemble and populate:
@@ -732,12 +739,22 @@ fn report_estimate(args: &Args, path: &Path, estimate: &ufat::plan::Estimate) {
 fn cmd_assemble(argv: &[OsString]) -> Result<()> {
     let args = Args::parse(
         argv,
-        &with(FORMAT_VALUES, &with(IMAGE_OPTIONS, &with(FILL_VALUES, &["fit"]))),
+        &with(
+            FORMAT_VALUES,
+            &with(IMAGE_OPTIONS, &with(FILL_VALUES, &["fit", "hash"])),
+        ),
         &with(FORMAT_FLAGS, &with(FILL_FLAGS, &["plan"])),
     )?;
     if args.flag("plan") {
         return plan(&args);
     }
+    let hash = match args.value("hash") {
+        None => None,
+        Some(a) => Some(
+            service::Hash::new(a)
+                .ok_or_else(|| err!(errno::EINVAL, "unknown hash algorithm '{}', sha256 or sha512", a))?,
+        ),
+    };
     let (path, paths) = match args.positional_paths().split_first() {
         Some((&i, s)) => (i, s.to_vec()),
         None => bail!(errno::EINVAL, "assemble takes an IMAGE and SOURCE arguments"),
@@ -753,6 +770,9 @@ fn cmd_assemble(argv: &[OsString]) -> Result<()> {
     let layout = *v.layout();
     v.close()?;
     report_layout(path, &layout, args.flag("verbose"));
+    if let Some(hash) = hash {
+        println!("{}", hash.of(&open_image(&args, path, Access::ReadOnly)?, &mut |_| {})?);
+    }
     Ok(())
 }
 
@@ -1028,6 +1048,16 @@ fn cmd_check(argv: &[OsString]) -> Result<ExitCode> {
     })
 }
 
+/// Prints what `GetCapabilities` answers, as JSON.
+fn cmd_capabilities(argv: &[OsString]) -> Result<()> {
+    let args = Args::parse(argv, &[], &[])?;
+    if !args.positional.is_empty() {
+        bail!(errno::EINVAL, "capabilities takes no arguments");
+    }
+    println!("{}", json::Value::Object(service::capabilities()?));
+    Ok(())
+}
+
 fn cmd_manifest(argv: &[OsString]) -> Result<()> {
     let args = Args::parse(argv, &[], &[])?;
     let [dir] = args.positional.as_slice() else {
@@ -1059,6 +1089,7 @@ fn run(argv: &[OsString]) -> Result<ExitCode> {
         "list" => cmd_list(rest)?,
         "describe" => cmd_describe(rest)?,
         "check" => return cmd_check(rest),
+        "capabilities" => cmd_capabilities(rest)?,
         "cat" => cmd_cat(rest)?,
         "manifest" => cmd_manifest(rest)?,
         other => bail!(errno::EINVAL, "unknown command '{}'", other),

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! The command line: assemble makes a file system and fills it, populate
 //! fills an existing one, both take directory trees, or with --manifest the
-//! tree a UAPI.16 manifest describes.
+//! tree a UAPI.16 manifest describes. The commands are the methods of the
+//! Varlink interface.
 
 mod common;
 
@@ -460,4 +461,35 @@ fn manifests_of_what_was_written() {
     let p = populated.to_str().unwrap();
     ok(&bin, &["populate", "--path", "/more", "--write-manifest", p, b, t]);
     assert!(String::from_utf8_lossy(&fs::read(&populated).unwrap()).contains("\"more/EFI/Linux/linux.efi\""));
+}
+
+/// assemble prints the hash of the file system it wrote on request, and
+/// capabilities prints what GetCapabilities answers.
+#[test]
+fn hashes_and_capabilities() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    let t = root.join("tree");
+    let t = t.to_str().unwrap();
+    let a = root.join("a.img");
+    let a = a.to_str().unwrap();
+    let hash = ok(&bin, &["assemble", "--create", "--hash", "sha256", a, t]);
+    let mut h = ufat::sha256::Sha256::new();
+    h.update(&fs::read(a).unwrap());
+    assert_eq!(hash, format!("{}\n", ufat::sha256::to_hex(&h.finalize())));
+    let hash = ok(&bin, &["assemble", "--hash", "sha512", a, t]);
+    assert_eq!(hash.trim().len(), 128);
+    fails(&bin, &["assemble", "--hash", "md5", a, t], "sha256 or sha512");
+    let caps = ok(&bin, &["capabilities"]);
+    assert!(
+        caps.starts_with('{') && caps.contains("\"fileSystemType\":\"vfat\""),
+        "{}",
+        caps
+    );
+    fails(&bin, &["capabilities", a], "takes no arguments");
 }

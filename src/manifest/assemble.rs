@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{Contents, Entry, InodeType, Manifest, Storable};
 use crate::errno::*;
+use crate::progress::Progress;
 use crate::sha256::{Sha256, DIGEST_SIZE};
 use crate::sys;
 use crate::volume::Volume;
@@ -438,11 +439,14 @@ pub struct AssembleReport {
     pub skipped: Vec<String>,
 }
 
-/// Hashes what passes through it.
+/// Hashes what passes through it and tells `progress` after every write how
+/// many bytes it took, on top of what `done` counts.
 struct HashingWriter<'a> {
     inner: &'a mut dyn Write,
     hasher: Sha256,
     written: u64,
+    done: Progress,
+    progress: &'a mut dyn FnMut(&Progress),
 }
 
 impl Write for HashingWriter<'_> {
@@ -450,11 +454,26 @@ impl Write for HashingWriter<'_> {
         self.inner.write_all(buf)?;
         self.hasher.update(buf);
         self.written += buf.len() as u64;
+        (self.progress)(&Progress {
+            bytes: self.done.bytes + self.written,
+            ..self.done
+        });
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
+    }
+}
+
+impl AssembleReport {
+    /// What the assembly has done so far, as a progress callback hears it.
+    fn progress(&self) -> Progress {
+        Progress {
+            files: self.files,
+            directories: self.directories,
+            bytes: self.bytes,
+        }
     }
 }
 
@@ -470,6 +489,18 @@ impl Volume {
         manifest: &Manifest,
         source: &mut dyn ContentSource,
         options: &AssembleOptions,
+    ) -> Result<AssembleReport> {
+        self.assemble_with_progress(manifest, source, options, &mut |_| {})
+    }
+
+    /// [`Volume::assemble`], telling `progress` what it wrote so far after
+    /// every directory, every file and every chunk of a file.
+    pub fn assemble_with_progress(
+        &mut self,
+        manifest: &Manifest,
+        source: &mut dyn ContentSource,
+        options: &AssembleOptions,
+        progress: &mut dyn FnMut(&Progress),
     ) -> Result<AssembleReport> {
         let mut report = AssembleReport::default();
         if let Some(now) = options.now_usec {
@@ -509,6 +540,7 @@ impl Volume {
                         Err(e) => return Err(e),
                     }
                     report.directories += 1;
+                    progress(&report.progress());
                 }
                 Storable::File(contents) => {
                     // The writer aborts the file when it is dropped on an
@@ -519,6 +551,8 @@ impl Volume {
                         inner: &mut writer,
                         hasher: Sha256::new(),
                         written: 0,
+                        done: report.progress(),
+                        progress: &mut *progress,
                     };
                     match contents.and_then(|c| c.literal.as_ref()) {
                         Some(literal) => {
@@ -561,6 +595,7 @@ impl Volume {
                     writer.finish()?;
                     report.files += 1;
                     report.bytes += written;
+                    progress(&report.progress());
                 }
             }
         }

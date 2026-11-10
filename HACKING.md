@@ -51,6 +51,9 @@ limited to 108 bytes. One test compares the targets of
 `RUST_TEST_THREADS=` limits how many tests of one binary run at the
 same time.
 
+tests/varlink.rs also drives the service with `varlinkctl` when it is
+installed.
+
 ## Formatting
 
     cargo fmt --all

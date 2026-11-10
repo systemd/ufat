@@ -99,6 +99,7 @@ dependencies = [
  "lexopt",
  "libc",
  "sha2",
+ "varlink",
 ]
 
 [[package]]
