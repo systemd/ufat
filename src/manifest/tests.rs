@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 use super::*;
-use crate::test_util::{volume, TempDir};
+use crate::test_util::{volume, TempDir, TempImage};
+use crate::volume::Volume;
+use std::os::fd::AsFd;
 use std::path::Path;
 
 /// A directory resolved once, the way the tool resolves the SOURCE of a
 /// manifest.
 fn dir_source(path: &Path) -> DirectorySource {
     DirectorySource::new(crate::host::open_dir(path).unwrap())
+}
+
+/// The manifest the generator writes for the tree at `path`.
+fn generated(path: &Path) -> Vec<u8> {
+    generate(crate::host::open_dir(path).unwrap().as_fd()).unwrap()
 }
 
 fn seq(records: &[&str]) -> Vec<u8> {
@@ -424,6 +431,33 @@ fn assembles_from_a_directory() {
         .assemble(&m, &mut dir_source(&dir), &AssembleOptions::default())
         .unwrap();
     assert_eq!(report.files, 3);
+
+    // The generator produces a manifest the reader accepts and the
+    // planner and assembler agree on.
+    let generated = generated(&dir);
+    let g = parse(&generated).unwrap();
+    assert_eq!(
+        g.entries.iter().filter_map(|e| e.name.clone()).collect::<Vec<_>>(),
+        vec!["EFI", "EFI/Linux", "EFI/Linux/b.efi", "EFI/a.txt"]
+    );
+    let mut plan = crate::plan::Plan::new(crate::plan::PlanOptions {
+        allow_small: true,
+        cluster_size: Some(512),
+        ..crate::plan::PlanOptions::new(512)
+    });
+    assert!(plan.add_manifest(&g).unwrap().is_empty());
+    let est = plan.estimate().unwrap();
+    let img = TempImage::new(est.size());
+    let mut o = crate::format::FormatOptions {
+        allow_small: true,
+        ..Default::default()
+    };
+    est.apply(&mut o);
+    crate::format::format(&img.device(), &o).unwrap();
+    let mut v = Volume::open(img.device()).unwrap();
+    v.assemble(&g, &mut dir_source(&dir), &AssembleOptions::default())
+        .unwrap();
+    assert_eq!(v.free_clusters(), 0);
 }
 
 #[test]
@@ -588,6 +622,20 @@ fn directory_objects_after_their_children() {
 }
 
 #[test]
+fn generator_leaves_the_manifest_out() {
+    let tmp = TempDir::new("manifest-generate");
+    let dir = tmp.path().to_path_buf();
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("Uapi16Manifest"), b"old").unwrap();
+    std::fs::write(dir.join("Uapi16Manifest.sig"), b"old").unwrap();
+    std::fs::write(dir.join("Uapi16Manifest2"), b"kept").unwrap();
+    std::fs::write(dir.join("sub/Uapi16Manifest"), b"kept").unwrap();
+    let m = parse(&generated(&dir)).unwrap();
+    let names: Vec<&str> = m.entries.iter().filter_map(|e| e.name.as_deref()).collect();
+    assert_eq!(names, vec!["Uapi16Manifest2", "sub", "sub/Uapi16Manifest"]);
+}
+
+#[test]
 fn validity() {
     let m = parse(&seq(&[ROOT, r#"{"name":"x","size":0,"validity":"revoked"}"#, TRAILER])).unwrap();
     let (_img, mut v) = volume(8 << 20, 512, 512);
@@ -624,4 +672,16 @@ fn validity() {
         ..Default::default()
     };
     assert!(v.assemble(&m, &mut StreamSource::new(&mut empty), &opts).is_ok());
+}
+
+/// mTimeNSec holds nanoseconds since the epoch in 64 bits: up to the year
+/// 2554, and nothing before 1970.
+#[test]
+fn times_outside_mtime_nsec_have_none() {
+    use std::time::{Duration, UNIX_EPOCH};
+    let last = UNIX_EPOCH + Duration::from_nanos(u64::MAX);
+    assert_eq!(generate::time_nsec(UNIX_EPOCH), Some(0));
+    assert_eq!(generate::time_nsec(last), Some(u64::MAX));
+    assert_eq!(generate::time_nsec(last + Duration::from_nanos(1)), None);
+    assert_eq!(generate::time_nsec(UNIX_EPOCH - Duration::from_secs(1)), None);
 }

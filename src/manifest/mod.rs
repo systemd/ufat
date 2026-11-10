@@ -32,11 +32,13 @@ use crate::{Detail, ManifestProblem, Result, UnsupportedKind, ValidityProblem};
 
 mod assemble;
 mod fields;
+mod generate;
 #[cfg(test)]
 mod tests;
 
 pub use assemble::{AssembleOptions, AssembleReport, ContentSource, DirectorySource, StreamSource};
 pub use fields::{base64_decode, valid_name};
+pub use generate::generate;
 
 use fields::{
     access_mode, boolean, check_extended_attributes, check_signature, fat_key, hash, string, uint, valid_gpt_label,
