@@ -27,6 +27,10 @@ tests.
 
 `meson test` runs the unit tests of the library.
 
+Set `TMPDIR` to a directory with a short path that is not a symbolic
+link. One test compares the targets of /proc/self/fd with paths below
+`TMPDIR`.
+
 ## Formatting
 
     meson compile -C build rustfmt

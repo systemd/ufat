@@ -190,6 +190,8 @@ pub struct Volume {
     fsinfo_raw: [u8; FSINFO_SIZE],
     fsinfo_on_disk: Option<FsInfo>,
     dirs: RefCell<DirectoryCache>,
+    /// The buffer file contents are copied through, kept between files.
+    pub(crate) copy_buffer: Vec<u8>,
     /// Flush before every write that publishes new state. See
     /// [`Volume::set_durable`].
     durable: bool,
@@ -287,6 +289,7 @@ impl Volume {
             fsinfo_raw,
             fsinfo_on_disk: fsinfo,
             dirs: RefCell::new(DirectoryCache::default()),
+            copy_buffer: Vec::new(),
             durable,
         })
     }
