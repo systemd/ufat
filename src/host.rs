@@ -23,12 +23,19 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
+use crate::device::{Access, Device};
 use crate::errno::*;
 use crate::sys;
 use crate::{Context, Result};
+use crate::{DescriptorProblem, Detail};
+
+/// The detail of a passed descriptor that cannot be used.
+fn unusable(problem: DescriptorProblem, flags: Option<i32>) -> Detail {
+    Detail::Descriptor { problem, flags }
+}
 
 /// Resolves `path`, a directory, once and returns it pinned: the descriptor
 /// everything below it is opened relative to. Symbolic links in the path
@@ -64,6 +71,226 @@ pub fn open_parent(path: &Path) -> Result<(OwnedFd, OsString)> {
         _ => Path::new("."),
     };
     Ok((open_dir(dir)?, name))
+}
+
+/// Checks the open flags of a descriptor another process handed over, the
+/// way systemd's fd_verify_safe_flags_full() checks an extrinsic
+/// descriptor before a privileged service works with it: an O_PATH
+/// descriptor is refused, since it cannot be read or written and reopening
+/// it would give the client access it does not have; so is every status
+/// flag that is not on the allowlist (the access mode, O_NOFOLLOW,
+/// O_EMPTYPATH and O_LARGEFILE, which stick to a descriptor without
+/// meaning anything once it is open, plus `extra`). O_APPEND among them
+/// would make positional writes append, O_DIRECT would make them fail on
+/// alignment, O_NONBLOCK would make reads from a pipe fail at random.
+/// Returns the access mode; O_WRONLY is refused since everything here reads.
+fn vet_flags(fd: BorrowedFd<'_>, extra: i32, what: &str) -> Result<Access> {
+    match vet_status(fd, extra, what)? {
+        sys::O_RDONLY => Ok(Access::ReadOnly),
+        sys::O_RDWR => Ok(Access::ReadWrite),
+        _ => bail!(
+            EBADFD,
+            unusable(DescriptorProblem::WriteOnly, None),
+            "the {} descriptor is open for writing only",
+            what
+        ),
+    }
+}
+
+/// The checks of [`vet_flags`] up to the access mode, which is returned as
+/// it is (O_RDONLY, O_WRONLY or O_RDWR) for the caller to judge.
+fn vet_status(fd: BorrowedFd<'_>, extra: i32, what: &str) -> Result<i32> {
+    let flags = sys::descriptor_flags(fd)?;
+    if flags & sys::O_PATH != 0 {
+        bail!(
+            EBADFD,
+            unusable(DescriptorProblem::OPath, None),
+            "the {} descriptor was opened with O_PATH and cannot be read",
+            what
+        );
+    }
+    let allowed = sys::O_ACCMODE | sys::O_NOFOLLOW | sys::O_EMPTYPATH | sys::O_LARGEFILE | extra;
+    let unexpected = flags & !allowed;
+    if unexpected != 0 {
+        let culprit = if unexpected & sys::O_APPEND != 0 {
+            " (O_APPEND among them: writes would append)"
+        } else {
+            ""
+        };
+        bail!(
+            EBADFD,
+            unusable(DescriptorProblem::Flags, Some(unexpected)),
+            "the {} descriptor has flags set we cannot work with: 0o{:o}{}",
+            what,
+            unexpected,
+            culprit
+        );
+    }
+    match flags & sys::O_ACCMODE {
+        mode @ (sys::O_RDONLY | sys::O_WRONLY | sys::O_RDWR) => Ok(mode),
+        other => bail!(
+            EBADFD,
+            unusable(DescriptorProblem::Flags, Some(other)),
+            "the {} descriptor has no valid access mode",
+            what
+        ),
+    }
+}
+
+/// Takes a descriptor another process handed over as the image: a regular
+/// file or block device, open for reading when the image is only read and
+/// for reading and writing when it is written (O_RDWR, since every write
+/// reads too; O_WRONLY and O_APPEND are refused), with O_NONBLOCK accepted
+/// as it is meaningless on both. A block device to be written is claimed
+/// exclusively; no lock is taken on a passed descriptor, the caller holds
+/// its own, see [`crate::device::Device::from_passed`].
+pub fn passed_image(fd: OwnedFd, access: Access) -> Result<Device> {
+    let open_for = vet_flags(fd.as_fd(), sys::O_NONBLOCK, "image")?;
+    if access == Access::ReadWrite && open_for != Access::ReadWrite {
+        bail!(
+            EBADFD,
+            unusable(DescriptorProblem::NotReadWrite, None),
+            "the image descriptor is not open for reading and writing"
+        );
+    }
+    let ft = sys::fstat(fd.as_fd())?.file_type();
+    if !ft.is_file() && !ft.is_block_device() {
+        bail!(
+            EBADFD,
+            unusable(DescriptorProblem::WrongType, None),
+            "the image descriptor is not a regular file or block device"
+        );
+    }
+    Device::from_passed(fd, access)
+}
+
+/// Takes a descriptor another process handed over as a source directory,
+/// the root everything below is resolved against: a directory, open for
+/// reading only (O_DIRECTORY accepted, O_PATH refused).
+pub fn passed_directory(fd: OwnedFd) -> Result<OwnedFd> {
+    if vet_flags(fd.as_fd(), sys::O_DIRECTORY, "source directory")? != Access::ReadOnly {
+        bail!(
+            EBADFD,
+            unusable(DescriptorProblem::NotReadOnly, None),
+            "the source directory descriptor is not open read-only"
+        );
+    }
+    if !sys::fstat(fd.as_fd())?.is_dir() {
+        bail!(
+            EBADFD,
+            unusable(DescriptorProblem::WrongType, None),
+            "the source directory descriptor is not a directory"
+        );
+    }
+    Ok(fd)
+}
+
+/// Takes a descriptor another process handed over as a file to copy: a
+/// regular file open for reading only, read with positional reads from
+/// its start, so the position of the client's descriptor is left alone.
+pub fn passed_file(fd: OwnedFd) -> Result<File> {
+    if vet_flags(fd.as_fd(), 0, "source file")? != Access::ReadOnly {
+        bail!(
+            EBADFD,
+            unusable(DescriptorProblem::NotReadOnly, None),
+            "the source file descriptor is not open read-only"
+        );
+    }
+    if !sys::fstat(fd.as_fd())?.is_file() {
+        bail!(
+            EBADFD,
+            unusable(DescriptorProblem::WrongType, None),
+            "the source file descriptor is not a regular file"
+        );
+    }
+    Ok(File::from(fd))
+}
+
+/// What a source descriptor turned out to be.
+#[derive(Debug)]
+pub enum PassedSource {
+    /// A directory, the tree the files come from.
+    Directory(OwnedFd),
+    /// A regular file or pipe carrying the files' contents in order.
+    Stream(File),
+}
+
+/// Takes a descriptor another process handed over as the source of a
+/// manifest's file contents, which its type decides, the way the command
+/// line's SOURCE is a directory or "-": a directory, open read-only
+/// (O_DIRECTORY accepted), is the tree the manifest describes; a regular
+/// file or pipe, open read-only and blocking, carries the contents in
+/// manifest order. Anything else is EBADFD.
+pub fn passed_source(fd: OwnedFd) -> Result<PassedSource> {
+    if vet_flags(fd.as_fd(), sys::O_DIRECTORY, "source")? != Access::ReadOnly {
+        bail!(
+            EBADFD,
+            unusable(DescriptorProblem::NotReadOnly, None),
+            "the source descriptor is not open read-only"
+        );
+    }
+    let ft = sys::fstat(fd.as_fd())?.file_type();
+    if ft.is_dir() {
+        Ok(PassedSource::Directory(fd))
+    } else if ft.is_file() || ft.is_fifo() {
+        Ok(PassedSource::Stream(File::from(fd)))
+    } else {
+        bail!(
+            EBADFD,
+            unusable(DescriptorProblem::WrongType, None),
+            "the source descriptor is not a directory, a regular file or a pipe"
+        );
+    }
+}
+
+/// Takes a descriptor another process handed over as a stream to read to
+/// its end from where it stands, a manifest or the contents of files in
+/// manifest order: a regular file or a pipe, open for reading only, without
+/// O_NONBLOCK since a pipe would then fail instead of wait. A socket is
+/// always open for reading and writing and so never passes here.
+pub fn passed_stream(fd: OwnedFd) -> Result<File> {
+    if vet_flags(fd.as_fd(), 0, "stream")? != Access::ReadOnly {
+        bail!(
+            EBADFD,
+            unusable(DescriptorProblem::NotReadOnly, None),
+            "the stream descriptor is not open read-only"
+        );
+    }
+    let ft = sys::fstat(fd.as_fd())?.file_type();
+    if !ft.is_file() && !ft.is_fifo() {
+        bail!(
+            EBADFD,
+            unusable(DescriptorProblem::WrongType, None),
+            "the stream descriptor is not a regular file or pipe"
+        );
+    }
+    Ok(File::from(fd))
+}
+
+/// Takes a descriptor another process handed over as the sink a manifest
+/// is written to: a regular file or a pipe, open for writing (O_WRONLY or
+/// O_RDWR). O_APPEND is accepted, since the manifest goes out sequentially
+/// and where in its file the caller wants it is the caller's business;
+/// O_NONBLOCK is not, since a full pipe would then fail instead of wait.
+/// A descriptor open read-only is `NotWritable`, anything but a regular
+/// file or pipe `WrongType`.
+pub fn passed_sink(fd: OwnedFd) -> Result<File> {
+    if vet_status(fd.as_fd(), sys::O_APPEND, "sink")? == sys::O_RDONLY {
+        bail!(
+            EBADFD,
+            unusable(DescriptorProblem::NotWritable, None),
+            "the sink descriptor is not open for writing"
+        );
+    }
+    let ft = sys::fstat(fd.as_fd())?.file_type();
+    if !ft.is_file() && !ft.is_fifo() {
+        bail!(
+            EBADFD,
+            unusable(DescriptorProblem::WrongType, None),
+            "the sink descriptor is not a regular file or pipe"
+        );
+    }
+    Ok(File::from(fd))
 }
 
 /// Raises the soft limit on open descriptors to the hard limit and returns
@@ -646,5 +873,120 @@ mod tests {
         let link_in_d = contents.iter().find(|(t, _)| t == "/d/link").unwrap();
         assert_eq!(link_in_d.1, "D");
         assert_eq!(contents.len(), 4);
+    }
+
+    /// What another process hands us is taken only when it is open the way
+    /// the use needs: no O_PATH, nothing beyond the access mode, read-only
+    /// for everything we read, read-write without O_APPEND for the image.
+    #[test]
+    fn passed_descriptors_are_vetted() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let tmp = TempDir::new("passed");
+        let root = tmp.path();
+        fs::write(root.join("file"), b"data").unwrap();
+        fs::create_dir(root.join("dir")).unwrap();
+        let open = |name: &str, flags: i32| -> OwnedFd {
+            let mut o = fs::OpenOptions::new();
+            o.read(flags & sys::O_ACCMODE != sys::O_WRONLY)
+                .write(flags & sys::O_ACCMODE != sys::O_RDONLY)
+                .custom_flags(flags & !sys::O_ACCMODE);
+            OwnedFd::from(o.open(root.join(name)).unwrap())
+        };
+        // Sources must be read-only.
+        assert!(passed_file(open("file", sys::O_RDONLY)).is_ok());
+        assert_eq!(passed_file(open("file", sys::O_RDWR)).unwrap_err().errno(), EBADFD);
+        assert_eq!(passed_file(open("dir", sys::O_RDONLY)).unwrap_err().errno(), EBADFD);
+        let pinned = sys::open_path(None, &root.join("file"), false).unwrap();
+        let err = passed_file(pinned).unwrap_err();
+        assert_eq!(err.errno(), EBADFD);
+        assert!(
+            matches!(
+                err.detail(),
+                Some(Detail::Descriptor {
+                    problem: DescriptorProblem::OPath,
+                    ..
+                })
+            ),
+            "{:?}",
+            err
+        );
+        assert!(passed_directory(open("dir", sys::O_RDONLY | sys::O_DIRECTORY)).is_ok());
+        assert!(passed_directory(open("dir", sys::O_RDONLY)).is_ok());
+        assert_eq!(
+            passed_directory(open("file", sys::O_RDONLY)).unwrap_err().errno(),
+            EBADFD
+        );
+        // Streams: a regular file or a pipe, blocking.
+        assert!(passed_stream(open("file", sys::O_RDONLY)).is_ok());
+        assert_eq!(passed_stream(open("dir", sys::O_RDONLY)).unwrap_err().errno(), EBADFD);
+        sys::make_fifo(&root.join("fifo")).unwrap();
+        let reader = open("fifo", sys::O_RDONLY | sys::O_NONBLOCK);
+        let _writer = open("fifo", sys::O_WRONLY);
+        let err = passed_stream(open("fifo", sys::O_RDONLY | sys::O_NONBLOCK)).unwrap_err();
+        assert!(
+            matches!(
+                err.detail(),
+                Some(Detail::Descriptor {
+                    problem: DescriptorProblem::Flags,
+                    flags: Some(f),
+                }) if f & sys::O_NONBLOCK != 0
+            ),
+            "{:?}",
+            err
+        );
+        assert!(passed_stream(open("fifo", sys::O_RDONLY)).is_ok());
+        drop(reader);
+        // The image: read-write for writing, O_APPEND never.
+        assert!(passed_image(open("file", sys::O_RDONLY), Access::ReadOnly).is_ok());
+        assert!(passed_image(open("file", sys::O_RDWR), Access::ReadOnly).is_ok());
+        assert!(passed_image(open("file", sys::O_RDWR), Access::ReadWrite).is_ok());
+        assert_eq!(
+            passed_image(open("file", sys::O_RDONLY), Access::ReadWrite)
+                .unwrap_err()
+                .errno(),
+            EBADFD
+        );
+        assert_eq!(
+            passed_image(open("file", sys::O_WRONLY), Access::ReadWrite)
+                .unwrap_err()
+                .errno(),
+            EBADFD
+        );
+        let err = passed_image(open("file", sys::O_RDWR | sys::O_APPEND), Access::ReadWrite).unwrap_err();
+        assert_eq!(err.errno(), EBADFD);
+        assert!(
+            matches!(
+                err.detail(),
+                Some(Detail::Descriptor {
+                    problem: DescriptorProblem::Flags,
+                    flags: Some(f),
+                }) if f & sys::O_APPEND != 0
+            ),
+            "{:?}",
+            err
+        );
+        assert_eq!(
+            passed_image(open("dir", sys::O_RDONLY), Access::ReadOnly)
+                .unwrap_err()
+                .errno(),
+            EBADFD
+        );
+        assert!(passed_image(open("file", sys::O_RDWR | sys::O_NONBLOCK), Access::ReadWrite).is_ok());
+        // A source is whatever its type says, as long as it is read-only.
+        assert!(matches!(
+            passed_source(open("dir", sys::O_RDONLY)).unwrap(),
+            PassedSource::Directory(_)
+        ));
+        assert!(matches!(
+            passed_source(open("file", sys::O_RDONLY)).unwrap(),
+            PassedSource::Stream(_)
+        ));
+        let _reader = open("fifo", sys::O_RDONLY | sys::O_NONBLOCK);
+        let _writer = open("fifo", sys::O_WRONLY);
+        assert!(matches!(
+            passed_source(open("fifo", sys::O_RDONLY)).unwrap(),
+            PassedSource::Stream(_)
+        ));
+        assert_eq!(passed_source(open("file", sys::O_RDWR)).unwrap_err().errno(), EBADFD);
     }
 }

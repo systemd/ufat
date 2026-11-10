@@ -32,7 +32,14 @@ use crate::errno::{
 // arm, arm64, m68k, mips, parisc, powerpc and sparc number some of them
 // differently from include/uapi/asm-generic/fcntl.h.
 pub(crate) const O_RDONLY: c_int = libc::O_RDONLY;
+pub(crate) const O_WRONLY: c_int = libc::O_WRONLY;
 pub(crate) const O_RDWR: c_int = libc::O_RDWR;
+/// The access mode bits of the flags.
+pub(crate) const O_ACCMODE: c_int = libc::O_ACCMODE;
+/// Every write goes to the end, whatever offset it names: pwrite() on
+/// such a descriptor appends (pwrite(2), BUGS), which is why an image
+/// descriptor must not carry it.
+pub(crate) const O_APPEND: c_int = libc::O_APPEND;
 pub(crate) const O_CREAT: c_int = libc::O_CREAT;
 /// On a block device O_EXCL asks for the exclusive claim a mounted file
 /// system holds.
@@ -47,7 +54,7 @@ pub(crate) const O_CLOEXEC: c_int = libc::O_CLOEXEC;
 /// A descriptor that pins an inode without opening it: fstat, openat and
 /// a later [`reopen`] work on it, reading and writing do not.
 pub(crate) const O_PATH: c_int = libc::O_PATH;
-pub(crate) use uapi::O_EMPTYPATH;
+pub(crate) use uapi::{O_EMPTYPATH, O_LARGEFILE};
 
 /// NAME_MAX, include/uapi/linux/limits.h: the longest file name.
 const NAME_MAX: usize = libc::NAME_MAX as usize;
@@ -444,6 +451,19 @@ fn readlink(link: BorrowedFd<'_>) -> io::Result<Vec<u8>> {
         }
         buf.resize(buf.len() * 2, 0);
     }
+}
+
+/// The open flags of a descriptor as the kernel keeps them (F_GETFL): the
+/// access mode and the status flags; O_CREAT, O_EXCL, O_NOCTTY and
+/// O_TRUNC are not kept and O_CLOEXEC lives elsewhere.
+pub(crate) fn descriptor_flags(fd: BorrowedFd<'_>) -> io::Result<c_int> {
+    // SAFETY: F_GETFL takes no argument and reads nothing through a
+    // pointer.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags)
 }
 
 /// Raises the soft limit on open descriptors to the hard limit and returns
@@ -1021,6 +1041,51 @@ mod tests {
         };
         let line = limits.lines().find(|l| l.starts_with("Max open files")).unwrap();
         assert_eq!(line.split_whitespace().nth(3), Some(raised.to_string().as_str()));
+    }
+
+    /// F_GETFL shows exactly what a plain open sets: the access mode and
+    /// O_LARGEFILE, which the kernel adds for a 64-bit process and glibc's
+    /// open64() for a 32-bit one. With a wrong O_LARGEFILE every descriptor
+    /// passed to the service would be refused.
+    #[test]
+    fn a_plain_open_has_the_access_mode_and_o_largefile() {
+        let tmp = TempDir::new("flags");
+        let path = tmp.path().join("file");
+        fs::write(&path, b"").unwrap();
+        let file = File::open(&path).unwrap();
+        assert_eq!(descriptor_flags(file.as_fd()).unwrap(), O_RDONLY | O_LARGEFILE);
+    }
+
+    /// Where the kernel knows O_EMPTYPATH, an empty path with it reopens
+    /// what a descriptor pins, and F_GETFL shows the flag. With a wrong
+    /// value [`reopen`] would fall back to procfs without a word. openat2
+    /// tells whether the kernel knows the flag: it refuses unknown flags
+    /// with EINVAL, where openat ignores them.
+    #[test]
+    fn o_emptypath_reopens_where_the_kernel_has_it() {
+        let tmp = TempDir::new("emptypath");
+        let path = tmp.path().join("file");
+        fs::write(&path, b"").unwrap();
+        let pinned = open_path(None, &path, false).unwrap();
+        // SAFETY: open_how is made of integers, and zero is a valid value
+        // for each.
+        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+        how.flags = (O_RDONLY | O_CLOEXEC | O_EMPTYPATH) as u64;
+        match openat2(pinned.as_fd(), c"", &how) {
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(EINVAL) => {
+                return eprintln!("skipping: the kernel does not know O_EMPTYPATH");
+            }
+            Err(e) if e.raw_os_error() == Some(ENOSYS) => {
+                return eprintln!("skipping: the kernel has no openat2");
+            }
+            Err(e) => panic!("openat2 with O_EMPTYPATH failed: {}", e),
+        }
+        let file = open_at(pinned.as_raw_fd(), c"", O_RDONLY | O_EMPTYPATH, 0).unwrap();
+        assert_eq!(
+            descriptor_flags(file.as_fd()).unwrap(),
+            O_RDONLY | O_LARGEFILE | O_EMPTYPATH
+        );
     }
 
     #[test]

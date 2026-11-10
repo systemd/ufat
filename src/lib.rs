@@ -21,8 +21,9 @@ compile_error!("ufat supports Linux with glibc only");
 #[macro_use]
 mod error;
 pub use error::{
-    ContentProblem, Context, CorruptPlace, Detail, Error, IdentifierProblem, LabelProblem, ManifestProblem,
-    NameProblem, NoSpaceReason, NotFat32Reason, Result, SourceProblem, UnsupportedKind, ValidityProblem,
+    ContentProblem, Context, CorruptPlace, DescriptorProblem, Detail, Error, IdentifierProblem, LabelProblem,
+    ManifestProblem, NameProblem, NoSpaceReason, NotFat32Reason, Result, SourceProblem, UnsupportedKind,
+    ValidityProblem,
 };
 
 pub mod boot;
