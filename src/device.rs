@@ -45,6 +45,9 @@ pub struct Device {
     /// so that [`Device::remove_if_created`] can take it away again while
     /// nothing has been written to it.
     created_in: Option<(OwnedFd, Vec<u8>)>,
+    /// How often the data was synced, for the tests of the write order.
+    #[cfg(test)]
+    pub(crate) syncs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Device {
@@ -173,6 +176,8 @@ impl Device {
             len,
             block_device,
             created_in: None,
+            #[cfg(test)]
+            syncs: Default::default(),
         })
     }
 
@@ -362,6 +367,8 @@ impl Device {
     /// Makes the data written so far reach stable storage (fdatasync): the
     /// barrier between a write and the one that publishes it.
     pub fn sync_data(&self) -> Result<()> {
+        #[cfg(test)]
+        self.syncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.file.sync_data().with_context(|| "fdatasync failed")?;
         Ok(())
     }

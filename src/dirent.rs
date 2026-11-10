@@ -20,6 +20,8 @@ pub const ATTR_DIRECTORY: u8 = 0x10;
 pub const ATTR_ARCHIVE: u8 = 0x20;
 /// The attribute combination marking a long file name entry.
 pub const ATTR_LONG_NAME: u8 = ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_VOLUME_ID;
+/// The attribute bits the specification reserves.
+pub const ATTR_RESERVED: u8 = 0xC0;
 /// First byte of a deleted entry.
 pub const ENTRY_DELETED: u8 = 0xE5;
 /// First byte of an unused entry; everything after it is unused too.
@@ -144,6 +146,15 @@ impl RawDirEntry {
             date: self.create_date,
             time: self.create_time,
             tenths: self.create_tenths,
+        }
+    }
+
+    /// The access date, which comes without a time.
+    pub fn access_timestamp(&self) -> FatTimestamp {
+        FatTimestamp {
+            date: self.access_date,
+            time: 0,
+            tenths: 0,
         }
     }
 }

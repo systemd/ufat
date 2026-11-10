@@ -140,6 +140,17 @@ impl FatTimestamp {
         self.time & 0x1f
     }
 
+    /// Whether the date names a day of a month. A day beyond the end of its
+    /// month still counts, as the readers roll it over.
+    pub fn date_is_valid(self) -> bool {
+        (1..=12).contains(&self.month()) && self.day() != 0
+    }
+
+    /// Whether the time names a time of the day.
+    pub fn time_is_valid(self) -> bool {
+        self.hours() <= 23 && self.minutes() <= 59 && self.two_seconds() <= 29
+    }
+
     /// Converts a system time, clamping to the representable range.
     pub fn from_system_time(t: SystemTime) -> FatTimestamp {
         match t.duration_since(UNIX_EPOCH) {
