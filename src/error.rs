@@ -168,6 +168,152 @@ impl CorruptPlace {
     }
 }
 
+/// What is wrong with a UAPI.16 manifest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManifestProblem {
+    /// A record is not valid JSON.
+    NotJson,
+    /// A record is not a JSON object.
+    NotObject,
+    /// A record is not UTF-8.
+    NotUtf8,
+    /// A record contains a NUL byte.
+    NulByte,
+    /// A record does not start with the record separator.
+    RecordSeparator,
+    /// A record is larger than the parser accepts.
+    RecordTooLarge,
+    /// The manifest holds no object at all.
+    Empty,
+    /// The trailer object is missing.
+    NoTrailer,
+    /// Data follows the trailer object.
+    DataAfterTrailer,
+    /// A file object follows a signature object.
+    FileAfterSignature,
+    /// The media type is missing on the first object, is not a string, or
+    /// is not one the parser knows.
+    MediaType,
+    /// The first object has a name.
+    FirstHasName,
+    /// The first object is not a directory.
+    FirstNotDirectory,
+    /// An object after the first has no name.
+    NoName,
+    /// A name is not a normalized relative path.
+    InvalidName,
+    /// Two objects carry the same name, or names FAT folds together.
+    DuplicateName,
+    /// An inode type the parser does not know.
+    UnknownType,
+    /// A field is of the wrong JSON type or shape, named by `field`.
+    FieldType,
+    /// A field's value is out of range, named by `field`.
+    FieldRange,
+    /// A field that the object's inode type does not permit, named by
+    /// `field`.
+    FieldNotPermitted,
+    /// Two fields contradict each other, the first named by `field`.
+    Contradiction,
+    /// A contents entry: not an object, more than one of file, url and
+    /// literal, a URL that is not http or https, a literal that is not
+    /// Base64, an encoding that is not permitted, or too many entries.
+    Contents,
+    /// A malformed signature object.
+    Signature,
+    /// A malformed extendedAttributes object.
+    ExtendedAttributes,
+    /// A regular file without a size whose contents would have to be
+    /// streamed.
+    NoSize,
+}
+
+impl ManifestProblem {
+    /// The value as the Varlink interface spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ManifestProblem::NotJson => "notJson",
+            ManifestProblem::NotObject => "notObject",
+            ManifestProblem::NotUtf8 => "notUtf8",
+            ManifestProblem::NulByte => "nulByte",
+            ManifestProblem::RecordSeparator => "recordSeparator",
+            ManifestProblem::RecordTooLarge => "recordTooLarge",
+            ManifestProblem::Empty => "empty",
+            ManifestProblem::NoTrailer => "noTrailer",
+            ManifestProblem::DataAfterTrailer => "dataAfterTrailer",
+            ManifestProblem::FileAfterSignature => "fileAfterSignature",
+            ManifestProblem::MediaType => "mediaType",
+            ManifestProblem::FirstHasName => "firstHasName",
+            ManifestProblem::FirstNotDirectory => "firstNotDirectory",
+            ManifestProblem::NoName => "noName",
+            ManifestProblem::InvalidName => "invalidName",
+            ManifestProblem::DuplicateName => "duplicateName",
+            ManifestProblem::UnknownType => "unknownType",
+            ManifestProblem::FieldType => "fieldType",
+            ManifestProblem::FieldRange => "fieldRange",
+            ManifestProblem::FieldNotPermitted => "fieldNotPermitted",
+            ManifestProblem::Contradiction => "contradiction",
+            ManifestProblem::Contents => "contents",
+            ManifestProblem::Signature => "signature",
+            ManifestProblem::ExtendedAttributes => "extendedAttributes",
+            ManifestProblem::NoSize => "noSize",
+        }
+    }
+}
+
+/// What a manifest asks for that cannot be done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsupportedKind {
+    /// Contents to be fetched from a URL.
+    Url,
+    /// Contents in an encoding, named by `value`.
+    Encoding,
+    /// Contents at an offset into a streamed source.
+    Offset,
+    /// Contents only available through a transport, named by `value`.
+    Transport,
+    /// A directory that refers to a sub-manifest.
+    SubManifest,
+    /// An inode type FAT cannot store, named by `value`.
+    InodeType,
+}
+
+impl UnsupportedKind {
+    /// The value as the Varlink interface spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnsupportedKind::Url => "url",
+            UnsupportedKind::Encoding => "encoding",
+            UnsupportedKind::Offset => "offset",
+            UnsupportedKind::Transport => "transport",
+            UnsupportedKind::SubManifest => "subManifest",
+            UnsupportedKind::InodeType => "inodeType",
+        }
+    }
+}
+
+/// Why a manifest entry is not valid now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValidityProblem {
+    /// Marked revoked.
+    Revoked,
+    /// Its validity has not begun.
+    NotYetValid,
+    /// Its validity has ended.
+    Expired,
+}
+
+impl ValidityProblem {
+    /// The value as the Varlink interface spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ValidityProblem::Revoked => "revoked",
+            ValidityProblem::NotYetValid => "notYetValid",
+            ValidityProblem::Expired => "expired",
+        }
+    }
+}
+
 /// What an error is about, for a program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Detail {
@@ -229,6 +375,33 @@ pub enum Detail {
         /// The cluster where the damage was found.
         cluster: Option<u32>,
     },
+    /// The manifest is malformed.
+    Manifest {
+        /// What is wrong.
+        problem: ManifestProblem,
+        /// The index of the record, counting from 0, when known.
+        record: Option<u64>,
+        /// The object's name, when known.
+        name: Option<String>,
+        /// The field, when the problem is with one.
+        field: Option<String>,
+    },
+    /// The manifest asks for something that cannot be done.
+    Unsupported {
+        /// The entry's path as the manifest names it, when about one.
+        name: Option<String>,
+        /// What cannot be done.
+        what: UnsupportedKind,
+        /// The encoding, transport or inode type asked for.
+        value: Option<String>,
+    },
+    /// A manifest entry is revoked or outside its validity window.
+    Validity {
+        /// The entry's path as the manifest names it.
+        name: String,
+        /// Why it is not valid.
+        problem: ValidityProblem,
+    },
     /// An option the caller gave is not valid, named as the Varlink
     /// interface spells it.
     InvalidOption(&'static str),
@@ -277,6 +450,12 @@ impl Error {
         self
     }
 
+    /// Whether the error is about the manifest itself rather than about
+    /// contents that do not match it.
+    pub fn is_manifest(&self) -> bool {
+        matches!(self.0.detail, Some(Detail::Manifest { .. }))
+    }
+
     /// Names the path inside the volume the error is about, where the
     /// detail has room for one and none is set yet: the file that did not
     /// fit, the entry that is too large, the directory found damaged, or
@@ -294,6 +473,21 @@ impl Error {
                 inner.detail = Some(Detail::Path(path.to_string()));
             }
             _ => {}
+        }
+        self
+    }
+
+    /// Fills in the record index and the object's name of a manifest
+    /// error that lacks them.
+    #[must_use]
+    pub fn in_record(mut self, index: u64, object: Option<&str>) -> Self {
+        if let Some(Detail::Manifest { record, name, .. }) = &mut self.0.detail {
+            if record.is_none() {
+                *record = Some(index);
+            }
+            if name.is_none() {
+                *name = object.map(str::to_string);
+            }
         }
         self
     }
