@@ -22,4 +22,5 @@ pub use error::{Context, CorruptPlace, Detail, Error, NoSpaceReason, NotFat32Rea
 pub mod boot;
 mod bytes;
 pub mod errno;
+pub mod fat;
 pub mod layout;
