@@ -13,8 +13,10 @@
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-#[cfg(not(target_os = "linux"))]
-compile_error!("ufat supports Linux only");
+// sys.rs calls the LFS64 functions of glibc, such as openat64(), which
+// musl does not have.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+compile_error!("ufat supports Linux with glibc only");
 
 #[macro_use]
 mod error;
@@ -22,9 +24,14 @@ pub use error::{Context, CorruptPlace, Detail, Error, NameProblem, NoSpaceReason
 
 pub mod boot;
 mod bytes;
+pub mod device;
 pub mod dirent;
 pub mod errno;
 pub mod fat;
+pub mod host;
 pub mod layout;
 pub mod name;
+mod sys;
+#[cfg(test)]
+mod test_util;
 pub mod time;

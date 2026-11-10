@@ -13,6 +13,8 @@ license = "LGPL-2.1-or-later"
 publish = false
 
 [workspace.dependencies]
+# The _IO and _IOR helpers came with 0.2.172. Stay on 0.2: 1.0 may drop
+# the LFS64 functions such as openat64 and fstatfs64.
 libc = "0.2.191"
 
 [workspace.lints.rust]
