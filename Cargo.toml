@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 [workspace]
-members = [".", "json", "tools", "tests/crash"]
+members = [".", "json", "varlink", "tools", "tests/crash"]
 # A plain `cargo build` or `cargo test` leaves out the case folding table
 # generator.
-default-members = [".", "json", "tests/crash"]
+default-members = [".", "json", "varlink", "tests/crash"]
 # cargo update picks dependency versions that support rust-version.
 resolver = "3"
 

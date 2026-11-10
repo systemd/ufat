@@ -109,3 +109,11 @@ dependencies = [
  "libc",
  "sha2",
 ]
+
+[[package]]
+name = "varlink"
+version = "0.0.0"
+dependencies = [
+ "json",
+ "libc",
+]

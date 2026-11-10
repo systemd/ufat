@@ -7,6 +7,9 @@ crates. lexopt parses the command line of the tool.
 
 - rustc and cargo 1.85 or newer. ufat has to keep building with rustc
   1.85.
+- Linux with glibc, on x86_64, i686, aarch64, armv7, loongarch64,
+  powerpc, powerpc64, powerpc64le, riscv64, s390x or sparc64. The build
+  fails on other targets, musl included.
 - rustfmt, for the formatting check, and clippy, for the lints.
 
 ## Building
@@ -32,7 +35,7 @@ With rustup, `cargo +1.85.0` selects rustc 1.85:
 
 `cargo test` runs:
 
-- the unit tests of the library and of the json crate,
+- the unit tests of the library and of the json and varlink crates,
 - the integration tests in tests/,
 - the crash consistency harness.
 
@@ -40,8 +43,9 @@ The tests build with the dev profile, which is optimized and keeps the
 overflow checks and debug assertions. `--release` turns those off.
 
 Set `TMPDIR` to a directory with a short path that is not a symbolic
-link. One test compares the targets of /proc/self/fd with paths below
-`TMPDIR`.
+link. Some tests create Unix sockets below it, and socket paths are
+limited to 108 bytes. One test compares the targets of
+/proc/self/fd with paths below `TMPDIR`.
 
 `cargo test` runs the test binaries one after the other.
 `RUST_TEST_THREADS=` limits how many tests of one binary run at the
