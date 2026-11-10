@@ -37,6 +37,56 @@ impl NoSpaceReason {
     }
 }
 
+/// Why an image holds no FAT32 file system we can work with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotFat32Reason {
+    /// The boot sector is all zeros.
+    Blank,
+    /// A FAT12 or FAT16 volume, or no FAT at all.
+    NotFat32,
+    /// A sector size this crate does not support.
+    SectorSize,
+    /// The image is too small to hold a file system.
+    TooSmall,
+}
+
+impl NotFat32Reason {
+    /// The value as the Varlink interface spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NotFat32Reason::Blank => "blank",
+            NotFat32Reason::NotFat32 => "notFat32",
+            NotFat32Reason::SectorSize => "sectorSize",
+            NotFat32Reason::TooSmall => "tooSmall",
+        }
+    }
+}
+
+/// Which structure of a volume is damaged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CorruptPlace {
+    /// A field of the boot sector, named by `field`.
+    BootSector,
+    /// The FAT itself.
+    Fat,
+    /// A cluster chain: it loops, or runs into a free, bad or invalid entry.
+    Chain,
+    /// A directory's contents.
+    Directory,
+}
+
+impl CorruptPlace {
+    /// The value as the Varlink interface spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CorruptPlace::BootSector => "bootSector",
+            CorruptPlace::Fat => "fat",
+            CorruptPlace::Chain => "chain",
+            CorruptPlace::Directory => "directory",
+        }
+    }
+}
+
 /// What an error is about, for a program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Detail {
@@ -55,6 +105,24 @@ pub enum Detail {
         reason: NoSpaceReason,
         /// The path inside the volume of what did not fit.
         path: Option<String>,
+    },
+    /// The image holds no FAT32 file system.
+    NotFat32 {
+        /// Why not.
+        reason: NotFat32Reason,
+        /// The sector size found, when that is the reason.
+        sector_size: Option<u32>,
+    },
+    /// The file system is damaged.
+    Corrupt {
+        /// Which structure.
+        place: CorruptPlace,
+        /// The boot sector field, for the boot sector.
+        field: Option<&'static str>,
+        /// The path inside the volume of the entry affected.
+        path: Option<String>,
+        /// The cluster where the damage was found.
+        cluster: Option<u32>,
     },
     /// An option the caller gave is not valid, named as the Varlink
     /// interface spells it.
