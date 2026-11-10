@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+//! The crate root for the verify target: the pure modules of the library, so
+//! that Kani needs neither the json crate nor any I/O. The Kani harnesses
+//! live in `#[cfg(kani)] mod proofs` blocks inside the modules themselves.
+#![allow(dead_code, unused_imports, unreachable_pub)]
+
+#[macro_use]
+#[path = "../src/error.rs"]
+mod error;
+pub use error::{CorruptPlace, Detail, Error, NameProblem, NoSpaceReason, NotFat32Reason, Result};
+
+#[path = "../src/boot.rs"]
+pub mod boot;
+#[path = "../src/bytes.rs"]
+mod bytes;
+#[path = "../src/dir.rs"]
+pub mod dir;
+#[path = "../src/dirent.rs"]
+pub mod dirent;
+#[path = "../src/errno.rs"]
+pub mod errno;
+#[path = "../src/fat.rs"]
+pub mod fat;
+#[path = "../src/layout.rs"]
+pub mod layout;
+#[path = "../src/name.rs"]
+pub mod name;
+#[path = "../src/time.rs"]
+pub mod time;

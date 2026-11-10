@@ -60,3 +60,28 @@ tests/exhaustive.rs checks the layout computation, the time conversion
 and the name handling over large ranges of inputs. It takes about a
 minute on 16 cores. It is built and run only when the `slow-tests`
 option is set.
+
+## Kani proofs
+
+The pure modules contain proofs for the Kani model checker in
+`#[cfg(kani)]` blocks. verify/lib.rs is a crate root that holds only
+these modules. Install Kani with:
+
+    cargo install --locked kani-verifier
+    cargo kani setup
+
+Then run:
+
+    meson compile -C build verify
+    HARNESS=layout::proofs::compute_fixed_params_any_total meson compile -C build verify
+    SLOW=1 meson compile -C build verify
+    DIR=1 meson compile -C build verify
+
+`HARNESS=` runs one harness. `SLOW=1` adds the harnesses that take longer
+than half an hour. `DIR=1` adds the harness of the directory index, which
+has not finished yet.
+
+Up to four harnesses run at the same time. `KANI_JOBS=` changes that.
+`KANI_VERBOSE=1` runs them one after the other and prints every check.
+Some harnesses need more memory than a laptop has. The default set takes
+about half an hour on a 512 core machine with `KANI_JOBS=24`.

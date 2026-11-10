@@ -1,1 +1,6 @@
 build/
+# Kani writes its intermediate files next to the crate root.
+verify/*
+!verify/lib.rs
+!verify/meson.build
+!verify/run.sh

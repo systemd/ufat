@@ -38,6 +38,7 @@ crate_roots = []
 subdir('src')
 subdir('tools')
 subdir('tests')
+subdir('verify')
 
 rustfmt = find_program('rustfmt', required : false)
 if rustfmt.found()
