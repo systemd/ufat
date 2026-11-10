@@ -41,6 +41,7 @@ extern "C" {
     fn getdents64(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn fstatfs(fd: c_int, buf: *mut StatFs) -> c_int;
     fn getrandom(buf: *mut c_void, len: usize, flags: c_uint) -> isize;
+    fn prlimit64(pid: c_int, resource: c_int, new_limit: *const Rlimit64, old_limit: *mut Rlimit64) -> c_int;
 }
 
 // The open(2) flags, include/uapi/asm-generic/fcntl.h. powerpc keeps its
@@ -485,6 +486,43 @@ fn readlink(link: BorrowedFd<'_>) -> io::Result<Vec<u8>> {
         }
         buf.resize(buf.len() * 2, 0);
     }
+}
+
+/// A resource limit as prlimit64() carries it: 64 bits on every
+/// architecture, unlike struct rlimit.
+#[repr(C)]
+struct Rlimit64 {
+    cur: u64,
+    max: u64,
+}
+
+/// RLIMIT_NOFILE, include/uapi/asm-generic/resource.h (mips and sparc
+/// differ and are refused in errno.rs).
+const RLIMIT_NOFILE: c_int = 7;
+
+/// Raises the soft limit on open descriptors to the hard limit and returns
+/// the soft limit in force afterwards, the way systemd's
+/// rlimit_nofile_bump() does for every tool: the soft limit of 1024 a
+/// process starts with is select()'s and nothing here uses select().
+pub(crate) fn raise_descriptor_limit() -> io::Result<u64> {
+    let mut old = Rlimit64 { cur: 0, max: 0 };
+    // SAFETY: pid 0 is the calling process; no new limit is passed and
+    // `old` is a struct of the layout the kernel fills in.
+    if unsafe { prlimit64(0, RLIMIT_NOFILE, std::ptr::null(), &mut old) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if old.cur >= old.max {
+        return Ok(old.cur);
+    }
+    let new = Rlimit64 {
+        cur: old.max,
+        max: old.max,
+    };
+    // SAFETY: as above, with a new limit of that layout and no old one asked for.
+    if unsafe { prlimit64(0, RLIMIT_NOFILE, &new, std::ptr::null_mut()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(new.cur)
 }
 
 /// The metadata of what `fd` refers to, an O_PATH descriptor included:
@@ -1061,6 +1099,14 @@ mod tests {
         symlink("elsewhere", dir.join("dangling")).unwrap();
         assert_eq!(code(create_file_at(d.as_fd(), b"dangling", 0o644).unwrap_err()), EEXIST);
         assert!(!dir.join("elsewhere").exists());
+    }
+
+    #[test]
+    fn raising_the_descriptor_limit_sticks() {
+        let raised = raise_descriptor_limit().unwrap();
+        assert!(raised > 0);
+        // Raised already: the same limit comes back.
+        assert_eq!(raise_descriptor_limit().unwrap(), raised);
     }
 
     #[test]

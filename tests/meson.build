@@ -16,10 +16,11 @@ if get_option('slow-tests')
 endif
 
 integration_env = {
+        'UFAT' : ufat.full_path(),
         'UFAT_FIXTURES' : meson.current_source_dir() / 'fixtures',
 }
 
-foreach name : ['fixtures']
+foreach name : ['fixtures', 'cli']
         exe = executable(
                 'test-' + name,
                 name + '.rs',
@@ -28,6 +29,7 @@ foreach name : ['fixtures']
         test('test-' + name,
              exe,
              env : integration_env,
+             depends : ufat,
              protocol : 'rust',
              timeout : 300)
         crate_roots += files(name + '.rs')

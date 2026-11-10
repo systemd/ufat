@@ -66,6 +66,16 @@ pub fn open_parent(path: &Path) -> Result<(OwnedFd, OsString)> {
     Ok((open_dir(dir)?, name))
 }
 
+/// Raises the soft limit on open descriptors to the hard limit and returns
+/// the soft limit in force afterwards: what systemd's tools do when they
+/// start (rlimit_nofile_bump()). A tree walk holds one descriptor per level
+/// of the tree, so a deep tree wants more than the traditional soft limit
+/// of 1024, which only select() ever needed. The tool calls this once at
+/// startup; a program embedding the library decides for itself.
+pub fn raise_descriptor_limit() -> Result<u64> {
+    Ok(sys::raise_descriptor_limit()?)
+}
+
 /// Opens the regular file `name` in the directory `dir` for reading, like
 /// [`open_file`] does for a path: `name` is a single file name (EINVAL
 /// otherwise), looked up relative to the descriptor, so a path the caller

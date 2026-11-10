@@ -37,6 +37,17 @@ crate_roots = []
 
 subdir('json')
 subdir('src')
+
+# meson links with -Cdefault-linker-libraries, which makes a crt-static
+# binary dynamically linked again.
+ufat = executable(
+        'ufat',
+        'src/bin/ufat/main.rs',
+        link_with : libufat,
+        rust_args : get_option('static') ? ['-Ctarget-feature=+crt-static', '-Cdefault-linker-libraries=no'] : [],
+        install : true)
+crate_roots += files('src/bin/ufat/main.rs')
+
 subdir('tools')
 subdir('tests')
 subdir('verify')

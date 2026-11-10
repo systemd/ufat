@@ -13,13 +13,19 @@ there are no external crates.
 
     meson setup build
     meson compile -C build
+    meson install -C build
 
-`meson compile` builds the library `build/src/libufat.rlib` and the
-tests.
+`meson compile` builds the library `build/src/libufat.rlib`, the tool
+`build/ufat` and the tests. `meson install` installs the tool into the
+`bin` directory below the prefix, `/usr/local` by default.
+`meson setup --prefix=` changes the prefix.
 
 `RUSTC=` selects the compiler when the build directory is set up:
 
     RUSTC="rustup run 1.85.0 rustc" meson setup build-1.85
+
+`meson setup -Dstatic=false` links `build/ufat` dynamically. By default
+it is linked statically.
 
 ## Tests
 
