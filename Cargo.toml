@@ -35,7 +35,7 @@ libc.workspace = true
 [lints]
 workspace = true
 
-# cargo build and cargo test run optimized, with the overflow checks and
-# debug assertions of the dev profile.
+# cargo build, cargo test and the exhaustive sweeps run optimized, with
+# the overflow checks and debug assertions of the dev profile.
 [profile.dev]
 opt-level = 2

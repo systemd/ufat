@@ -68,3 +68,12 @@ the one in the tree:
 
 The table never changes. A newer Unicode version would make some names
 that differ today one name.
+
+## Exhaustive sweeps
+
+    cargo test --locked --test exhaustive -- --ignored
+
+tests/exhaustive.rs checks the layout computation, the time conversion
+and the name handling over large ranges of inputs. It takes about a
+minute on 16 cores. Its tests are ignored by default, so a plain
+`cargo test` skips them.
