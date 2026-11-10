@@ -35,6 +35,7 @@ pub mod host;
 pub mod layout;
 pub mod name;
 mod path;
+pub mod plan;
 pub mod populate;
 mod sys;
 #[cfg(test)]
