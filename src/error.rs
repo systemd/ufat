@@ -12,9 +12,54 @@ use std::fmt;
 
 use crate::errno::{EINVAL, EIO, ENOMEM};
 
+/// What a volume ran out of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoSpaceReason {
+    /// No free cluster is left.
+    Clusters,
+    /// The volume is too small for a FAT32 file system of the geometry asked for.
+    Volume,
+    /// A directory has all the entry slots FAT32 allows.
+    DirectoryEntries,
+    /// Every numeric tail for the short name is taken.
+    ShortNames,
+}
+
+impl NoSpaceReason {
+    /// The value as the Varlink interface spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NoSpaceReason::Clusters => "clusters",
+            NoSpaceReason::Volume => "volume",
+            NoSpaceReason::DirectoryEntries => "directoryEntries",
+            NoSpaceReason::ShortNames => "shortNames",
+        }
+    }
+}
+
 /// What an error is about, for a program.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Detail {}
+pub enum Detail {
+    /// A file or a volume is larger than FAT32 allows.
+    TooLarge {
+        /// The path inside the volume, for a file.
+        path: Option<String>,
+        /// The size in bytes.
+        size: u64,
+        /// The largest size FAT32 allows, in bytes.
+        maximum: u64,
+    },
+    /// The volume has no room.
+    NoSpace {
+        /// What ran out.
+        reason: NoSpaceReason,
+        /// The path inside the volume of what did not fit.
+        path: Option<String>,
+    },
+    /// An option the caller gave is not valid, named as the Varlink
+    /// interface spells it.
+    InvalidOption(&'static str),
+}
 
 /// An error with an errno value, a description of what went wrong and the
 /// detail a program acts on.

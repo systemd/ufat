@@ -21,6 +21,7 @@ add_project_arguments(
         '-Wunused_qualifications',
         # rustc warns about any cfg not listed here.
         '--check-cfg=cfg(test)',
+        '--check-cfg=cfg(kani)',
         language : 'rust')
 
 # The tests always run with overflow checks and debug assertions.

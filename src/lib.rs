@@ -17,6 +17,7 @@ compile_error!("ufat supports Linux only");
 
 #[macro_use]
 mod error;
-pub use error::{Context, Detail, Error, Result};
+pub use error::{Context, Detail, Error, NoSpaceReason, Result};
 
 pub mod errno;
+pub mod layout;
