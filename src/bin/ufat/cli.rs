@@ -19,7 +19,7 @@ use ufat::plan::{Plan, PlanOptions};
 use ufat::populate::{CopyOptions, TimePolicy};
 use ufat::time::civil_from_days;
 use ufat::volume::Volume;
-use ufat::{bail, err, Result};
+use ufat::{bail, err, Context, Result};
 
 use crate::util;
 
@@ -89,6 +89,8 @@ Options for assemble and populate:
                         path of a SOURCE file, or the directory to create
   --parents             Create missing parent directories of --path, and
                         accept a directory that exists (populate)
+  --write-manifest PATH Write the UAPI.16 manifest of the file system to PATH
+                        afterwards (also describe)
   --verbose             Report what was written
 
 Options for remove:
@@ -102,7 +104,7 @@ never repairs), 8 when the image could not be checked.
 
 /// Options whose value is a path on the host, which can be any bytes. The
 /// values of all other options are UTF-8.
-const PATH_OPTIONS: &[&str] = &["fit", "manifest"];
+const PATH_OPTIONS: &[&str] = &["fit", "manifest", "write-manifest"];
 
 /// Parsed command line: options with optional values plus positional
 /// arguments. Paths on the host are taken as the bytes they are; paths
@@ -274,7 +276,14 @@ const FORMAT_VALUES: &[&str] = &[
     "hidden-sectors",
 ];
 /// Options of the commands that fill a volume from sources.
-const FILL_VALUES: &[&str] = &["timestamp", "times", "path", "manifest", "unsupported"];
+const FILL_VALUES: &[&str] = &[
+    "timestamp",
+    "times",
+    "path",
+    "manifest",
+    "unsupported",
+    "write-manifest",
+];
 const FILL_FLAGS: &[&str] = &["no-replace", "no-check-validity", "verbose"];
 const FORMAT_FLAGS: &[&str] = &["no-align", "mkfs-fat-compat", "zero", "create", "verbose"];
 
@@ -563,6 +572,22 @@ fn fill(v: &mut Volume, args: &Args, sources: &Sources) -> Result<()> {
     Ok(())
 }
 
+/// Writes the UAPI.16 manifest of everything `v` holds to the file `path`,
+/// for `--write-manifest`.
+fn write_manifest(v: &Volume, path: &Path) -> Result<()> {
+    let file = std::fs::File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
+    let mut out = std::io::BufWriter::new(file);
+    let report = manifest::volume::write(v, v.root_time()?, manifest::volume::Fields::default(), &mut out)?;
+    if report.omitted > 0 {
+        eprintln!(
+            "ufat: {} entries are not in {}: their names cannot be written in a manifest",
+            report.omitted,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Reports the geometry of a freshly made file system.
 fn report_layout(image: &Path, layout: &ufat::layout::Layout, verbose: bool) {
     if verbose {
@@ -722,6 +747,9 @@ fn cmd_assemble(argv: &[OsString]) -> Result<()> {
     } else {
         assemble_filled(&args, path, &paths)?
     };
+    if let Some(m) = args.path("write-manifest") {
+        write_manifest(&v, m)?;
+    }
     let layout = *v.layout();
     v.close()?;
     report_layout(path, &layout, args.flag("verbose"));
@@ -786,6 +814,9 @@ fn cmd_populate(argv: &[OsString]) -> Result<()> {
             }
         }
         v.copy_file(file.as_fd(), path, &options)?;
+        if let Some(m) = args.path("write-manifest") {
+            write_manifest(&v, m)?;
+        }
         return v.close();
     }
     if paths.is_empty() && args.path("manifest").is_none() {
@@ -801,6 +832,9 @@ fn cmd_populate(argv: &[OsString]) -> Result<()> {
         } else {
             v.create_dir(path, time)?;
         }
+        if let Some(m) = args.path("write-manifest") {
+            write_manifest(&v, m)?;
+        }
         return v.close();
     }
     let sources = sources(&args, &paths, false)?;
@@ -810,6 +844,9 @@ fn cmd_populate(argv: &[OsString]) -> Result<()> {
         ensure_dir(&mut v, path, parents, time)?;
     }
     fill(&mut v, &args, &sources)?;
+    if let Some(m) = args.path("write-manifest") {
+        write_manifest(&v, m)?;
+    }
     v.close()
 }
 
@@ -889,7 +926,7 @@ fn cmd_list(argv: &[OsString]) -> Result<()> {
 }
 
 fn cmd_describe(argv: &[OsString]) -> Result<()> {
-    let args = Args::parse(argv, IMAGE_OPTIONS, &[])?;
+    let args = Args::parse(argv, &with(IMAGE_OPTIONS, &["write-manifest"]), &[])?;
     let image = image_arg(&args, "describe")?;
     let v = open_volume(&args, image, Access::ReadOnly)?;
     let l = v.layout();
@@ -914,6 +951,9 @@ fn cmd_describe(argv: &[OsString]) -> Result<()> {
             "note:             below the FAT32 minimum of {} clusters",
             ufat::layout::MIN_CLUSTERS
         );
+    }
+    if let Some(m) = args.path("write-manifest") {
+        write_manifest(&v, m)?;
     }
     Ok(())
 }
