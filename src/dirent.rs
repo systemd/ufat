@@ -30,6 +30,10 @@ pub const ENTRY_E5_ESCAPE: u8 = 0x05;
 pub const CASE_LOWER_BASE: u8 = 0x08;
 /// Flag in the NT reserved byte: the extension is lower case.
 pub const CASE_LOWER_EXT: u8 = 0x10;
+/// The 8.3 name of the "." entry of a subdirectory.
+pub const DOT_NAME: [u8; 11] = *b".          ";
+/// The 8.3 name of the ".." entry of a subdirectory.
+pub const DOTDOT_NAME: [u8; 11] = *b"..         ";
 
 /// A decoded short directory entry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

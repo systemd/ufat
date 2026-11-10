@@ -48,6 +48,8 @@ pub fn valid_media(media: u8) -> bool {
 /// fat_set_state()); a volume it finds dirty it mounts anyway, warns about,
 /// and leaves dirty for good.
 pub const NT_FLAG_DIRTY: u8 = 0x01;
+/// Offset of the NT flags byte in the boot sector.
+pub const NT_FLAGS_OFFSET: usize = 0x41;
 /// Bit in the extended flags that turns FAT mirroring off: then only one
 /// FAT is active.
 pub const EXT_FLAGS_NO_MIRRORING: u16 = 0x80;

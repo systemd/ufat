@@ -25,6 +25,7 @@ pub use error::{
 pub mod boot;
 mod bytes;
 pub mod device;
+pub(crate) mod dir;
 pub mod dirent;
 pub mod errno;
 pub mod fat;
@@ -32,7 +33,9 @@ pub mod format;
 pub mod host;
 pub mod layout;
 pub mod name;
+mod path;
 mod sys;
 #[cfg(test)]
 mod test_util;
 pub mod time;
+pub mod volume;

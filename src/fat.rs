@@ -53,6 +53,8 @@ pub const ENTRY_MASK: u32 = 0x0FFF_FFFF;
 pub const END_OF_CHAIN_MIN: u32 = 0x0FFF_FFF8;
 /// The end of chain marker this crate writes.
 pub const END_OF_CHAIN: u32 = 0x0FFF_FFFF;
+/// Bit of FAT entry 1 that is set while the volume is cleanly unmounted.
+pub const ENTRY1_CLEAN_SHUTDOWN: u32 = 1 << 27;
 /// Marks a bad cluster.
 pub const BAD_CLUSTER: u32 = 0x0FFF_FFF7;
 /// A free cluster.
@@ -397,6 +399,13 @@ impl Fat {
     fn set(&mut self, store: &dyn FatStore, cluster: u32, value: u32) -> Result<()> {
         debug_assert!(self.layout.valid_cluster(cluster));
         self.write(store, cluster, value, false)
+    }
+
+    /// Sets reserved entry 1 as a whole. Its top bits carry the dirty flag
+    /// (bit 27 clear) and the hardware error flag (bit 26 clear) that EDK2
+    /// and the specification use.
+    pub(crate) fn set_entry1(&mut self, store: &dyn FatStore, value: u32) -> Result<()> {
+        self.write(store, 1, value, true)
     }
 
     /// Starts following the chain at `first`. [`Fat::step`] yields its
