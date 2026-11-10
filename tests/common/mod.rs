@@ -4,8 +4,19 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// Runs the tests of a binary one at a time. A child process inherits every
+/// descriptor open at the moment it is forked, and with it the lock on an
+/// image some other test holds, until it execs; a test that opens images
+/// while another spawns programs would see a spurious EBUSY. Hold the guard
+/// for the whole test.
+pub fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// A temporary path, removed on drop (file or directory).
 pub struct Temp(pub PathBuf);
@@ -43,4 +54,12 @@ impl Drop for Temp {
             let _ = std::fs::remove_file(&self.0);
         }
     }
+}
+
+/// The ufat binary under test, which cargo builds for the integration
+/// tests of the ufat package.
+pub fn ufat() -> Option<PathBuf> {
+    option_env!("CARGO_BIN_EXE_ufat")
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
 }

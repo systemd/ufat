@@ -1,6 +1,7 @@
 # Hacking on ufat
 
-ufat is built with cargo. It depends on the libc and sha2 crates.
+ufat is built with cargo. It depends on the libc, sha2 and lexopt
+crates. lexopt parses the command line of the tool.
 
 ## Requirements
 
@@ -11,8 +12,12 @@ ufat is built with cargo. It depends on the libc and sha2 crates.
 ## Building
 
     cargo build --locked
+    cargo build --release --locked
 
-`cargo build` builds the library.
+`cargo build` builds the library and the tool `target/debug/ufat`.
+`--release` builds `target/release/ufat`. `cargo install --locked --path .`
+installs the tool into `~/.cargo/bin`. With `--root /usr/local` it goes
+into /usr/local/bin.
 
 Cargo.lock is part of the tree. `--locked` makes cargo use the versions
 it lists.

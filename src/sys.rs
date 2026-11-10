@@ -446,6 +446,36 @@ fn readlink(link: BorrowedFd<'_>) -> io::Result<Vec<u8>> {
     }
 }
 
+/// Raises the soft limit on open descriptors to the hard limit and returns
+/// the soft limit in force afterwards, the way systemd's
+/// rlimit_nofile_bump() does for every tool: the soft limit of 1024 a
+/// process starts with is select()'s and nothing here uses select().
+pub(crate) fn raise_descriptor_limit() -> io::Result<u64> {
+    // prlimit64() carries 64 bits on every architecture, unlike struct
+    // rlimit.
+    let mut old = libc::rlimit64 {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: pid 0 is the calling process; no new limit is passed and
+    // `old` is a struct of the layout the kernel fills in.
+    if unsafe { libc::prlimit64(0, libc::RLIMIT_NOFILE, std::ptr::null(), &mut old) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if old.rlim_cur >= old.rlim_max {
+        return Ok(old.rlim_cur);
+    }
+    let new = libc::rlimit64 {
+        rlim_cur: old.rlim_max,
+        rlim_max: old.rlim_max,
+    };
+    // SAFETY: as above, with a new limit of that layout and no old one asked for.
+    if unsafe { libc::prlimit64(0, libc::RLIMIT_NOFILE, &new, std::ptr::null_mut()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(new.rlim_cur)
+}
+
 /// The metadata of what `fd` refers to, an O_PATH descriptor included:
 /// fstat (statx where std has it) on the descriptor, never on a path.
 pub(crate) fn fstat(fd: BorrowedFd<'_>) -> io::Result<std::fs::Metadata> {
@@ -976,6 +1006,21 @@ mod tests {
         symlink("elsewhere", dir.join("dangling")).unwrap();
         assert_eq!(code(create_file_at(d.as_fd(), b"dangling", 0o644).unwrap_err()), EEXIST);
         assert!(!dir.join("elsewhere").exists());
+    }
+
+    #[test]
+    fn raising_the_descriptor_limit_sticks() {
+        let raised = raise_descriptor_limit().unwrap();
+        assert!(raised > 0);
+        // Raised already: the same limit comes back.
+        assert_eq!(raise_descriptor_limit().unwrap(), raised);
+        // And it is the limit on open files, RLIMIT_NOFILE, which mips and
+        // sparc number differently.
+        let Ok(limits) = fs::read_to_string("/proc/self/limits") else {
+            return eprintln!("skipping: no /proc/self/limits");
+        };
+        let line = limits.lines().find(|l| l.starts_with("Max open files")).unwrap();
+        assert_eq!(line.split_whitespace().nth(3), Some(raised.to_string().as_str()));
     }
 
     #[test]
