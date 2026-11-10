@@ -43,6 +43,56 @@ impl NameProblem {
     }
 }
 
+/// What is wrong with a volume label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabelProblem {
+    /// Longer than the 11 characters FAT stores.
+    TooLong,
+    /// A character a FAT label cannot hold: a non-printable or non-ASCII
+    /// one, one of `* ? . , ; : / \ | + = < > [ ] "`, or a leading space.
+    InvalidCharacter,
+    /// The file system has no label at all; unused on FAT.
+    NotSupported,
+}
+
+impl LabelProblem {
+    /// The value as the Varlink interface spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LabelProblem::TooLong => "tooLong",
+            LabelProblem::InvalidCharacter => "invalidCharacter",
+            LabelProblem::NotSupported => "notSupported",
+        }
+    }
+}
+
+/// What is wrong with a file system identifier, the volume serial number
+/// on FAT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentifierProblem {
+    /// Not `XXXX-XXXX` or eight hex digits.
+    Malformed,
+    /// An identifier of another kind than the one the file system
+    /// carries, a UUID where FAT has a 32 bit serial.
+    WrongKind,
+    /// The file system carries no identifier; unused on FAT.
+    NotSupported,
+    /// A value the file system reserves; unused on FAT.
+    Reserved,
+}
+
+impl IdentifierProblem {
+    /// The value as the Varlink interface spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IdentifierProblem::Malformed => "malformed",
+            IdentifierProblem::WrongKind => "wrongKind",
+            IdentifierProblem::NotSupported => "notSupported",
+            IdentifierProblem::Reserved => "reserved",
+        }
+    }
+}
+
 /// What a volume ran out of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoSpaceReason {
@@ -127,6 +177,20 @@ pub enum Detail {
         name: String,
         /// What is wrong with it.
         problem: NameProblem,
+    },
+    /// A volume label is not valid.
+    Label {
+        /// The label as it was given.
+        label: String,
+        /// What is wrong with it.
+        problem: LabelProblem,
+    },
+    /// A file system identifier, the volume serial number, is not valid.
+    Identifier {
+        /// The identifier as it was given.
+        identifier: String,
+        /// What is wrong with it.
+        problem: IdentifierProblem,
     },
     /// A file or a volume is larger than FAT32 allows.
     TooLarge {

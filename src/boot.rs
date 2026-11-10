@@ -51,6 +51,10 @@ pub const NT_FLAG_DIRTY: u8 = 0x01;
 /// Bit in the extended flags that turns FAT mirroring off: then only one
 /// FAT is active.
 pub const EXT_FLAGS_NO_MIRRORING: u16 = 0x80;
+/// The BIOS drive number of the first fixed disk.
+pub const DRIVE_NUMBER_FIXED: u8 = 0x80;
+/// The jump over the BPB to the boot code that mkfs.fat writes.
+pub const BOOT_JUMP: [u8; 3] = [0xEB, 0x58, 0x90];
 /// Size of the boot code area in a FAT32 boot sector.
 pub const BOOT_CODE_SIZE: usize = 420;
 /// Lead signature of the FSInfo sector ("RRaA").

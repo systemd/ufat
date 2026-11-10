@@ -11,7 +11,7 @@
 //! recurse-dir.c, see the individual functions.
 #![allow(unsafe_code)]
 
-use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, CStr, CString};
+use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void, CStr, CString};
 use std::fs::File;
 use std::io::{self, Read};
 use std::mem::ManuallyDrop;
@@ -21,7 +21,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use crate::errno::{EBADF, EINVAL, ELOOP, ENODEV, ENOENT, ENOSYS, ENOTTY, ENXIO, EOPNOTSUPP};
+use crate::errno::{EBADF, EINVAL, EIO, ELOOP, ENODEV, ENOENT, ENOSYS, ENOTTY, ENXIO, EOPNOTSUPP};
 
 extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
@@ -33,6 +33,7 @@ extern "C" {
     fn openat(dirfd: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
     fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int;
     fn fstatfs(fd: c_int, buf: *mut StatFs) -> c_int;
+    fn getrandom(buf: *mut c_void, len: usize, flags: c_uint) -> isize;
 }
 
 // The open(2) flags, include/uapi/asm-generic/fcntl.h. powerpc keeps its
@@ -76,6 +77,20 @@ pub(crate) const SYSFS_MAGIC: c_long = 0x6265_6572;
 
 fn errno(code: i32) -> io::Error {
     io::Error::from_raw_os_error(code)
+}
+
+/// Makes a system call until no signal interrupts it, and turns a negative
+/// return into the error in errno.
+fn retry(mut call: impl FnMut() -> isize) -> io::Result<usize> {
+    loop {
+        if let Ok(n) = usize::try_from(call()) {
+            return Ok(n);
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
 }
 
 fn cstring(bytes: &[u8]) -> io::Result<CString> {
@@ -261,6 +276,25 @@ pub(crate) fn fs_type(fd: BorrowedFd<'_>) -> io::Result<c_long> {
         return Err(io::Error::last_os_error());
     }
     Ok(st.f_type)
+}
+
+/// Fills `buf` from the kernel's random number generator, getrandom(2),
+/// going on after a short read or a signal. There is no reason to open
+/// /dev/urandom for this, systemd's random_bytes() doesn't either.
+pub(crate) fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        let rest = &mut buf[done..];
+        let n = retry(|| {
+            // SAFETY: getrandom writes at most rest.len() bytes into rest.
+            unsafe { getrandom(rest.as_mut_ptr().cast(), rest.len(), 0) }
+        })?;
+        if n == 0 {
+            return Err(errno(EIO));
+        }
+        done += n;
+    }
+    Ok(())
 }
 
 /// `flock(2)` operations, include/uapi/asm-generic/fcntl.h.
@@ -591,6 +625,16 @@ mod tests {
         symlink("elsewhere", dir.join("dangling")).unwrap();
         assert_eq!(code(create_file_at(d.as_fd(), b"dangling", 0o644).unwrap_err()), EEXIST);
         assert!(!dir.join("elsewhere").exists());
+    }
+
+    #[test]
+    fn random_bytes_fills_the_buffer() {
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        random_bytes(&mut a).unwrap();
+        random_bytes(&mut b).unwrap();
+        assert_ne!(a, b);
+        random_bytes(&mut []).unwrap();
     }
 
     #[test]
