@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! SHA-256 (FIPS 180-4), used to verify the contents listed in manifests.
+//!
+//! Blocks are compressed with the x86 SHA extensions when the CPU has them
+//! and with the portable code otherwise; both give the same digest, which
+//! a test checks. The intrinsics are the one place with unsafe code besides
+//! the system calls in `sys`.
 
 /// Size of a digest in bytes.
 pub const DIGEST_SIZE: usize = 32;
@@ -52,8 +57,19 @@ impl Sha256 {
     }
 
     /// Compresses a whole number of blocks.
+    #[allow(unsafe_code)]
     fn compress_blocks(state: &mut [u32; 8], blocks: &[u8]) {
         debug_assert_eq!(blocks.len() % 64, 0);
+        #[cfg(target_arch = "x86_64")]
+        {
+            if x86::available() {
+                // SAFETY: the CPU has the sha, ssse3 and sse4.1 features the
+                // function is compiled for, checked right above; blocks is
+                // a whole number of 64 byte blocks.
+                unsafe { x86::compress(state, blocks) };
+                return;
+            }
+        }
         for block in blocks.chunks_exact(64) {
             Self::compress(state, block);
         }
@@ -164,6 +180,132 @@ impl Sha256 {
     }
 }
 
+/// SHA-256 with the x86 SHA extensions, following the schedule of Intel's
+/// reference implementation: four rounds per pair of `_mm_sha256rnds2_epu32`
+/// with the message schedule computed alongside by `msg1` and `msg2`.
+///
+/// The 16 groups of rounds are written out, with the four groups of
+/// message words in flight in four named registers. A loop over the groups
+/// with the words in an array is not unrolled at the optimization level we
+/// build with, and LLVM then keeps the array on the stack, which costs a
+/// third of the throughput.
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+mod x86 {
+    use super::K;
+    use std::arch::x86_64::*;
+
+    /// Whether the CPU has what [`compress`] needs.
+    pub(super) fn available() -> bool {
+        is_x86_feature_detected!("sha") && is_x86_feature_detected!("ssse3") && is_x86_feature_detected!("sse4.1")
+    }
+
+    /// Compresses `blocks`, a whole number of 64 byte blocks, into `state`.
+    ///
+    /// # Safety
+    /// The CPU must support the sha, ssse3 and sse4.1 features.
+    #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
+    pub(super) unsafe fn compress(state: &mut [u32; 8], blocks: &[u8]) {
+        // SAFETY: the caller guarantees the target features. Every load and
+        // store is unaligned and stays inside its array or slice: the two
+        // halves of the eight words of `state` at words 0 and 4, `K[k..k + 4]`
+        // of the 64 constants for k up to 60, and four 16 byte loads from
+        // each 64 byte block.
+        unsafe {
+            // Big endian words within each 16 byte load.
+            let mask = _mm_set_epi64x(0x0c0d_0e0f_0809_0a0b, 0x0405_0607_0001_0203);
+            // The state lives in the two registers as ABEF and CDGH.
+            let mut tmp = _mm_loadu_si128(state.as_ptr().cast::<__m128i>());
+            let mut state1 = _mm_loadu_si128(state.as_ptr().add(4).cast::<__m128i>());
+            tmp = _mm_shuffle_epi32::<0xB1>(tmp);
+            state1 = _mm_shuffle_epi32::<0x1B>(state1);
+            let mut state0 = _mm_alignr_epi8::<8>(tmp, state1);
+            state1 = _mm_blend_epi16::<0xF0>(state1, tmp);
+            // Four rounds with the message words `m` and the constants K[k..k + 4].
+            macro_rules! rounds {
+                ($m:ident, $k:literal) => {{
+                    let msg = _mm_add_epi32($m, _mm_loadu_si128(K.as_ptr().add($k).cast::<__m128i>()));
+                    state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
+                    let msg = _mm_shuffle_epi32::<0x0E>(msg);
+                    state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
+                }};
+            }
+            // The words for the group after the next one: sigma1 of the group
+            // just used plus the carry from the one before it. This reads the
+            // words of the group before as they are, so it comes before `msg1`
+            // changes them.
+            macro_rules! msg2 {
+                ($next:ident, $prev:ident, $cur:ident) => {{
+                    let carry = _mm_alignr_epi8::<4>($cur, $prev);
+                    $next = _mm_sha256msg2_epu32(_mm_add_epi32($next, carry), $cur);
+                }};
+            }
+            // sigma0 of the group just used for the group before it.
+            macro_rules! msg1 {
+                ($prev:ident, $cur:ident) => {
+                    $prev = _mm_sha256msg1_epu32($prev, $cur);
+                };
+            }
+            for block in blocks.chunks_exact(64) {
+                let (save0, save1) = (state0, state1);
+                let p = block.as_ptr().cast::<__m128i>();
+                let mut m0 = _mm_shuffle_epi8(_mm_loadu_si128(p), mask);
+                let mut m1 = _mm_shuffle_epi8(_mm_loadu_si128(p.add(1)), mask);
+                let mut m2 = _mm_shuffle_epi8(_mm_loadu_si128(p.add(2)), mask);
+                let mut m3 = _mm_shuffle_epi8(_mm_loadu_si128(p.add(3)), mask);
+                rounds!(m0, 0);
+                rounds!(m1, 4);
+                msg1!(m0, m1);
+                rounds!(m2, 8);
+                msg1!(m1, m2);
+                rounds!(m3, 12);
+                msg2!(m0, m2, m3);
+                msg1!(m2, m3);
+                rounds!(m0, 16);
+                msg2!(m1, m3, m0);
+                msg1!(m3, m0);
+                rounds!(m1, 20);
+                msg2!(m2, m0, m1);
+                msg1!(m0, m1);
+                rounds!(m2, 24);
+                msg2!(m3, m1, m2);
+                msg1!(m1, m2);
+                rounds!(m3, 28);
+                msg2!(m0, m2, m3);
+                msg1!(m2, m3);
+                rounds!(m0, 32);
+                msg2!(m1, m3, m0);
+                msg1!(m3, m0);
+                rounds!(m1, 36);
+                msg2!(m2, m0, m1);
+                msg1!(m0, m1);
+                rounds!(m2, 40);
+                msg2!(m3, m1, m2);
+                msg1!(m1, m2);
+                rounds!(m3, 44);
+                msg2!(m0, m2, m3);
+                msg1!(m2, m3);
+                rounds!(m0, 48);
+                msg2!(m1, m3, m0);
+                msg1!(m3, m0);
+                rounds!(m1, 52);
+                msg2!(m2, m0, m1);
+                rounds!(m2, 56);
+                msg2!(m3, m1, m2);
+                rounds!(m3, 60);
+                state0 = _mm_add_epi32(state0, save0);
+                state1 = _mm_add_epi32(state1, save1);
+            }
+            tmp = _mm_shuffle_epi32::<0x1B>(state0);
+            state1 = _mm_shuffle_epi32::<0xB1>(state1);
+            state0 = _mm_blend_epi16::<0xF0>(tmp, state1);
+            state1 = _mm_alignr_epi8::<8>(state1, tmp);
+            _mm_storeu_si128(state.as_mut_ptr().cast::<__m128i>(), state0);
+            _mm_storeu_si128(state.as_mut_ptr().add(4).cast::<__m128i>(), state1);
+        }
+    }
+}
+
 /// The digest of `data`.
 pub fn digest(data: &[u8]) -> [u8; DIGEST_SIZE] {
     let mut h = Sha256::new();
@@ -201,7 +343,28 @@ pub fn from_hex(text: &str) -> Option<[u8; DIGEST_SIZE]> {
 mod tests {
     use super::*;
 
-    /// The FIPS 180-4 vectors.
+    /// The digest computed with the portable compressor alone, so that the
+    /// known answers also cover it on CPUs that have the accelerated one.
+    fn portable_digest(data: &[u8]) -> [u8; DIGEST_SIZE] {
+        let mut padded = data.to_vec();
+        padded.push(0x80);
+        while padded.len() % 64 != 56 {
+            padded.push(0);
+        }
+        padded.extend_from_slice(&(data.len() as u64 * 8).to_be_bytes());
+        let mut state = H0;
+        for block in padded.chunks_exact(64) {
+            Sha256::compress(&mut state, block);
+        }
+        let mut out = [0u8; DIGEST_SIZE];
+        for (chunk, s) in out.chunks_exact_mut(4).zip(state) {
+            chunk.copy_from_slice(&s.to_be_bytes());
+        }
+        out
+    }
+
+    /// The FIPS 180-4 vectors, on the path the CPU selects and on the
+    /// portable one.
     #[test]
     fn vectors() {
         let million = vec![b'a'; 1_000_000];
@@ -224,6 +387,12 @@ mod tests {
             ),
         ] {
             assert_eq!(to_hex(&digest(data)), expected, "{} bytes", data.len());
+            assert_eq!(
+                to_hex(&portable_digest(data)),
+                expected,
+                "{} bytes, portable",
+                data.len()
+            );
         }
         assert_eq!(digest(b""), EMPTY);
     }
@@ -238,6 +407,35 @@ mod tests {
                 h.update(piece);
             }
             assert_eq!(h.finalize(), expected, "chunk size {}", chunk);
+        }
+    }
+
+    /// The accelerated path, when the CPU has it, agrees with the portable
+    /// one on every block count and alignment of the data.
+    #[test]
+    fn portable_and_accelerated_agree() {
+        let data: Vec<u8> = (0..(4 << 20) + 128u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        for (start, len) in [
+            (0usize, 0usize),
+            (0, 64),
+            (0, 128),
+            (3, 64),
+            (5, 4096),
+            (0, 100_032),
+            (7, 299_968),
+            (1, 4 << 20),
+            (0, (4 << 20) + 64),
+        ] {
+            let slice = &data[start..start + len];
+            let mut portable = H0;
+            for block in slice.chunks_exact(64) {
+                Sha256::compress(&mut portable, block);
+            }
+            let mut fast = H0;
+            Sha256::compress_blocks(&mut fast, slice);
+            assert_eq!(portable, fast, "start {} len {}", start, len);
         }
     }
 

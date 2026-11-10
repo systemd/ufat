@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! The raw system calls std does not wrap, and the descriptor based file
-//! access built on them. This is the only module with unsafe code.
+//! access built on them. Besides the SHA extension intrinsics in `sha256`,
+//! this is the only module with unsafe code.
 //!
 //! Everything here names an open descriptor and at most one directory
 //! entry below it. A path is looked up exactly once, at the edge, with
