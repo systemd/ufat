@@ -1,5 +1,13 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 use super::*;
+use crate::test_util::{volume, TempDir};
+use std::path::Path;
+
+/// A directory resolved once, the way the tool resolves the SOURCE of a
+/// manifest.
+fn dir_source(path: &Path) -> DirectorySource {
+    DirectorySource::new(crate::host::open_dir(path).unwrap())
+}
 
 fn seq(records: &[&str]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -311,4 +319,309 @@ fn base64_round_trip() {
         let decoded = base64_decode(std::str::from_utf8(&lines).unwrap());
         assert_eq!(decoded.as_deref(), Some(&data[..]), "{} bytes", len);
     }
+}
+
+fn manifest_with_tree() -> (Manifest, Vec<u8>) {
+    let a = b"first file".to_vec();
+    let b = vec![7u8; 5000];
+    let m = parse(&seq(&[
+        ROOT,
+        r#"{"mTimeNSec":1700000000000000000,"name":"EFI","type":"dir"}"#,
+        &format!(
+            r#"{{"mTimeNSec":1700000001000000000,"name":"EFI/a.txt","sha256":"{}","size":{}}}"#,
+            sha256::to_hex(&sha256::digest(&a)),
+            a.len()
+        ),
+        &format!(
+            r#"{{"mode":292,"name":"EFI/Linux/b.efi","sha256":"{}","size":{}}}"#,
+            sha256::to_hex(&sha256::digest(&b)),
+            b.len()
+        ),
+        r#"{"contents":[{"literal":"aGVsbG8="}],"name":"literal.txt","size":5}"#,
+        TRAILER,
+    ]))
+    .unwrap();
+    let mut blob = a;
+    blob.extend(b);
+    (m, blob)
+}
+
+#[test]
+fn assembles_from_a_stream() {
+    let (m, blob) = manifest_with_tree();
+    assert_eq!(m.streamed_bytes().unwrap(), blob.len() as u64);
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let mut reader: &[u8] = &blob;
+    let report = v
+        .assemble(&m, &mut StreamSource::new(&mut reader), &AssembleOptions::default())
+        .unwrap();
+    assert_eq!((report.files, report.directories, report.bytes), (3, 1, 5015));
+    assert_eq!(
+        v.metadata("/EFI/a.txt").unwrap().modified,
+        UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    );
+    let b = v.metadata("/EFI/Linux/b.efi").unwrap();
+    assert_eq!(b.size, 5000);
+    assert_eq!(
+        b.attributes & crate::dirent::ATTR_READ_ONLY,
+        crate::dirent::ATTR_READ_ONLY
+    );
+    // Implicitly created directories get the default time, clamped to
+    // the FAT epoch.
+    assert_eq!(
+        v.metadata("/EFI/Linux").unwrap().modified,
+        UNIX_EPOCH + Duration::from_secs(crate::time::FAT_EPOCH as u64)
+    );
+    let mut back = String::new();
+    v.open_file("/literal.txt").unwrap().read_to_string(&mut back).unwrap();
+    assert_eq!(back, "hello");
+
+    // A short stream fails at the file it runs out in and leaves no
+    // trace of it. The files before it are complete.
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let mut short: &[u8] = &blob[..100];
+    assert_eq!(
+        v.assemble(&m, &mut StreamSource::new(&mut short), &AssembleOptions::default())
+            .unwrap_err()
+            .errno(),
+        EBADMSG
+    );
+    assert!(v.metadata("/EFI/Linux/b.efi").is_err());
+    assert_eq!(v.metadata("/EFI/a.txt").unwrap().size, 10);
+
+    // A corrupted stream fails the hash check. The file it was about to
+    // replace survives untouched.
+    let mut bad = blob.clone();
+    bad[0] ^= 1;
+    let mut bad_reader: &[u8] = &bad;
+    let e = v
+        .assemble(&m, &mut StreamSource::new(&mut bad_reader), &AssembleOptions::default())
+        .unwrap_err();
+    assert!(e.message().contains("hash"), "{}", e);
+    let mut back = String::new();
+    v.open_file("/EFI/a.txt").unwrap().read_to_string(&mut back).unwrap();
+    assert_eq!(back, "first file");
+
+    // On a fresh volume the failed file leaves nothing behind.
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let mut bad_reader: &[u8] = &bad;
+    v.assemble(&m, &mut StreamSource::new(&mut bad_reader), &AssembleOptions::default())
+        .unwrap_err();
+    assert!(v.metadata("/EFI/a.txt").is_err());
+    assert!(v.metadata("/EFI").is_ok());
+}
+
+#[test]
+fn assembles_from_a_directory() {
+    let tmp = TempDir::new("manifest");
+    let dir = tmp.path().to_path_buf();
+    std::fs::create_dir_all(dir.join("EFI/Linux")).unwrap();
+    std::fs::write(dir.join("EFI/a.txt"), b"first file").unwrap();
+    std::fs::write(dir.join("EFI/Linux/b.efi"), vec![7u8; 5000]).unwrap();
+    let (m, _) = manifest_with_tree();
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let report = v
+        .assemble(&m, &mut dir_source(&dir), &AssembleOptions::default())
+        .unwrap();
+    assert_eq!(report.files, 3);
+}
+
+#[test]
+fn unsupported_entries() {
+    let hello = sha256::to_hex(&sha256::digest(b"hello"));
+    let m = parse(&seq(&[
+        ROOT,
+        r#"{"name":"a/b/link","type":"lnk","contents":[{"literal":"eA=="}]}"#,
+        r#"{"name":"encoded","size":5,"contents":[{"literal":"H4sIAAAAAAAAA8tIzcnJBwCGphA2BQAAAA==","encoding":"gzip"}]}"#,
+        r#"{"name":"remote","size":5,"contents":[{"url":"https://example.com/x"}]}"#,
+        &format!(r#"{{"name":"sub","type":"dir","sha256":"{}","size":5}}"#, hello),
+        r#"{"name":"ok","size":0}"#,
+        TRAILER,
+    ]))
+    .unwrap();
+    let unsupported: Vec<String> = m
+        .entries
+        .iter()
+        .filter(|e| e.check_supported().is_err())
+        .map(|e| e.name.clone().unwrap())
+        .collect();
+    assert_eq!(unsupported, vec!["a/b/link", "encoded", "remote", "sub"]);
+    assert_eq!(m.check_supported().unwrap_err().errno(), EOPNOTSUPP);
+    assert_eq!(m.streamed_bytes().unwrap(), 0);
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let mut empty: &[u8] = &[];
+    let e = v
+        .assemble(&m, &mut StreamSource::new(&mut empty), &AssembleOptions::default())
+        .unwrap_err();
+    assert_eq!(e.errno(), EOPNOTSUPP);
+    // Nothing was created for the entry that failed, not even parents.
+    assert_eq!(v.read_dir("/").unwrap().len(), 0);
+    let r = v
+        .assemble(
+            &m,
+            &mut StreamSource::new(&mut empty),
+            &AssembleOptions {
+                skip_unsupported: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(r.skipped, unsupported);
+    assert_eq!((r.files, r.directories), (1, 0));
+    assert_eq!(v.metadata("/a").unwrap_err().errno(), ENOENT);
+    // The planner skips the same entries.
+    let mut plan = crate::plan::Plan::new(crate::plan::PlanOptions {
+        allow_small: true,
+        ..crate::plan::PlanOptions::new(512)
+    });
+    assert_eq!(plan.add_manifest(&m).unwrap(), unsupported);
+}
+
+#[test]
+fn contents_are_chosen_by_what_can_be_used() {
+    let hello = sha256::to_hex(&sha256::digest(b"hello"));
+    let m = parse(&seq(&[
+        ROOT,
+        // A URL first, then an encoded literal, then plain data.
+        &format!(r#"{{"name":"x","size":5,"sha256":"{}","contents":[{{"url":"https://example.com/x"}},{{"literal":"AAAA","encoding":"gzip"}},{{"literal":"aGVsbG8="}}]}}"#, hello),
+        // A URL with a file as the alternative is read from the source.
+        &format!(r#"{{"name":"y","size":5,"sha256":"{}","contents":[{{"url":"https://example.com/y"}},{{"file":"data/y.bin"}}]}}"#, hello),
+        TRAILER,
+    ]))
+    .unwrap();
+    assert_eq!(
+        m.entries[0].fat_contents().unwrap().unwrap().literal.as_deref(),
+        Some(&b"hello"[..])
+    );
+    assert!(!m.entries[0].is_streamed());
+    assert_eq!(
+        m.entries[1].fat_contents().unwrap().unwrap().file.as_deref(),
+        Some("data/y.bin")
+    );
+    assert!(m.entries[1].is_streamed());
+    let tmp = TempDir::new("manifest-contents");
+    let dir = tmp.path().to_path_buf();
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    std::fs::write(dir.join("data/y.bin"), b"hello").unwrap();
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let r = v
+        .assemble(&m, &mut dir_source(&dir), &AssembleOptions::default())
+        .unwrap();
+    assert_eq!((r.files, r.bytes), (2, 10));
+    for name in ["/x", "/y"] {
+        let mut back = String::new();
+        v.open_file(name).unwrap().read_to_string(&mut back).unwrap();
+        assert_eq!(back, "hello");
+    }
+}
+
+#[test]
+fn source_files_stay_inside_the_source_directory() {
+    let tmp = TempDir::new("manifest-beneath");
+    let dir = tmp.path().to_path_buf();
+    std::fs::create_dir_all(dir.join("tree/sub")).unwrap();
+    std::fs::write(dir.join("outside.txt"), b"outside").unwrap();
+    std::fs::write(dir.join("tree/sub/inside.txt"), b"inside").unwrap();
+    std::os::unix::fs::symlink("sub/inside.txt", dir.join("tree/in.lnk")).unwrap();
+    std::os::unix::fs::symlink("../outside.txt", dir.join("tree/out.lnk")).unwrap();
+    std::os::unix::fs::symlink(dir.join("outside.txt"), dir.join("tree/abs.lnk")).unwrap();
+    let record =
+        |name: &str, file: &str| format!(r#"{{"name":"{}","size":6,"contents":[{{"file":"{}"}}]}}"#, name, file);
+    let base = dir.join("tree");
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    // Plain files work; a symlink does not until asked for.
+    let m = parse(&seq(&[ROOT, &record("a", "sub/inside.txt"), TRAILER])).unwrap();
+    v.assemble(&m, &mut dir_source(&base), &AssembleOptions::default())
+        .unwrap();
+    let m = parse(&seq(&[ROOT, &record("b", "in.lnk"), TRAILER])).unwrap();
+    assert!(v
+        .assemble(&m, &mut dir_source(&base), &AssembleOptions::default())
+        .is_err());
+    v.assemble(
+        &m,
+        &mut dir_source(&base).follow_symlinks(true),
+        &AssembleOptions::default(),
+    )
+    .unwrap();
+    // Nothing leads out of the tree, however it is spelled.
+    for file in ["out.lnk", "abs.lnk"] {
+        let m = parse(&seq(&[ROOT, &record("c", file), TRAILER])).unwrap();
+        assert!(
+            v.assemble(
+                &m,
+                &mut dir_source(&base).follow_symlinks(true),
+                &AssembleOptions::default()
+            )
+            .is_err(),
+            "{}",
+            file
+        );
+    }
+    assert_eq!(v.read_dir("/").unwrap().len(), 2);
+}
+
+#[test]
+fn directory_objects_after_their_children() {
+    let m = parse(&seq(&[
+        ROOT,
+        r#"{"name":"d/x","size":0}"#,
+        r#"{"name":"d","type":"dir","mTimeNSec":1700000000000000000}"#,
+        TRAILER,
+    ]))
+    .unwrap();
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let mut empty: &[u8] = &[];
+    let opts = AssembleOptions {
+        default_time: UNIX_EPOCH + Duration::from_secs(1_000_000_000),
+        ..Default::default()
+    };
+    let r = v.assemble(&m, &mut StreamSource::new(&mut empty), &opts).unwrap();
+    assert_eq!((r.files, r.directories), (1, 1));
+    assert_eq!(
+        v.metadata("/d").unwrap().modified,
+        UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    );
+    assert_eq!(
+        v.metadata("/d/x").unwrap().modified,
+        UNIX_EPOCH + Duration::from_secs(1_000_000_000)
+    );
+}
+
+#[test]
+fn validity() {
+    let m = parse(&seq(&[ROOT, r#"{"name":"x","size":0,"validity":"revoked"}"#, TRAILER])).unwrap();
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let mut empty: &[u8] = &[];
+    let opts = AssembleOptions {
+        now_usec: Some(1),
+        ..Default::default()
+    };
+    assert_eq!(
+        v.assemble(&m, &mut StreamSource::new(&mut empty), &opts)
+            .unwrap_err()
+            .errno(),
+        EKEYREVOKED
+    );
+    let m = parse(&seq(&[
+        ROOT,
+        r#"{"name":"d","type":"dir","validUntilUSec":10}"#,
+        r#"{"name":"d/x","size":0}"#,
+        TRAILER,
+    ]))
+    .unwrap();
+    let opts = AssembleOptions {
+        now_usec: Some(20),
+        ..Default::default()
+    };
+    assert_eq!(
+        v.assemble(&m, &mut StreamSource::new(&mut empty), &opts)
+            .unwrap_err()
+            .errno(),
+        EKEYEXPIRED
+    );
+    let opts = AssembleOptions {
+        now_usec: Some(5),
+        ..Default::default()
+    };
+    assert!(v.assemble(&m, &mut StreamSource::new(&mut empty), &opts).is_ok());
 }

@@ -24,7 +24,9 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use crate::errno::{EBADF, EINVAL, EIO, ELOOP, ENODEV, ENOENT, ENOSYS, ENOTDIR, ENOTTY, ENXIO, EOPNOTSUPP};
+use crate::errno::{
+    EAGAIN, EBADF, EINVAL, EIO, ELOOP, ENODEV, ENOENT, ENOSYS, ENOTDIR, ENOTTY, ENXIO, EOPNOTSUPP, EPERM,
+};
 
 // The open(2) flags. libc has the values of each architecture: alpha,
 // arm, arm64, m68k, mips, parisc, powerpc and sparc number some of them
@@ -227,10 +229,115 @@ fn procfs_missing() -> io::Error {
     crate::Error::new(ENOSYS, "procfs is not mounted on /proc, cannot reopen a descriptor").into()
 }
 
+/// Whether openat2 is available: unknown, yes, or no (an old kernel, or a
+/// seccomp filter that answers ENOSYS on purpose, as systemd's does).
+static OPENAT2: AtomicU8 = AtomicU8::new(PROBE_UNKNOWN);
+
+fn openat2(dir: BorrowedFd<'_>, path: &CStr, how: &libc::open_how) -> io::Result<OwnedFd> {
+    // SAFETY: the arguments are a directory descriptor, a NUL terminated
+    // path, a pointer to an open_how of the size passed along; the kernel
+    // reads them for the duration of the call. glibc reads every argument
+    // after the number as a long.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            c_long::from(dir.as_raw_fd()),
+            path.as_ptr(),
+            std::ptr::from_ref(how),
+            size_of::<libc::open_how>() as c_long,
+        )
+    };
+    let fd = RawFd::try_from(fd)
+        .ok()
+        .filter(|&fd| fd >= 0)
+        .ok_or_else(io::Error::last_os_error)?;
+    // SAFETY: a descriptor the kernel just handed to us and nobody else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Resolves `path` below the directory `root` and pins the result as an
+/// O_PATH descriptor. The root is the boundary the way it is for systemd's
+/// chase() with a root: an absolute symbolic link target starts over at
+/// the root, ".." at the root stays there, and nothing resolves to
+/// anything outside it. Ordinary symbolic links are followed only when
+/// `follow_symlinks` is set, otherwise any on the way fails with ELOOP.
+/// Magic links (the ones under /proc) are never followed: that is
+/// RESOLVE_NO_MAGICLINKS, which chase() itself does not ask for; a link
+/// that jumps to an inode has no business in a tree we copy. With
+/// `directory` the result has to be one, as it has when the path ends in
+/// a slash.
+///
+/// The kernel does the walk through openat2(RESOLVE_IN_ROOT) when it can;
+/// without openat2 (Linux before 5.6, or a seccomp filter saying ENOSYS or
+/// EPERM), and when the kernel reports EAGAIN because a mount or rename
+/// elsewhere raced with a ".." step, the walk is done by hand in
+/// [`chase_by_hand`], as chase() falls back to its own loop.
+pub(crate) fn chase(root: BorrowedFd<'_>, path: &[u8], follow_symlinks: bool, directory: bool) -> io::Result<OwnedFd> {
+    if OPENAT2.load(Ordering::Relaxed) != PROBE_MISSING {
+        let c = cstring(if path.is_empty() { b"." } else { path })?;
+        // SAFETY: open_how is made of integers, and zero is a valid value
+        // for each. libc marks it non_exhaustive, so it is zeroed and then
+        // filled in.
+        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+        how.flags = (O_PATH | O_CLOEXEC | if directory { O_DIRECTORY } else { 0 }) as u64;
+        how.resolve = libc::RESOLVE_IN_ROOT
+            | libc::RESOLVE_NO_MAGICLINKS
+            | if follow_symlinks { 0 } else { libc::RESOLVE_NO_SYMLINKS };
+        match openat2(root, &c, &how) {
+            Ok(fd) => return Ok(fd),
+            Err(e) => match e.raw_os_error() {
+                Some(ENOSYS) => OPENAT2.store(PROBE_MISSING, Ordering::Relaxed),
+                // EPERM may be a filter or a real permission problem, the
+                // walk by hand will report the latter again; EAGAIN is the
+                // kernel giving up on a ".." step after a concurrent mount
+                // or rename anywhere on the system.
+                Some(EPERM | EAGAIN) => {}
+                _ => return Err(e),
+            },
+        }
+    }
+    chase_by_hand(root, path, follow_symlinks, directory)
+}
+
 /// The components of a path for the walk by hand: empty ones and "." carry
 /// nothing.
 fn components(path: &[u8]) -> impl Iterator<Item = &[u8]> {
     path.split(|&b| b == b'/').filter(|c| !c.is_empty() && *c != b".")
+}
+
+/// [`chase`] without openat2: one component at a time, each pinned as an
+/// O_PATH descriptor relative to the previous one and never followed by the
+/// kernel, a symbolic link read through its own descriptor and its target
+/// put back in front of what is left to do, ".." checked against the
+/// root's identity. After [`CHASE_MAX`] steps the walk gives up with ELOOP.
+pub(crate) fn chase_by_hand(
+    root: BorrowedFd<'_>,
+    path: &[u8],
+    follow_symlinks: bool,
+    directory: bool,
+) -> io::Result<OwnedFd> {
+    let root_md = fstat(root)?;
+    if !root_md.is_dir() {
+        return Err(errno(ENOTDIR));
+    }
+    // A path ending in "/", "/." or "/..", and "." or ".." itself, can only
+    // name a directory. The kernel enforces that on its own walk; chaseat()
+    // turns it into CHASE_MUST_BE_DIRECTORY for its own, and so do we.
+    let directory = directory
+        || path.ends_with(b"/")
+        || path.ends_with(b"/.")
+        || path.ends_with(b"/..")
+        || path == b"."
+        || path == b"..";
+    let todo = components(path).map(<[u8]>::to_vec).collect();
+    walk_from(
+        root,
+        &root_md,
+        root.try_clone_to_owned()?,
+        todo,
+        follow_symlinks,
+        directory,
+    )
 }
 
 /// Follows the symbolic link `link`, an entry of the directory `dir` pinned
@@ -764,6 +871,98 @@ mod tests {
         assert_eq!(text, "contents");
         assert!(reopen(d.as_fd(), O_RDONLY | O_DIRECTORY).is_ok());
         EMPTYPATH.store(PROBE_UNKNOWN, Ordering::Relaxed);
+    }
+
+    /// The escapes a resolution below a root has to refuse, against the
+    /// kernel's walk and against ours.
+    fn check_chase(chase: fn(BorrowedFd<'_>, &[u8], bool, bool) -> io::Result<OwnedFd>, name: &str) {
+        let tmp = TempDir::new(name);
+        let dir = tmp.path();
+        fs::create_dir_all(dir.join("root/sub/deep")).unwrap();
+        fs::write(dir.join("root/sub/deep/file"), b"inside").unwrap();
+        fs::write(dir.join("root/top"), b"top").unwrap();
+        fs::write(dir.join("outside"), b"outside").unwrap();
+        symlink("deep/file", dir.join("root/sub/rel")).unwrap();
+        symlink("/top", dir.join("root/sub/abs")).unwrap();
+        symlink("../../outside", dir.join("root/sub/up")).unwrap();
+        symlink(dir.join("outside"), dir.join("root/sub/far")).unwrap();
+        symlink("loop", dir.join("root/loop")).unwrap();
+        symlink("/proc/self/fd/0", dir.join("root/magic")).unwrap();
+        let root = open_path(None, &dir.join("root"), true).unwrap();
+        let text = |fd: OwnedFd| {
+            let mut s = String::new();
+            File::from(reopen(fd.as_fd(), O_RDONLY).unwrap())
+                .read_to_string(&mut s)
+                .unwrap();
+            s
+        };
+        assert_eq!(
+            text(chase(root.as_fd(), b"sub/deep/file", false, false).unwrap()),
+            "inside"
+        );
+        assert_eq!(
+            text(chase(root.as_fd(), b"/sub//deep/./file", false, false).unwrap()),
+            "inside"
+        );
+        assert!(fstat(chase(root.as_fd(), b"", false, true).unwrap().as_fd())
+            .unwrap()
+            .is_dir());
+        assert!(fstat(chase(root.as_fd(), b"sub", false, true).unwrap().as_fd())
+            .unwrap()
+            .is_dir());
+        assert_eq!(code(chase(root.as_fd(), b"top", false, true).unwrap_err()), ENOTDIR);
+        // A trailing slash, "/." or "/.." names a directory or nothing.
+        for dir in [&b"sub/"[..], b"sub/.", b"sub/deep/..", b".", b"..", b"/"] {
+            assert!(
+                fstat(chase(root.as_fd(), dir, false, false).unwrap().as_fd())
+                    .unwrap()
+                    .is_dir(),
+                "{:?}",
+                dir
+            );
+        }
+        assert_eq!(code(chase(root.as_fd(), b"top/", false, false).unwrap_err()), ENOTDIR);
+        assert_eq!(code(chase(root.as_fd(), b"top/.", false, false).unwrap_err()), ENOTDIR);
+        assert_eq!(code(chase(root.as_fd(), b"missing", false, false).unwrap_err()), ENOENT);
+        assert_eq!(code(chase(root.as_fd(), b"top/x", false, false).unwrap_err()), ENOTDIR);
+        // Without following, every symbolic link is a dead end.
+        for link in [&b"sub/rel"[..], b"sub/abs", b"sub/up", b"sub/far", b"loop"] {
+            assert_eq!(
+                code(chase(root.as_fd(), link, false, false).unwrap_err()),
+                ELOOP,
+                "{:?}",
+                link
+            );
+        }
+        // Following stays inside the root: an absolute target starts at
+        // the root, ".." above the root stays at the root, a target that
+        // leads outside is looked for inside.
+        assert_eq!(text(chase(root.as_fd(), b"sub/rel", true, false).unwrap()), "inside");
+        assert_eq!(text(chase(root.as_fd(), b"sub/abs", true, false).unwrap()), "top");
+        assert_eq!(text(chase(root.as_fd(), b"../../top", true, false).unwrap()), "top");
+        assert_eq!(text(chase(root.as_fd(), b"sub/../top", true, false).unwrap()), "top");
+        assert_eq!(code(chase(root.as_fd(), b"sub/up", true, false).unwrap_err()), ENOENT);
+        assert_eq!(code(chase(root.as_fd(), b"sub/far", true, false).unwrap_err()), ENOENT);
+        assert_eq!(code(chase(root.as_fd(), b"loop", true, false).unwrap_err()), ELOOP);
+        assert_eq!(code(chase(root.as_fd(), b"magic", true, false).unwrap_err()), ENOENT);
+        // A magic link itself is refused, with the root being /proc.
+        let proc = open_path(None, Path::new("/proc"), true).unwrap();
+        if fs_kind(proc.as_fd()).unwrap() == FsKind::Proc {
+            assert_eq!(code(chase(proc.as_fd(), b"self/fd/0", true, false).unwrap_err()), ELOOP);
+            assert!(fstat(chase(proc.as_fd(), b"self/fd", true, true).unwrap().as_fd())
+                .unwrap()
+                .is_dir());
+        }
+    }
+
+    #[test]
+    fn chase_stays_below_the_root() {
+        check_chase(chase, "chase");
+    }
+
+    #[test]
+    fn chase_by_hand_stays_below_the_root() {
+        check_chase(chase_by_hand, "chase-by-hand");
     }
 
     #[test]
