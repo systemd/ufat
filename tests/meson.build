@@ -34,3 +34,17 @@ foreach name : ['fixtures', 'cli', 'reference']
              timeout : 300)
         crate_roots += files(name + '.rs')
 endforeach
+
+# crash.rs links the library with the write trace under the name ufat.
+test_crash = executable(
+        'test-crash',
+        'crash.rs',
+        link_with : libufat_trace,
+        rust_dependency_map : {'ufat_trace' : 'ufat'},
+        rust_args : ['--test'] + test_rust_args)
+test('test-crash',
+     test_crash,
+     args : ['--test-threads=1'],
+     protocol : 'rust',
+     timeout : 300)
+crate_roots += files('crash.rs')

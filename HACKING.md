@@ -34,7 +34,8 @@ it is linked statically.
 `meson test` runs:
 
 - the unit tests of the library and of the json crate,
-- the integration tests in tests/.
+- the integration tests in tests/,
+- the crash consistency harness.
 
 Set `TMPDIR` to a directory with a short path that is not a symbolic
 link. One test compares the targets of /proc/self/fd with paths below
@@ -109,3 +110,23 @@ tests/reference.rs compares ufat with mkfs.fat, fsck.fat, mtools and
 sha256sum. A test whose tool is not installed is skipped.
 `UFAT_MTOOLS=` points at a directory with mtools binaries, for example a
 local build.
+
+## Crash consistency
+
+tests/crash.rs records the writes of a test scenario. It uses a copy of
+the library built with `--cfg ufat_trace`. It then builds every state a
+crash could leave on the device and checks each one with fsck and
+against the expected files. Three models of the device are checked:
+
+- Every sector is written whole, and writes land in order.
+- A write of several sectors can stop at any sector boundary.
+- Between two flushes, the device can keep any subset of the writes.
+
+The harness runs as part of `meson test`. For its full output, run it
+directly:
+
+    build/tests/test-crash --nocapture --test-threads=1
+    UFAT_CRASH_FULL=1 build/tests/test-crash --nocapture --test-threads=1
+
+`UFAT_CRASH_FULL=1` checks every subset of the writes between two
+flushes instead of a sample.

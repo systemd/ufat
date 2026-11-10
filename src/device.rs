@@ -4,6 +4,11 @@
 //! A [`Device`] is a window of `len` bytes starting at `offset` into an open
 //! file, so a file system inside a partition of a larger image can be
 //! addressed as if it started at byte 0.
+//!
+//! Built with `--cfg ufat_trace` the device can also record what it does to
+//! the file, for the crash consistency harness in tests/crash.rs; see
+//! [`Device::trace_to`]. The ordinary build has neither the field nor the
+//! code for it.
 
 use std::fs::File;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -48,6 +53,10 @@ pub struct Device {
     /// How often the data was synced, for the tests of the write order.
     #[cfg(test)]
     pub(crate) syncs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Where the records of every write, zero and sync go; see
+    /// [`Device::trace_to`].
+    #[cfg(ufat_trace)]
+    trace: Option<File>,
 }
 
 impl Device {
@@ -178,6 +187,8 @@ impl Device {
             created_in: None,
             #[cfg(test)]
             syncs: Default::default(),
+            #[cfg(ufat_trace)]
+            trace: None,
         })
     }
 
@@ -330,6 +341,8 @@ impl Device {
         self.file
             .write_all_at(buf, abs)
             .with_context(|| format!("write of {} bytes at offset {} failed", buf.len(), offset))?;
+        #[cfg(ufat_trace)]
+        self.record(TRACE_WRITE, abs, buf.len() as u64, buf)?;
         Ok(())
     }
 
@@ -351,6 +364,8 @@ impl Device {
             return Ok(());
         }
         if sys::zero_range(&self.file, self.block_device, self.offset + offset, len)? {
+            #[cfg(ufat_trace)]
+            self.record(TRACE_ZERO, self.offset + offset, len, &[])?;
             return Ok(());
         }
         let zeros = vec![0u8; chunk_len(len, ZERO_CHUNK)];
@@ -370,13 +385,69 @@ impl Device {
         #[cfg(test)]
         self.syncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.file.sync_data().with_context(|| "fdatasync failed")?;
+        #[cfg(ufat_trace)]
+        self.record(TRACE_BARRIER, 0, 0, &[])?;
         Ok(())
     }
 
     /// Flushes everything written so far to stable storage.
     pub fn sync(&self) -> Result<()> {
         self.file.sync_all()?;
+        #[cfg(ufat_trace)]
+        self.record(TRACE_SYNC, 0, 0, &[])?;
         Ok(())
+    }
+}
+
+/// The record tags of a write trace: a write with its bytes, a range made
+/// to read as zeros, the fdatasync barrier, the fsync, and a note from the
+/// program driving the device.
+#[cfg(ufat_trace)]
+const TRACE_WRITE: u8 = b'W';
+#[cfg(ufat_trace)]
+const TRACE_ZERO: u8 = b'Z';
+#[cfg(ufat_trace)]
+const TRACE_BARRIER: u8 = b'F';
+#[cfg(ufat_trace)]
+const TRACE_SYNC: u8 = b'S';
+#[cfg(ufat_trace)]
+const TRACE_NOTE: u8 = b'N';
+
+#[cfg(ufat_trace)]
+impl Device {
+    /// Records everything that changes the file from now on to `file`, in
+    /// the order it happens: every write with its bytes, every range made
+    /// to read as zeros, every fdatasync and fsync. The crash consistency
+    /// harness replays such a trace to build the states a crash can leave
+    /// behind. Each record is a tag byte, the absolute file offset as a
+    /// little endian u64 and a length as a little endian u64; a write
+    /// (`W`) and a note (`N`) are followed by that many bytes, a zeroed
+    /// range (`Z`) names its length and carries no bytes, a barrier (`F`)
+    /// and a sync (`S`) have offset and length zero. Reads are not
+    /// recorded; they do not matter for what a crash leaves behind.
+    pub fn trace_to(&mut self, file: File) {
+        self.trace = Some(file);
+    }
+
+    /// Puts a note into the trace, for the program driving the device to
+    /// mark where one of its operations begins.
+    pub fn trace_note(&self, text: &str) -> Result<()> {
+        self.record(TRACE_NOTE, 0, text.len() as u64, text.as_bytes())
+    }
+
+    fn record(&self, tag: u8, offset: u64, len: u64, data: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let Some(mut trace) = self.trace.as_ref() else {
+            return Ok(());
+        };
+        let mut header = [0u8; 17];
+        header[0] = tag;
+        header[1..9].copy_from_slice(&offset.to_le_bytes());
+        header[9..17].copy_from_slice(&len.to_le_bytes());
+        trace
+            .write_all(&header)
+            .and_then(|()| trace.write_all(data))
+            .with_context(|| "writing the device trace failed")
     }
 }
 

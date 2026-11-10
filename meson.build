@@ -22,6 +22,7 @@ add_project_arguments(
         # rustc warns about any cfg not listed here.
         '--check-cfg=cfg(test)',
         '--check-cfg=cfg(kani)',
+        '--check-cfg=cfg(ufat_trace)',
         language : 'rust')
 
 # The tests always run with overflow checks and debug assertions.
