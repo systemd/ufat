@@ -55,6 +55,8 @@ pub const END_OF_CHAIN_MIN: u32 = 0x0FFF_FFF8;
 pub const END_OF_CHAIN: u32 = 0x0FFF_FFFF;
 /// Bit of FAT entry 1 that is set while the volume is cleanly unmounted.
 pub const ENTRY1_CLEAN_SHUTDOWN: u32 = 1 << 27;
+/// Bit of FAT entry 1 that is set while no driver saw a hardware error.
+pub const ENTRY1_NO_HARD_ERROR: u32 = 1 << 26;
 /// Marks a bad cluster.
 pub const BAD_CLUSTER: u32 = 0x0FFF_FFF7;
 /// A free cluster.
@@ -369,6 +371,17 @@ impl Fat {
             v if v >= END_OF_CHAIN_MIN => Entry::End,
             v if self.layout.valid_cluster(v) => Entry::Next(v),
             v => Entry::Invalid(v),
+        })
+    }
+
+    /// The clusters of the chain that starts at `first`, as far as the FAT
+    /// links them. The walk ends at the end of the chain and at an entry
+    /// that is free, bad, invalid or cannot be read. It does not notice a
+    /// loop, so callers bound it.
+    pub(crate) fn chain<'a>(&'a self, store: &'a dyn FatStore, first: u32) -> impl Iterator<Item = u32> + 'a {
+        std::iter::successors(Some(first), move |&cluster| match self.get(store, cluster) {
+            Ok(Entry::Next(next)) => Some(next),
+            _ => None,
         })
     }
 

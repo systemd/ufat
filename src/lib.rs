@@ -30,6 +30,7 @@ pub mod dirent;
 pub mod errno;
 pub mod fat;
 pub mod format;
+pub mod fsck;
 pub mod host;
 pub mod layout;
 pub mod name;

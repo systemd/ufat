@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-//! Temporary images and directories for the tests.
+//! Temporary images, directories and volumes for the tests.
+use crate::device::{Access, Device};
+use crate::format::{self, FormatOptions};
+use crate::volume::Volume;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,6 +28,11 @@ impl TempImage {
 
     pub(crate) fn path(&self) -> &Path {
         &self.0
+    }
+
+    /// The image, opened for writing.
+    pub(crate) fn device(&self) -> Device {
+        Device::open(&self.0, Access::ReadWrite).unwrap()
     }
 }
 
@@ -54,4 +62,24 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+/// The options [`volume`] formats with.
+pub(crate) fn format_options(sector_size: u32, cluster_size: u32) -> FormatOptions {
+    FormatOptions {
+        sector_size: Some(sector_size),
+        cluster_size: Some(cluster_size),
+        allow_small: true,
+        volume_id: 0x1234_abcd,
+        label: Some("TEST".into()),
+        ..FormatOptions::default()
+    }
+}
+
+/// A freshly formatted volume of `size` bytes in a temporary image.
+pub(crate) fn volume(size: u64, sector_size: u32, cluster_size: u32) -> (TempImage, Volume) {
+    let img = TempImage::new(size);
+    format::format(&img.device(), &format_options(sector_size, cluster_size)).unwrap();
+    let vol = Volume::open(img.device()).unwrap();
+    (img, vol)
 }

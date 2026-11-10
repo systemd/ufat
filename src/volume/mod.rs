@@ -40,6 +40,8 @@ use crate::Result;
 use crate::{Detail, NoSpaceReason, NotFat32Reason};
 
 mod file;
+#[cfg(test)]
+mod tests;
 mod tree;
 
 pub use file::{FileReader, FileWriter, OpenFile, OpenRead};
