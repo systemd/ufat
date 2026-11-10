@@ -37,6 +37,7 @@ pub mod name;
 mod path;
 pub mod plan;
 pub mod populate;
+pub mod sha256;
 mod sys;
 #[cfg(test)]
 mod test_util;
