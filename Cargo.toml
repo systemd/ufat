@@ -17,6 +17,7 @@ libc = "0.2.191"
 [workspace.lints.rust]
 unreachable_pub = "warn"
 unused_qualifications = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 
 [package]
 name = "ufat"
