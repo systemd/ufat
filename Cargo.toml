@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 [workspace]
-members = [".", "json", "varlink", "tools", "tests/crash"]
+members = [".", "json", "varlink", "tools", "tests/crash", "tests/fuzz"]
 # A plain `cargo build` or `cargo test` leaves out the case folding table
-# generator.
+# generator and the fuzzing seeds.
 default-members = [".", "json", "varlink", "tests/crash"]
 # cargo update picks dependency versions that support rust-version.
 resolver = "3"
@@ -23,6 +23,7 @@ lexopt = "0.3.2"
 libc = "0.2.191"
 # 0.11.1 and later need rustc 1.88.
 sha2 = { version = "0.11.0", default-features = false }
+ufat = { path = "." }
 varlink = { path = "varlink" }
 
 [workspace.lints.rust]
@@ -47,7 +48,8 @@ varlink.workspace = true
 [lints]
 workspace = true
 
-# cargo build, cargo test and the exhaustive sweeps run optimized, with
-# the overflow checks and debug assertions of the dev profile.
+# cargo build, cargo test, the fuzzing campaign and the exhaustive sweeps
+# run optimized, with the overflow checks and debug assertions of the dev
+# profile.
 [profile.dev]
 opt-level = 2

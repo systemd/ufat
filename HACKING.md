@@ -154,3 +154,19 @@ on its own:
 
 `UFAT_CRASH_FULL=1` checks every subset of the writes between two
 flushes instead of a sample.
+
+## Fuzzing
+
+    cargo build --locked -p ufat -p fuzz-seeds
+    tests/fuzz/run.sh
+    ITERATIONS=20000 WORKERS=16 tests/fuzz/run.sh
+
+tests/fuzz/run.sh mutates FAT images and manifests and runs the tool and
+the service on them. It also sends malformed Varlink messages to the
+service. The default run takes about 15 seconds. It needs python3.
+mkfs.fat and mtools add more seed images when they are installed.
+
+The results go to `target/fuzz`. `FUZZ_OUT=` changes that. Every crash,
+hang or unexpected exit is stored under `out/findings` together with the
+input that caused it. tests/fuzz/repro/ holds checks for defects found
+earlier.
