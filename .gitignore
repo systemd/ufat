@@ -4,3 +4,5 @@ verify/*
 !verify/lib.rs
 !verify/meson.build
 !verify/run.sh
+# Python writes these when the fuzz scripts import each other.
+__pycache__/

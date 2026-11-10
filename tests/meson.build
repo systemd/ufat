@@ -48,3 +48,5 @@ test('test-crash',
      protocol : 'rust',
      timeout : 300)
 crate_roots += files('crash.rs')
+
+subdir('fuzz')
