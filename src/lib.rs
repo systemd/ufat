@@ -38,6 +38,7 @@ pub mod host;
 pub mod layout;
 pub mod name;
 mod path;
+pub mod populate;
 mod sys;
 #[cfg(test)]
 mod test_util;

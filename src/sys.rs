@@ -13,7 +13,8 @@
 
 mod uapi;
 
-use std::ffi::{c_int, c_uint, CStr, CString};
+use std::collections::VecDeque;
+use std::ffi::{c_int, c_long, c_uint, CStr, CString};
 use std::fs::File;
 use std::io::{self, Read};
 use std::mem::{ManuallyDrop, MaybeUninit};
@@ -23,7 +24,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use crate::errno::{EBADF, EINVAL, EIO, ELOOP, ENODEV, ENOENT, ENOSYS, ENOTTY, ENXIO, EOPNOTSUPP};
+use crate::errno::{EBADF, EINVAL, EIO, ELOOP, ENODEV, ENOENT, ENOSYS, ENOTDIR, ENOTTY, ENXIO, EOPNOTSUPP};
 
 // The open(2) flags. libc has the values of each architecture: alpha,
 // arm, arm64, m68k, mips, parisc, powerpc and sparc number some of them
@@ -48,6 +49,11 @@ pub(crate) use uapi::O_EMPTYPATH;
 
 /// NAME_MAX, include/uapi/linux/limits.h: the longest file name.
 const NAME_MAX: usize = libc::NAME_MAX as usize;
+
+/// Steps a resolution by hand may take before we assume a loop, the
+/// CHASE_MAX of src/basic/chase.h: if people change the tree behind our
+/// back they might send us in circles.
+const CHASE_MAX: usize = 128;
 
 fn errno(code: i32) -> io::Error {
     io::Error::from_raw_os_error(code)
@@ -221,6 +227,118 @@ fn procfs_missing() -> io::Error {
     crate::Error::new(ENOSYS, "procfs is not mounted on /proc, cannot reopen a descriptor").into()
 }
 
+/// The components of a path for the walk by hand: empty ones and "." carry
+/// nothing.
+fn components(path: &[u8]) -> impl Iterator<Item = &[u8]> {
+    path.split(|&b| b == b'/').filter(|c| !c.is_empty() && *c != b".")
+}
+
+/// Follows the symbolic link `link`, an entry of the directory `dir` pinned
+/// without following it, to what it names below `root`: the way the walk by
+/// hand treats a link it meets, except that it starts from the directory the
+/// link is in rather than from the root, so nothing between the root and
+/// the link is looked up by name again. An absolute target starts over at
+/// `root`, ".." at the root stays there. openat2 cannot express a start
+/// that is not the root, so this is always the walk by hand.
+pub(crate) fn follow_link_at(root: BorrowedFd<'_>, dir: BorrowedFd<'_>, link: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+    let root_md = fstat(root)?;
+    if !root_md.is_dir() {
+        return Err(errno(ENOTDIR));
+    }
+    let (todo, absolute) = link_target(link)?;
+    let start = if absolute { root } else { dir };
+    walk_from(root, &root_md, start.try_clone_to_owned()?, todo, true, false)
+}
+
+/// The components of the target of the symbolic link `link`, read through
+/// the link's own descriptor, and whether the target is absolute. An empty
+/// target is EINVAL. A magic link jumps to an inode rather than to a path;
+/// its text is what the inode would be called ("/dev/pts/3") or a
+/// "type:[inode]" tag. Resolving that text below the root could not escape
+/// anyway, but openat2 refuses the link with RESOLVE_NO_MAGICLINKS and so
+/// do we (ELOOP). The plain symbolic links of procfs, /proc/self or
+/// /proc/mounts, name a relative path.
+fn link_target(link: BorrowedFd<'_>) -> io::Result<(VecDeque<Vec<u8>>, bool)> {
+    let target = readlink(link)?;
+    if target.is_empty() {
+        return Err(errno(EINVAL));
+    }
+    if (target[0] == b'/' || target.contains(&b':')) && fs_kind(link)? == FsKind::Proc {
+        return Err(errno(ELOOP));
+    }
+    Ok((components(&target).map(<[u8]>::to_vec).collect(), target[0] == b'/'))
+}
+
+/// The steps of the walk by hand: `todo` resolved component by component
+/// from the pinned directory `fd`, with `root` as the boundary.
+fn walk_from(
+    root: BorrowedFd<'_>,
+    root_md: &std::fs::Metadata,
+    mut fd: OwnedFd,
+    mut todo: VecDeque<Vec<u8>>,
+    follow_symlinks: bool,
+    directory: bool,
+) -> io::Result<OwnedFd> {
+    let mut steps = 0;
+    while let Some(first) = todo.pop_front() {
+        steps += 1;
+        if steps > CHASE_MAX {
+            return Err(errno(ELOOP));
+        }
+        if first == b".." {
+            // At the root going up changes nothing, as with RESOLVE_IN_ROOT.
+            let md = fstat(fd.as_fd())?;
+            if md.dev() == root_md.dev() && md.ino() == root_md.ino() {
+                continue;
+            }
+            fd = open_at(fd.as_raw_fd(), c"..", O_PATH | O_NOFOLLOW | O_DIRECTORY, 0)?;
+            continue;
+        }
+        let child = open_at(fd.as_raw_fd(), &cstring(&first)?, O_PATH | O_NOFOLLOW, 0)?;
+        if fstat(child.as_fd())?.file_type().is_symlink() {
+            if !follow_symlinks {
+                return Err(errno(ELOOP));
+            }
+            let (target, absolute) = link_target(child.as_fd())?;
+            if absolute {
+                fd = root.try_clone_to_owned()?;
+            }
+            for c in target.into_iter().rev() {
+                todo.push_front(c);
+            }
+            continue;
+        }
+        fd = child;
+    }
+    if directory && !fstat(fd.as_fd())?.is_dir() {
+        return Err(errno(ENOTDIR));
+    }
+    Ok(fd)
+}
+
+/// The target of the symbolic link `link` refers to, read through the
+/// descriptor itself (`readlinkat(fd, "")`), so that nothing is looked up
+/// again.
+fn readlink(link: BorrowedFd<'_>) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; 4096];
+    loop {
+        // SAFETY: an empty path makes readlinkat read the link the
+        // descriptor refers to; it writes at most buf.len() bytes into buf.
+        let n = unsafe { libc::readlinkat(link.as_raw_fd(), c"".as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        let n = usize::try_from(n).map_err(|_| io::Error::last_os_error())?;
+        if n < buf.len() {
+            buf.truncate(n);
+            return Ok(buf);
+        }
+        // Filled to the brim: the target may be longer, try again with
+        // more room, up to the longest path there is.
+        if buf.len() >= 65536 {
+            return Err(errno(ELOOP));
+        }
+        buf.resize(buf.len() * 2, 0);
+    }
+}
+
 /// The metadata of what `fd` refers to, an O_PATH descriptor included:
 /// fstat (statx where std has it) on the descriptor, never on a path.
 pub(crate) fn fstat(fd: BorrowedFd<'_>) -> io::Result<std::fs::Metadata> {
@@ -228,6 +346,15 @@ pub(crate) fn fstat(fd: BorrowedFd<'_>) -> io::Result<std::fs::Metadata> {
     // own, stays open; std only calls fstat or statx on it.
     let file = ManuallyDrop::new(unsafe { File::from_raw_fd(fd.as_raw_fd()) });
     file.metadata()
+}
+
+/// Reads from `fd` at `offset` without touching its file position.
+pub(crate) fn pread(fd: BorrowedFd<'_>, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    // SAFETY: the File is never dropped, so the descriptor, which we do not
+    // own, stays open; std only calls pread on it.
+    let file = ManuallyDrop::new(unsafe { File::from_raw_fd(fd.as_raw_fd()) });
+    file.read_at(buf, offset)
 }
 
 /// The file systems we tell apart, by the magic numbers of
@@ -259,6 +386,66 @@ pub(crate) fn fs_kind(fd: BorrowedFd<'_>) -> io::Result<FsKind> {
     } else {
         FsKind::Other
     })
+}
+
+/// The names in the directory `dir`, in the order the file system hands
+/// them out, without "." and "..": getdents64 on the descriptor into a
+/// buffer, the records walked by their d_reclen, as systemd's
+/// readdir_all() does. The descriptor has to be open for reading
+/// (O_DIRECTORY, not O_PATH); its position ends up at the end.
+pub(crate) fn list_dir(dir: BorrowedFd<'_>) -> io::Result<Vec<Vec<u8>>> {
+    // struct linux_dirent64: d_ino u64, d_off s64, d_reclen u16, d_type u8,
+    // then d_name, NUL terminated and padded to the record length.
+    const HEADER: usize = 8 + 8 + 2 + 1;
+    const RECLEN: usize = 8 + 8;
+    // The kernel stores d_ino and d_off of every record at an offset
+    // aligned for them, so the buffer is made of u64: 32 KiB.
+    let mut words = vec![0u64; 4 * 1024];
+    let len = size_of_val(words.as_slice());
+    let mut names = Vec::new();
+    loop {
+        let n = retry(|| {
+            // SAFETY: getdents64 writes at most `len` bytes into the
+            // buffer. The libc crate has no getdents64(), and glibc's
+            // syscall() reads every argument after the number as a long.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_getdents64,
+                    c_long::from(dir.as_raw_fd()),
+                    words.as_mut_ptr(),
+                    len as c_long,
+                ) as isize
+            }
+        })?;
+        if n == 0 {
+            return Ok(names);
+        }
+        if n > len {
+            return Err(errno(EIO));
+        }
+        // SAFETY: the bytes of the buffer, all initialized; a u8 has no
+        // alignment and every value is valid.
+        let buf = unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), len) };
+        let mut off = 0;
+        while off < n {
+            if n - off < HEADER {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated directory entry"));
+            }
+            let reclen = usize::from(u16::from_ne_bytes([buf[off + RECLEN], buf[off + RECLEN + 1]]));
+            if reclen < HEADER || reclen > n - off {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bogus directory entry length",
+                ));
+            }
+            let name = &buf[off + HEADER..off + reclen];
+            let name = CStr::from_bytes_until_nul(name).map_or(name, CStr::to_bytes);
+            if !name.is_empty() && name != b"." && name != b".." {
+                names.push(name.to_vec());
+            }
+            off += reclen;
+        }
+    }
 }
 
 /// Fills `buf` from the kernel's random number generator, getrandom(2),
@@ -468,6 +655,47 @@ mod tests {
         e.raw_os_error().unwrap_or(0)
     }
 
+    fn sorted(mut names: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        names.sort();
+        names
+    }
+
+    /// Many names, the longest name there is, and more entries than one
+    /// getdents64 buffer holds: the listing matches std's.
+    #[test]
+    fn list_dir_reads_whole_directories() {
+        let tmp = TempDir::new("list");
+        let dir = tmp.path();
+        let long = "n".repeat(255);
+        fs::write(dir.join(&long), b"").unwrap();
+        for i in 0..2000 {
+            fs::write(dir.join(format!("f{:04}", i)), b"").unwrap();
+        }
+        // 300 names of 255 bytes take 300 records of 280 bytes, several
+        // 32 KiB buffers.
+        for i in 0..300 {
+            fs::write(dir.join(format!("{:03}{}", i, &long[3..])), b"").unwrap();
+        }
+        let expected: Vec<Vec<u8>> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().as_bytes().to_vec())
+            .collect();
+        assert_eq!(expected.len(), 2301);
+        let listing = open_path(None, dir, true).unwrap();
+        let listing = reopen(listing.as_fd(), O_RDONLY | O_DIRECTORY).unwrap();
+        let names = list_dir(listing.as_fd()).unwrap();
+        assert_eq!(sorted(names), sorted(expected));
+        // Read to the end, a second call sees nothing more.
+        assert!(list_dir(listing.as_fd()).unwrap().is_empty());
+        // An O_PATH descriptor cannot be listed.
+        let pinned = open_path(None, dir, true).unwrap();
+        assert!(list_dir(pinned.as_fd()).is_err());
+        let empty = dir.join("empty");
+        fs::create_dir(&empty).unwrap();
+        let e = reopen(open_path(None, &empty, true).unwrap().as_fd(), O_RDONLY | O_DIRECTORY).unwrap();
+        assert!(list_dir(e.as_fd()).unwrap().is_empty());
+    }
+
     #[test]
     fn pin_entry_takes_one_name_and_never_follows() {
         let tmp = TempDir::new("pin");
@@ -480,6 +708,7 @@ mod tests {
         assert!(fstat(pin_entry(d.as_fd(), b"sub").unwrap().as_fd()).unwrap().is_dir());
         let link = pin_entry(d.as_fd(), b"link").unwrap();
         assert!(fstat(link.as_fd()).unwrap().file_type().is_symlink());
+        assert_eq!(readlink(link.as_fd()).unwrap(), b"file");
         assert_eq!(code(pin_entry(d.as_fd(), b"missing").unwrap_err()), ENOENT);
         for bad in [&b""[..], b".", b"..", b"sub/file", b"a\0b"] {
             assert_eq!(
@@ -487,6 +716,7 @@ mod tests {
                 io::ErrorKind::InvalidInput
             );
         }
+        assert_eq!(code(open_path(None, &dir.join("file"), true).unwrap_err()), ENOTDIR);
         // pin_name() follows the link in its place but takes one name only.
         assert!(fstat(pin_name(d.as_fd(), b"link", false).unwrap().as_fd())
             .unwrap()
@@ -494,6 +724,7 @@ mod tests {
         assert!(fstat(pin_name(d.as_fd(), b"sub", true).unwrap().as_fd())
             .unwrap()
             .is_dir());
+        assert_eq!(code(pin_name(d.as_fd(), b"link", true).unwrap_err()), ENOTDIR);
         assert_eq!(code(pin_name(d.as_fd(), b"missing", false).unwrap_err()), ENOENT);
         assert_eq!(
             pin_name(d.as_fd(), b"sub/file", false).unwrap_err().kind(),
@@ -517,6 +748,11 @@ mod tests {
             .read_to_string(&mut text)
             .unwrap();
         assert_eq!(text, "contents");
+        let listing = reopen(d.as_fd(), O_RDONLY | O_DIRECTORY).unwrap();
+        assert_eq!(
+            sorted(list_dir(listing.as_fd()).unwrap()),
+            vec![b"file".to_vec(), b"moved".to_vec()]
+        );
         assert_eq!(code(reopen(pinned.as_fd(), O_RDONLY | O_CREAT).unwrap_err()), EINVAL);
         assert_eq!(code(reopen(pinned.as_fd(), O_RDONLY | O_NOFOLLOW).unwrap_err()), ELOOP);
         // Each way of reopening works, whatever the kernel offers.
@@ -583,6 +819,19 @@ mod tests {
         };
         if fs_kind(all.as_fd()).unwrap() != FsKind::Sysfs {
             return eprintln!("skipping: /sys is not sysfs");
+        }
+        let listing = reopen(all.as_fd(), O_RDONLY | O_DIRECTORY).unwrap();
+        for name in sorted(list_dir(listing.as_fd()).unwrap()).iter().take(8) {
+            let text = std::str::from_utf8(name).unwrap();
+            let (major, minor) = text.split_once(':').unwrap();
+            let dev = libc::makedev(major.parse().unwrap(), minor.parse().unwrap());
+            // Gone between the listing and the open: a device was removed.
+            let Some(dir) = sysfs_block_device(dev).unwrap() else {
+                continue;
+            };
+            assert_eq!(read_sysattr(dir.as_fd(), b"dev").unwrap().trim(), text);
+            // A partition has a start, a whole disk reports 0.
+            assert_eq!(sysfs_partition_start(dir.as_fd()).unwrap() % 512, 0);
         }
         // Major 0 is no block device major; sysfs knows no such device.
         assert!(sysfs_block_device(libc::makedev(0, 0)).unwrap().is_none());

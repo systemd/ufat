@@ -31,6 +31,10 @@ With rustup, `cargo +1.85.0` selects rustc 1.85:
 The tests build with the dev profile, which is optimized and keeps the
 overflow checks and debug assertions. `--release` turns those off.
 
+Set `TMPDIR` to a directory with a short path that is not a symbolic
+link. One test compares the targets of /proc/self/fd with paths below
+`TMPDIR`.
+
 ## Formatting
 
     cargo fmt --all
