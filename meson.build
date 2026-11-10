@@ -35,6 +35,7 @@ add_test_setup('default',
 # Every crate root, for rustfmt. It follows the mod declarations from there.
 crate_roots = []
 
+subdir('json')
 subdir('src')
 subdir('tools')
 subdir('tests')
