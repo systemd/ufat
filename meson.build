@@ -28,13 +28,23 @@ add_project_arguments(
 # The tests always run with overflow checks and debug assertions.
 test_rust_args = ['-Coverflow-checks=yes', '-Cdebug-assertions=yes']
 
+# With -Db_coverage=true the tests leave their profiles for the
+# coverage-report target.
+coverage_env = {}
+if get_option('b_coverage')
+        coverage_env += {'LLVM_PROFILE_FILE' : meson.project_build_root() / 'coverage' / '%p-%m.profraw'}
+endif
+
 # The style checks run with --suite style only.
 add_test_setup('default',
                exclude_suites : ['style'],
+               env : coverage_env,
                is_default : true)
 
 # Every crate root, for rustfmt. It follows the mod declarations from there.
 crate_roots = []
+# Every test binary, for the coverage report.
+test_executables = []
 
 subdir('json')
 subdir('src')
@@ -63,4 +73,12 @@ if rustfmt.found()
              suite : 'style')
         run_target('rustfmt',
                    command : [rustfmt, '--edition', '2021', crate_roots])
+endif
+
+if get_option('b_coverage')
+        run_target('coverage-report',
+                   command : [files('tools/coverage.sh'),
+                              meson.project_build_root() / 'coverage',
+                              test_executables,
+                              ufat])
 endif

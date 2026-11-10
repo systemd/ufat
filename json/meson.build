@@ -10,3 +10,4 @@ unit_tests_json = executable(
         'lib.rs',
         rust_args : ['--test'] + test_rust_args)
 test('unit-tests-json', unit_tests_json, protocol : 'rust')
+test_executables += unit_tests_json

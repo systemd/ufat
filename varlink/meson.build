@@ -12,3 +12,4 @@ unit_tests_varlink = executable(
         link_with : libjson,
         rust_args : ['--test'] + test_rust_args)
 test('unit-tests-varlink', unit_tests_varlink, protocol : 'rust')
+test_executables += unit_tests_varlink

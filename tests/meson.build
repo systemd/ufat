@@ -33,6 +33,7 @@ foreach name : ['fixtures', 'cli', 'reference', 'varlink']
              protocol : 'rust',
              timeout : 300)
         crate_roots += files(name + '.rs')
+        test_executables += exe
 endforeach
 
 # crash.rs links the library with the write trace under the name ufat.
@@ -48,5 +49,6 @@ test('test-crash',
      protocol : 'rust',
      timeout : 300)
 crate_roots += files('crash.rs')
+test_executables += test_crash
 
 subdir('fuzz')

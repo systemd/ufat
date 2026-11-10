@@ -150,6 +150,24 @@ hang or unexpected exit is stored under `out/findings` together with the
 input that caused it. tests/fuzz/repro/ holds checks for defects found
 earlier.
 
+## Coverage
+
+    meson setup -Db_coverage=true build-coverage
+    meson test -C build-coverage
+    meson compile -C build-coverage coverage-report
+
+With `-Db_coverage=true` everything is built with coverage
+instrumentation, and the tests leave their profiles in
+`build-coverage/coverage`. The `coverage-report` target merges the
+profiles of the test runs since the last report and prints the line
+coverage of every file. The report is saved in
+`build-coverage/coverage/report.txt`.
+
+The report needs llvm-profdata and llvm-cov at least as new as the LLVM
+in rustc. `LLVM_PROFDATA=` and `LLVM_COV=` select them. `meson setup`
+warns that gcovr or lcov is missing. The `coverage-report` target needs
+neither.
+
 ## Benchmarks
 
     meson compile -C build bench

@@ -12,6 +12,7 @@ unit_tests = executable(
         link_with : libjson,
         rust_args : ['--test'] + test_rust_args)
 test('unit-tests', unit_tests, protocol : 'rust')
+test_executables += unit_tests
 
 # The library with the write trace of device.rs compiled in, for the crash
 # consistency harness only. Nothing else links against it.
