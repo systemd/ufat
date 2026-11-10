@@ -41,6 +41,7 @@ extern "C" {
     fn getdents64(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn fstatfs(fd: c_int, buf: *mut StatFs) -> c_int;
     fn getrandom(buf: *mut c_void, len: usize, flags: c_uint) -> isize;
+    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn prlimit64(pid: c_int, resource: c_int, new_limit: *const Rlimit64, old_limit: *mut Rlimit64) -> c_int;
 }
 
@@ -49,7 +50,14 @@ extern "C" {
 // alpha, parisc, sparc and mips differ in more of them, the last two are
 // refused in errno.rs already and the first two are no targets of rustc.
 pub(crate) const O_RDONLY: c_int = 0;
+pub(crate) const O_WRONLY: c_int = 1;
 pub(crate) const O_RDWR: c_int = 2;
+/// The access mode bits of the flags.
+pub(crate) const O_ACCMODE: c_int = 3;
+/// Every write goes to the end, whatever offset it names: pwrite() on
+/// such a descriptor appends (pwrite(2), BUGS), which is why an image
+/// descriptor must not carry it.
+pub(crate) const O_APPEND: c_int = 1 << 10;
 pub(crate) const O_CREAT: c_int = 1 << 6;
 /// On a block device O_EXCL asks for the exclusive claim a mounted file
 /// system holds.
@@ -73,6 +81,14 @@ pub(crate) const O_PATH: c_int = 1 << 21;
 /// Linux 7.2: `openat(fd, "", flags | O_EMPTYPATH)` opens what `fd` refers
 /// to, which is how an O_PATH descriptor becomes a real one without procfs.
 pub(crate) const O_EMPTYPATH: c_int = 1 << 26;
+/// Set by the kernel on every descriptor a 64-bit process opens and
+/// reported by F_GETFL, although glibc hides the flag's value from us.
+#[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+pub(crate) const O_LARGEFILE: c_int = 0o100000;
+#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+pub(crate) const O_LARGEFILE: c_int = 0o200000;
+/// fcntl(2) commands.
+const F_GETFL: c_int = 3;
 
 /// AT_FDCWD, include/uapi/linux/fcntl.h.
 const AT_FDCWD: c_int = -100;
@@ -486,6 +502,19 @@ fn readlink(link: BorrowedFd<'_>) -> io::Result<Vec<u8>> {
         }
         buf.resize(buf.len() * 2, 0);
     }
+}
+
+/// The open flags of a descriptor as the kernel keeps them (F_GETFL): the
+/// access mode and the status flags; O_CREAT, O_EXCL, O_NOCTTY and
+/// O_TRUNC are not kept and O_CLOEXEC lives elsewhere.
+pub(crate) fn descriptor_flags(fd: BorrowedFd<'_>) -> io::Result<c_int> {
+    // SAFETY: F_GETFL takes no argument and reads nothing through a
+    // pointer.
+    let flags = unsafe { fcntl(fd.as_raw_fd(), F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags)
 }
 
 /// A resource limit as prlimit64() carries it: 64 bits on every

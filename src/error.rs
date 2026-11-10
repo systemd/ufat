@@ -168,6 +168,40 @@ impl CorruptPlace {
     }
 }
 
+/// Why a descriptor another process handed over cannot be used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DescriptorProblem {
+    /// Opened with O_PATH: nothing can be read through it.
+    OPath,
+    /// Status flags set that the service cannot work with; `flags` says which.
+    Flags,
+    /// Open for writing only.
+    WriteOnly,
+    /// Open for writing where it has to be read-only.
+    NotReadOnly,
+    /// Not open for reading and writing where it has to be.
+    NotReadWrite,
+    /// Not open for writing where it has to be written to.
+    NotWritable,
+    /// Not of the type the parameter needs.
+    WrongType,
+}
+
+impl DescriptorProblem {
+    /// The value as the Varlink interface spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DescriptorProblem::OPath => "oPath",
+            DescriptorProblem::Flags => "flags",
+            DescriptorProblem::WriteOnly => "writeOnly",
+            DescriptorProblem::NotReadOnly => "notReadOnly",
+            DescriptorProblem::NotReadWrite => "notReadWrite",
+            DescriptorProblem::NotWritable => "notWritable",
+            DescriptorProblem::WrongType => "wrongType",
+        }
+    }
+}
+
 /// What is wrong with a UAPI.16 manifest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManifestProblem {
@@ -420,6 +454,13 @@ pub enum Detail {
         path: Option<String>,
         /// The cluster where the damage was found.
         cluster: Option<u32>,
+    },
+    /// A descriptor handed over by another process is not usable.
+    Descriptor {
+        /// Why not.
+        problem: DescriptorProblem,
+        /// The offending status flags, when that is the problem.
+        flags: Option<i32>,
     },
     /// The manifest is malformed.
     Manifest {

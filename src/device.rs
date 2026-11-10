@@ -198,6 +198,36 @@ impl Device {
         Device::from_file(File::from(owned))
     }
 
+    /// Takes a descriptor another process handed over as the image, already
+    /// vetted by [`crate::host::passed_image`] to be a regular file or block
+    /// device open the right way. A block device to be written is claimed
+    /// exclusively, the way a mount claims it, by reopening it through the
+    /// descriptor with O_EXCL: a passed descriptor cannot carry a claim, a
+    /// mounted device is EBUSY, and reopening grants nothing the client did
+    /// not have since the descriptor was checked to be open for reading and
+    /// writing already. The BSD lock [`Device::open`] takes is not taken
+    /// here: it would live on the caller's open file description, outlast
+    /// the call for as long as the caller keeps its descriptor, and
+    /// releasing it would release a lock the caller holds itself. Whoever
+    /// hands over a descriptor is in charge of locking what it refers to.
+    pub fn from_passed(fd: OwnedFd, access: Access) -> Result<Device> {
+        let md = sys::fstat(fd.as_fd())?;
+        let file = if access == Access::ReadWrite && md.file_type().is_block_device() {
+            let flags = sys::O_RDWR | sys::O_EXCL | sys::O_NONBLOCK | sys::O_NOCTTY;
+            File::from(sys::reopen(fd.as_fd(), flags).map_err(|e| {
+                let hint = if e.raw_os_error() == Some(EBUSY) {
+                    ", it is in use (mounted?)"
+                } else {
+                    ""
+                };
+                Error::from(e).context(format!("failed to claim the block device{}", hint))
+            })?)
+        } else {
+            File::from(fd)
+        };
+        Device::from_file(file)
+    }
+
     /// Narrows the device to `len` bytes (or everything up to the end when
     /// None) starting at `offset`, relative to the current window.
     pub fn window(mut self, offset: u64, len: Option<u64>) -> Result<Device> {
