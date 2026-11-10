@@ -1,7 +1,6 @@
 # Hacking on ufat
 
-ufat is built with cargo. The libc crate is its only external
-dependency.
+ufat is built with cargo. It depends on the libc and sha2 crates.
 
 ## Requirements
 
