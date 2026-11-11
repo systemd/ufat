@@ -17,7 +17,7 @@ compile_error!("only Linux is supported");
 mod error;
 pub use error::{
     ContentProblem, Context, CorruptPlace, DescriptorProblem, Detail, Error, IdentifierProblem, LabelProblem,
-    ManifestProblem, NameProblem, NoSpaceReason, NotFat32Reason, Result, SourceProblem, UnsupportedKind,
+    ManifestProblem, NameProblem, NoSpaceReason, NotCpioReason, NotFat32Reason, Result, SourceProblem, UnsupportedKind,
     ValidityProblem,
 };
 

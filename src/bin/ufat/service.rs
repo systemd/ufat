@@ -161,7 +161,8 @@ fn corrupt_place(place: CorruptPlace) -> &'static str {
         CorruptPlace::BootSector => "superblock",
         CorruptPlace::Fat => "allocation",
         CorruptPlace::Chain => "chain",
-        CorruptPlace::Directory => "directory",
+        // An entry of a cpio archive, which this service never reads.
+        CorruptPlace::Directory | CorruptPlace::Entry => "directory",
     }
 }
 
@@ -241,6 +242,11 @@ fn map_error(e: &fat::Error) -> varlink::Error {
             interface_error("NotFileSystem", o)
         }
         Detail::NotEmpty { found } => interface_error("ImageNotEmpty", json::object! { "found" => found.as_str() }),
+        Detail::NotCpio { reason, found } => {
+            let mut o = json::object! { "reason" => reason.as_str() };
+            optional(&mut o, "found", *found);
+            interface_error("NotFileSystem", o)
+        }
         Detail::Corrupt {
             place,
             field,

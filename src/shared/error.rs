@@ -156,7 +156,30 @@ impl NotFat32Reason {
     }
 }
 
-/// Which structure of a volume is damaged.
+/// Why an image holds no cpio archive we can work with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotCpioReason {
+    /// The image is empty or holds nothing but NUL bytes.
+    Blank,
+    /// The image starts with something else that is known: compressed
+    /// data, or a cpio archive in one of the older formats.
+    OtherFormat,
+    /// The image starts with nothing that is known.
+    Unknown,
+}
+
+impl NotCpioReason {
+    /// The value as the Varlink interface spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NotCpioReason::Blank => "blank",
+            NotCpioReason::OtherFormat => "foreignImageType",
+            NotCpioReason::Unknown => "unknown",
+        }
+    }
+}
+
+/// Which structure of a volume or an archive is damaged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CorruptPlace {
     /// A field of the boot sector, named by `field`.
@@ -167,6 +190,9 @@ pub enum CorruptPlace {
     Chain,
     /// A directory's contents.
     Directory,
+    /// An entry of a cpio archive: its header, with the field named by
+    /// `field`, its name or the extent of its data.
+    Entry,
 }
 
 impl CorruptPlace {
@@ -177,6 +203,7 @@ impl CorruptPlace {
             CorruptPlace::Fat => "fat",
             CorruptPlace::Chain => "chain",
             CorruptPlace::Directory => "directory",
+            CorruptPlace::Entry => "entry",
         }
     }
 }
@@ -468,6 +495,13 @@ pub enum Detail {
         /// are `fat12` and `fat16`. `unknown` when libblkid is not
         /// available and the image is not blank.
         found: String,
+    },
+    /// The image holds no cpio archive.
+    NotCpio {
+        /// Why not.
+        reason: NotCpioReason,
+        /// What the image starts with instead, when that is known.
+        found: Option<&'static str>,
     },
     /// The file system is damaged.
     Corrupt {

@@ -19,10 +19,11 @@ extern crate shared;
 pub(crate) use shared::sys;
 pub use shared::{bail, err};
 pub use shared::{device, errno, host, progress, sha256, sha512};
-pub use shared::{Context, Detail, Error, NameProblem, Result};
+pub use shared::{Context, CorruptPlace, Detail, Error, NameProblem, NotCpioReason, Result};
 
 pub mod header;
 pub mod name;
+pub mod read;
 #[cfg(test)]
 mod test_util;
 pub mod write;
