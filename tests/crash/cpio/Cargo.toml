@@ -23,6 +23,7 @@ path = "crash.rs"
 
 [dependencies]
 shared = { package = "shared-trace", path = "../shared" }
+uapi16.workspace = true
 
 [lints]
 workspace = true

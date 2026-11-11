@@ -40,6 +40,7 @@ name = "cpio"
 version = "0.1.0"
 dependencies = [
  "shared",
+ "uapi16",
 ]
 
 [[package]]
@@ -47,6 +48,7 @@ name = "cpio-trace"
 version = "0.1.0"
 dependencies = [
  "shared-trace",
+ "uapi16",
 ]
 
 [[package]]

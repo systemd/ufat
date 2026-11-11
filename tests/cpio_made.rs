@@ -14,6 +14,7 @@
 mod common;
 
 use std::fs::{self, File, Permissions};
+use std::io::Cursor;
 use std::os::fd::AsFd;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::net::UnixListener;
@@ -26,6 +27,7 @@ use cpio::device::{Access, Device};
 use cpio::header::Format;
 use cpio::header::STOPPER;
 use cpio::host::open_dir;
+use cpio::manifest::{Described, FileObject, InodeType, Manifest, ManifestOptions, Sha256, SourceDirectory};
 use cpio::name::Name;
 use cpio::plan::{Plan, TreeOptions};
 use cpio::populate;
@@ -225,13 +227,72 @@ fn made() -> Vec<(&'static str, Vec<u8>)> {
     .unwrap();
     added(&plain, &mut plan, &populate::Options::default());
     keep(&mut archives, "made-populate-twice", &plain);
+
+    // What systemd-manifest wrote for the trees of the manifest fixtures:
+    // from the files next to the manifest, from a stream of their
+    // contents, and added to an archive.
+    let special = from_manifest("special", false);
+    keep(&mut archives, "made-manifest-special", &special);
+    let esp = from_manifest("esp", true);
+    keep(&mut archives, "made-manifest-esp-stream", &esp);
+    let grown = assembled(first.path(), &write::Options::default());
+    let mut plan = Plan::new();
+    plan.add_manifest(described("special"), named(b"srv/special"), &ManifestOptions::default())
+        .unwrap();
+    added(&grown, &mut plan, &populate::Options::default());
+    keep(&mut archives, "made-populate-manifest", &grown);
     archives
 }
 
+/// The directory of the fixtures of all kinds.
+fn fixtures() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
+/// The manifest of a manifest fixture.
+fn manifest_of(case: &str) -> Manifest {
+    Manifest::parse(&fs::read(fixtures().join(case).join("Uapi16Manifest")).unwrap()).unwrap()
+}
+
+/// What the manifest of a manifest fixture describes, with the files of
+/// its tree.
+fn described(case: &str) -> Described {
+    let tree = open_dir(&fixtures().join(case).join("tree")).unwrap();
+    Described::in_directory(manifest_of(case), SourceDirectory::new(tree)).unwrap()
+}
+
+/// An archive of what the manifest of a fixture describes, the root
+/// included, with the contents from the files or from a stream of them.
+fn from_manifest(case: &str, stream: bool) -> Temp {
+    let manifest = manifest_of(case);
+    let options = ManifestOptions::default();
+    let mut plan = Plan::new();
+    plan.add_directory(named(b"."), options.attributes(&manifest.root))
+        .unwrap();
+    let described = if stream {
+        // What a stream carries: the contents of every file whose
+        // contents are not in the manifest, in the order of the manifest.
+        let mut contents = Vec::new();
+        for object in manifest.objects.iter().filter(|object| object.is_streamed()) {
+            contents.extend(fs::read(fixtures().join(case).join("tree").join(object.name.as_str())).unwrap());
+        }
+        Described::in_stream(manifest, Cursor::new(contents))
+    } else {
+        described(case)
+    };
+    plan.add_manifest(described, named(b"."), &options).unwrap();
+    let layout = write::Options::default();
+    let measure = plan.measure(&layout, 0, &|_| false).unwrap();
+    let image = Temp::new(".cpio");
+    let window = measure
+        .make_room(Device::create(image.path()).unwrap(), 0, None)
+        .unwrap();
+    plan.assemble(&window, &layout, &measure, &mut |_| {}).unwrap();
+    image
+}
+
 fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/cpio")
-        .join(format!("{}.cpio", name))
+    fixtures().join("cpio").join(format!("{}.cpio", name))
 }
 
 #[test]
@@ -283,17 +344,113 @@ fn what_is_written_is_sound_and_the_same_every_time() {
                 .all(|kind| matches!(kind, ProblemKind::NoMagic | ProblemKind::Replaced)));
             continue;
         }
-        if name.starts_with("made-assemble") {
-            assert_eq!(kinds, [], "{}", name);
-        } else {
-            assert!(!kinds.is_empty(), "{}", name);
+        // Only an archive that entries were added to has entries that
+        // take the place of earlier ones.
+        if name.starts_with("made-populate") {
             assert!(
                 kinds.iter().all(|kind| *kind == ProblemKind::Replaced),
                 "{}: {:?}",
                 name,
                 kinds
             );
+        } else {
+            assert_eq!(kinds, [], "{}", name);
         }
         assert_eq!(report.errors(), 0, "{}", name);
+    }
+}
+
+/// What a kernel unpacked of an archive made from a manifest is what the
+/// manifest describes: every object under its name with its type, owner,
+/// mode, time, size and, for a regular file, the contents its hash is of.
+#[test]
+fn a_kernel_unpacked_what_the_manifest_describes() {
+    let _serial = common::serial();
+    for (archive, case, below) in [
+        ("made-manifest-special", "special", ""),
+        ("made-manifest-esp-stream", "esp", ""),
+        ("made-populate-manifest", "special", "srv/special/"),
+    ] {
+        let listing = fs::read_to_string(fixture(archive).with_extension("unpacked")).unwrap();
+        assert!(!listing.lines().any(|line| line.starts_with("! ")), "{}", archive);
+        // A name in a listing as init.c writes it.
+        let escaped = |name: &str| -> String {
+            name.bytes()
+                .map(|b| {
+                    if b <= 0x20 || b >= 0x7f || b == b'\\' {
+                        format!("\\x{:02x}", b)
+                    } else {
+                        (b as char).to_string()
+                    }
+                })
+                .collect()
+        };
+        let manifest = manifest_of(case);
+        let mut objects: Vec<(String, &FileObject)> = manifest
+            .objects
+            .iter()
+            .map(|object| (format!("{}{}", below, object.name), object))
+            .collect();
+        if below.is_empty() {
+            objects.push((".".to_string(), &manifest.root));
+        }
+        for (name, object) in objects {
+            let line = listing
+                .lines()
+                .find(|line| line.split(' ').next() == Some(escaped(&name).as_str()))
+                .unwrap_or_else(|| panic!("{}: the kernel did not unpack '{}'", archive, name));
+            let field = |key: &str| line.split(' ').find_map(|word| word.strip_prefix(key));
+            let letter = match object.inode_type {
+                InodeType::Regular => "f",
+                InodeType::Directory => "d",
+                InodeType::Symlink => "l",
+                InodeType::Fifo => "p",
+                InodeType::CharDevice => "c",
+                InodeType::BlockDevice => "b",
+                InodeType::Socket => "s",
+            };
+            assert_eq!(line.split(' ').nth(1), Some(letter), "{}: {}", archive, line);
+            if let Some(mode) = object.mode {
+                assert_eq!(
+                    field("mode="),
+                    Some(format!("{:04o}", mode.bits()).as_str()),
+                    "{}: {}",
+                    archive,
+                    line
+                );
+            }
+            if let Some(uid) = object.uid {
+                assert_eq!(field("uid="), Some(uid.to_string().as_str()), "{}: {}", archive, line);
+            }
+            if let Some(gid) = object.gid {
+                assert_eq!(field("gid="), Some(gid.to_string().as_str()), "{}: {}", archive, line);
+            }
+            if let Some(nsec) = object.mtime_nsec {
+                let secs = Duration::from_nanos(nsec).as_secs().to_string();
+                assert_eq!(field("mtime="), Some(secs.as_str()), "{}: {}", archive, line);
+            }
+            if object.inode_type == InodeType::Regular {
+                let data = fs::read(fixtures().join(case).join("tree").join(object.name.as_str())).unwrap();
+                assert_eq!(Some(Sha256::of(&data)), object.sha256, "{}", name);
+                let sum = data.iter().fold(0u32, |sum, &b| sum.wrapping_add(u32::from(b)));
+                assert_eq!(
+                    field("size="),
+                    Some(data.len().to_string().as_str()),
+                    "{}: {}",
+                    archive,
+                    line
+                );
+                assert_eq!(
+                    field("sum="),
+                    Some(format!("{:08x}", sum).as_str()),
+                    "{}: {}",
+                    archive,
+                    line
+                );
+            }
+            if object.inode_token.is_some() && object.inode_type != InodeType::Symlink {
+                assert_eq!(field("nlink="), Some("2"), "{}: {}", archive, line);
+            }
+        }
     }
 }

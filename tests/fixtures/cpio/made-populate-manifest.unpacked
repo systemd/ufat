@@ -1,0 +1,35 @@
+. d mode=0755 uid=0 gid=0 mtime=1577934245
+big f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=9000 sum=00118144 head=0221405f7e9dbcdbfa1938577695b4d3
+bin d mode=0755 uid=0 gid=0 mtime=1577934245
+bin/setuid f mode=4755 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000073 head=73
+bin/tool f mode=0755 uid=0 gid=0 mtime=1577934245 nlink=1 size=17 sum=000004d4 head=23212f62696e2f73680a657869742030
+dangling l uid=0 gid=0 mtime=1577934245 nlink=1 target=nowhere
+empty d mode=0700 uid=0 gid=0 mtime=1577934245
+etc d mode=0755 uid=0 gid=0 mtime=1577934245
+etc/a-link f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 size=5000 sum=0009b9ac head=01203f5e7d9cbbdaf91837567594b3d2
+etc/conf f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=4 sum=00000149 head=6f6c640a
+etc/empty f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=0 sum=00000000
+etc/keep f mode=0600 uid=0 gid=0 mtime=1577934245 nlink=1 size=5 sum=000001af head=6b6565700a
+lib d mode=0755 uid=0 gid=0 mtime=1577934245
+lib/a.so f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 link=etc/a-link size=5000 sum=0009b9ac head=01203f5e7d9cbbdaf91837567594b3d2
+lib/b.so f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 link=etc/a-link size=5000 sum=0009b9ac head=01203f5e7d9cbbdaf91837567594b3d2
+link l uid=0 gid=0 mtime=1577934245 nlink=1 target=etc/conf
+run d mode=0755 uid=0 gid=0 mtime=1577934245
+run/sock s mode=0600 uid=0 gid=0 mtime=1577934245 nlink=1
+sbin l uid=0 gid=0 mtime=1577934245 nlink=1 target=bin
+srv d mode=0755 uid=0 gid=0 mtime=0
+srv/special d mode=0755 uid=0 gid=0 mtime=0
+srv/special/Mixed\x20Case.TXT f mode=0664 uid=1000 gid=1000 mtime=1700000100 nlink=1 size=7 sum=00000286 head=7365636f6e640a
+srv/special/a.txt f mode=0664 uid=1000 gid=1000 mtime=1700000100 nlink=1 size=6 sum=00000232 head=66697273740a
+srv/special/empty f mode=0664 uid=1000 gid=1000 mtime=1700000102 nlink=1 size=0 sum=00000000
+srv/special/empty\x20dir d mode=0775 uid=1000 gid=1000 mtime=1699999100
+srv/special/link l uid=1000 gid=1000 mtime=1700000102 nlink=1 target=a.txt
+srv/special/sub d mode=0775 uid=1000 gid=1000 mtime=1699999100
+srv/special/sub/fifo p mode=0664 uid=1000 gid=1000 mtime=1700000102 nlink=1
+srv/special/sub/hl_a f mode=0664 uid=1000 gid=1000 mtime=1700000102 nlink=2 size=11 sum=00000420 head=686172646c696e6b65640a
+srv/special/sub/hl_b f mode=0664 uid=1000 gid=1000 mtime=1700000102 nlink=2 link=srv/special/sub/hl_a size=11 sum=00000420 head=686172646c696e6b65640a
+srv/special/sub/nested d mode=0775 uid=1000 gid=1000 mtime=1699999100
+srv/special/sub/nested/deep.conf f mode=0664 uid=1000 gid=1000 mtime=1700000100 nlink=1 size=6 sum=00000225 head=74686972640a
+srv/special/sub/readonly.bin f mode=0444 uid=1000 gid=1000 mtime=1700000100 nlink=1 size=10 sum=00000388 head=72656164206f6e6c790a
+srv/special/sub/\xc3\xbcmlaut\x20\xe2\x88\x9e.txt f mode=0664 uid=1000 gid=1000 mtime=1700000102 nlink=1 size=7 sum=000002a2 head=756d6c6175740a
+tmp d mode=1777 uid=0 gid=0 mtime=1577934245

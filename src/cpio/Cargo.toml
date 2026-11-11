@@ -13,6 +13,7 @@ path = "lib.rs"
 
 [dependencies]
 shared.workspace = true
+uapi16.workspace = true
 
 [lints]
 workspace = true

@@ -1,0 +1,14 @@
+. d mode=0775 uid=1000 gid=1000 mtime=1699999000
+EFI d mode=0775 uid=1000 gid=1000 mtime=1699999000
+EFI/BOOT d mode=0775 uid=1000 gid=1000 mtime=1699999000
+EFI/BOOT/BOOTX64.EFI f mode=0664 uid=1000 gid=1000 mtime=1700000000 nlink=1 size=4096 sum=00042023 head=4d5a4242424242424242424242424242
+EFI/Linux d mode=0775 uid=1000 gid=1000 mtime=1699999000
+EFI/Linux/linux-6.12.4-200.fc41.x86_64+3.efi f mode=0664 uid=1000 gid=1000 mtime=1700000002 nlink=1 size=6395 sum=00041ce1 head=4d5a310a320a330a340a350a360a370a
+EFI/systemd d mode=0775 uid=1000 gid=1000 mtime=1699999000
+EFI/systemd/systemd-bootx64.efi f mode=0664 uid=1000 gid=1000 mtime=1700000000 nlink=1 size=4096 sum=00042023 head=4d5a4242424242424242424242424242
+loader d mode=0775 uid=1000 gid=1000 mtime=1699999000
+loader/entries d mode=0775 uid=1000 gid=1000 mtime=1699999000
+loader/entries/fedora.conf f mode=0664 uid=1000 gid=1000 mtime=1700000004 nlink=1 size=65 sum=000013a6 head=7469746c65204665646f72610a6c696e
+loader/entries.srel f mode=0664 uid=1000 gid=1000 mtime=1700000004 nlink=1 size=6 sum=000001fd head=74797065310a
+loader/loader.conf f mode=0664 uid=1000 gid=1000 mtime=1700000004 nlink=1 size=28 sum=00000a0e head=74696d656f757420350a636f6e736f6c
+loader/random-seed f mode=0664 uid=1000 gid=1000 mtime=1700000006 nlink=1 size=32 sum=00000d08 head=73656564736565647365656473656564

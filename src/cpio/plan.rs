@@ -19,6 +19,7 @@
 
 use std::collections::{btree_map, BTreeMap, HashMap};
 use std::fs::{File, Metadata};
+use std::num::NonZeroU64;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::time::UNIX_EPOCH;
@@ -26,6 +27,7 @@ use std::time::UNIX_EPOCH;
 use crate::errno::*;
 use crate::header::{DeviceNumber, Kind, MAX_FILE_SIZE, PERMISSIONS};
 use crate::host::{walk_with, HostEntry};
+use crate::manifest::{Described, Manifest};
 use crate::name::{Name, NameBuf};
 use crate::sys;
 use crate::times::TimePolicy;
@@ -72,7 +74,7 @@ impl TreeOptions {
 }
 
 /// Where the contents of a planned regular file are.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum Contents {
     /// In a file of a host tree: the tree by its position in the plan,
     /// how much of the entry's name is the directory the tree went below,
@@ -80,8 +82,19 @@ pub(crate) enum Contents {
     Host { root: u32, strip: u32, dev: u64, ino: u64 },
     /// In an open file the plan holds, by its position there.
     File { index: u32 },
+    /// Where the manifest of the plan has them, by the position of the
+    /// object in the manifest.
+    Manifest { object: u32 },
     /// Nowhere: the entry is no regular file.
     None,
+}
+
+/// What can have several names: a file on the host by its device and
+/// inode number, an inode of a manifest by its token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Identity {
+    Host(u64, u64),
+    Manifest(NonZeroU64),
 }
 
 /// An entry of a plan.
@@ -97,15 +110,15 @@ pub struct Planned {
     pub rdev: DeviceNumber,
     /// The target of a symbolic link.
     pub target: Vec<u8>,
-    /// The file on the host, for what can have several names there: the
-    /// entries of a plan with the same one are hard links of each other.
-    identity: Option<(u64, u64)>,
+    /// The file itself, for what can have several names: the entries of
+    /// a plan with the same one are hard links of each other.
+    pub(crate) identity: Option<Identity>,
     pub(crate) contents: Contents,
 }
 
 impl Planned {
     /// An entry of the kind `kind` with nothing to it but `attributes`.
-    fn new(kind: Kind, attributes: Attributes) -> Planned {
+    pub(crate) fn new(kind: Kind, attributes: Attributes) -> Planned {
         Planned {
             kind,
             attributes,
@@ -179,7 +192,7 @@ impl Planned {
         }
         // A directory has one name and the kernel never links symbolic links.
         if md.nlink() > 1 && !matches!(kind, Kind::Directory | Kind::Symlink) {
-            planned.identity = Some((md.dev(), md.ino()));
+            planned.identity = Some(Identity::Host(md.dev(), md.ino()));
         }
         Ok(planned)
     }
@@ -250,8 +263,8 @@ struct Group {
 #[derive(Debug)]
 pub struct Steps<'a> {
     entries: btree_map::Iter<'a, Box<[u8]>, Planned>,
-    /// The files with several names, by what they are on the host.
-    groups: HashMap<(u64, u64), Group>,
+    /// The files with several names.
+    groups: HashMap<Identity, Group>,
     /// The number the next hard-linked file gets.
     next: u32,
 }
@@ -315,6 +328,9 @@ pub struct Plan {
     roots: Vec<OwnedFd>,
     /// The files that were planned one by one, open.
     files: Vec<File>,
+    /// The manifest entries were planned from, with where the contents of
+    /// its files are. A plan has one at most.
+    pub(crate) described: Option<Described>,
 }
 
 impl Plan {
@@ -342,7 +358,7 @@ impl Plan {
     /// stays as it is. Anything else replaces what is planned under its
     /// name when `replace` allows it, and a directory and something that is
     /// none never replace each other.
-    fn insert(&mut self, name: Name<'_>, planned: Planned, replace: bool) -> Result<()> {
+    pub(crate) fn insert(&mut self, name: Name<'_>, planned: Planned, replace: bool) -> Result<()> {
         let key = KeyBuf::of(name.as_bytes()).into_bytes();
         match self.entries.get(&key[..]).map(|p| p.kind) {
             None => {}
@@ -448,7 +464,7 @@ impl Plan {
     /// the same file. What has one name in the plan is a file of its own,
     /// however many names it has on the host.
     pub fn steps(&self) -> Steps<'_> {
-        let mut groups: HashMap<(u64, u64), Group> = HashMap::new();
+        let mut groups: HashMap<Identity, Group> = HashMap::new();
         for identity in self.entries.values().filter_map(|planned| planned.identity) {
             groups.entry(identity).or_default().names += 1;
         }
@@ -561,7 +577,22 @@ impl Plan {
                 }
                 Ok(file.try_clone()?)
             }
-            Contents::None => bail!(EINVAL, "'{}' has no contents to read", name),
+            Contents::Manifest { .. } | Contents::None => bail!(EINVAL, "'{}' has no contents to read", name),
+        }
+    }
+
+    /// The manifest entries were planned from.
+    pub fn manifest(&self) -> Option<&Manifest> {
+        self.described.as_ref().map(Described::manifest)
+    }
+
+    /// Gives the directory that is planned at `name` the attributes
+    /// `attributes`.
+    pub(crate) fn restate_directory(&mut self, name: Name<'_>, attributes: Attributes) {
+        if let Some(planned) = self.entries.get_mut(KeyBuf::of(name.as_bytes()).as_bytes()) {
+            if planned.kind == Kind::Directory {
+                planned.attributes = attributes;
+            }
         }
     }
 }

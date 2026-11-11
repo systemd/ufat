@@ -300,6 +300,10 @@ pub enum ManifestProblem {
     /// A regular file without a size whose contents would have to be
     /// streamed.
     NoSize,
+    /// A symbolic link without its target.
+    NoTarget,
+    /// A device node without its device number.
+    NoDeviceNumber,
 }
 
 impl ManifestProblem {
@@ -331,6 +335,8 @@ impl ManifestProblem {
             ManifestProblem::Signature => "signature",
             ManifestProblem::ExtendedAttributes => "extendedAttributes",
             ManifestProblem::NoSize => "noSize",
+            ManifestProblem::NoTarget => "noTarget",
+            ManifestProblem::NoDeviceNumber => "noDeviceNumber",
         }
     }
 }

@@ -25,8 +25,9 @@ use crate::errno::*;
 use crate::header::Kind;
 use crate::host::{read_some, FromStart};
 use crate::image::{Stopped, StoppedSink};
+use crate::manifest::Feed;
 use crate::name::Name;
-use crate::plan::{Measure, Plan, Role, Step};
+use crate::plan::{Contents, Measure, Plan, Role, Step};
 use crate::progress::Progress;
 use crate::write::{self, Links, Sink, Writer};
 use crate::{Context, Detail, Error, Result};
@@ -70,6 +71,8 @@ struct Writing<'a, S: Sink> {
     groups: HashMap<u32, Links>,
     /// What the contents of a file are copied through.
     buffer: Vec<u8>,
+    /// Where the contents of what a manifest describes come from.
+    feed: Option<Feed<'a>>,
 }
 
 impl<S: Sink> Writing<'_, S> {
@@ -101,22 +104,53 @@ impl<S: Sink> Writing<'_, S> {
                 self.writer
                     .node(name, planned.kind, &planned.attributes, planned.rdev, links.as_ref())?
             }
-            Kind::Regular => match links {
-                Some(links) if !step.role.carries_contents() => {
-                    self.writer.file_link(name, &planned.attributes, &links)?
+            Kind::Regular => {
+                // What a manifest describes has its contents where the
+                // manifest says.
+                let object = match planned.contents {
+                    Contents::Manifest { object } => Some(object as usize),
+                    _ => None,
+                };
+                match (links, object.zip(self.feed.as_mut())) {
+                    (Some(links), described) if !step.role.carries_contents() => {
+                        self.writer.file_link(name, &planned.attributes, &links)?;
+                        // A manifest has the contents with every name of a
+                        // file. They are held against it for each of them.
+                        if let Some((object, feed)) = described {
+                            feed.check(object)?;
+                        }
+                    }
+                    (links, Some((object, feed))) => {
+                        self.writer
+                            .file_begin(name, &planned.attributes, links.as_ref(), planned.size)?;
+                        self.report.bytes += feed.write(object, self.writer, self.report.progress(), self.progress)?;
+                        self.writer.file_end()?;
+                        self.report.files += 1;
+                    }
+                    (links, None) => {
+                        let file = self.plan.open(name, planned)?;
+                        self.writer
+                            .file_begin(name, &planned.attributes, links.as_ref(), planned.size)?;
+                        self.copy(name, &file, planned.size)?;
+                        self.writer.file_end()?;
+                        self.report.files += 1;
+                    }
                 }
-                _ => {
-                    let file = self.plan.open(name, planned)?;
-                    self.writer
-                        .file_begin(name, &planned.attributes, links.as_ref(), planned.size)?;
-                    self.copy(name, &file, planned.size)?;
-                    self.writer.file_end()?;
-                    self.report.files += 1;
-                }
-            },
+            }
         }
         (self.progress)(&self.report.progress());
         Ok(())
+    }
+
+    /// Writes every entry of the plan.
+    fn entries(&mut self) -> Result<()> {
+        for step in self.plan.steps() {
+            self.entry(&step)?;
+        }
+        match &self.feed {
+            Some(feed) => feed.finish(),
+            None => Ok(()),
+        }
     }
 
     /// Copies the `size` bytes of `file`, the contents of the entry
@@ -151,7 +185,15 @@ impl Plan {
     /// and tells `progress` what is written so far after every entry and
     /// every piece of a file's contents. The trailer is the caller's to
     /// write, with [`Writer::finish`].
-    pub fn write<S: Sink>(&self, writer: &mut Writer<S>, progress: &mut dyn FnMut(&Progress)) -> Result<Report> {
+    ///
+    /// The contents of what a manifest describes are read from where
+    /// [`Plan::add_manifest`] was told they are, and held against the
+    /// sizes and hashes of the manifest while they are written. A stream
+    /// of them is used up by that.
+    pub fn write<S: Sink>(&mut self, writer: &mut Writer<S>, progress: &mut dyn FnMut(&Progress)) -> Result<Report> {
+        // Reading from where the contents are changes it, the plan stays
+        // as it is.
+        let mut described = self.described.take();
         let mut writing = Writing {
             plan: self,
             writer,
@@ -159,11 +201,12 @@ impl Plan {
             report: Report::default(),
             groups: HashMap::new(),
             buffer: vec![0u8; COPY_BUFFER],
+            feed: described.as_mut().map(Feed::new),
         };
-        for step in self.steps() {
-            writing.entry(&step)?;
-        }
-        Ok(writing.report)
+        let written = writing.entries();
+        let report = writing.report;
+        self.described = described;
+        written.map(|()| report)
     }
 
     /// Writes the plan as a new archive into `window`, the part of an
@@ -174,7 +217,7 @@ impl Plan {
     /// good when this returns, and it is stopped until then: a call that
     /// fails after it began to write leaves it stopped.
     pub fn assemble(
-        &self,
+        &mut self,
         window: &Device,
         options: &write::Options,
         measure: &Measure,
@@ -191,7 +234,7 @@ impl Plan {
     /// the archive may be taken for a whole one: [`Stopped::archive`] is
     /// the archive to read until then.
     pub fn assemble_stopped<'a>(
-        &self,
+        &mut self,
         window: &'a Device,
         options: &write::Options,
         measure: &Measure,
@@ -310,7 +353,7 @@ mod tests {
         plan
     }
 
-    fn archive_of(plan: &Plan, options: &write::Options) -> (Vec<u8>, Report) {
+    fn archive_of(plan: &mut Plan, options: &write::Options) -> (Vec<u8>, Report) {
         let mut writer = Writer::new(Vec::new(), *options).unwrap();
         let mut report = plan.write(&mut writer, &mut |_| {}).unwrap();
         let (bytes, len) = writer.finish().unwrap();
@@ -321,10 +364,10 @@ mod tests {
     #[test]
     fn a_tree_becomes_an_archive_that_unpacks_to_it() {
         let tmp = tree("assemble");
-        let plan = plan_of(&tmp);
+        let mut plan = plan_of(&tmp);
         let options = write::Options::default();
         let measure = plan.measure(&options, 0, &|_| false).unwrap();
-        let (bytes, report) = archive_of(&plan, &options);
+        let (bytes, report) = archive_of(&mut plan, &options);
         assert_eq!(report.len, measure.len);
         assert_eq!(bytes.len() as u64, measure.len);
         assert_eq!(
@@ -381,8 +424,8 @@ mod tests {
                 end_alignment: 4,
             },
         ] {
-            let (first, _) = archive_of(&plan_of(&one), &options);
-            let (second, _) = archive_of(&plan_of(&other), &options);
+            let (first, _) = archive_of(&mut plan_of(&one), &options);
+            let (second, _) = archive_of(&mut plan_of(&other), &options);
             assert!(first == second);
             assert_eq!(check::check(&first).unwrap().problems, []);
         }
@@ -391,7 +434,7 @@ mod tests {
     #[test]
     fn progress_is_told_as_the_archive_grows() {
         let tmp = tree("assemble-progress");
-        let plan = plan_of(&tmp);
+        let mut plan = plan_of(&tmp);
         let mut writer = Writer::new(Vec::new(), write::Options::default()).unwrap();
         let mut seen = Vec::new();
         let report = plan.write(&mut writer, &mut |p| seen.push(*p)).unwrap();
@@ -408,14 +451,14 @@ mod tests {
         // Another file under the planned name. It is there before the
         // planned one goes, so it cannot get the same inode number.
         let tmp = tree("assemble-replaced");
-        let plan = plan_of(&tmp);
+        let mut plan = plan_of(&tmp);
         fs::write(tmp.path().join("d/other"), b"hello\n").unwrap();
         fs::rename(tmp.path().join("d/other"), tmp.path().join("d/file")).unwrap();
         let mut writer = Writer::new(Vec::new(), write::Options::default()).unwrap();
         assert_eq!(plan.write(&mut writer, &mut |_| {}).unwrap_err().errno(), ESTALE);
         // The same file with another size.
         let tmp = tree("assemble-grown");
-        let plan = plan_of(&tmp);
+        let mut plan = plan_of(&tmp);
         fs::OpenOptions::new()
             .append(true)
             .open(tmp.path().join("d/file"))
@@ -425,12 +468,12 @@ mod tests {
         assert_eq!(plan.write(&mut writer, &mut |_| {}).unwrap_err().errno(), ESTALE);
         // A file that is gone, and one turned into a symbolic link.
         let tmp = tree("assemble-gone");
-        let plan = plan_of(&tmp);
+        let mut plan = plan_of(&tmp);
         fs::remove_file(tmp.path().join("big")).unwrap();
         let mut writer = Writer::new(Vec::new(), write::Options::default()).unwrap();
         assert_eq!(plan.write(&mut writer, &mut |_| {}).unwrap_err().errno(), ENOENT);
         let tmp = tree("assemble-linked");
-        let plan = plan_of(&tmp);
+        let mut plan = plan_of(&tmp);
         fs::remove_file(tmp.path().join("big")).unwrap();
         symlink("/etc/passwd", tmp.path().join("big")).unwrap();
         let mut writer = Writer::new(Vec::new(), write::Options::default()).unwrap();
@@ -440,7 +483,7 @@ mod tests {
     #[test]
     fn an_image_is_grown_to_the_archive_and_never_shrunk() {
         let tmp = tree("assemble-image");
-        let plan = plan_of(&tmp);
+        let mut plan = plan_of(&tmp);
         let options = write::Options::default();
         let measure = plan.measure(&options, 0, &|_| false).unwrap();
         // An empty file is grown to the archive.
@@ -484,10 +527,10 @@ mod tests {
         use crate::header::STOPPER;
         use crate::read::Foreign;
         let tmp = tree("assemble-stopped");
-        let plan = plan_of(&tmp);
+        let mut plan = plan_of(&tmp);
         let options = write::Options::default();
         let measure = plan.measure(&options, 0, &|_| false).unwrap();
-        let (bytes, _) = archive_of(&plan, &options);
+        let (bytes, _) = archive_of(&mut plan, &options);
         // Over an archive that is there, in an image with room behind it.
         let img = TempImage::new(0);
         let mut old = bytes.clone();
@@ -523,7 +566,7 @@ mod tests {
         // and behind a few bytes. Either way the image is left stopped.
         for (spoiled, name) in [("d/file", "assemble-spoiled-late"), ("a", "assemble-spoiled-early")] {
             let tmp = tree(name);
-            let plan = plan_of(&tmp);
+            let mut plan = plan_of(&tmp);
             let measure = plan.measure(&options, 0, &|_| false).unwrap();
             fs::OpenOptions::new()
                 .append(true)
@@ -548,7 +591,7 @@ mod tests {
                 if spoiled == "a" { &b"x"[..] } else { b"hello\n" },
             )
             .unwrap();
-            let plan = plan_of(&tmp);
+            let mut plan = plan_of(&tmp);
             let measure = plan.measure(&options, 0, &|_| false).unwrap();
             let window = measure.make_room(img.device(), 0, None).unwrap();
             plan.assemble(&window, &options, &measure, &mut |_| {}).unwrap();
@@ -580,7 +623,7 @@ mod tests {
         );
         // A window that is too small for what was measured.
         let tmp = tree("assemble-small");
-        let plan = plan_of(&tmp);
+        let mut plan = plan_of(&tmp);
         let options = write::Options::default();
         let measure = plan.measure(&options, 0, &|_| false).unwrap();
         let img = TempImage::new(4096);

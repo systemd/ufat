@@ -19,12 +19,16 @@ extern crate shared;
 pub(crate) use shared::sys;
 pub use shared::{bail, err};
 pub use shared::{device, errno, host, progress, sha256, sha512, times};
-pub use shared::{Context, CorruptPlace, Detail, Error, NameProblem, NotCpioReason, Result};
+pub use shared::{
+    ContentProblem, Context, CorruptPlace, Detail, Error, ManifestProblem, NameProblem, NotCpioReason, Result,
+    SourceProblem, UnsupportedKind,
+};
 
 pub mod assemble;
 pub mod check;
 pub mod header;
 pub mod image;
+pub mod manifest;
 pub mod name;
 pub mod plan;
 pub mod populate;

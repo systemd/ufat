@@ -6,7 +6,8 @@ use std::os::fd::{AsFd, OwnedFd};
 
 use uapi16::{Directory, Name, OpenError};
 
-use crate::sys;
+use crate::errno::*;
+use crate::{sys, Context};
 
 /// The directory on the host the files of a manifest are taken from: the
 /// one the manifest lives in, or the one the caller chose instead.
@@ -39,6 +40,20 @@ impl SourceDirectory {
     pub fn follow_symlinks(mut self, follow: bool) -> SourceDirectory {
         self.follow_symlinks = follow;
         self
+    }
+
+    /// The target of the symbolic link `link` names below the directory.
+    /// The directory the link is in is resolved like the path of a file,
+    /// the link itself is not followed.
+    pub fn read_link(&self, link: &Name) -> crate::Result<Vec<u8>> {
+        let failed = || format!("failed to read the link {}", link);
+        let (parent, name) = link.rsplit_once('/').unwrap_or(("", link.as_str()));
+        let dir = sys::chase(self.dir.as_fd(), parent.as_bytes(), self.follow_symlinks, true).with_context(failed)?;
+        let pinned = sys::pin_entry(dir.as_fd(), name.as_bytes()).with_context(failed)?;
+        if !sys::fstat(pinned.as_fd()).with_context(failed)?.is_symlink() {
+            bail!(EINVAL, "{} is not a symbolic link", link);
+        }
+        sys::readlink(pinned.as_fd()).with_context(failed)
     }
 
     /// Pins the file `file` names below the directory and checks that it
