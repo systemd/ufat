@@ -13,7 +13,7 @@
 
 mod common;
 
-use std::fs::{self, Permissions};
+use std::fs::{self, File, Permissions};
 use std::os::fd::AsFd;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::net::UnixListener;
@@ -22,13 +22,15 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use common::Temp;
 use cpio::check::{self, ProblemKind};
-use cpio::device::Device;
+use cpio::device::{Access, Device};
 use cpio::header::Format;
 use cpio::header::STOPPER;
 use cpio::host::open_dir;
 use cpio::name::Name;
 use cpio::plan::{Plan, TreeOptions};
+use cpio::populate;
 use cpio::times::TimePolicy;
+use cpio::tree::Tree;
 use cpio::write::{self, Attributes};
 
 /// The name `bytes` are. The tests know them to be one.
@@ -96,6 +98,25 @@ fn first_tree(root: &Path) {
     fs::set_permissions(root.join("run/sock"), Permissions::from_mode(0o600)).unwrap();
 }
 
+/// The tree that is added.
+fn second_tree(root: &Path) {
+    dir(root.join("etc"), 0o700);
+    put(root.join("etc/conf"), b"new and longer\n", 0o640);
+    put(root.join("etc/added"), b"added\n", 0o644);
+    dir(root.join("usr"), 0o755);
+    dir(root.join("usr/share"), 0o755);
+    dir(root.join("usr/share/doc"), 0o755);
+    put(root.join("usr/share/doc/readme"), b"read me\n", 0o444);
+    dir(root.join("lib"), 0o755);
+    put(root.join("lib/c.so"), &pattern(4500, 3), 0o644);
+    fs::hard_link(root.join("lib/c.so"), root.join("lib/d.so")).unwrap();
+    symlink("bin/tool", root.join("link2")).unwrap();
+    dir(root.join("empty"), 0o755);
+    put(root.join("empty/now-filled"), b"x", 0o644);
+    // A file where a symbolic link is.
+    put(root.join("link"), b"a file where a link was\n", 0o644);
+}
+
 fn assembled(tree: &Path, layout: &write::Options) -> Temp {
     let mut plan = Plan::new();
     plan.add_directory(named(b"."), DIRECTORY).unwrap();
@@ -111,6 +132,13 @@ fn assembled(tree: &Path, layout: &write::Options) -> Temp {
     image
 }
 
+fn added(image: &Temp, plan: &mut Plan, options: &populate::Options) {
+    let mut device = Device::open(image.path(), Access::ReadWrite).unwrap();
+    let report = plan.populate(&mut device, 0, None, options, &mut |_| {}).unwrap();
+    drop(device);
+    assert_eq!(report.len, fs::metadata(image.path()).unwrap().len());
+}
+
 fn aligned() -> write::Options {
     write::Options {
         format: Format::Crc,
@@ -123,6 +151,8 @@ fn aligned() -> write::Options {
 fn made() -> Vec<(&'static str, Vec<u8>)> {
     let first = Temp::dir();
     first_tree(first.path());
+    let second = Temp::dir();
+    second_tree(second.path());
     let mut archives = Vec::new();
     let keep = |archives: &mut Vec<_>, name, image: &Temp| archives.push((name, fs::read(image.path()).unwrap()));
 
@@ -135,12 +165,66 @@ fn made() -> Vec<(&'static str, Vec<u8>)> {
     // see cpio::image::StoppedSink: the image is stopped at its first
     // byte, with nothing of the archive behind the stopped magic at first
     // and all of it but its first byte in the end.
+    // tests/crash/cpio/crash.rs has that these are the states that come
+    // up.
     let mut cut = vec![0u8; before.len()];
     cut[..6].copy_from_slice(&Format::Newc.stopped_magic());
     archives.push(("made-assemble-cut-early", cut));
     let mut cut = before.clone();
     cut[0] = STOPPER;
     archives.push(("made-assemble-cut", cut));
+
+    // A tree over the root of what is there.
+    let over = |image: &Temp, options: &populate::Options| {
+        let mut plan = Plan::new();
+        plan.add_tree(open_dir(second.path()).unwrap().as_fd(), named(b"."), &fixed())
+            .unwrap();
+        added(image, &mut plan, options);
+    };
+    over(&plain, &populate::Options::default());
+    keep(&mut archives, "made-populate", &plain);
+    // What is in the image when adding to it is cut off, see
+    // cpio::image::SpliceSink: the archive is stopped where its trailer
+    // was, with the beginning of what is added behind the stopper or all
+    // of it, and at the end it is stopped at the new trailer only.
+    // tests/crash/cpio/crash.rs has that these are the states that come
+    // up.
+    let after = fs::read(plain.path()).unwrap();
+    let old_trailer = Tree::open(&before[..]).unwrap().trailer_offset().unwrap() as usize;
+    let new_trailer = Tree::open(&after[..]).unwrap().trailer_offset().unwrap() as usize;
+    let mut cut = before.clone();
+    cut.resize(after.len(), 0);
+    cut[old_trailer] = STOPPER;
+    cut[old_trailer + 1..old_trailer + 3001].copy_from_slice(&after[old_trailer + 1..old_trailer + 3001]);
+    archives.push(("made-populate-cut-early", cut));
+    let mut cut = after.clone();
+    cut[old_trailer] = STOPPER;
+    cut[new_trailer] = STOPPER;
+    archives.push(("made-populate-cut", cut.clone()));
+    cut[old_trailer] = after[old_trailer];
+    archives.push(("made-populate-cut-late", cut));
+    let options = populate::Options {
+        end_alignment: 4096,
+        data_alignment: 4096,
+        replace: true,
+    };
+    over(&checked, &options);
+    keep(&mut archives, "made-populate-aligned", &checked);
+
+    // A tree below a new directory and one file, added to what was added.
+    let mut plan = Plan::new();
+    plan.add_directory(named(b"opt"), DIRECTORY).unwrap();
+    plan.add_directory(named(b"opt/pkg"), DIRECTORY).unwrap();
+    plan.add_tree(open_dir(second.path()).unwrap().as_fd(), named(b"opt/pkg"), &fixed())
+        .unwrap();
+    plan.add_file(
+        named(b"etc/motd"),
+        File::open(second.path().join("usr/share/doc/readme")).unwrap(),
+        &fixed(),
+    )
+    .unwrap();
+    added(&plain, &mut plan, &populate::Options::default());
+    keep(&mut archives, "made-populate-twice", &plain);
     archives
 }
 
@@ -175,7 +259,7 @@ fn what_is_written_is_what_a_kernel_unpacked() {
 }
 
 /// A second run writes the same bytes, and a check has nothing to say
-/// about them.
+/// about them but that a later entry takes the place of an earlier one.
 #[test]
 fn what_is_written_is_sound_and_the_same_every_time() {
     let _serial = common::serial();
@@ -186,14 +270,30 @@ fn what_is_written_is_sound_and_the_same_every_time() {
         assert!(bytes == again, "{} is not written the same twice", name);
         let report = check::check(&bytes[..]).unwrap();
         let kinds: Vec<ProblemKind> = report.problems.iter().map(|p| p.kind).collect();
-        if name.starts_with("made-assemble-cut") {
+        if name.starts_with("made-populate-cut") || name.starts_with("made-assemble-cut") {
             // The check says what the kernel says: no entry where the
-            // archive is stopped. Stopped at its first byte, it has
-            // nothing unpacked.
-            assert_eq!(kinds, [ProblemKind::NoMagic], "{}", name);
-            assert_eq!(report.records, 0, "{}", name);
+            // archive is stopped.
+            assert_eq!(kinds.last(), Some(&ProblemKind::NoMagic), "{}", name);
+            if name.starts_with("made-assemble-cut") {
+                // Stopped at its first byte, it has nothing unpacked.
+                assert_eq!((report.records, kinds.len()), (0, 1), "{}", name);
+            }
+            assert!(kinds
+                .iter()
+                .all(|kind| matches!(kind, ProblemKind::NoMagic | ProblemKind::Replaced)));
             continue;
         }
-        assert_eq!(kinds, [], "{}", name);
+        if name.starts_with("made-assemble") {
+            assert_eq!(kinds, [], "{}", name);
+        } else {
+            assert!(!kinds.is_empty(), "{}", name);
+            assert!(
+                kinds.iter().all(|kind| *kind == ProblemKind::Replaced),
+                "{}: {:?}",
+                name,
+                kinds
+            );
+        }
+        assert_eq!(report.errors(), 0, "{}", name);
     }
 }

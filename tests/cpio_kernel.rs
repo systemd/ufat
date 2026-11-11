@@ -230,6 +230,9 @@ fn expected(case: &str) -> Expected {
         },
         "end-gap-misaligned" => damaged("Misaligned"),
         "end-magic-old" | "end-magic-none" | "end-stopper" => damaged("Magic"),
+        // An archive that was stopped while entries were added to it. What
+        // lies behind a stopper is nothing to the kernel.
+        "made-populate-cut-early" | "made-populate-cut" | "made-populate-cut-late" => damaged("Magic"),
         // An archive that was stopped at its first byte while it was
         // written: nothing of it is unpacked.
         "made-assemble-cut-early" | "made-assemble-cut" => damaged("Magic"),

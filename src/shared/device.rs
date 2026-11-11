@@ -269,6 +269,28 @@ impl Device {
             .set_len(total)
             .with_context(|| format!("failed to grow the image to {} bytes", total))?;
         self.len = total;
+        #[cfg(ufat_trace)]
+        self.record(TRACE_LENGTH, total, 0, &[])?;
+        Ok(())
+    }
+
+    /// Cuts a regular image file back to `total` bytes: what a caller does
+    /// that grew the file with [`Device::grow`] for something that failed.
+    /// A file that is not longer than that is left alone, and so is a block
+    /// device.
+    pub fn shrink(&mut self, total: u64) -> Result<()> {
+        if self.offset != 0 {
+            bail!(EINVAL, "cannot shrink a window into an image");
+        }
+        if self.block_device || self.len <= total {
+            return Ok(());
+        }
+        self.file
+            .set_len(total)
+            .with_context(|| format!("failed to cut the image back to {} bytes", total))?;
+        self.len = total;
+        #[cfg(ufat_trace)]
+        self.record(TRACE_LENGTH, total, 0, &[])?;
         Ok(())
     }
 
@@ -429,12 +451,14 @@ impl Device {
 }
 
 /// The record tags of a write trace: a write with its bytes, a range made
-/// to read as zeros, the fdatasync barrier, the fsync, and a note from the
-/// program driving the device.
+/// to read as zeros, a new length of the file, the fdatasync barrier, the
+/// fsync, and a note from the program driving the device.
 #[cfg(ufat_trace)]
 const TRACE_WRITE: u8 = b'W';
 #[cfg(ufat_trace)]
 const TRACE_ZERO: u8 = b'Z';
+#[cfg(ufat_trace)]
+const TRACE_LENGTH: u8 = b'L';
 #[cfg(ufat_trace)]
 const TRACE_BARRIER: u8 = b'F';
 #[cfg(ufat_trace)]
@@ -451,9 +475,10 @@ impl Device {
     /// behind. Each record is a tag byte, the absolute file offset as a
     /// little endian u64 and a length as a little endian u64; a write
     /// (`W`) and a note (`N`) are followed by that many bytes, a zeroed
-    /// range (`Z`) names its length and carries no bytes, a barrier (`F`)
-    /// and a sync (`S`) have offset and length zero. Reads are not
-    /// recorded; they do not matter for what a crash leaves behind.
+    /// range (`Z`) names its length and carries no bytes, a new length of
+    /// the file (`L`) has it as its offset, a barrier (`F`) and a sync
+    /// (`S`) have offset and length zero. Reads are not recorded; they do
+    /// not matter for what a crash leaves behind.
     pub fn trace_to(&mut self, file: File) {
         self.trace = Some(file);
     }
@@ -571,12 +596,22 @@ mod tests {
             Device::create(&dir.join("missing-dir/x.img")).unwrap_err().errno(),
             ENOENT
         );
-        // A window cannot be grown.
+        // A window cannot be grown, or cut back.
         let mut dev = Device::open(&dir.join("new.img"), Access::ReadWrite)
             .unwrap()
             .window(4096, None)
             .unwrap();
         assert_eq!(dev.grow(1 << 20).unwrap_err().errno(), EINVAL);
+        assert_eq!(dev.shrink(0).unwrap_err().errno(), EINVAL);
+        drop(dev);
+        // What was grown is cut back, and never made longer.
+        let mut dev = Device::open(&dir.join("new.img"), Access::ReadWrite).unwrap();
+        dev.shrink(1 << 20).unwrap();
+        assert_eq!(dev.len(), 8192);
+        dev.shrink(4096).unwrap();
+        assert_eq!(dev.len(), 4096);
+        drop(dev);
+        assert_eq!(std::fs::metadata(dir.join("new.img")).unwrap().len(), 4096);
     }
 
     #[test]

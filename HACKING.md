@@ -51,7 +51,7 @@ With rustup, `cargo +1.85.0` selects rustc 1.85:
 - the unit tests of the two libraries and of the json, shared, uapi16,
   varlink, dlopen, dlopen-note and blkid crates,
 - the integration tests in tests/,
-- the crash consistency harness.
+- the crash consistency harnesses.
 
 The tests build with the dev profile, which is optimized and keeps the
 overflow checks and debug assertions. `--release` turns those off.
@@ -193,6 +193,13 @@ on its own:
 
 `UFAT_CRASH_FULL=1` checks every subset of the writes between two
 flushes instead of a sample.
+
+tests/crash/cpio/crash.rs does the same for cpio archives, with the
+cpio-trace package. While an archive is written, every state has to be
+what the image held, the archive, or an image whose first byte makes the
+kernel fail. While entries are added to an archive, every state has to
+be the archive as it was, the archive with everything that was added, or
+one of the two with a byte in it that makes every reader fail.
 
 ## Fuzzing
 

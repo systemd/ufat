@@ -14,6 +14,7 @@ members = [
     "src/varlink",
     "tools",
     "tests/crash",
+    "tests/crash/cpio",
     "tests/crash/shared",
     "tests/fuzz",
     "bench",
@@ -32,6 +33,7 @@ default-members = [
     "src/uapi16",
     "src/varlink",
     "tests/crash",
+    "tests/crash/cpio",
 ]
 # cargo update picks dependency versions that support rust-version.
 resolver = "3"

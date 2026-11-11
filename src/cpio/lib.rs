@@ -27,6 +27,7 @@ pub mod header;
 pub mod image;
 pub mod name;
 pub mod plan;
+pub mod populate;
 pub mod read;
 #[cfg(test)]
 mod test_util;

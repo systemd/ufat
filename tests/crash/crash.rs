@@ -117,6 +117,8 @@ fn read_trace(path: &Path) -> Vec<Record> {
                 data: payload(&mut pos),
             },
             b'Z' => Record::Zero { offset, len },
+            // No scenario here grows or cuts the image.
+            b'L' => panic!("the image changed its length to {} bytes", offset),
             b'F' => Record::Barrier,
             b'S' => Record::Sync,
             b'N' => Record::Note(String::from_utf8_lossy(&payload(&mut pos)).into_owned()),

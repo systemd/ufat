@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use common::{find_program, Temp};
+use cpio::header::STOPPER;
 use cpio::read::{Scanner, Standing};
+use cpio::tree::Tree;
 
 /// The readers, each with what makes it unpack an archive into the
 /// current directory, times included, and replace what is there.
@@ -51,14 +53,19 @@ fn fixtures_named(prefix: &str) -> BTreeMap<String, PathBuf> {
 /// The archives ucpio wrote, by name.
 fn made() -> BTreeMap<String, PathBuf> {
     let mut made = fixtures_named("made-");
-    made.retain(|name, _| !name.starts_with(STOPPED));
-    assert!(made.len() >= 2, "only {} archives found", made.len());
+    made.retain(|name, _| !name.starts_with(CUT) && !name.starts_with(STOPPED));
+    assert!(made.len() >= 5, "only {} archives found", made.len());
     made
 }
+
+/// The archives that are what a crash leaves of one that entries were
+/// being added to.
+const CUT: &str = "made-populate-cut";
 
 /// The archives that are what a crash or a failure leaves of one that was
 /// being written: stopped at their first byte.
 const STOPPED: &str = "made-assemble-cut";
+
 /// Runs a reader on `archive` in `dir`. Returns what it wrote to its
 /// standard output and error.
 fn read_with(program: &Path, args: &[&str], archive: &Path, dir: &Path) -> (String, String) {
@@ -279,15 +286,16 @@ fn gnu_cpio_finds_the_checksums_right() {
     let Some(cpio) = find_program("cpio") else {
         return skip("cpio");
     };
-    let name = "made-assemble-aligned";
-    let dir = Temp::dir();
-    let (_, stderr) = read_with(
-        &cpio,
-        &["-i", "--only-verify-crc", "--quiet"],
-        &made()[name],
-        dir.path(),
-    );
-    assert_eq!(stderr, "", "{}", name);
+    for name in ["made-assemble-aligned", "made-populate-aligned"] {
+        let dir = Temp::dir();
+        let (_, stderr) = read_with(
+            &cpio,
+            &["-i", "--only-verify-crc", "--quiet"],
+            &made()[name],
+            dir.path(),
+        );
+        assert_eq!(stderr, "", "{}", name);
+    }
     // And it does look: the fixture with a wrong one.
     let dir = Temp::dir();
     let out = Command::new(&cpio)
@@ -297,6 +305,52 @@ fn gnu_cpio_finds_the_checksums_right() {
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&out.stderr).contains("checksum error"));
+}
+
+/// A later entry takes the place of an earlier one of the same name when
+/// the kernel unpacks an archive. GNU cpio and busybox keep the earlier of
+/// two entries of the same age unless they are told to replace what is
+/// there, and the entries of an archive made with one fixed time are of
+/// the same age.
+#[test]
+fn a_later_entry_of_the_same_age_needs_the_readers_to_replace() {
+    let _serial = common::serial();
+    let archive = &made()["made-populate"];
+    let kernel = kernel_listing(archive);
+    let conf = |lines: &[String]| {
+        lines
+            .iter()
+            .find(|line| line.starts_with("etc/conf "))
+            .and_then(|line| line.split(' ').find(|word| word.starts_with("sum=")))
+            .unwrap()
+            .to_string()
+    };
+    let later = conf(&kernel);
+    for (reader, with, without) in [
+        ("cpio", &["-idmu", "--quiet"][..], &["-idm", "--quiet"][..]),
+        ("busybox", &["cpio", "-idmu"], &["cpio", "-idm"]),
+    ] {
+        let Some(program) = find_program(reader) else {
+            skip(reader);
+            continue;
+        };
+        let dir = Temp::dir();
+        read_with(&program, with, archive, dir.path());
+        assert_eq!(conf(&list(dir.path())), later, "{}", reader);
+        let dir = Temp::dir();
+        let (_, stderr) = read_with(&program, without, archive, dir.path());
+        assert_ne!(conf(&list(dir.path())), later, "{}", reader);
+        // Each reader says so in its own words, with or without quotes
+        // around the name.
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.contains("etc/conf") && line.contains("not created")),
+            "{}: {}",
+            reader,
+            stderr
+        );
+    }
 }
 
 /// An archive that was not finished is stopped at its first byte. The
@@ -355,6 +409,50 @@ fn readers_do_not_take_an_archive_that_was_not_finished() {
                     fs::read_dir(dir.path()).unwrap().count(),
                     0,
                     "{} {:?} unpacked entries of {}",
+                    reader,
+                    args,
+                    name
+                );
+            }
+        }
+    }
+}
+
+/// An archive that was cut off while entries were added to it is one that
+/// every reader fails on, whatever it unpacks before it does.
+#[test]
+fn readers_fail_on_an_archive_that_was_cut_off() {
+    let _serial = common::serial();
+    let mut cut = fixtures_named(CUT);
+    assert_eq!(cut.len(), 3);
+    // The first of these states: nothing of what is added is there yet.
+    let mut stopped = fs::read(&made()["made-assemble"]).unwrap();
+    let trailer = Tree::open(&stopped[..]).unwrap().trailer_offset().unwrap() as usize;
+    stopped[trailer] = STOPPER;
+    let first = Temp::new(".cpio");
+    fs::write(first.path(), stopped).unwrap();
+    cut.insert("made-assemble, stopped".into(), first.path().to_path_buf());
+    for (reader, list, unpack) in [
+        ("cpio", &["-t", "--quiet"][..], &["-idmu", "--quiet"][..]),
+        ("bsdcpio", &["-t", "--quiet"], &["-idmu", "--quiet"]),
+        ("busybox", &["cpio", "-t"], &["cpio", "-idmu"]),
+    ] {
+        let Some(program) = find_program(reader) else {
+            skip(reader);
+            continue;
+        };
+        for (name, archive) in &cut {
+            for args in [list, unpack] {
+                let dir = Temp::dir();
+                let out = Command::new(&program)
+                    .args(args)
+                    .current_dir(dir.path())
+                    .stdin(Stdio::from(File::open(archive).unwrap()))
+                    .output()
+                    .unwrap();
+                assert!(
+                    !out.status.success(),
+                    "{} {:?} took {} for a whole archive",
                     reader,
                     args,
                     name

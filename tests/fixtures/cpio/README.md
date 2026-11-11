@@ -49,8 +49,10 @@ tool writes.
 | `builtin` | entries below the directories the kernel has before it unpacks anything |
 
 The `made-*` cases are archives ucpio wrote. tests/cpio_made.rs writes
-the files when `UCPIO_BLESS=1` is set. `made-assemble-cut*` are the
-states a crash or a failure leaves of an archive that was being written.
+the files when `UCPIO_BLESS=1` is set. `made-populate-cut*` are the
+states a crash leaves of an archive that entries were being added to.
+`made-assemble-cut*` are the states a crash or a failure leaves of an
+archive that was being written.
 
 ## Making them again
 

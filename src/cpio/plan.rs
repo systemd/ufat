@@ -78,6 +78,8 @@ pub(crate) enum Contents {
     /// how much of the entry's name is the directory the tree went below,
     /// and the file that was seen there.
     Host { root: u32, strip: u32, dev: u64, ino: u64 },
+    /// In an open file the plan holds, by its position there.
+    File { index: u32 },
     /// Nowhere: the entry is no regular file.
     None,
 }
@@ -183,6 +185,18 @@ impl Planned {
     }
 }
 
+#[cfg(test)]
+impl Planned {
+    /// A planned node, for the tests of rules that only look at what an
+    /// entry is.
+    pub(crate) fn for_test(kind: Kind, rdev: DeviceNumber) -> Planned {
+        Planned {
+            rdev,
+            ..Planned::new(kind, Attributes::default())
+        }
+    }
+}
+
 /// What a name of a plan is to the file it leads to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -282,6 +296,8 @@ pub struct Measure {
     /// The length of the archive, with the trailer and the padding of its
     /// end.
     pub len: u64,
+    /// Where the trailer starts in the archive.
+    pub trailer: u64,
     /// Regular files, each counted once whatever the number of its names.
     pub files: u64,
     /// Directories, the root not among them.
@@ -297,6 +313,8 @@ pub struct Plan {
     entries: BTreeMap<Box<[u8]>, Planned>,
     /// The directories the trees were read from, pinned.
     roots: Vec<OwnedFd>,
+    /// The files that were planned one by one, open.
+    files: Vec<File>,
 }
 
 impl Plan {
@@ -344,6 +362,45 @@ impl Plan {
     /// that is planned already stays as it is.
     pub fn add_directory(&mut self, name: Name<'_>, attributes: Attributes) -> Result<()> {
         self.insert(name, Planned::new(Kind::Directory, attributes), true)
+    }
+
+    /// Plans the open regular file `file` as `name`, read from its first
+    /// byte when the archive is written. Its permissions, owner and time
+    /// are the file's, as `options` passes them on.
+    pub fn add_file(&mut self, name: Name<'_>, file: File, options: &TreeOptions) -> Result<()> {
+        let md = file.metadata()?;
+        if !md.is_file() {
+            bail!(EINVAL, "the source of '{}' is not a regular file", name);
+        }
+        if md.len() > MAX_FILE_SIZE {
+            bail!(
+                EFBIG,
+                Detail::TooLarge {
+                    path: Some(name.to_string()),
+                    size: md.len(),
+                    maximum: MAX_FILE_SIZE,
+                },
+                "the source of '{}' has {} bytes, more than the {} a cpio archive can hold",
+                name,
+                md.len(),
+                MAX_FILE_SIZE
+            );
+        }
+        let index = u32::try_from(self.files.len()).map_err(|_| err!(E2BIG, "too many source files"))?;
+        let planned = Planned {
+            size: md.len(),
+            contents: Contents::File { index },
+            ..Planned::new(Kind::Regular, options.attributes(&md))
+        };
+        self.insert(name, planned, options.replace)?;
+        self.files.push(file);
+        Ok(())
+    }
+
+    /// Takes out of the plan every entry `keep` says no to.
+    pub fn retain(&mut self, keep: &mut dyn FnMut(Name<'_>, &Planned) -> bool) {
+        self.entries
+            .retain(|key, planned| keep(Name::from_checked(&Key::new(key).name()), planned));
     }
 
     /// Plans everything below the open directory `root`, the entries going
@@ -461,6 +518,7 @@ impl Plan {
                 "the archive would have more entries than the format can number"
             );
         }
+        measure.trailer = cursor.offset();
         measure.len = cursor.finish();
         Ok(measure)
     }
@@ -471,27 +529,40 @@ impl Plan {
         (self.roots[root as usize].as_fd(), &name.as_bytes()[strip as usize..])
     }
 
-    /// Opens the file of a host tree the entry `planned` at `name` was
-    /// made for, and makes sure it still is that file.
+    /// Opens the file the entry `planned` at `name` was made for, and
+    /// makes sure it still is the file that was planned.
     pub(crate) fn open(&self, name: Name<'_>, planned: &Planned) -> Result<File> {
-        let Contents::Host { root, strip, dev, ino } = planned.contents else {
-            bail!(EINVAL, "'{}' has no contents to read", name);
-        };
-        let (root, path) = self.host_path(name, root, strip);
-        let shown = String::from_utf8_lossy(path);
-        let pinned = sys::chase(root, path, false, false).with_context(|| format!("failed to open {}", shown))?;
-        let md = sys::fstat(pinned.as_fd()).with_context(|| format!("failed to stat {}", shown))?;
-        if !md.is_file() || (md.dev(), md.ino()) != (dev, ino) || md.len() != planned.size {
-            bail!(
+        let changed = |shown: &str| {
+            err!(
                 ESTALE,
                 "{} changed while the archive was written: it is not the file of {} bytes that was there",
                 shown,
                 planned.size
-            );
+            )
+        };
+        match planned.contents {
+            Contents::Host { root, strip, dev, ino } => {
+                let (root, path) = self.host_path(name, root, strip);
+                let shown = String::from_utf8_lossy(path);
+                let pinned =
+                    sys::chase(root, path, false, false).with_context(|| format!("failed to open {}", shown))?;
+                let md = sys::fstat(pinned.as_fd()).with_context(|| format!("failed to stat {}", shown))?;
+                if !md.is_file() || (md.dev(), md.ino()) != (dev, ino) || md.len() != planned.size {
+                    return Err(changed(&shown));
+                }
+                let fd = sys::reopen(pinned.as_fd(), sys::O_RDONLY | sys::O_NONBLOCK | sys::O_NOCTTY)
+                    .with_context(|| format!("failed to open {}", shown))?;
+                Ok(File::from(fd))
+            }
+            Contents::File { index } => {
+                let file = &self.files[index as usize];
+                if file.metadata()?.len() != planned.size {
+                    return Err(changed(&format!("the source of '{}'", name)));
+                }
+                Ok(file.try_clone()?)
+            }
+            Contents::None => bail!(EINVAL, "'{}' has no contents to read", name),
         }
-        let fd = sys::reopen(pinned.as_fd(), sys::O_RDONLY | sys::O_NONBLOCK | sys::O_NOCTTY)
-            .with_context(|| format!("failed to open {}", shown))?;
-        Ok(File::from(fd))
     }
 }
 
@@ -560,11 +631,14 @@ mod tests {
             measure,
             Measure {
                 len: 1536,
+                trailer: measure.trailer,
                 files: 4,
                 directories: 2,
                 bytes: 6 + 1 + 3,
             }
         );
+        // The trailer is all that follows the entries but padding.
+        assert_eq!(measure.len, (measure.trailer + 124).div_ceil(512) * 512);
     }
 
     #[test]
@@ -785,11 +859,13 @@ mod tests {
             end_alignment: 4,
             ..write::Options::default()
         };
-        assert_eq!(plan.measure(&options, 0, &|_| false).unwrap().len, by_hand as u64);
+        let measure = plan.measure(&options, 0, &|_| false).unwrap();
+        assert_eq!((measure.len, measure.trailer), (by_hand as u64, by_hand as u64 - 124));
         // Entries that start further into an archive take as much room.
+        let measure = plan.measure(&options, 1000, &|_| false).unwrap();
         assert_eq!(
-            plan.measure(&options, 1000, &|_| false).unwrap().len,
-            1000 + by_hand as u64
+            (measure.len, measure.trailer),
+            (1000 + by_hand as u64, 876 + by_hand as u64)
         );
         let bad = write::Options {
             end_alignment: 3,
