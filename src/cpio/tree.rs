@@ -103,7 +103,8 @@ pub enum FindingKind {
     /// A directory that is not empty is where the entry wants to be. The
     /// entry is lost.
     DirectoryInTheWay,
-    /// The entry replaces an earlier one of the same name.
+    /// The entry replaces an earlier one of the same name, of its kind or
+    /// of another.
     Replaced,
     /// A name of a hard-linked file whose first name is not there anymore.
     /// The entry is lost.
@@ -927,7 +928,12 @@ impl Replayer {
         };
         let key = spot.key;
         let h = &record.header;
+        let had = self.tree.names.contains_key(&key[..]);
         let before = self.tree.clean(&key, Some(Kind::Regular));
+        // Something of another kind was there and went.
+        if had && before == Place::Free {
+            self.find(FindingKind::Replaced, record);
+        }
         let id = match self.link(record, &key, Kind::Regular) {
             Some(Err(())) => return,
             // A link is opened without truncating it: an entry without
@@ -984,10 +990,20 @@ impl Replayer {
         }
         let key = spot.key;
         let there = match spot.ending {
-            Ending::Plain => match self.tree.clean(&key, Some(Kind::Directory)) {
-                Place::Free => None,
-                Place::Taken(id) => Some(id),
-            },
+            Ending::Plain => {
+                let had = self.tree.names.contains_key(&key[..]);
+                match self.tree.clean(&key, Some(Kind::Directory)) {
+                    Place::Free => {
+                        // Something that is no directory was there and
+                        // went.
+                        if had {
+                            self.find(FindingKind::Replaced, record);
+                        }
+                        None
+                    }
+                    Place::Taken(id) => Some(id),
+                }
+            }
             // Under such a name nothing goes to make room.
             Ending::Slash | Ending::Dot => match self.tree.names.get(&key[..]).copied() {
                 None if spot.ending == Ending::Dot => {
@@ -1084,7 +1100,12 @@ impl Replayer {
             }
         };
         let key = spot.key;
+        let had = self.tree.names.contains_key(&key[..]);
         let before = self.tree.clean(&key, Some(kind));
+        // Something of another kind was there and went.
+        if had && before == Place::Free {
+            self.find(FindingKind::Replaced, record);
+        }
         if self.link(record, &key, kind).is_some() {
             return;
         }
@@ -1528,6 +1549,7 @@ mod tests {
             [
                 (FindingKind::MissingParent, b"t/orphan/child".to_vec()),
                 (FindingKind::Replaced, b"t/dup".to_vec()),
+                (FindingKind::Replaced, b"t/dirfile".to_vec()),
                 (FindingKind::Skipped(Skip::Data), b"t/dirsize".to_vec()),
                 (FindingKind::EmptyTarget, b"t/emptysym".to_vec()),
                 (FindingKind::LinkCount, b"t/nl2-single".to_vec()),
@@ -1590,7 +1612,9 @@ mod tests {
             [
                 (FindingKind::Replaced, b"t/d".to_vec()),
                 (FindingKind::DirectoryInTheWay, b"t/full".to_vec()),
+                (FindingKind::Replaced, b"t/f2d".to_vec()),
                 (FindingKind::Replaced, b"t/h1".to_vec()),
+                (FindingKind::Replaced, b"t/s2f".to_vec()),
                 (FindingKind::Replaced, b"t/f2s".to_vec()),
             ]
         );
@@ -1825,6 +1849,7 @@ mod tests {
             [
                 FindingKind::Removal,
                 FindingKind::BrokenLink,
+                FindingKind::Replaced,
                 FindingKind::BrokenLink,
                 FindingKind::BrokenLink,
                 FindingKind::LinkCount,
