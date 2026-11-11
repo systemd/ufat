@@ -66,11 +66,6 @@ fn sha512_hex(data: &[u8]) -> String {
     fat::sha512::to_hex(&fat::sha512::digest(data))
 }
 
-/// Names the entries a listing with the more flag returned, one per reply.
-fn names(replies: &[Object]) -> Vec<&str> {
-    replies.iter().map(|r| str_of(object_of(r, "entry"), "name")).collect()
-}
-
 /// Opens the volume in `image` through the library, to look at what the
 /// service did.
 fn volume(image: &Path, access: Access) -> Volume {

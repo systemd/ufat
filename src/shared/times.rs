@@ -4,6 +4,11 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Nanoseconds in a second.
+pub const NSEC_PER_SEC: u64 = 1_000_000_000;
+/// Microseconds in a second.
+pub const USEC_PER_SEC: u64 = 1_000_000;
+
 /// How copied files and directories get their timestamps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimePolicy {

@@ -1,7 +1,7 @@
 # Hacking on ufat
 
-ufat is built with cargo. It depends on the libc, sha2 and lexopt
-crates. lexopt parses the command line of the tool.
+ufat and ucpio are built with cargo. They depend on the libc, sha2 and
+lexopt crates. lexopt parses the command lines of the tools.
 
 ufat does not link against libblkid. It loads libblkid.so.1 with
 dlopen() when it needs it. The workspace has a crate for each part of
@@ -30,10 +30,10 @@ that:
     cargo build --locked
     cargo build --release --locked
 
-`cargo build` builds the library and the tool `target/debug/ufat`.
-`--release` builds `target/release/ufat`. `cargo install --locked --path .`
-installs the tool into `~/.cargo/bin`. With `--root /usr/local` it goes
-into /usr/local/bin.
+`cargo build` builds the libraries and the tools `target/debug/ufat` and
+`target/debug/ucpio`. `--release` builds them below `target/release`.
+`cargo install --locked --path .` installs the tools into `~/.cargo/bin`.
+With `--root /usr/local` they go into /usr/local/bin.
 
 Cargo.lock is part of the tree. `--locked` makes cargo use the versions
 it lists.
@@ -172,6 +172,10 @@ qemu:
 tests/fixtures/cpio/README.md describes the cases, the listings and what
 the script needs. Add a case there for every rule of the kernel that
 ucpio relies on.
+
+tests/cpio_tool.rs and tests/cpio_service.rs run the ucpio command line
+and the ucpio service. They compare what the tool writes with the same
+archives.
 
 ## Crash consistency
 

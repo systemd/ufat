@@ -14,6 +14,9 @@ It is made for the EFI System Partition (ESP). It can:
 ufat is a Rust library, a command line tool and a Varlink service. The
 tool and the service are the same binary.
 
+This repository also has ucpio, which does the same for cpio archives,
+the format of the initramfs. docs/ucpio.md describes it.
+
 ## Properties
 
 - FAT32 only, with long file names. FAT12, FAT16 and exFAT are not
@@ -43,8 +46,9 @@ linked ufat, which a musl build is by default, cannot load it.
     cargo build --release --locked
     cargo install --locked --path . --root /usr/local
 
-This builds the tool `target/release/ufat` and installs it into
-/usr/local/bin. Without `--root` it goes into ~/.cargo/bin.
+This builds the tools `target/release/ufat` and `target/release/ucpio`
+and installs them into /usr/local/bin. Without `--root` they go into
+~/.cargo/bin.
 
 HACKING.md describes the tests and the other tools, and how to submit
 changes.

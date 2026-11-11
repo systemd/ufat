@@ -480,6 +480,16 @@ impl Tree {
         counts
     }
 
+    /// How long the archive in `source` is with the padding behind it: up
+    /// to the end of the image, or up to where something else follows the
+    /// trailer.
+    pub fn archive_len<S: Source + ?Sized>(&self, source: &S) -> Result<u64> {
+        Ok(match self.end() {
+            End::Trailer(end) => source.first_nonzero(end)?.unwrap_or(source.len()),
+            End::NoTrailer => source.len(),
+        })
+    }
+
     /// An identity for what `name` leads to: two names with the same one
     /// are hard links of one file.
     pub fn inode_id(&self, name: &[u8]) -> Option<u32> {

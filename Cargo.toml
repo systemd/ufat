@@ -84,15 +84,13 @@ publish.workspace = true
 
 [dependencies]
 cli.workspace = true
+cpio.workspace = true
 fat.workspace = true
 json.workspace = true
 libc.workspace = true
 service.workspace = true
 shared.workspace = true
 varlink.workspace = true
-
-[dev-dependencies]
-cpio.workspace = true
 
 [lints]
 workspace = true

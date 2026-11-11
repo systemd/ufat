@@ -206,6 +206,16 @@ impl NameBuf {
         self.0
     }
 
+    /// The name an archive has for what is at `path` in it: a path as a
+    /// user gives it, with or without slashes in front. The root is `/`.
+    pub fn from_path(path: &[u8]) -> Result<NameBuf> {
+        let below = &path[path.iter().take_while(|&&b| b == b'/').count()..];
+        if below.is_empty() {
+            return Ok(NameBuf::from(Name::ROOT));
+        }
+        NameBuf::new(below.to_vec())
+    }
+
     /// A name this crate put together from names that were checked.
     pub(crate) fn from_checked(bytes: Vec<u8>) -> NameBuf {
         debug_assert!(Name::new(&bytes).is_ok());

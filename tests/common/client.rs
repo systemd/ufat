@@ -366,3 +366,8 @@ pub fn file_with(dir: &Path, name: &str, data: &[u8]) -> File {
     std::fs::write(&path, data).unwrap();
     ro(&path)
 }
+
+/// Names the entries a listing with the more flag returned, one per reply.
+pub fn names(replies: &[Object]) -> Vec<&str> {
+    replies.iter().map(|r| str_of(object_of(r, "entry"), "name")).collect()
+}
