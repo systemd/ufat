@@ -33,3 +33,4 @@ pub mod sha512;
 pub mod sys;
 #[cfg(test)]
 mod test_util;
+pub mod times;

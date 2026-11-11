@@ -456,7 +456,7 @@ fn walk_from(
 /// The target of the symbolic link `link` refers to, read through the
 /// descriptor itself (`readlinkat(fd, "")`), so that nothing is looked up
 /// again.
-fn readlink(link: BorrowedFd<'_>) -> io::Result<Vec<u8>> {
+pub fn readlink(link: BorrowedFd<'_>) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; 4096];
     loop {
         // SAFETY: an empty path makes readlinkat read the link the

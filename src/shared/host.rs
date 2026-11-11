@@ -356,6 +356,12 @@ impl HostEntry {
         self.metadata.is_file()
     }
 
+    /// Where the entry, a symbolic link, points: the target of the pinned
+    /// inode, so it is the link the metadata describes.
+    pub fn read_link(&self) -> Result<Vec<u8>> {
+        sys::readlink(self.fd.as_fd()).with_context(|| format!("failed to read the link {}", self.path.display()))
+    }
+
     /// Opens the entry, a regular file, for reading: the pinned inode
     /// reopened, so what is read is what the metadata describes.
     pub fn open_file(&self) -> Result<File> {
@@ -386,14 +392,15 @@ fn list_names(dir: BorrowedFd<'_>, dir_path: &Path) -> Result<Vec<Vec<u8>>> {
 }
 
 /// One level of a walk: the directory, pinned, its identity, the names in
-/// it still to visit, and where it is on the host and inside the volume.
-struct Level {
+/// it still to visit, where it is on the host and what the walk's caller
+/// made of it, the path it gets inside a volume or an archive.
+struct Level<T> {
     dir: OwnedFd,
     dev: u64,
     ino: u64,
     names: std::vec::IntoIter<Vec<u8>>,
     path: PathBuf,
-    target: String,
+    target: T,
 }
 
 /// Walks the tree under the directory `root` in byte order of the names,
@@ -401,6 +408,50 @@ struct Level {
 /// inside the volume (`dest` plus the names below) and decides whether to
 /// descend into a directory. The populator, the planner and the manifest
 /// generator all walk through here, so they see the same tree.
+///
+/// A name that is not UTF-8 is an error since it could not be stored as a
+/// long name anyway, and so is a path inside the volume longer than
+/// [`crate::path::MAX_PATH`]. See [`walk_with`] for how the tree is read.
+pub fn walk_tree(
+    root: BorrowedFd<'_>,
+    dest: &str,
+    follow_symlinks: bool,
+    visit: &mut dyn FnMut(&str, &HostEntry) -> Result<bool>,
+) -> Result<()> {
+    walk_with(
+        root,
+        dest.to_string(),
+        follow_symlinks,
+        &mut |parent: &String, path, name| {
+            let name = std::str::from_utf8(name).map_err(|_| err!(EINVAL, "{} is not valid UTF-8", path.display()))?;
+            let target = crate::path::join(parent, name);
+            if target.len() > crate::path::MAX_PATH {
+                bail!(
+                    ENAMETOOLONG,
+                    "{}: its path inside the volume is longer than {} bytes",
+                    path.display(),
+                    crate::path::MAX_PATH
+                );
+            }
+            Ok(target)
+        },
+        &mut |target, entry| visit(target, entry),
+    )
+}
+
+/// What [`walk_with`] asks about every name: what the caller made of the
+/// directory the name is in, the path of the entry below the root of the
+/// walk and the name. The answer is what the caller makes of the entry.
+pub type Enter<'a, T> = dyn FnMut(&T, &Path, &[u8]) -> Result<T> + 'a;
+
+/// Walks the tree under the directory `root` in byte order of the names,
+/// level by level. What a name becomes where the tree is copied to is for
+/// the caller to say: `enter` is called for every name with what it
+/// returned for the directory the name is in (`top` for the entries of
+/// `root`), the entry's path below `root` and the name, and its error
+/// ends the walk before the entry is looked at. `visit` is then called
+/// with the result and the entry and decides whether to descend into a
+/// directory.
 ///
 /// Every entry is pinned relative to the descriptor of its directory,
 /// without following it, when the walk reaches it, and examined through
@@ -415,14 +466,13 @@ struct Level {
 /// leaves it out: it is not there to copy. A directory that is already on
 /// the stack, reached through a followed link or a bind mount of a
 /// directory into itself, is ELOOP: the tree would otherwise go on until
-/// the path limit. A name that is not UTF-8 is an error since it could not
-/// be stored as a long name anyway, and so is a path inside the volume
-/// longer than [`crate::path::MAX_PATH`].
-pub fn walk_tree(
+/// the path limit.
+pub fn walk_with<T>(
     root: BorrowedFd<'_>,
-    dest: &str,
+    top: T,
     follow_symlinks: bool,
-    visit: &mut dyn FnMut(&str, &HostEntry) -> Result<bool>,
+    enter: &mut Enter<'_, T>,
+    visit: &mut dyn FnMut(&T, &HostEntry) -> Result<bool>,
 ) -> Result<()> {
     let names = list_names(root, Path::new("")).with_context(|| "failed to list the source directory")?;
     let root_md = sys::fstat(root).with_context(|| "failed to stat the source directory")?;
@@ -432,7 +482,7 @@ pub fn walk_tree(
         ino: root_md.ino(),
         names: names.into_iter(),
         path: PathBuf::new(),
-        target: dest.to_string(),
+        target: top,
     }];
     loop {
         let Some(level) = stack.last_mut() else { return Ok(()) };
@@ -441,18 +491,9 @@ pub fn walk_tree(
             continue;
         };
         let path = level.path.join(OsStr::from_bytes(&name));
-        let name = String::from_utf8(name).map_err(|_| err!(EINVAL, "{} is not valid UTF-8", path.display()))?;
-        let target = crate::path::join(&level.target, &name);
-        if target.len() > crate::path::MAX_PATH {
-            bail!(
-                ENAMETOOLONG,
-                "{}: its path inside the volume is longer than {} bytes",
-                path.display(),
-                crate::path::MAX_PATH
-            );
-        }
+        let target = enter(&level.target, &path, &name)?;
         let stat = || format!("failed to stat {}", path.display());
-        let mut fd = match sys::pin_entry(level.dir.as_fd(), name.as_bytes()) {
+        let mut fd = match sys::pin_entry(level.dir.as_fd(), &name) {
             Ok(fd) => fd,
             // Vanished since the listing: nothing to copy, as for
             // recurse_dir().

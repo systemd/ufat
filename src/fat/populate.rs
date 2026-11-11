@@ -20,31 +20,10 @@ use crate::volume::{Volume, MAX_FILE_SIZE};
 use crate::Detail;
 use crate::{Context, Error, Result};
 
+pub use shared::times::TimePolicy;
+
 /// Size of the buffer used when copying file contents.
 const COPY_BUFFER: usize = 1024 * 1024;
-
-/// How copied files and directories get their timestamps.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TimePolicy {
-    /// Keep the source's modification time.
-    Preserve,
-    /// Stamp everything with this time.
-    Fixed(SystemTime),
-    /// Keep the source's modification time unless it is later than this,
-    /// the SOURCE_DATE_EPOCH convention.
-    Clamp(SystemTime),
-}
-
-impl TimePolicy {
-    /// The time to store for a source modified at `source`.
-    pub fn resolve(self, source: SystemTime) -> SystemTime {
-        match self {
-            TimePolicy::Preserve => source,
-            TimePolicy::Fixed(t) => t,
-            TimePolicy::Clamp(t) => source.min(t),
-        }
-    }
-}
 
 /// Options for copying.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
