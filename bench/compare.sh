@@ -1,9 +1,10 @@
 #!/bin/bash
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
-# Compares two ufat binaries on a few small workloads, see HACKING.md. What
-# every run cost goes to $BENCH_DIR/out/compare.tsv, and bench/compare.py
-# turns that into a table and a verdict.
+# Compares two ufat binaries on a few small workloads, see HACKING.md. The
+# CI runs it with the binary of main as BASE and that of a pull request as
+# HEAD. What every run cost goes to $BENCH_DIR/out/compare.tsv, and
+# bench/compare.py turns that into a table and a verdict.
 #
 # Usage: bench/compare.sh BASE HEAD [CASE-REGEX]
 #

@@ -229,3 +229,37 @@ A commit that makes a workload slower on purpose names the workload in a
 
 `bench/compare.py --accept FILE` reads such names from FILE and reports
 those regressions without failing.
+
+## Continuous integration
+
+GitHub Actions runs .github/workflows/ci.yml for every pull request, for
+every push to main and once a week. It runs:
+
+- the build and the tests with rustc 1.85 and with the current stable
+  rustc, on x86_64 and aarch64, with warnings turned into errors,
+- the case folding table check, which generates the table from the
+  Unicode 16.0.0 files,
+- clippy with rustc 1.85 and with the current stable rustc, for every
+  supported architecture,
+- rustfmt,
+- the build and the tests for the other architectures, under qemu
+  except for i686,
+- the exhaustive sweeps,
+- the fuzzing campaign, with 5000 iterations in the weekly run,
+- the coverage report, which is shown in the job summary,
+- Kani with `--only-codegen`, which checks that every proof builds. The
+  proofs themselves need more time and memory than the CI has,
+- a check that the crates from outside the tree are libc, lexopt, sha2
+  and the crates sha2 needs,
+- bench/compare.sh with the release binary and that of the base: the
+  target branch for a pull request, main before a push, and main of a
+  week earlier for the weekly run. It accepts the regressions that the
+  `Perf-regression:` trailers of the commits since the base name.
+
+The build jobs fail when mkfs.fat, fsck.fat, mtools or a varlinkctl with
+`--push-fd` is missing, instead of skipping the tests that need them.
+
+Dependabot proposes updates of the actions and of the crates once a
+month. It keeps libc on 0.2. It updates sha2 and the crates it needs in
+one pull request, and skips sha2 0.11.1 and later, which need rustc
+1.88.

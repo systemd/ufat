@@ -6,8 +6,8 @@
 
 OUT is the out directory of bench/compare.sh. Prints a Markdown table of
 what every workload cost with the base and the head binary, appends it to
---summary, and exits 1 when the head binary regressed beyond a limit on a
-workload that --accept does not name.
+--summary (the job summary in CI), and exits 1 when the head binary
+regressed beyond a limit on a workload that --accept does not name.
 
 --accept FILE holds the values of the Perf-regression: trailers of the
 commits between base and head, one per line: glob patterns of workload

@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      actions:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 2
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    groups:
+      # sha2 and the crates it needs move together.
+      rustcrypto:
+        patterns:
+          - "block-buffer"
+          - "cfg-if"
+          - "cpufeatures"
+          - "crypto-common"
+          - "digest"
+          - "hybrid-array"
+          - "sha2"
+          - "typenum"
+    ignore:
+      # Stay on 0.2: 1.0 may drop the LFS64 functions ufat calls.
+      - dependency-name: "libc"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+      # sha2 0.11.1 and later need rustc 1.88, newer than rust-version.
+      # Drop this when rust-version reaches it.
+      - dependency-name: "sha2"
+        versions:
+          - ">= 0.11.1"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 1
