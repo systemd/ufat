@@ -180,7 +180,8 @@ type InodeFlag(appendOnly, immutable, noAtime, noCow, noDump)
 # whether content has to come with Assemble, whether Populate works afterwards.
 type Capabilities(
 	# The filesystem type as the kernel names it (vfat, ext4, xfs, btrfs,
-	# f2fs, erofs, squashfs, exfat)
+	# f2fs, erofs, squashfs, exfat), or the name of the archive format for
+	# what the kernel unpacks instead of mounting (cpio)
 	fileSystemType: string,
 	# The implementation and its version, as identifiers
 	implementation: string,
@@ -322,6 +323,21 @@ type VfatOptions(
 	mkfsFatCompatible: ?bool
 )
 
+# cpio: what an archive in the new ASCII format, the one the kernel unpacks
+# an initramfs from, is made with.
+type CpioOptions(
+	# Pad the end of the archive to a multiple of this many bytes, 512 by
+	# default; a multiple of 4
+	endAlignment: ?int,
+	# Start the contents of files of at least this many bytes at a multiple
+	# of it, a power of two; off by default
+	dataAlignment: ?int,
+	# Write the form with checksums (070702), false by default
+	checksums: ?bool,
+	# Write an entry for the root directory, true by default
+	rootEntry: ?bool
+)
+
 # Parameters for making a filesystem. The generic ones every implementation
 # understands or refuses with OperationNotSupported when the filesystem has
 # no such thing (Capabilities.operations says which); the per-filesystem
@@ -354,7 +370,8 @@ type FormatOptions(
 	# Features to turn on or off, by the names Capabilities.features lists
 	enableFeatures: ?[]string,
 	disableFeatures: ?[]string,
-	vfat: ?VfatOptions
+	vfat: ?VfatOptions,
+	cpio: ?CpioOptions
 )
 
 # The algorithm of Assemble's imageHash, systemd's ManifestHash names. The
@@ -416,8 +433,9 @@ type ProblemClass(superblock, allocation, directory, name, timestamp, label, cha
 
 # A finding of Check: its class and kind and the facts about it, each set
 # when the kind has it. Kinds are identifiers the implementation documents
-# (ufat: chainLoop, orphanedLongName, ...); block stands for the
-# filesystem's allocation unit, a cluster on FAT.
+# (ufat: chainLoop, orphanedLongName, ...; ucpio: missingParent, replaced,
+# ...); block stands for the filesystem's allocation unit, a cluster on FAT,
+# and slot for the position of an entry in a directory or an archive.
 type Problem(
 	severity: ProblemSeverity,
 	class: ProblemClass,
@@ -629,7 +647,9 @@ error SizeRequired()
 # filesystem, a partition table or anything else blkid recognizes, which
 # found names the way blkid names it (foreignImageType), a sector size the
 # implementation does not support (sectorSize), too few bytes (tooSmall),
-# or data the implementation does not recognize (unknown).
+# or data the implementation does not recognize (unknown). Where a cpio
+# archive is expected, foreignImageType is compressed data or an archive in
+# an older format, and found names the format (gzip, xz, zstd, ...).
 type NotFileSystemReason(blank, foreignImageType, sectorSize, tooSmall, unknown)
 error NotFileSystem(reason: NotFileSystemReason, found: ?string, sectorSize: ?int)
 
@@ -661,7 +681,7 @@ error IsADirectory(path: string)
 error DirectoryNotEmpty(path: string)
 
 # A name inside the filesystem is not valid for it.
-type NameProblem(empty, dotComponent, invalidCharacter, leadingSpace, trailingSpaceOrDot, tooLong, caseCollision)
+type NameProblem(empty, dotComponent, invalidCharacter, leadingSpace, trailingSpaceOrDot, tooLong, caseCollision, reserved)
 error InvalidName(name: string, reason: NameProblem)
 
 # The label does not fit the filesystem's rules.
@@ -673,7 +693,7 @@ type IdentifierProblem(malformed, wrongKind, notSupported, reserved)
 error InvalidIdentifier(identifier: string, reason: IdentifierProblem)
 
 # The manifest cannot be parsed or is inconsistent.
-type ManifestProblem(notJson, notObject, notUtf8, nulByte, recordSeparator, recordTooLarge, empty, noTrailer, dataAfterTrailer, fileAfterSignature, mediaType, firstHasName, firstNotDirectory, noName, invalidName, duplicateName, unknownType, fieldType, fieldRange, fieldNotPermitted, contradiction, contents, signature, extendedAttributes, noSize)
+type ManifestProblem(notJson, notObject, notUtf8, nulByte, recordSeparator, recordTooLarge, empty, noTrailer, dataAfterTrailer, fileAfterSignature, mediaType, firstHasName, firstNotDirectory, noName, invalidName, duplicateName, unknownType, fieldType, fieldRange, fieldNotPermitted, contradiction, contents, signature, extendedAttributes, noSize, noTarget, noDeviceNumber)
 error InvalidManifest(reason: ManifestProblem, record: ?int, name: ?string, field: ?string)
 
 # A file the manifest names is not below the source as described.
