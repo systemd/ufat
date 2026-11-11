@@ -21,6 +21,7 @@ pub use shared::{bail, err};
 pub use shared::{device, errno, host, progress, sha256, sha512};
 pub use shared::{Context, CorruptPlace, Detail, Error, NameProblem, NotCpioReason, Result};
 
+pub mod check;
 pub mod header;
 pub mod name;
 pub mod read;
