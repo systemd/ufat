@@ -201,7 +201,7 @@ fn every_second_round_trips() {
 
 #[test]
 fn every_timestamp_word_round_trips() {
-    let n = threads() as u64;
+    let n = threads();
     let span = (1u64 << 32) / n;
     thread::scope(|s| {
         for t in 0..n {
