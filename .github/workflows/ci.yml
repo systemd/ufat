@@ -1,0 +1,254 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# The build and the tests with the oldest and the newest rustc on x86_64
+# and aarch64, the lints, the exhaustive sweeps, a fuzzing run, the
+# coverage report and a compile check of the Kani proofs. See HACKING.md.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    # Weekly, which catches a new stable rustc or runner image, with a
+    # longer fuzzing run.
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build and test (${{ matrix.runner }}, rustc ${{ matrix.rust }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Ubuntu 26.04 has meson >= 1.4 and a varlinkctl with --push-fd.
+        runner: [ubuntu-26.04, ubuntu-26.04-arm]
+        rust: ['1.85.0', stable]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends meson ninja-build dosfstools mtools
+
+      - name: Install rustc ${{ matrix.rust }}
+        env:
+          RUST: ${{ matrix.rust }}
+        run: |
+          rustup toolchain install "$RUST" --profile minimal
+          rustup default "$RUST"
+          rustc --version
+
+      - name: Check for the reference tools
+        # The tests skip what they cannot find. Here they must not.
+        run: |
+          export PATH=$PATH:/usr/sbin:/sbin
+          for tool in mkfs.fat fsck.fat mcopy mdir mmd mtype sha256sum mkfifo varlinkctl; do
+            command -v "$tool" || { echo "::error::$tool is missing"; exit 1; }
+          done
+          varlinkctl --help | grep -- --push-fd >/dev/null || { echo "::error::varlinkctl has no --push-fd"; exit 1; }
+
+      - name: Configure
+        run: meson setup --werror -Dslow-tests=true build
+
+      - name: Build
+        run: |
+          meson compile -C build
+          # The helpers that are not built by default.
+          ninja -C build tools/fold-table-gen tests/fuzz/fuzz-seeds bench/measure bench/genfile
+
+      - name: Test
+        run: meson test -C build --no-suite slow --print-errorlogs
+
+      - name: Check the case folding table
+        if: matrix.rust == '1.85.0'
+        run: meson compile -C build check-fold-table
+
+      - name: Install
+        run: |
+          meson install -C build --destdir "$PWD/destdir"
+          file destdir/usr/local/bin/ufat | grep static-pie
+
+      - name: Upload the test logs
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: meson-logs-${{ matrix.runner }}-${{ matrix.rust }}
+          path: build/meson-logs/
+
+  lint:
+    name: rustfmt and clippy
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends meson ninja-build
+
+      - name: Install rustc
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          rustc --version
+
+      - name: Configure
+        run: meson setup --werror -Dslow-tests=true build
+
+      - name: rustfmt
+        run: meson test -C build --suite style --print-errorlogs
+
+      - name: clippy
+        run: |
+          meson compile -C build
+          ninja -C build clippy
+
+  slow:
+    name: Exhaustive sweeps
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends meson ninja-build
+
+      - name: Configure
+        run: meson setup --werror -Dslow-tests=true build
+
+      - name: Test
+        run: meson test -C build --suite slow --print-errorlogs
+
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends meson ninja-build dosfstools mtools
+
+      - name: Configure
+        run: meson setup build
+
+      - name: Fuzz
+        env:
+          ITERATIONS: ${{ github.event_name == 'schedule' && '5000' || '200' }}
+        run: meson compile -C build fuzz
+
+      - name: Upload the findings
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: fuzz
+          path: build/fuzz/out/
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends meson ninja-build dosfstools mtools
+
+      - name: Install rustc
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools
+          rustup default stable
+          rustc --version
+
+      - name: Configure
+        run: meson setup -Db_coverage=true build
+
+      - name: Test
+        run: meson test -C build --print-errorlogs
+
+      - name: Report
+        run: |
+          # llvm-tools matches the LLVM of rustc.
+          bin=$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin
+          LLVM_PROFDATA=$bin/llvm-profdata LLVM_COV=$bin/llvm-cov meson compile -C build coverage-report
+          {
+            echo '```'
+            cat build/coverage/report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: coverage
+          path: build/coverage/report.txt
+
+  kani:
+    name: Kani proofs build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    env:
+      KANI_VERSION: 0.68.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends meson ninja-build
+
+      - name: Install Kani ${{ env.KANI_VERSION }}
+        run: |
+          cargo install --locked kani-verifier --version "$KANI_VERSION"
+          cargo kani setup
+
+      - name: Configure
+        run: meson setup build
+
+      - name: Build the proofs
+        # Running them takes more time and memory than a runner has. This
+        # only checks that every harness builds, the slow ones and the one
+        # of the directory index included.
+        env:
+          SLOW: 1
+          DIR: 1
+          KANI_FLAGS: -Z stubbing -Z unstable-options --only-codegen
+        run: meson compile -C build verify

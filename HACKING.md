@@ -192,3 +192,21 @@ checks that `ufat assemble` and `mkfs.fat` write the same bytes.
 `BENCH_CASES=` selects cases by a regular expression. The other settings
 are described at the top of bench/run.sh. The results are in
 `$BENCH_DIR/out/summary.txt`.
+
+## Continuous integration
+
+GitHub Actions runs .github/workflows/ci.yml for every pull request, for
+every push to main and once a week. It runs:
+
+- the build and the tests with rustc 1.85 and with the current stable
+  rustc, on x86_64 and aarch64, with `--werror`,
+- `check-fold-table` with rustc 1.85,
+- rustfmt and clippy,
+- the exhaustive sweeps,
+- the fuzzing campaign, with 5000 iterations in the weekly run,
+- the coverage report, which is shown in the job summary,
+- Kani with `--only-codegen`, which checks that every proof builds. The
+  proofs themselves need more time and memory than the CI has.
+
+The build jobs fail when mkfs.fat, fsck.fat, mtools or a varlinkctl with
+`--push-fd` is missing, instead of skipping the tests that need them.
