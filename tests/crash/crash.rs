@@ -11,7 +11,7 @@
 //! prefix with its last write torn at a sector boundary (model B), and
 //! within one fsync epoch every pair dropped and every subset (model C).
 //! Runs with `cargo test` against the library of the fat-trace package,
-//! which is built with `--cfg ufat_trace`.
+//! which sits on the shared crate built with `--cfg ufat_trace`.
 
 extern crate fat_trace as fat;
 

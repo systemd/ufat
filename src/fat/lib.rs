@@ -13,12 +13,15 @@
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-#[cfg(not(target_os = "linux"))]
-compile_error!("ufat supports Linux only");
-
+// The error type, images, access to the host and the hashes live in the
+// shared crate. They are part of this crate's interface under the names
+// they always had.
 #[macro_use]
-mod error;
-pub use error::{
+extern crate shared;
+pub use shared::{bail, err};
+pub use shared::{device, errno, host, progress, sha256, sha512};
+pub(crate) use shared::{path, sys};
+pub use shared::{
     ContentProblem, Context, CorruptPlace, DescriptorProblem, Detail, Error, IdentifierProblem, LabelProblem,
     ManifestProblem, NameProblem, NoSpaceReason, NotFat32Reason, Result, SourceProblem, UnsupportedKind,
     ValidityProblem,
@@ -26,25 +29,17 @@ pub use error::{
 
 pub mod boot;
 mod bytes;
-pub mod device;
 pub(crate) mod dir;
 pub mod dirent;
-pub mod errno;
 pub mod fat;
 pub mod format;
 pub mod fsck;
-pub mod host;
 pub mod layout;
 pub mod manifest;
 pub mod name;
-mod path;
 pub mod plan;
 pub mod populate;
 pub mod probe;
-pub mod progress;
-pub mod sha256;
-pub mod sha512;
-mod sys;
 #[cfg(test)]
 mod test_util;
 pub mod time;

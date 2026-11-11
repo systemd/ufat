@@ -131,7 +131,7 @@ pub enum NotFat32Reason {
     /// partition table, a FAT12 or FAT16 volume included, and names it in
     /// `found`.
     NotFat32,
-    /// A FAT boot sector with a sector size this crate does not support.
+    /// A FAT boot sector with a sector size the FAT library does not support.
     SectorSize,
     /// The image is too small to hold a file system.
     TooSmall,

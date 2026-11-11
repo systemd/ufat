@@ -329,12 +329,12 @@ fn open_pinned_file(pinned: BorrowedFd<'_>, what: &dyn std::fmt::Display) -> Res
 
 /// Opens the directory `dir`, pinned or open, for listing: a descriptor of
 /// our own with its own position, so a caller's descriptor keeps its state.
-pub(crate) fn listing_of(dir: BorrowedFd<'_>) -> Result<OwnedFd> {
+pub fn listing_of(dir: BorrowedFd<'_>) -> Result<OwnedFd> {
     Ok(sys::reopen(dir, sys::O_RDONLY | sys::O_DIRECTORY)?)
 }
 
 /// An entry of a host directory, pinned while it is being visited.
-pub(crate) struct HostEntry {
+pub struct HostEntry {
     /// Where the entry is inside the tree, relative to the tree's root: for
     /// messages and the lists of skipped entries.
     pub path: PathBuf,
@@ -346,17 +346,19 @@ pub(crate) struct HostEntry {
 }
 
 impl HostEntry {
-    pub(crate) fn is_dir(&self) -> bool {
+    /// Whether the entry is a directory.
+    pub fn is_dir(&self) -> bool {
         self.metadata.is_dir()
     }
 
-    pub(crate) fn is_file(&self) -> bool {
+    /// Whether the entry is a regular file.
+    pub fn is_file(&self) -> bool {
         self.metadata.is_file()
     }
 
     /// Opens the entry, a regular file, for reading: the pinned inode
     /// reopened, so what is read is what the metadata describes.
-    pub(crate) fn open_file(&self) -> Result<File> {
+    pub fn open_file(&self) -> Result<File> {
         let fd = sys::reopen(self.fd.as_fd(), sys::O_RDONLY | sys::O_NONBLOCK | sys::O_NOCTTY)
             .with_context(|| format!("failed to open {}", self.path.display()))?;
         Ok(File::from(fd))
@@ -416,7 +418,7 @@ struct Level {
 /// the path limit. A name that is not UTF-8 is an error since it could not
 /// be stored as a long name anyway, and so is a path inside the volume
 /// longer than [`crate::path::MAX_PATH`].
-pub(crate) fn walk_tree(
+pub fn walk_tree(
     root: BorrowedFd<'_>,
     dest: &str,
     follow_symlinks: bool,
@@ -489,7 +491,7 @@ pub(crate) fn walk_tree(
 /// bare read() fails with EINTR when a handler that returns is installed,
 /// as it is in a process such as systemd that hosts this library; std
 /// retries only in read_exact() and friends.
-pub(crate) fn read_some(reader: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
+pub fn read_some(reader: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
     loop {
         match reader.read(buf) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -501,13 +503,14 @@ pub(crate) fn read_some(reader: &mut dyn Read, buf: &mut [u8]) -> io::Result<usi
 /// Reads a descriptor from its start with positional reads, so the file
 /// position of a descriptor somebody else owns is neither used nor
 /// changed.
-pub(crate) struct FromStart<'a> {
+pub struct FromStart<'a> {
     fd: BorrowedFd<'a>,
     pos: u64,
 }
 
 impl<'a> FromStart<'a> {
-    pub(crate) fn new(fd: BorrowedFd<'a>) -> FromStart<'a> {
+    /// Reads `fd` from its first byte.
+    pub fn new(fd: BorrowedFd<'a>) -> FromStart<'a> {
         FromStart { fd, pos: 0 }
     }
 }

@@ -321,7 +321,7 @@ impl Device {
 
     /// The descriptor of the underlying file, for libblkid to probe the
     /// image through.
-    pub(crate) fn fd(&self) -> BorrowedFd<'_> {
+    pub fn fd(&self) -> BorrowedFd<'_> {
         self.file.as_fd()
     }
 

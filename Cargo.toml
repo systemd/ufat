@@ -8,10 +8,12 @@ members = [
     "src/dlopen-note",
     "src/fat",
     "src/json",
+    "src/shared",
     "src/uapi16",
     "src/varlink",
     "tools",
     "tests/crash",
+    "tests/crash/shared",
     "tests/fuzz",
     "bench",
 ]
@@ -24,6 +26,7 @@ default-members = [
     "src/dlopen-note",
     "src/fat",
     "src/json",
+    "src/shared",
     "src/uapi16",
     "src/varlink",
     "tests/crash",
@@ -51,6 +54,7 @@ lexopt = "0.3.2"
 libc = "0.2.191"
 # 0.11.1 and later need rustc 1.88.
 sha2 = { version = "0.11.0", default-features = false }
+shared = { path = "src/shared" }
 uapi16 = { path = "src/uapi16" }
 varlink = { path = "src/varlink" }
 

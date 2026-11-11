@@ -31,29 +31,36 @@ use crate::errno::{
 // The open(2) flags. libc has the values of each architecture: alpha,
 // arm, arm64, m68k, mips, parisc, powerpc and sparc number some of them
 // differently from include/uapi/asm-generic/fcntl.h.
-pub(crate) const O_RDONLY: c_int = libc::O_RDONLY;
-pub(crate) const O_WRONLY: c_int = libc::O_WRONLY;
-pub(crate) const O_RDWR: c_int = libc::O_RDWR;
+/// Open for reading only.
+pub const O_RDONLY: c_int = libc::O_RDONLY;
+/// Open for writing only.
+pub const O_WRONLY: c_int = libc::O_WRONLY;
+/// Open for reading and writing.
+pub const O_RDWR: c_int = libc::O_RDWR;
 /// The access mode bits of the flags.
-pub(crate) const O_ACCMODE: c_int = libc::O_ACCMODE;
+pub const O_ACCMODE: c_int = libc::O_ACCMODE;
 /// Every write goes to the end, whatever offset it names: pwrite() on
 /// such a descriptor appends (pwrite(2), BUGS), which is why an image
 /// descriptor must not carry it.
-pub(crate) const O_APPEND: c_int = libc::O_APPEND;
-pub(crate) const O_CREAT: c_int = libc::O_CREAT;
+pub const O_APPEND: c_int = libc::O_APPEND;
+/// Create the file when it is not there.
+pub const O_CREAT: c_int = libc::O_CREAT;
 /// On a block device O_EXCL asks for the exclusive claim a mounted file
 /// system holds.
-pub(crate) const O_EXCL: c_int = libc::O_EXCL;
+pub const O_EXCL: c_int = libc::O_EXCL;
 /// No terminal becomes ours when what we open turns out to be one.
-pub(crate) const O_NOCTTY: c_int = libc::O_NOCTTY;
+pub const O_NOCTTY: c_int = libc::O_NOCTTY;
 /// No waiting for the other end when what we open turns out to be a FIFO.
-pub(crate) const O_NONBLOCK: c_int = libc::O_NONBLOCK;
-pub(crate) const O_DIRECTORY: c_int = libc::O_DIRECTORY;
-pub(crate) const O_NOFOLLOW: c_int = libc::O_NOFOLLOW;
-pub(crate) const O_CLOEXEC: c_int = libc::O_CLOEXEC;
+pub const O_NONBLOCK: c_int = libc::O_NONBLOCK;
+/// What is opened has to be a directory.
+pub const O_DIRECTORY: c_int = libc::O_DIRECTORY;
+/// A symbolic link as the last component is not followed.
+pub const O_NOFOLLOW: c_int = libc::O_NOFOLLOW;
+/// The descriptor does not survive an exec.
+pub const O_CLOEXEC: c_int = libc::O_CLOEXEC;
 /// A descriptor that pins an inode without opening it: fstat, openat and
 /// a later [`reopen`] work on it, reading and writing do not.
-pub(crate) const O_PATH: c_int = libc::O_PATH;
+pub const O_PATH: c_int = libc::O_PATH;
 pub(crate) use uapi::{O_EMPTYPATH, O_LARGEFILE};
 
 /// NAME_MAX, include/uapi/linux/limits.h: the longest file name.
@@ -115,7 +122,7 @@ fn open_at(dirfd: c_int, path: &CStr, flags: c_int, mode: c_uint) -> io::Result<
 /// expects; with `directory` the result has to be one (ENOTDIR). This is
 /// the one lookup a path given to us at the edge gets: systemd's chase()
 /// without a root boundary is a single xopenat(path, O_PATH) as well.
-pub(crate) fn open_path(dir: Option<BorrowedFd<'_>>, path: &Path, directory: bool) -> io::Result<OwnedFd> {
+pub fn open_path(dir: Option<BorrowedFd<'_>>, path: &Path, directory: bool) -> io::Result<OwnedFd> {
     let path = cstring(path.as_os_str().as_bytes())?;
     let flags = O_PATH | if directory { O_DIRECTORY } else { 0 };
     open_at(dir.map_or(libc::AT_FDCWD, |d| d.as_raw_fd()), &path, flags, 0)
@@ -125,7 +132,7 @@ pub(crate) fn open_path(dir: Option<BorrowedFd<'_>>, path: &Path, directory: boo
 /// without following it when it is a symbolic link: the way recurse_dir()
 /// in systemd's src/basic/recurse-dir.c takes hold of every entry before
 /// looking at it. What the descriptor is, is told by [`fstat`].
-pub(crate) fn pin_entry(dir: BorrowedFd<'_>, name: &[u8]) -> io::Result<OwnedFd> {
+pub fn pin_entry(dir: BorrowedFd<'_>, name: &[u8]) -> io::Result<OwnedFd> {
     open_at(dir.as_raw_fd(), &filename(name)?, O_PATH | O_NOFOLLOW, 0)
 }
 
@@ -134,7 +141,7 @@ pub(crate) fn pin_entry(dir: BorrowedFd<'_>, name: &[u8]) -> io::Result<OwnedFd>
 /// last component of a path whose parent is pinned already, the way
 /// chase_and_open() opens the final component relative to the parent it
 /// chased. With `directory` the result has to be one.
-pub(crate) fn pin_name(dir: BorrowedFd<'_>, name: &[u8], directory: bool) -> io::Result<OwnedFd> {
+pub fn pin_name(dir: BorrowedFd<'_>, name: &[u8], directory: bool) -> io::Result<OwnedFd> {
     let flags = O_PATH | if directory { O_DIRECTORY } else { 0 };
     open_at(dir.as_raw_fd(), &filename(name)?, flags, 0)
 }
@@ -143,14 +150,14 @@ pub(crate) fn pin_name(dir: BorrowedFd<'_>, name: &[u8], directory: bool) -> io:
 /// that name exists (EEXIST) and never following a symbolic link in its
 /// place: the first step of systemd's openat_report_new(). The file is
 /// open for reading and writing and does not wait for anything.
-pub(crate) fn create_file_at(dir: BorrowedFd<'_>, name: &[u8], mode: u32) -> io::Result<File> {
+pub fn create_file_at(dir: BorrowedFd<'_>, name: &[u8], mode: u32) -> io::Result<File> {
     let flags = O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY;
     Ok(File::from(open_at(dir.as_raw_fd(), &filename(name)?, flags, mode)?))
 }
 
 /// Removes the entry `name` of the directory `dir`, which must not be a
 /// directory itself: `unlinkat(2)` without AT_REMOVEDIR.
-pub(crate) fn unlink_at(dir: BorrowedFd<'_>, name: &[u8]) -> io::Result<()> {
+pub fn unlink_at(dir: BorrowedFd<'_>, name: &[u8]) -> io::Result<()> {
     let name = filename(name)?;
     // SAFETY: a NUL terminated name and plain integers; unlinkat reads the
     // name for the duration of the call and nothing else.
@@ -184,7 +191,7 @@ static EMPTYPATH: AtomicU8 = AtomicU8::new(PROBE_UNKNOWN);
 /// through a descriptor (EINVAL, where fd_reopen() asserts), and
 /// O_NOFOLLOW is ELOOP as it is there: the magic link is a symbolic link,
 /// so the flag could only ever fail.
-pub(crate) fn reopen(fd: BorrowedFd<'_>, flags: c_int) -> io::Result<OwnedFd> {
+pub fn reopen(fd: BorrowedFd<'_>, flags: c_int) -> io::Result<OwnedFd> {
     if flags & O_CREAT != 0 {
         return Err(errno(EINVAL));
     }
@@ -279,7 +286,7 @@ fn openat2(dir: BorrowedFd<'_>, path: &CStr, how: &libc::open_how) -> io::Result
 /// EPERM), and when the kernel reports EAGAIN because a mount or rename
 /// elsewhere raced with a ".." step, the walk is done by hand in
 /// [`chase_by_hand`], as chase() falls back to its own loop.
-pub(crate) fn chase(root: BorrowedFd<'_>, path: &[u8], follow_symlinks: bool, directory: bool) -> io::Result<OwnedFd> {
+pub fn chase(root: BorrowedFd<'_>, path: &[u8], follow_symlinks: bool, directory: bool) -> io::Result<OwnedFd> {
     if OPENAT2.load(Ordering::Relaxed) != PROBE_MISSING {
         let c = cstring(if path.is_empty() { b"." } else { path })?;
         // SAFETY: open_how is made of integers, and zero is a valid value
@@ -317,12 +324,7 @@ fn components(path: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// kernel, a symbolic link read through its own descriptor and its target
 /// put back in front of what is left to do, ".." checked against the
 /// root's identity. After [`CHASE_MAX`] steps the walk gives up with ELOOP.
-pub(crate) fn chase_by_hand(
-    root: BorrowedFd<'_>,
-    path: &[u8],
-    follow_symlinks: bool,
-    directory: bool,
-) -> io::Result<OwnedFd> {
+pub fn chase_by_hand(root: BorrowedFd<'_>, path: &[u8], follow_symlinks: bool, directory: bool) -> io::Result<OwnedFd> {
     let root_md = fstat(root)?;
     if !root_md.is_dir() {
         return Err(errno(ENOTDIR));
@@ -354,7 +356,7 @@ pub(crate) fn chase_by_hand(
 /// the link is looked up by name again. An absolute target starts over at
 /// `root`, ".." at the root stays there. openat2 cannot express a start
 /// that is not the root, so this is always the walk by hand.
-pub(crate) fn follow_link_at(root: BorrowedFd<'_>, dir: BorrowedFd<'_>, link: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+pub fn follow_link_at(root: BorrowedFd<'_>, dir: BorrowedFd<'_>, link: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     let root_md = fstat(root)?;
     if !root_md.is_dir() {
         return Err(errno(ENOTDIR));
@@ -456,7 +458,7 @@ fn readlink(link: BorrowedFd<'_>) -> io::Result<Vec<u8>> {
 /// The open flags of a descriptor as the kernel keeps them (F_GETFL): the
 /// access mode and the status flags; O_CREAT, O_EXCL, O_NOCTTY and
 /// O_TRUNC are not kept and O_CLOEXEC lives elsewhere.
-pub(crate) fn descriptor_flags(fd: BorrowedFd<'_>) -> io::Result<c_int> {
+pub fn descriptor_flags(fd: BorrowedFd<'_>) -> io::Result<c_int> {
     // SAFETY: F_GETFL takes no argument and reads nothing through a
     // pointer.
     let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
@@ -470,7 +472,7 @@ pub(crate) fn descriptor_flags(fd: BorrowedFd<'_>) -> io::Result<c_int> {
 /// the soft limit in force afterwards, the way systemd's
 /// rlimit_nofile_bump() does for every tool: the soft limit of 1024 a
 /// process starts with is select()'s and nothing here uses select().
-pub(crate) fn raise_descriptor_limit() -> io::Result<u64> {
+pub fn raise_descriptor_limit() -> io::Result<u64> {
     // prlimit64() carries 64 bits on every architecture, unlike struct
     // rlimit.
     let mut old = libc::rlimit64 {
@@ -498,7 +500,7 @@ pub(crate) fn raise_descriptor_limit() -> io::Result<u64> {
 
 /// The metadata of what `fd` refers to, an O_PATH descriptor included:
 /// fstat (statx where std has it) on the descriptor, never on a path.
-pub(crate) fn fstat(fd: BorrowedFd<'_>) -> io::Result<std::fs::Metadata> {
+pub fn fstat(fd: BorrowedFd<'_>) -> io::Result<std::fs::Metadata> {
     // SAFETY: the File is never dropped, so the descriptor, which we do not
     // own, stays open; std only calls fstat or statx on it.
     let file = ManuallyDrop::new(unsafe { File::from_raw_fd(fd.as_raw_fd()) });
@@ -506,7 +508,7 @@ pub(crate) fn fstat(fd: BorrowedFd<'_>) -> io::Result<std::fs::Metadata> {
 }
 
 /// Reads from `fd` at `offset` without touching its file position.
-pub(crate) fn pread(fd: BorrowedFd<'_>, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+pub fn pread(fd: BorrowedFd<'_>, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     use std::os::unix::fs::FileExt;
     // SAFETY: the File is never dropped, so the descriptor, which we do not
     // own, stays open; std only calls pread on it.
@@ -517,16 +519,19 @@ pub(crate) fn pread(fd: BorrowedFd<'_>, buf: &mut [u8], offset: u64) -> io::Resu
 /// The file systems we tell apart, by the magic numbers of
 /// include/uapi/linux/magic.h.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FsKind {
+pub enum FsKind {
+    /// procfs.
     Proc,
+    /// sysfs.
     Sysfs,
+    /// Any other file system.
     Other,
 }
 
 /// The kind of file system `fd` is on, fstatfs(2). fstatfs64() works on
 /// 32-bit targets too when a count of the file system does not fit 32
 /// bits.
-pub(crate) fn fs_kind(fd: BorrowedFd<'_>) -> io::Result<FsKind> {
+pub fn fs_kind(fd: BorrowedFd<'_>) -> io::Result<FsKind> {
     let mut st = MaybeUninit::<libc::statfs64>::uninit();
     // SAFETY: fstatfs64 writes one struct statfs64 through the pointer.
     if unsafe { libc::fstatfs64(fd.as_raw_fd(), st.as_mut_ptr()) } < 0 {
@@ -553,7 +558,7 @@ pub(crate) fn fs_kind(fd: BorrowedFd<'_>) -> io::Result<FsKind> {
 /// buffer, the records walked by their d_reclen, as systemd's
 /// readdir_all() does. The descriptor has to be open for reading
 /// (O_DIRECTORY, not O_PATH); its position ends up at the end.
-pub(crate) fn list_dir(dir: BorrowedFd<'_>) -> io::Result<Vec<Vec<u8>>> {
+pub fn list_dir(dir: BorrowedFd<'_>) -> io::Result<Vec<Vec<u8>>> {
     // struct linux_dirent64: d_ino u64, d_off s64, d_reclen u16, d_type u8,
     // then d_name, NUL terminated and padded to the record length.
     const HEADER: usize = 8 + 8 + 2 + 1;
@@ -611,7 +616,7 @@ pub(crate) fn list_dir(dir: BorrowedFd<'_>) -> io::Result<Vec<Vec<u8>>> {
 /// Fills `buf` from the kernel's random number generator, getrandom(2),
 /// going on after a short read or a signal. There is no reason to open
 /// /dev/urandom for this, systemd's random_bytes() doesn't either.
-pub(crate) fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
+pub fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
     let mut done = 0;
     while done < buf.len() {
         let rest = &mut buf[done..];
@@ -630,7 +635,7 @@ pub(crate) fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
 /// Takes a BSD lock on `fd` without waiting: shared for reading, exclusive
 /// for writing. Returns false when another open file description holds a
 /// conflicting lock.
-pub(crate) fn try_lock(fd: BorrowedFd<'_>, exclusive: bool) -> io::Result<bool> {
+pub fn try_lock(fd: BorrowedFd<'_>, exclusive: bool) -> io::Result<bool> {
     let operation = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH } | libc::LOCK_NB;
     // SAFETY: flock takes a descriptor and flags, nothing else.
     if unsafe { libc::flock(fd.as_raw_fd(), operation) } < 0 {
@@ -648,7 +653,7 @@ pub(crate) fn try_lock(fd: BorrowedFd<'_>, exclusive: bool) -> io::Result<bool> 
 /// ext4 support), or a zero-out command sent to a block device. Returns
 /// false when the kernel or the file system offers neither, so that the
 /// caller writes the zeros instead.
-pub(crate) fn zero_range(file: &File, block_device: bool, offset: u64, len: u64) -> io::Result<bool> {
+pub fn zero_range(file: &File, block_device: bool, offset: u64, len: u64) -> io::Result<bool> {
     let fd = file.as_raw_fd();
     let r = if block_device {
         let range = [offset, len];
@@ -675,7 +680,7 @@ pub(crate) fn zero_range(file: &File, block_device: bool, offset: u64, len: u64)
 }
 
 /// Returns the size in bytes of the block device behind `fd`.
-pub(crate) fn block_device_size(fd: BorrowedFd<'_>) -> io::Result<u64> {
+pub fn block_device_size(fd: BorrowedFd<'_>) -> io::Result<u64> {
     let mut size: u64 = 0;
     // SAFETY: BLKGETSIZE64 stores a u64 through the pointer and nothing
     // else; the pointer is valid for the duration of the call.
@@ -763,7 +768,7 @@ fn sysfs_partition_start(dir: BorrowedFd<'_>) -> io::Result<u64> {
 /// libudev for its hidden sectors field. The device number comes from
 /// fstat() on the descriptor, [`sysfs_block_device`] finds and verifies
 /// the device's directory, and the attribute is read relative to it.
-pub(crate) fn partition_start(fd: BorrowedFd<'_>) -> io::Result<u64> {
+pub fn partition_start(fd: BorrowedFd<'_>) -> io::Result<u64> {
     let md = fstat(fd)?;
     if !md.file_type().is_block_device() {
         return Err(errno(ENOTTY));
@@ -777,7 +782,7 @@ pub(crate) fn partition_start(fd: BorrowedFd<'_>) -> io::Result<u64> {
 }
 
 /// Returns the logical block size of the block device behind `fd`.
-pub(crate) fn block_device_logical_block_size(fd: BorrowedFd<'_>) -> io::Result<u32> {
+pub fn block_device_logical_block_size(fd: BorrowedFd<'_>) -> io::Result<u32> {
     let mut size: c_int = 0;
     // SAFETY: BLKSSZGET stores an int through the pointer and nothing else;
     // the pointer is valid for the duration of the call.
@@ -794,7 +799,7 @@ pub(crate) fn block_device_logical_block_size(fd: BorrowedFd<'_>) -> io::Result<
 /// Creates a FIFO, for the tests of the opens. Spawning mkfifo(1) would
 /// hand the child every open descriptor until it execs, locks included.
 #[cfg(test)]
-pub(crate) fn make_fifo(path: &Path) -> io::Result<()> {
+pub fn make_fifo(path: &Path) -> io::Result<()> {
     let c = CString::new(path.as_os_str().as_bytes())?;
     // SAFETY: a valid NUL terminated path; mkfifo touches nothing else.
     if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {

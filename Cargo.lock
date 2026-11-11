@@ -80,8 +80,7 @@ version = "0.1.0"
 dependencies = [
  "blkid",
  "json",
- "libc",
- "sha2",
+ "shared",
  "uapi16",
 ]
 
@@ -91,8 +90,7 @@ version = "0.1.0"
 dependencies = [
  "blkid",
  "json",
- "libc",
- "sha2",
+ "shared-trace",
  "uapi16",
 ]
 
@@ -141,6 +139,24 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+]
+
+[[package]]
+name = "shared"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2",
+ "uapi16",
+]
+
+[[package]]
+name = "shared-trace"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2",
+ "uapi16",
 ]
 
 [[package]]

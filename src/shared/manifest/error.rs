@@ -4,7 +4,6 @@
 
 use uapi16::{ErrorKind, Invalid, Problem, Unsupported};
 
-use super::volume_path;
 use crate::errno::*;
 use crate::{ContentProblem, Detail, Error, ManifestProblem, SourceProblem, UnsupportedKind, ValidityProblem};
 
@@ -46,7 +45,7 @@ impl From<uapi16::Error> for Error {
         // about what the volume is to hold, and by its name in the
         // manifest where it is about the manifest or its files.
         let name = e.name().unwrap_or_default();
-        let path = volume_path(name);
+        let path = crate::path::join("/", name);
         match e.kind() {
             // What the volume said when it was written to comes back as it
             // was.

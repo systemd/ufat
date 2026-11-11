@@ -10,7 +10,7 @@
 extern crate libc;
 
 #[macro_use]
-#[path = "../src/fat/error.rs"]
+#[path = "../src/shared/error.rs"]
 mod error;
 pub use error::{CorruptPlace, Detail, Error, NameProblem, NoSpaceReason, NotFat32Reason, Result};
 
@@ -22,7 +22,7 @@ mod bytes;
 pub mod dir;
 #[path = "../src/fat/dirent.rs"]
 pub mod dirent;
-#[path = "../src/fat/errno.rs"]
+#[path = "../src/shared/errno.rs"]
 pub mod errno;
 #[path = "../src/fat/fat.rs"]
 pub mod fat;

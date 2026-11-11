@@ -48,8 +48,8 @@ With rustup, `cargo +1.85.0` selects rustc 1.85:
 
 `cargo test` runs:
 
-- the unit tests of the library and of the json, uapi16, varlink,
-  dlopen, dlopen-note and blkid crates,
+- the unit tests of the library and of the json, shared, uapi16,
+  varlink, dlopen, dlopen-note and blkid crates,
 - the integration tests in tests/,
 - the crash consistency harness.
 
@@ -157,11 +157,11 @@ local build.
 
 ## Crash consistency
 
-tests/crash/crash.rs records the writes of a test scenario. It uses a
-copy of the library built with `--cfg ufat_trace`, the fat-trace
-package. It then builds every state a crash could leave on the device
-and checks each one with fsck and against the expected files. Three
-models of the device are checked:
+tests/crash/crash.rs records the writes of a test scenario. It uses the
+fat-trace package, a copy of the library on a copy of the shared crate
+built with `--cfg ufat_trace`. It then builds every state a crash could
+leave on the device and checks each one with fsck and against the
+expected files. Three models of the device are checked:
 
 - Every sector is written whole, and writes land in order.
 - A write of several sectors can stop at any sector boundary.

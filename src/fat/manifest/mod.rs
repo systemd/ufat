@@ -30,7 +30,6 @@ use crate::volume::MAX_FILE_SIZE;
 use crate::{Detail, Error, ManifestProblem, Result, UnsupportedKind};
 
 mod assemble;
-mod error;
 mod generate;
 #[cfg(test)]
 mod tests;

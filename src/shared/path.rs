@@ -13,10 +13,10 @@ use crate::{Detail, NameProblem};
 /// Longest path accepted, in bytes: Linux's PATH_MAX without the NUL. A
 /// longer path could not be opened on the mounted volume in one go, and
 /// without a bound the paths a tree walk builds grow with the tree.
-pub(crate) const MAX_PATH: usize = 4095;
+pub const MAX_PATH: usize = 4095;
 
 /// Splits `path` into its names.
-pub(crate) fn components(path: &str) -> Result<Vec<&str>> {
+pub fn components(path: &str) -> Result<Vec<&str>> {
     let bad = |problem: NameProblem| Detail::Name {
         name: path.to_string(),
         problem,
@@ -49,7 +49,7 @@ pub(crate) fn components(path: &str) -> Result<Vec<&str>> {
 }
 
 /// Appends `name` to the directory path `dir`.
-pub(crate) fn join(dir: &str, name: &str) -> String {
+pub fn join(dir: &str, name: &str) -> String {
     format!("{}/{}", dir.trim_end_matches('/'), name)
 }
 
