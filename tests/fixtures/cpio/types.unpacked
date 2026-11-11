@@ -1,0 +1,23 @@
+. d mode=0751 uid=1 gid=2 mtime=1577934246
+d d mode=0755 uid=0 gid=0 mtime=1577934245
+d/bigdev c mode=0600 uid=0 gid=0 mtime=1577934245 nlink=1 rdev=4095:1048575
+d/blk b mode=0660 uid=0 gid=0 mtime=1577934245 nlink=1 rdev=8:1
+d/chr c mode=0600 uid=0 gid=0 mtime=1577934245 nlink=1 rdev=1:3
+d/dangling l uid=0 gid=0 mtime=1577934245 nlink=1 target=nowhere/at/all
+d/dir-mtime-max d mode=0755 uid=0 gid=0 mtime=4294967295
+d/empty f mode=0600 uid=0 gid=0 mtime=1577934245 nlink=1 size=0 sum=00000000
+d/fifo p mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1
+d/file f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=9 sum=00000378 head=636f6e74656e74730a
+d/max-owner f mode=0644 uid=4294967294 gid=4294967294 mtime=1577934245 nlink=1 size=1 sum=0000006d head=6d
+d/mode-0000 f mode=0000 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=0000006e head=6e
+d/mode-7777 f mode=7777 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000061 head=61
+d/mode-dir-0000 d mode=0000 uid=0 gid=0 mtime=1577934245
+d/mtime-0 f mode=0644 uid=0 gid=0 mtime=0 nlink=1 size=1 sum=00000030 head=30
+d/mtime-max f mode=0644 uid=0 gid=0 mtime=4294967295 nlink=1 size=1 sum=0000006d head=6d
+d/owned f mode=0640 uid=1234 gid=5678 mtime=1577934245 nlink=1 size=1 sum=0000006f head=6f
+d/sgid-dir d mode=2775 uid=0 gid=0 mtime=1577934245
+d/sock s mode=0755 uid=0 gid=0 mtime=1577934245 nlink=1
+d/sticky d mode=1777 uid=0 gid=0 mtime=1577934245
+d/suid f mode=4755 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000073 head=73
+d/sym l uid=42 gid=43 mtime=1577934245 nlink=1 target=file
+d/sym-mode l uid=0 gid=0 mtime=1577934245 nlink=1 target=file

@@ -1,0 +1,12 @@
+. d mode=1777 uid=0 gid=0 mtime=boot
+c d mode=0755 uid=0 gid=0 mtime=1577934245
+c/a f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 size=6 sum=00000277 head=6c696e6b6564
+c/again f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=13 sum=000004e7 head=636865636b656420616761696e
+c/b f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 link=c/a size=6 sum=00000277 head=6c696e6b6564
+c/chr c mode=0600 uid=0 gid=0 mtime=1577934245 nlink=1 rdev=1:3
+c/dir d mode=0755 uid=0 gid=0 mtime=1577934245
+c/empty f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=0 sum=00000000
+c/file f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=16 sum=00000655 head=636865636b656420636f6e74656e7473
+c/newc f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=11 sum=00000450 head=6e6f20636865636b73756d
+c/newc-check f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=32 sum=00000ba5 head=6120636865636b73756d207468617420
+c/sym l uid=0 gid=0 mtime=1577934245 nlink=1 target=file

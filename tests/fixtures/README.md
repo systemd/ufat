@@ -25,3 +25,6 @@ as git can hold it: the FIFO is missing, the hardlinks are two files, the
 extended attribute is gone and the modification times are whatever the
 checkout set. The tests take times from the manifests and skip the FIFO
 and the symlink the way an assembly skips them.
+
+The `cpio` directory holds the fixtures of ucpio: archives and what a
+kernel unpacked them to. It has a README of its own.

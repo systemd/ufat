@@ -1,0 +1,9 @@
+. d mode=1777 uid=0 gid=0 mtime=boot
+d d mode=0755 uid=0 gid=0 mtime=1577934245
+d/both-max b mode=0660 uid=0 gid=0 mtime=1577934245 nlink=1 rdev=4095:1048575
+d/dir-rdev d mode=0755 uid=0 gid=0 mtime=1577934245
+d/file-rdev f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000066 head=66
+d/major-4096 c mode=0600 uid=0 gid=0 mtime=1577934245 nlink=1 rdev=0:0
+d/major-4097 c mode=0600 uid=0 gid=0 mtime=1577934245 nlink=1 rdev=1:5
+d/minor-2-20 c mode=0600 uid=0 gid=0 mtime=1577934245 nlink=1 rdev=1:0
+d/minor-2-20-plus c mode=0600 uid=0 gid=0 mtime=1577934245 nlink=1 rdev=7:9

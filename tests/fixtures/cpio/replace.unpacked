@@ -1,0 +1,28 @@
+. d mode=1777 uid=0 gid=0 mtime=boot
+r d mode=0755 uid=0 gid=0 mtime=1577934245
+r/dir-dir d mode=0755 uid=2 gid=2 mtime=1000
+r/dir-fifo p mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1
+r/dir-file f mode=0644 uid=0 gid=0 mtime=1000 nlink=1 size=1 sum=00000066 head=66
+r/dir-sym l uid=0 gid=0 mtime=1577934245 nlink=1 target=victim
+r/fifo-fifo p mode=0644 uid=5 gid=0 mtime=5000 nlink=1
+r/file-dir d mode=0700 uid=0 gid=0 mtime=5000
+r/file-empty f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=0 sum=00000000
+r/file-file f mode=0644 uid=2 gid=2 mtime=2000 nlink=1 size=4 sum=0000017b head=74776f21
+r/file-node c mode=0600 uid=0 gid=0 mtime=1577934245 nlink=1 rdev=1:3
+r/file-shorter f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000078 head=78
+r/file-sym l uid=0 gid=0 mtime=1577934245 nlink=1 target=victim
+r/full-file d mode=0755 uid=0 gid=0 mtime=1000
+r/full-file/child f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000063 head=63
+r/full-node d mode=0600 uid=7 gid=8 mtime=1000
+r/full-node/child f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000063 head=63
+r/full-sym d mode=0755 uid=9 gid=9 mtime=1000
+r/full-sym/child f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000063 head=63
+r/link-1 f mode=0600 uid=3 gid=0 mtime=3000 nlink=2 size=4 sum=0000016b head=6e657721
+r/link-2 f mode=0600 uid=3 gid=0 mtime=3000 nlink=2 link=r/link-1 size=4 sum=0000016b head=6e657721
+r/node-file f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=4 sum=000001a0 head=66696c65
+r/node-node c mode=0666 uid=3 gid=0 mtime=1577934254 nlink=1 rdev=1:3
+r/node-other b mode=0660 uid=0 gid=0 mtime=1577934245 nlink=1 rdev=8:1
+r/sym-dir d mode=0755 uid=0 gid=0 mtime=1577934245
+r/sym-file f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=6 sum=0000027b head=646972656374
+r/sym-sym l uid=4 gid=0 mtime=4000 nlink=1 target=two
+r/victim f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=6 sum=0000028c head=76696374696d

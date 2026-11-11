@@ -155,6 +155,18 @@ sha256sum. A test whose tool is not installed is skipped.
 `UFAT_MTOOLS=` points at a directory with mtools binaries, for example a
 local build.
 
+## The cpio fixtures
+
+tests/fixtures/cpio holds archives and, for each of them, what a kernel
+unpacked it to. tests/cpio_kernel.rs compares that with what ucpio says
+the archive unpacks to. The fixtures are made by booting them in qemu:
+
+    tests/fixtures/cpio/make-fixtures.py --kernel /boot/vmlinuz-...
+
+tests/fixtures/cpio/README.md describes the cases, the listings and what
+the script needs. Add a case there for every rule of the kernel that
+ucpio relies on.
+
 ## Crash consistency
 
 tests/crash/crash.rs records the writes of a test scenario. It uses the

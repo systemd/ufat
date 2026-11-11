@@ -1,0 +1,4 @@
+. d mode=1777 uid=0 gid=0 mtime=boot
+e d mode=0755 uid=0 gid=0 mtime=1577934245
+e/a f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 size=6 sum=00000277 head=6c696e6b6564
+e/b f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 link=e/a size=6 sum=00000277 head=6c696e6b6564

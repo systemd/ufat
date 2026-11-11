@@ -185,6 +185,7 @@ dependencies = [
 name = "ufat"
 version = "0.1.0"
 dependencies = [
+ "cpio",
  "fat",
  "json",
  "lexopt",

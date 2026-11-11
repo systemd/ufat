@@ -81,6 +81,9 @@ lexopt.workspace = true
 libc.workspace = true
 varlink.workspace = true
 
+[dev-dependencies]
+cpio.workspace = true
+
 [lints]
 workspace = true
 
