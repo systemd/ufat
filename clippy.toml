@@ -1,0 +1,2 @@
+# The oldest rustc ufat builds with, see rust_msrv in meson.build.
+msrv = "1.85"
