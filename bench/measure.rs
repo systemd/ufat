@@ -3,8 +3,8 @@
 //! and prints what it cost: wall, user and system time, peak RSS, and the
 //! bytes the child passed to read and write system calls.
 //!
-//! Standard library only, like the rest of ufat. bench/meson.build builds
-//! it against the json and varlink crates.
+//! Like the rest of ufat, it uses the standard library and the libc crate,
+//! and the json and varlink crates of this tree.
 //!
 //! Usage:
 //!   measure [OPTIONS] -- COMMAND [ARGS...]
@@ -29,7 +29,7 @@
 //! child exited and before it is reaped, so they cover the child alone.
 //! The child's exit status becomes ours.
 
-use std::ffi::{c_int, c_long};
+use std::ffi::c_int;
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsFd, FromRawFd, IntoRawFd, OwnedFd};
@@ -37,45 +37,6 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::Instant;
-
-#[repr(C)]
-struct Timeval {
-    tv_sec: c_long,
-    tv_usec: c_long,
-}
-
-#[repr(C)]
-struct Rusage {
-    ru_utime: Timeval,
-    ru_stime: Timeval,
-    ru_maxrss: c_long,
-    ru_ixrss: c_long,
-    ru_idrss: c_long,
-    ru_isrss: c_long,
-    ru_minflt: c_long,
-    ru_majflt: c_long,
-    ru_nswap: c_long,
-    ru_inblock: c_long,
-    ru_oublock: c_long,
-    ru_msgsnd: c_long,
-    ru_msgrcv: c_long,
-    ru_nsignals: c_long,
-    ru_nvcsw: c_long,
-    ru_nivcsw: c_long,
-}
-
-extern "C" {
-    fn waitid(idtype: c_int, id: u32, infop: *mut [u64; 16], options: c_int) -> c_int;
-    fn wait4(pid: c_int, status: *mut c_int, options: c_int, rusage: *mut Rusage) -> c_int;
-    fn dup2(from: c_int, to: c_int) -> c_int;
-    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
-}
-
-const P_PID: c_int = 1;
-const WEXITED: c_int = 4;
-const WNOWAIT: c_int = 0x0100_0000;
-const EINTR: i32 = 4;
-const F_SETFD: c_int = 2;
 
 #[derive(Default)]
 struct ProcIo {
@@ -105,32 +66,33 @@ fn read_proc_io(pid: u32) -> ProcIo {
 
 /// Waits for the child without reaping it, reads its I/O counters while it
 /// is a zombie, then reaps it with its resource usage.
-fn wait_measured(pid: u32) -> io::Result<(i32, Rusage, ProcIo)> {
-    let raw_pid = c_int::try_from(pid).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    let mut info = [0u64; 16];
+fn wait_measured(pid: u32) -> io::Result<(i32, libc::rusage, ProcIo)> {
+    let raw_pid = libc::pid_t::try_from(pid).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: siginfo_t is plain data; waitid fills it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     loop {
-        // SAFETY: info is a 128 byte buffer, the size of siginfo_t.
-        let r = unsafe { waitid(P_PID, pid, &mut info, WEXITED | WNOWAIT) };
+        // SAFETY: info is a siginfo_t, valid for the call.
+        let r = unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
         if r == 0 {
             break;
         }
         let e = io::Error::last_os_error();
-        if e.raw_os_error() != Some(EINTR) {
+        if e.raw_os_error() != Some(libc::EINTR) {
             return Err(e);
         }
     }
     let io = read_proc_io(pid);
     let mut status: c_int = 0;
-    // SAFETY: Rusage is plain data; wait4 fills it.
-    let mut ru: Rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: rusage is plain data; wait4 fills it.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     loop {
         // SAFETY: both pointers are valid for the call.
-        let r = unsafe { wait4(raw_pid, &mut status, 0, &mut ru) };
+        let r = unsafe { libc::wait4(raw_pid, &mut status, 0, &mut ru) };
         if r == raw_pid {
             break;
         }
         let e = io::Error::last_os_error();
-        if e.raw_os_error() != Some(EINTR) {
+        if e.raw_os_error() != Some(libc::EINTR) {
             return Err(e);
         }
     }
@@ -142,7 +104,7 @@ fn wait_measured(pid: u32) -> io::Result<(i32, Rusage, ProcIo)> {
     Ok((code, ru, io))
 }
 
-fn seconds(t: &Timeval) -> f64 {
+fn seconds(t: &libc::timeval) -> f64 {
     t.tv_sec as f64 + t.tv_usec as f64 / 1e6
 }
 
@@ -238,7 +200,7 @@ fn spawn_ufat(o: &Options) -> io::Result<(Child, UnixStream)> {
     // already, then dup2 does nothing and fcntl clears its FD_CLOEXEC.
     unsafe {
         command.pre_exec(move || {
-            if dup2(theirs_fd, 3) < 0 || fcntl(3, F_SETFD, 0) < 0 {
+            if libc::dup2(theirs_fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())

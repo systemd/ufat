@@ -3,51 +3,30 @@
 //! crate lives here.
 #![allow(unsafe_code)]
 
-#[cfg(any(
-    target_arch = "mips",
-    target_arch = "mips32r6",
-    target_arch = "mips64",
-    target_arch = "mips64r6",
-    target_arch = "sparc",
-    target_arch = "sparc64"
-))]
-compile_error!(
-    "the socket option and errno numbers in this crate follow the generic Linux layout; mips and sparc differ"
-);
-
-use std::ffi::{c_int, c_long, c_short, c_ulong, c_void};
+use std::ffi::{c_int, c_long, c_uint};
 use std::io;
+use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 
-extern "C" {
-    fn getsockopt(fd: c_int, level: c_int, name: c_int, value: *mut c_void, len: *mut u32) -> c_int;
-    fn setsockopt(fd: c_int, level: c_int, name: c_int, value: *const c_void, len: u32) -> c_int;
-    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
-    fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
-    fn geteuid() -> u32;
-    fn getpid() -> c_int;
-    fn syscall(number: c_long, ...) -> c_long;
-    fn pthread_sigmask(how: c_int, set: *const SigSet, old: *mut SigSet) -> c_int;
-    fn recvmsg(fd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
-    fn sendmsg(fd: c_int, msg: *const MsgHdr, flags: c_int) -> isize;
+/// A signal set with SIGTERM alone.
+fn sigterm_set() -> libc::sigset_t {
+    let mut set = MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: sigemptyset() initializes the set, and sigaddset() adds a
+    // valid signal to it; neither fails for these arguments.
+    unsafe {
+        libc::sigemptyset(set.as_mut_ptr());
+        libc::sigaddset(set.as_mut_ptr(), libc::SIGTERM);
+        set.assume_init()
+    }
 }
 
-/// glibc's sigset_t: 1024 bits.
-#[repr(C)]
-struct SigSet([u64; 16]);
-
-const SIG_BLOCK: c_int = 0;
-const SIG_UNBLOCK: c_int = 1;
-const SIGTERM: c_int = 15;
-
 fn change_sigterm(how: c_int) -> io::Result<()> {
-    let mut set = SigSet([0; 16]);
-    set.0[0] = 1 << (SIGTERM - 1);
+    let set = sigterm_set();
     // SAFETY: the set is a valid sigset_t for the duration of the call; the
     // old mask is not requested. pthread_sigmask() returns the error number
     // instead of setting errno.
-    let r = unsafe { pthread_sigmask(how, &set, std::ptr::null_mut()) };
+    let r = unsafe { libc::pthread_sigmask(how, &set, std::ptr::null_mut()) };
     if r != 0 {
         return Err(io::Error::from_raw_os_error(r));
     }
@@ -57,88 +36,51 @@ fn change_sigterm(how: c_int) -> io::Result<()> {
 /// Blocks SIGTERM for the calling thread. A pending SIGTERM takes effect
 /// when [`unblock_sigterm`] runs.
 pub(crate) fn block_sigterm() -> io::Result<()> {
-    change_sigterm(SIG_BLOCK)
+    change_sigterm(libc::SIG_BLOCK)
 }
 
 /// Unblocks SIGTERM for the calling thread.
 pub(crate) fn unblock_sigterm() -> io::Result<()> {
-    change_sigterm(SIG_UNBLOCK)
+    change_sigterm(libc::SIG_UNBLOCK)
 }
 
-// Socket option numbers as in include/uapi/asm-generic/socket.h. powerpc
-// numbers the first few differently (arch/powerpc/include/uapi/asm/socket.h);
-// alpha, mips, parisc and sparc differ further and are refused below.
-const SOL_SOCKET: c_int = 1;
-#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
-const SO_PEERCRED: c_int = 21;
-#[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
-const SO_PEERCRED: c_int = 17;
-const SO_ACCEPTCONN: c_int = 30;
-/// Linux 6.16; older kernels reject it, which is fine.
+/// SO_PASSRIGHTS, Linux 6.16. Older kernels reject it, which is fine. The
+/// libc crate has it for sparc only. The other architectures take it from
+/// include/uapi/asm-generic/socket.h, powerpc included.
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "x86",
+    target_arch = "aarch64",
+    target_arch = "arm",
+    target_arch = "loongarch64",
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "riscv64",
+    target_arch = "s390x"
+))]
 const SO_PASSRIGHTS: c_int = 83;
-// Message flags, include/linux/socket.h, and the one ancillary message
-// type we deal in.
-const MSG_PEEK: c_int = 2;
-const MSG_CTRUNC: c_int = 8;
-const MSG_NOSIGNAL: c_int = 0x4000;
-const MSG_CMSG_CLOEXEC: c_int = 0x4000_0000;
-const SCM_RIGHTS: c_int = 1;
+// arch/sparc/include/uapi/asm/socket.h
+#[cfg(target_arch = "sparc64")]
+const SO_PASSRIGHTS: c_int = 0x5c;
+#[cfg(target_arch = "sparc64")]
+const _: () = assert!(SO_PASSRIGHTS == libc::SO_PASSRIGHTS);
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "x86",
+    target_arch = "aarch64",
+    target_arch = "arm",
+    target_arch = "loongarch64",
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "riscv64",
+    target_arch = "s390x",
+    target_arch = "sparc64"
+)))]
+compile_error!("varlink/sys.rs has no SO_PASSRIGHTS for this architecture");
+
 /// SCM_MAX_FD (include/net/scm.h): the kernel passes at most this many
 /// descriptors in one message, and we make room for exactly that.
 pub(crate) const MAX_FDS: usize = 253;
-const F_SETFD: c_int = 2;
-const FD_CLOEXEC: c_int = 1;
-const POLLIN: c_short = 1;
-const SYS_PIDFD_OPEN: c_long = 434;
-const SYS_SIGNALFD4: c_long = 289;
-const SFD_CLOEXEC: c_int = 0o2000000;
-const SFD_NONBLOCK: c_int = 0o4000;
-// errno values, include/uapi/asm-generic/errno-base.h and errno.h.
-pub(crate) const ENXIO: c_int = 6;
-pub(crate) const EBADF: c_int = 9;
-pub(crate) const ENOTSOCK: c_int = 88;
-
-#[repr(C)]
-struct PollFd {
-    fd: c_int,
-    events: c_short,
-    revents: c_short,
-}
-
-#[repr(C)]
-struct UCred {
-    pid: i32,
-    uid: u32,
-    gid: u32,
-}
-
-/// struct iovec.
-#[repr(C)]
-struct IoVec {
-    base: *mut c_void,
-    len: usize,
-}
-
-/// struct msghdr as glibc lays it out: the padding after `namelen` on
-/// 64-bit targets falls out of repr(C).
-#[repr(C)]
-struct MsgHdr {
-    name: *mut c_void,
-    namelen: u32,
-    iov: *mut IoVec,
-    iovlen: usize,
-    control: *mut c_void,
-    controllen: usize,
-    flags: c_int,
-}
-
-/// struct cmsghdr; the data follows, aligned like a size_t.
-#[repr(C)]
-struct CmsgHdr {
-    len: usize,
-    level: c_int,
-    type_: c_int,
-}
 
 /// Makes a system call until no signal interrupts it, and turns a negative
 /// return into the error in errno.
@@ -154,19 +96,26 @@ fn retry(mut call: impl FnMut() -> isize) -> io::Result<usize> {
     }
 }
 
-/// CMSG_ALIGN, CMSG_LEN and CMSG_SPACE of the C headers.
-const fn cmsg_align(n: usize) -> usize {
-    (n + size_of::<usize>() - 1) & !(size_of::<usize>() - 1)
+/// The bytes `count` descriptors take in a control message.
+const fn fds_size(count: usize) -> c_uint {
+    (count * size_of::<c_int>()) as c_uint
 }
-const fn cmsg_len(data: usize) -> usize {
-    cmsg_align(size_of::<CmsgHdr>()) + data
-}
-const fn cmsg_space(data: usize) -> usize {
-    cmsg_align(size_of::<CmsgHdr>()) + cmsg_align(data)
-}
+
 /// A control buffer with room for MAX_FDS descriptors, as size_t words so
 /// that it is aligned for the headers.
-const CONTROL_WORDS: usize = cmsg_space(MAX_FDS * size_of::<c_int>()) / size_of::<usize>() + 1;
+// SAFETY: CMSG_SPACE() computes a size and touches no memory.
+const CONTROL_WORDS: usize = unsafe { libc::CMSG_SPACE(fds_size(MAX_FDS)) } as usize / size_of::<usize>() + 1;
+
+/// A message header for the one buffer `iov`, without an address, a
+/// control buffer or flags.
+fn message(iov: &mut libc::iovec) -> libc::msghdr {
+    // SAFETY: msghdr is pointers and integers, for which all zeros is a
+    // valid value.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = iov;
+    msg.msg_iovlen = 1;
+    msg
+}
 
 /// What one recvmsg() delivered.
 pub(crate) struct Received {
@@ -183,23 +132,15 @@ pub(crate) struct Received {
 /// `buf.len()` bytes. Returns 0 at the end of the stream. No control
 /// buffer is passed, so the kernel installs no descriptors for a peek.
 pub(crate) fn peek(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
-    let mut iov = IoVec {
-        base: buf.as_mut_ptr().cast(),
-        len: buf.len(),
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
     };
-    let mut msg = MsgHdr {
-        name: std::ptr::null_mut(),
-        namelen: 0,
-        iov: &mut iov,
-        iovlen: 1,
-        control: std::ptr::null_mut(),
-        controllen: 0,
-        flags: 0,
-    };
+    let mut msg = message(&mut iov);
     retry(|| {
         // SAFETY: the header points at one iovec over the caller's buffer,
         // both alive for the call; no control buffer is passed.
-        unsafe { recvmsg(fd.as_raw_fd(), &mut msg, MSG_PEEK) }
+        unsafe { libc::recvmsg(fd.as_raw_fd(), &mut msg, libc::MSG_PEEK) }
     })
 }
 
@@ -208,56 +149,56 @@ pub(crate) fn peek(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
 /// them leaks into a child. The caller decides what they belong to.
 pub(crate) fn recv_with_fds(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<Received> {
     let mut control = [0usize; CONTROL_WORDS];
-    let mut iov = IoVec {
-        base: buf.as_mut_ptr().cast(),
-        len: buf.len(),
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
     };
-    let mut msg = MsgHdr {
-        name: std::ptr::null_mut(),
-        namelen: 0,
-        iov: &mut iov,
-        iovlen: 1,
-        control: control.as_mut_ptr().cast(),
-        controllen: size_of::<[usize; CONTROL_WORDS]>(),
-        flags: 0,
-    };
+    let mut msg = message(&mut iov);
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = size_of_val(&control);
     let n = retry(|| {
         // SAFETY: the header points at one iovec over the caller's buffer
         // and at a control buffer of the stated size, all alive for the
         // call.
-        unsafe { recvmsg(fd.as_raw_fd(), &mut msg, MSG_CMSG_CLOEXEC) }
+        unsafe { libc::recvmsg(fd.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) }
     })?;
     // Walk the control messages the kernel filled in. Anything that is not
     // SCM_RIGHTS (credentials, for one) is skipped.
     let mut fds = Vec::new();
-    let base = control.as_ptr().cast::<u8>();
-    let header = cmsg_align(size_of::<CmsgHdr>());
-    let mut offset = 0;
-    while offset + size_of::<CmsgHdr>() <= msg.controllen {
-        // SAFETY: the kernel wrote a cmsghdr at every offset it reports
-        // within controllen; reading it unaligned is always sound.
-        let hdr = unsafe { std::ptr::read_unaligned(base.add(offset).cast::<CmsgHdr>()) };
-        if hdr.len < header || offset + hdr.len > msg.controllen {
+    // SAFETY: CMSG_LEN() computes a size and touches no memory.
+    let header = unsafe { libc::CMSG_LEN(0) } as usize;
+    let end = msg.msg_control.addr() + msg.msg_controllen;
+    // SAFETY: the header describes the control buffer, which the kernel
+    // filled in up to msg_controllen.
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    while !cmsg.is_null() {
+        // SAFETY: CMSG_FIRSTHDR() and CMSG_NXTHDR() return a header only
+        // where one fits before the end of the buffer, at an offset the
+        // kernel aligned for it in a buffer aligned for it.
+        let hdr = unsafe { &*cmsg };
+        // They do not check that the data fits as well.
+        if hdr.cmsg_len < header || hdr.cmsg_len > end - cmsg.addr() {
             break;
         }
-        if hdr.level == SOL_SOCKET && hdr.type_ == SCM_RIGHTS {
-            let count = (hdr.len - header) / size_of::<c_int>();
-            for i in 0..count {
-                let at = offset + header + i * size_of::<c_int>();
-                // SAFETY: the data of an SCM_RIGHTS message is `count` ints
-                // within the `hdr.len` bytes checked above, read unaligned.
-                let raw = unsafe { std::ptr::read_unaligned(base.add(at).cast::<c_int>()) };
+        if hdr.cmsg_level == libc::SOL_SOCKET && hdr.cmsg_type == libc::SCM_RIGHTS {
+            // SAFETY: the data follows the header.
+            let data = unsafe { libc::CMSG_DATA(cmsg) };
+            for i in 0..(hdr.cmsg_len - header) / size_of::<c_int>() {
+                // SAFETY: the data of an SCM_RIGHTS message is ints within
+                // the cmsg_len bytes checked above, read unaligned.
+                let raw = unsafe { data.add(i * size_of::<c_int>()).cast::<c_int>().read_unaligned() };
                 // SAFETY: the kernel installed each of them as a descriptor
                 // that we now own.
                 fds.push(unsafe { OwnedFd::from_raw_fd(raw) });
             }
         }
-        offset += cmsg_align(hdr.len);
+        // SAFETY: as for CMSG_FIRSTHDR(); null after the last header.
+        cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
     }
     Ok(Received {
         bytes: n,
         fds,
-        truncated: msg.flags & MSG_CTRUNC != 0,
+        truncated: msg.msg_flags & libc::MSG_CTRUNC != 0,
     })
 }
 
@@ -273,55 +214,55 @@ pub(crate) fn send_with_fds(fd: BorrowedFd<'_>, data: &[u8], fds: &[BorrowedFd<'
         ));
     }
     let mut control = [0usize; CONTROL_WORDS];
-    let header = cmsg_align(size_of::<CmsgHdr>());
-    let data_len = fds.len() * size_of::<c_int>();
+    // sendmsg() only reads through the iovec.
+    let mut iov = libc::iovec {
+        iov_base: data.as_ptr().cast_mut().cast(),
+        iov_len: data.len(),
+    };
+    let mut msg = message(&mut iov);
     if !fds.is_empty() {
-        let hdr = CmsgHdr {
-            len: cmsg_len(data_len),
-            level: SOL_SOCKET,
-            type_: SCM_RIGHTS,
-        };
-        let base = control.as_mut_ptr().cast::<u8>();
-        // SAFETY: the control buffer has room for the header and MAX_FDS
-        // ints, written unaligned.
-        unsafe { std::ptr::write_unaligned(base.cast::<CmsgHdr>(), hdr) };
-        for (i, f) in fds.iter().enumerate() {
-            let at = header + i * size_of::<c_int>();
-            // SAFETY: as above; there are at most MAX_FDS of them.
-            unsafe { std::ptr::write_unaligned(base.add(at).cast::<c_int>(), f.as_raw_fd()) };
+        let size = fds_size(fds.len());
+        msg.msg_control = control.as_mut_ptr().cast();
+        // SAFETY: CMSG_SPACE() computes a size and touches no memory.
+        msg.msg_controllen = unsafe { libc::CMSG_SPACE(size) } as usize;
+        // SAFETY: the control buffer is aligned for the header and has
+        // room for it and for MAX_FDS ints, and msg_controllen covers
+        // them, so CMSG_FIRSTHDR() returns its start. The ints are
+        // written unaligned.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_len = libc::CMSG_LEN(size) as usize;
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            let data = libc::CMSG_DATA(cmsg);
+            for (i, f) in fds.iter().enumerate() {
+                data.add(i * size_of::<c_int>())
+                    .cast::<c_int>()
+                    .write_unaligned(f.as_raw_fd());
+            }
         }
     }
-    // sendmsg() only reads through the iovec.
-    let mut iov = IoVec {
-        base: data.as_ptr().cast_mut().cast(),
-        len: data.len(),
-    };
-    let msg = MsgHdr {
-        name: std::ptr::null_mut(),
-        namelen: 0,
-        iov: &mut iov,
-        iovlen: 1,
-        control: if fds.is_empty() {
-            std::ptr::null_mut()
-        } else {
-            control.as_mut_ptr().cast()
-        },
-        controllen: if fds.is_empty() { 0 } else { cmsg_space(data_len) },
-        flags: 0,
-    };
     retry(|| {
         // SAFETY: the header points at one iovec over `data` and at the
         // control buffer filled above, both alive for the call.
-        unsafe { sendmsg(fd.as_raw_fd(), &msg, MSG_NOSIGNAL) }
+        unsafe { libc::sendmsg(fd.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
     })
 }
 
 fn sockopt_int(fd: BorrowedFd<'_>, name: c_int) -> io::Result<c_int> {
     let mut value: c_int = 0;
-    let mut len = size_of::<c_int>() as u32;
+    let mut len = size_of::<c_int>() as libc::socklen_t;
     // SAFETY: the option stores an int through the pointer; both pointers are
     // valid for the duration of the call.
-    let r = unsafe { getsockopt(fd.as_raw_fd(), SOL_SOCKET, name, (&raw mut value).cast(), &mut len) };
+    let r = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            name,
+            (&raw mut value).cast(),
+            &mut len,
+        )
+    };
     if r < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -330,20 +271,20 @@ fn sockopt_int(fd: BorrowedFd<'_>, name: c_int) -> io::Result<c_int> {
 
 /// Whether the socket is in listening state.
 pub(crate) fn is_listening(fd: BorrowedFd<'_>) -> io::Result<bool> {
-    Ok(sockopt_int(fd, SO_ACCEPTCONN)? != 0)
+    Ok(sockopt_int(fd, libc::SO_ACCEPTCONN)? != 0)
 }
 
 /// The credentials of the peer of a connected AF_UNIX socket: (pid, uid,
 /// gid).
 pub(crate) fn peer_credentials(fd: BorrowedFd<'_>) -> io::Result<(i32, u32, u32)> {
-    let mut cred = UCred { pid: 0, uid: 0, gid: 0 };
-    let mut len = size_of::<UCred>() as u32;
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: SO_PEERCRED fills a struct ucred of exactly this layout.
     let r = unsafe {
-        getsockopt(
+        libc::getsockopt(
             fd.as_raw_fd(),
-            SOL_SOCKET,
-            SO_PEERCRED,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
             (&raw mut cred).cast(),
             &mut len,
         )
@@ -352,7 +293,7 @@ pub(crate) fn peer_credentials(fd: BorrowedFd<'_>) -> io::Result<(i32, u32, u32)
         return Err(io::Error::last_os_error());
     }
     // A wrong option number must never read as credentials.
-    if len as usize != size_of::<UCred>() {
+    if len as usize != size_of::<libc::ucred>() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "SO_PEERCRED returned an unexpected size",
@@ -370,12 +311,12 @@ pub(crate) fn allow_passed_fds(fd: BorrowedFd<'_>) {
     let on: c_int = 1;
     // SAFETY: the option takes an int; the pointer is valid for the call.
     unsafe {
-        setsockopt(
+        libc::setsockopt(
             fd.as_raw_fd(),
-            SOL_SOCKET,
+            libc::SOL_SOCKET,
             SO_PASSRIGHTS,
             (&raw const on).cast(),
-            size_of::<c_int>() as u32,
+            size_of::<c_int>() as libc::socklen_t,
         );
     }
 }
@@ -383,7 +324,7 @@ pub(crate) fn allow_passed_fds(fd: BorrowedFd<'_>) {
 /// Sets FD_CLOEXEC on a descriptor.
 pub(crate) fn set_cloexec(fd: BorrowedFd<'_>) -> io::Result<()> {
     // SAFETY: F_SETFD with an int argument is a plain fcntl call.
-    if unsafe { fcntl(fd.as_raw_fd(), F_SETFD, FD_CLOEXEC) } < 0 {
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -395,15 +336,15 @@ pub(crate) fn wait_readable<const N: usize>(
     fds: [BorrowedFd<'_>; N],
     timeout_ms: Option<u32>,
 ) -> io::Result<[bool; N]> {
-    let mut polled = fds.map(|fd| PollFd {
+    let mut polled = fds.map(|fd| libc::pollfd {
         fd: fd.as_raw_fd(),
-        events: POLLIN,
+        events: libc::POLLIN,
         revents: 0,
     });
     let timeout = timeout_ms.map_or(-1, |t| c_int::try_from(t).unwrap_or(c_int::MAX));
     retry(|| {
         // SAFETY: N pollfds, valid for the call.
-        unsafe { poll(polled.as_mut_ptr(), N as c_ulong, timeout) as isize }
+        unsafe { libc::poll(polled.as_mut_ptr(), N as libc::nfds_t, timeout) as isize }
     })?;
     Ok(polled.map(|p| p.revents != 0))
 }
@@ -411,19 +352,25 @@ pub(crate) fn wait_readable<const N: usize>(
 /// The effective user id of this process.
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: geteuid has no preconditions.
-    unsafe { geteuid() }
+    unsafe { libc::geteuid() }
+}
+
+/// A pidfd for the process `pid`. None if the kernel has no pidfd_open().
+fn pidfd_open(pid: libc::pid_t) -> Option<OwnedFd> {
+    // SAFETY: pidfd_open(pid, 0) takes no pointers. glibc reads every
+    // argument after the number as a long.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, c_long::from(pid), 0 as c_long) };
+    let fd = RawFd::try_from(fd).ok().filter(|&fd| fd >= 0)?;
+    // SAFETY: the system call returned a fresh descriptor that we now own.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// The inode number of this process's pidfd, which is what LISTEN_PIDFDID
 /// carries. None if the kernel has no pidfd_open().
 pub(crate) fn own_pidfd_inode() -> Option<u64> {
     // SAFETY: getpid() has no preconditions.
-    let pid = unsafe { getpid() };
-    // SAFETY: pidfd_open(pid, 0) takes no pointers.
-    let fd = unsafe { syscall(SYS_PIDFD_OPEN, c_long::from(pid), 0 as c_long) };
-    let fd = RawFd::try_from(fd).ok().filter(|&fd| fd >= 0)?;
-    // SAFETY: the system call returned a fresh descriptor that we now own.
-    let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let pid = unsafe { libc::getpid() };
+    let file = std::fs::File::from(pidfd_open(pid)?);
     Some(file.metadata().ok()?.ino())
 }
 
@@ -441,25 +388,117 @@ pub(crate) unsafe fn take_fd(fd: RawFd) -> OwnedFd {
 /// process. SIGTERM must be blocked in every thread for the signal to wait
 /// there instead of killing the process.
 pub(crate) fn sigterm_fd() -> io::Result<OwnedFd> {
-    let mut set = SigSet([0; 16]);
-    set.0[0] = 1 << (SIGTERM - 1);
-    // The kernel's sigset_t is 64 bits, not glibc's 1024: the size passed
-    // must be the kernel's, and the first word of the set holds SIGTERM.
-    // glibc reads every argument after the number as a long.
-    // SAFETY: a valid set of that size, read for the duration of the call.
-    let fd = unsafe {
-        syscall(
-            SYS_SIGNALFD4,
-            -1 as c_long,
-            set.0.as_ptr(),
-            size_of::<u64>() as c_long,
-            c_long::from(SFD_CLOEXEC | SFD_NONBLOCK),
-        )
-    };
-    let fd = RawFd::try_from(fd)
-        .ok()
-        .filter(|&fd| fd >= 0)
-        .ok_or_else(io::Error::last_os_error)?;
-    // SAFETY: the system call returned a fresh descriptor that we now own.
+    let set = sigterm_set();
+    // SAFETY: a valid set, read for the duration of the call.
+    let fd = unsafe { libc::signalfd(-1, &set, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: signalfd() returned a fresh descriptor that we now own.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::fd::AsFd;
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+
+    /// Whether the running kernel is at least `major.minor`.
+    fn kernel_at_least(major: u32, minor: u32) -> bool {
+        let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") else {
+            return false;
+        };
+        let mut numbers = release.split(|c: char| !c.is_ascii_digit()).map(str::parse::<u32>);
+        match (numbers.next(), numbers.next()) {
+            (Some(Ok(a)), Some(Ok(b))) => (a, b) >= (major, minor),
+            _ => false,
+        }
+    }
+
+    /// A SIGTERM for this thread, which blocks it, makes the descriptor
+    /// readable and reads back as SIGTERM. pthread_kill() keeps the signal
+    /// away from the other threads of the test.
+    #[test]
+    fn sigterm_fd_reports_a_blocked_sigterm() {
+        block_sigterm().unwrap();
+        let fd = sigterm_fd().unwrap();
+        assert_eq!(wait_readable([fd.as_fd()], Some(0)).unwrap(), [false]);
+        // SAFETY: the signal goes to the calling thread, which blocks it,
+        // so it stays pending until the descriptor takes it.
+        assert_eq!(unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTERM) }, 0);
+        assert_eq!(wait_readable([fd.as_fd()], Some(10_000)).unwrap(), [true]);
+        let mut info = [0u8; size_of::<libc::signalfd_siginfo>()];
+        assert_eq!(std::fs::File::from(fd).read(&mut info).unwrap(), info.len());
+        // ssi_signo comes first.
+        assert_eq!(u32::from_ne_bytes(info[..4].try_into().unwrap()), libc::SIGTERM as u32);
+        unblock_sigterm().unwrap();
+    }
+
+    /// SO_PEERCRED has the number of this architecture: the peer of a
+    /// socket pair is this process.
+    #[test]
+    fn peer_credentials_of_a_socket_pair() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        // SAFETY: getpid() and getegid() have no preconditions.
+        let (pid, gid) = unsafe { (libc::getpid(), libc::getegid()) };
+        assert_eq!(peer_credentials(a.as_fd()).unwrap(), (pid, effective_uid(), gid));
+    }
+
+    /// SO_ACCEPTCONN has the number of this architecture: a listening
+    /// socket says so, a connected one does not.
+    #[test]
+    fn listening_sockets_are_told_apart() {
+        let name = format!("ufat-varlink-sys-test-{}", std::process::id());
+        let listener = UnixListener::bind_addr(&SocketAddr::from_abstract_name(name).unwrap()).unwrap();
+        assert!(is_listening(listener.as_fd()).unwrap());
+        let (a, _b) = UnixStream::pair().unwrap();
+        assert!(!is_listening(a.as_fd()).unwrap());
+    }
+
+    /// SO_PASSRIGHTS has the kernel's number: turned off on the receiving
+    /// end, descriptors sent there are refused (EPERM, Linux 6.16), and
+    /// allow_passed_fds() lets them through again.
+    #[test]
+    fn so_passrights_turns_passed_descriptors_off_and_on() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let off: c_int = 0;
+        // SAFETY: the option takes an int; the pointer is valid for the call.
+        let r = unsafe {
+            libc::setsockopt(
+                b.as_raw_fd(),
+                libc::SOL_SOCKET,
+                SO_PASSRIGHTS,
+                (&raw const off).cast(),
+                size_of::<c_int>() as libc::socklen_t,
+            )
+        };
+        if r != 0 {
+            let e = io::Error::last_os_error();
+            assert_eq!(e.raw_os_error(), Some(libc::ENOPROTOOPT));
+            assert!(!kernel_at_least(6, 16), "SO_PASSRIGHTS refused: {}", e);
+            return eprintln!("skipping: SO_PASSRIGHTS needs Linux 6.16");
+        }
+        let e = send_with_fds(a.as_fd(), b"x", &[a.as_fd()]).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EPERM));
+        allow_passed_fds(b.as_fd());
+        assert_eq!(send_with_fds(a.as_fd(), b"x", &[a.as_fd()]).unwrap(), 1);
+        let mut buf = [0u8; 1];
+        let received = recv_with_fds(b.as_fd(), &mut buf).unwrap();
+        assert_eq!((received.bytes, received.fds.len(), received.truncated), (1, 1, false));
+    }
+
+    /// pidfd_open() has the number of this architecture: the kernel shows
+    /// our pid for the descriptor.
+    #[test]
+    fn pidfd_open_opens_a_pidfd() {
+        // SAFETY: getpid() has no preconditions.
+        let pid = unsafe { libc::getpid() };
+        let fd = pidfd_open(pid).expect("pidfd_open() failed");
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).unwrap();
+        assert!(info.lines().any(|l| l == format!("Pid:\t{}", pid)), "{}", info);
+        assert!(own_pidfd_inode().is_some());
+    }
 }

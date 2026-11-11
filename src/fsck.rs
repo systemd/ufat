@@ -8,6 +8,7 @@
 //! risk, are errors; everything else is a warning.
 
 use std::cell::{Cell, RefCell};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt;
 use std::ops::Range;
@@ -1469,7 +1470,7 @@ impl<'a> Checker<'a> {
             if chain.is_empty() {
                 continue;
             }
-            if len as usize > max_clusters {
+            if len > max_clusters as u64 {
                 self.error(|| {
                     Problem::new(ProblemKind::DirectoryTooLong)
                         .path(self.chain_path(dir.chain))
@@ -1706,7 +1707,7 @@ impl<'a> Checker<'a> {
                 _ => {}
             }
         }
-        if !is_root && !(saw_dot && saw_dotdot) {
+        if !(is_root || (saw_dot && saw_dotdot)) {
             self.error(|| {
                 Problem::new(ProblemKind::DotEntryMissing)
                     .path(self.chain_path(dir.chain))
@@ -1872,23 +1873,18 @@ impl<'a> Checker<'a> {
             return;
         }
         let (_, got, _) = self.claim_chain(at, short.first_cluster, 0);
-        if got < expected {
-            self.error(|| {
-                Problem::new(ProblemKind::TooFewClusters)
-                    .path(self.path_of(path))
-                    .size_bytes(u64::from(short.size))
-                    .clusters(got)
-                    .clusters_needed(expected)
-            });
-        } else if got > expected {
-            self.error(|| {
-                Problem::new(ProblemKind::TooManyClusters)
-                    .path(self.path_of(path))
-                    .size_bytes(u64::from(short.size))
-                    .clusters(got)
-                    .clusters_needed(expected)
-            });
-        }
+        let kind = match got.cmp(&expected) {
+            Ordering::Less => ProblemKind::TooFewClusters,
+            Ordering::Greater => ProblemKind::TooManyClusters,
+            Ordering::Equal => return,
+        };
+        self.error(|| {
+            Problem::new(kind)
+                .path(self.path_of(path))
+                .size_bytes(u64::from(short.size))
+                .clusters(got)
+                .clusters_needed(expected)
+        });
     }
 
     fn check_unreferenced(&mut self) {

@@ -57,9 +57,13 @@ impl Drop for Temp {
     }
 }
 
-/// The ufat binary under test, named by `UFAT`.
+/// The ufat binary under test, which cargo builds for the integration
+/// tests of the ufat package. The crash harness lives in a package without
+/// it.
 pub fn ufat() -> Option<PathBuf> {
-    std::env::var_os("UFAT").map(PathBuf::from).filter(|p| p.is_file())
+    option_env!("CARGO_BIN_EXE_ufat")
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
 }
 
 /// Finds a program in PATH, /usr/sbin and /sbin.

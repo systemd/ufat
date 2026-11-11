@@ -12,11 +12,13 @@
 //! recurse-dir.c, see the individual functions.
 #![allow(unsafe_code)]
 
+mod uapi;
+
 use std::collections::VecDeque;
-use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void, CStr, CString};
+use std::ffi::{c_int, c_long, c_uint, CStr, CString};
 use std::fs::File;
 use std::io::{self, Read};
-use std::mem::ManuallyDrop;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -27,92 +29,36 @@ use crate::errno::{
     EAGAIN, EBADF, EINVAL, EIO, ELOOP, ENODEV, ENOENT, ENOSYS, ENOTDIR, ENOTTY, ENXIO, EOPNOTSUPP, EPERM,
 };
 
-extern "C" {
-    fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
-    #[cfg(test)]
-    fn mkfifo(path: *const c_char, mode: u32) -> c_int;
-    fn flock(fd: c_int, operation: c_int) -> c_int;
-    fn syscall(number: c_long, ...) -> c_long;
-    #[cfg(target_pointer_width = "64")]
-    fn fallocate(fd: c_int, mode: c_int, offset: i64, len: i64) -> c_int;
-    fn openat(dirfd: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
-    fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int;
-    fn readlinkat(dirfd: c_int, path: *const c_char, buf: *mut c_char, size: usize) -> isize;
-    fn getdents64(fd: c_int, buf: *mut c_void, count: usize) -> isize;
-    fn fstatfs(fd: c_int, buf: *mut StatFs) -> c_int;
-    fn getrandom(buf: *mut c_void, len: usize, flags: c_uint) -> isize;
-    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
-    fn prlimit64(pid: c_int, resource: c_int, new_limit: *const Rlimit64, old_limit: *mut Rlimit64) -> c_int;
-}
-
-// The open(2) flags, include/uapi/asm-generic/fcntl.h. powerpc keeps its
-// own O_DIRECTORY and O_NOFOLLOW (arch/powerpc/include/uapi/asm/fcntl.h);
-// alpha, parisc, sparc and mips differ in more of them, the last two are
-// refused in errno.rs already and the first two are no targets of rustc.
-pub(crate) const O_RDONLY: c_int = 0;
-pub(crate) const O_WRONLY: c_int = 1;
-pub(crate) const O_RDWR: c_int = 2;
+// The open(2) flags. libc has the values of each architecture: alpha,
+// arm, arm64, m68k, mips, parisc, powerpc and sparc number some of them
+// differently from include/uapi/asm-generic/fcntl.h.
+pub(crate) const O_RDONLY: c_int = libc::O_RDONLY;
+pub(crate) const O_WRONLY: c_int = libc::O_WRONLY;
+pub(crate) const O_RDWR: c_int = libc::O_RDWR;
 /// The access mode bits of the flags.
-pub(crate) const O_ACCMODE: c_int = 3;
+pub(crate) const O_ACCMODE: c_int = libc::O_ACCMODE;
 /// Every write goes to the end, whatever offset it names: pwrite() on
 /// such a descriptor appends (pwrite(2), BUGS), which is why an image
 /// descriptor must not carry it.
-pub(crate) const O_APPEND: c_int = 1 << 10;
-pub(crate) const O_CREAT: c_int = 1 << 6;
+pub(crate) const O_APPEND: c_int = libc::O_APPEND;
+pub(crate) const O_CREAT: c_int = libc::O_CREAT;
 /// On a block device O_EXCL asks for the exclusive claim a mounted file
 /// system holds.
-pub(crate) const O_EXCL: c_int = 1 << 7;
+pub(crate) const O_EXCL: c_int = libc::O_EXCL;
 /// No terminal becomes ours when what we open turns out to be one.
-pub(crate) const O_NOCTTY: c_int = 1 << 8;
+pub(crate) const O_NOCTTY: c_int = libc::O_NOCTTY;
 /// No waiting for the other end when what we open turns out to be a FIFO.
-pub(crate) const O_NONBLOCK: c_int = 1 << 11;
-#[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
-pub(crate) const O_DIRECTORY: c_int = 1 << 16;
-#[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
-pub(crate) const O_NOFOLLOW: c_int = 1 << 17;
-#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
-pub(crate) const O_DIRECTORY: c_int = 1 << 14;
-#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
-pub(crate) const O_NOFOLLOW: c_int = 1 << 15;
-pub(crate) const O_CLOEXEC: c_int = 1 << 19;
+pub(crate) const O_NONBLOCK: c_int = libc::O_NONBLOCK;
+pub(crate) const O_DIRECTORY: c_int = libc::O_DIRECTORY;
+pub(crate) const O_NOFOLLOW: c_int = libc::O_NOFOLLOW;
+pub(crate) const O_CLOEXEC: c_int = libc::O_CLOEXEC;
 /// A descriptor that pins an inode without opening it: fstat, openat and
 /// a later [`reopen`] work on it, reading and writing do not.
-pub(crate) const O_PATH: c_int = 1 << 21;
-/// Linux 7.2: `openat(fd, "", flags | O_EMPTYPATH)` opens what `fd` refers
-/// to, which is how an O_PATH descriptor becomes a real one without procfs.
-pub(crate) const O_EMPTYPATH: c_int = 1 << 26;
-/// Set by the kernel on every descriptor a 64-bit process opens and
-/// reported by F_GETFL, although glibc hides the flag's value from us.
-#[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
-pub(crate) const O_LARGEFILE: c_int = 0o100000;
-#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
-pub(crate) const O_LARGEFILE: c_int = 0o200000;
-/// fcntl(2) commands.
-const F_GETFL: c_int = 3;
+pub(crate) const O_PATH: c_int = libc::O_PATH;
+pub(crate) use uapi::{O_EMPTYPATH, O_LARGEFILE};
 
-/// AT_FDCWD, include/uapi/linux/fcntl.h.
-const AT_FDCWD: c_int = -100;
 /// NAME_MAX, include/uapi/linux/limits.h: the longest file name.
-const NAME_MAX: usize = 255;
-
-/// `openat2(2)`, include/uapi/linux/openat2.h. The syscall number is the
-/// same on every architecture since it was added after the numbers were
-/// unified.
-const SYS_OPENAT2: c_long = 437;
-const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
-const RESOLVE_NO_SYMLINKS: u64 = 0x04;
-const RESOLVE_IN_ROOT: u64 = 0x10;
-
-#[repr(C)]
-struct OpenHow {
-    flags: u64,
-    mode: u64,
-    resolve: u64,
-}
-
-/// The file system magic numbers we tell apart, include/uapi/linux/magic.h.
-pub(crate) const PROC_SUPER_MAGIC: c_long = 0x9fa0;
-pub(crate) const SYSFS_MAGIC: c_long = 0x6265_6572;
+const NAME_MAX: usize = libc::NAME_MAX as usize;
 
 /// Steps a resolution by hand may take before we assume a loop, the
 /// CHASE_MAX of src/basic/chase.h: if people change the tree behind our
@@ -152,10 +98,11 @@ fn filename(name: &[u8]) -> io::Result<CString> {
 }
 
 /// `openat(2)`. `mode` matters with O_CREAT only; O_CLOEXEC is always set.
+/// openat64() opens files of any size on 32-bit targets too.
 fn open_at(dirfd: c_int, path: &CStr, flags: c_int, mode: c_uint) -> io::Result<OwnedFd> {
-    // SAFETY: a NUL terminated path and plain integers; openat reads the
+    // SAFETY: a NUL terminated path and plain integers; openat64 reads the
     // path for the duration of the call and nothing else.
-    let fd = unsafe { openat(dirfd, path.as_ptr(), flags | O_CLOEXEC, mode) };
+    let fd = unsafe { libc::openat64(dirfd, path.as_ptr(), flags | O_CLOEXEC, mode) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -172,7 +119,7 @@ fn open_at(dirfd: c_int, path: &CStr, flags: c_int, mode: c_uint) -> io::Result<
 pub(crate) fn open_path(dir: Option<BorrowedFd<'_>>, path: &Path, directory: bool) -> io::Result<OwnedFd> {
     let path = cstring(path.as_os_str().as_bytes())?;
     let flags = O_PATH | if directory { O_DIRECTORY } else { 0 };
-    open_at(dir.map_or(AT_FDCWD, |d| d.as_raw_fd()), &path, flags, 0)
+    open_at(dir.map_or(libc::AT_FDCWD, |d| d.as_raw_fd()), &path, flags, 0)
 }
 
 /// Pins the entry `name` of the directory `dir` as an O_PATH descriptor
@@ -208,7 +155,7 @@ pub(crate) fn unlink_at(dir: BorrowedFd<'_>, name: &[u8]) -> io::Result<()> {
     let name = filename(name)?;
     // SAFETY: a NUL terminated name and plain integers; unlinkat reads the
     // name for the duration of the call and nothing else.
-    if unsafe { unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } < 0 {
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -266,7 +213,7 @@ pub(crate) fn reopen(fd: BorrowedFd<'_>, flags: c_int) -> io::Result<OwnedFd> {
         return open_at(fd.as_raw_fd(), c".", flags, 0);
     }
     let link = cstring(format!("/proc/self/fd/{}", fd.as_raw_fd()).as_bytes())?;
-    match open_at(AT_FDCWD, &link, flags, 0) {
+    match open_at(libc::AT_FDCWD, &link, flags, 0) {
         Err(e) if e.raw_os_error() == Some(ENOENT) => Err(proc_fd_enoent_errno()),
         r => r,
     }
@@ -278,8 +225,8 @@ pub(crate) fn reopen(fd: BorrowedFd<'_>, flags: c_int) -> io::Result<OwnedFd> {
 /// EBADF when it is and the descriptor is not, and the ENOENT itself when
 /// it cannot tell.
 fn proc_fd_enoent_errno() -> io::Error {
-    match open_path(None, Path::new("/proc"), true).and_then(|proc| fs_type(proc.as_fd())) {
-        Ok(PROC_SUPER_MAGIC) => errno(EBADF),
+    match open_path(None, Path::new("/proc"), true).and_then(|proc| fs_kind(proc.as_fd())) {
+        Ok(FsKind::Proc) => errno(EBADF),
         Ok(_) => procfs_missing(),
         Err(e) if e.raw_os_error() == Some(ENOENT) => procfs_missing(),
         Err(_) => errno(ENOENT),
@@ -294,18 +241,18 @@ fn procfs_missing() -> io::Error {
 /// seccomp filter that answers ENOSYS on purpose, as systemd's does).
 static OPENAT2: AtomicU8 = AtomicU8::new(PROBE_UNKNOWN);
 
-fn openat2(dir: BorrowedFd<'_>, path: &CStr, how: &OpenHow) -> io::Result<OwnedFd> {
+fn openat2(dir: BorrowedFd<'_>, path: &CStr, how: &libc::open_how) -> io::Result<OwnedFd> {
     // SAFETY: the arguments are a directory descriptor, a NUL terminated
     // path, a pointer to an open_how of the size passed along; the kernel
     // reads them for the duration of the call. glibc reads every argument
     // after the number as a long.
     let fd = unsafe {
-        syscall(
-            SYS_OPENAT2,
+        libc::syscall(
+            libc::SYS_openat2,
             c_long::from(dir.as_raw_fd()),
             path.as_ptr(),
             std::ptr::from_ref(how),
-            size_of::<OpenHow>() as c_long,
+            size_of::<libc::open_how>() as c_long,
         )
     };
     let fd = RawFd::try_from(fd)
@@ -336,11 +283,14 @@ fn openat2(dir: BorrowedFd<'_>, path: &CStr, how: &OpenHow) -> io::Result<OwnedF
 pub(crate) fn chase(root: BorrowedFd<'_>, path: &[u8], follow_symlinks: bool, directory: bool) -> io::Result<OwnedFd> {
     if OPENAT2.load(Ordering::Relaxed) != PROBE_MISSING {
         let c = cstring(if path.is_empty() { b"." } else { path })?;
-        let how = OpenHow {
-            flags: (O_PATH | O_CLOEXEC | if directory { O_DIRECTORY } else { 0 }) as u64,
-            mode: 0,
-            resolve: RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS | if follow_symlinks { 0 } else { RESOLVE_NO_SYMLINKS },
-        };
+        // SAFETY: open_how is made of integers, and zero is a valid value
+        // for each. libc marks it non_exhaustive, so it is zeroed and then
+        // filled in.
+        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+        how.flags = (O_PATH | O_CLOEXEC | if directory { O_DIRECTORY } else { 0 }) as u64;
+        how.resolve = libc::RESOLVE_IN_ROOT
+            | libc::RESOLVE_NO_MAGICLINKS
+            | if follow_symlinks { 0 } else { libc::RESOLVE_NO_SYMLINKS };
         match openat2(root, &c, &how) {
             Ok(fd) => return Ok(fd),
             Err(e) => match e.raw_os_error() {
@@ -428,7 +378,7 @@ fn link_target(link: BorrowedFd<'_>) -> io::Result<(VecDeque<Vec<u8>>, bool)> {
     if target.is_empty() {
         return Err(errno(EINVAL));
     }
-    if (target[0] == b'/' || target.contains(&b':')) && fs_type(link)? == PROC_SUPER_MAGIC {
+    if (target[0] == b'/' || target.contains(&b':')) && fs_kind(link)? == FsKind::Proc {
         return Err(errno(ELOOP));
     }
     Ok((components(&target).map(<[u8]>::to_vec).collect(), target[0] == b'/'))
@@ -489,7 +439,7 @@ fn readlink(link: BorrowedFd<'_>) -> io::Result<Vec<u8>> {
     loop {
         // SAFETY: an empty path makes readlinkat read the link the
         // descriptor refers to; it writes at most buf.len() bytes into buf.
-        let n = unsafe { readlinkat(link.as_raw_fd(), c"".as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        let n = unsafe { libc::readlinkat(link.as_raw_fd(), c"".as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
         let n = usize::try_from(n).map_err(|_| io::Error::last_os_error())?;
         if n < buf.len() {
             buf.truncate(n);
@@ -510,48 +460,41 @@ fn readlink(link: BorrowedFd<'_>) -> io::Result<Vec<u8>> {
 pub(crate) fn descriptor_flags(fd: BorrowedFd<'_>) -> io::Result<c_int> {
     // SAFETY: F_GETFL takes no argument and reads nothing through a
     // pointer.
-    let flags = unsafe { fcntl(fd.as_raw_fd(), F_GETFL) };
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(flags)
 }
 
-/// A resource limit as prlimit64() carries it: 64 bits on every
-/// architecture, unlike struct rlimit.
-#[repr(C)]
-struct Rlimit64 {
-    cur: u64,
-    max: u64,
-}
-
-/// RLIMIT_NOFILE, include/uapi/asm-generic/resource.h (mips and sparc
-/// differ and are refused in errno.rs).
-const RLIMIT_NOFILE: c_int = 7;
-
 /// Raises the soft limit on open descriptors to the hard limit and returns
 /// the soft limit in force afterwards, the way systemd's
 /// rlimit_nofile_bump() does for every tool: the soft limit of 1024 a
 /// process starts with is select()'s and nothing here uses select().
 pub(crate) fn raise_descriptor_limit() -> io::Result<u64> {
-    let mut old = Rlimit64 { cur: 0, max: 0 };
+    // prlimit64() carries 64 bits on every architecture, unlike struct
+    // rlimit.
+    let mut old = libc::rlimit64 {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
     // SAFETY: pid 0 is the calling process; no new limit is passed and
     // `old` is a struct of the layout the kernel fills in.
-    if unsafe { prlimit64(0, RLIMIT_NOFILE, std::ptr::null(), &mut old) } < 0 {
+    if unsafe { libc::prlimit64(0, libc::RLIMIT_NOFILE, std::ptr::null(), &mut old) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    if old.cur >= old.max {
-        return Ok(old.cur);
+    if old.rlim_cur >= old.rlim_max {
+        return Ok(old.rlim_cur);
     }
-    let new = Rlimit64 {
-        cur: old.max,
-        max: old.max,
+    let new = libc::rlimit64 {
+        rlim_cur: old.rlim_max,
+        rlim_max: old.rlim_max,
     };
     // SAFETY: as above, with a new limit of that layout and no old one asked for.
-    if unsafe { prlimit64(0, RLIMIT_NOFILE, &new, std::ptr::null_mut()) } < 0 {
+    if unsafe { libc::prlimit64(0, libc::RLIMIT_NOFILE, &new, std::ptr::null_mut()) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(new.cur)
+    Ok(new.rlim_cur)
 }
 
 /// The metadata of what `fd` refers to, an O_PATH descriptor included:
@@ -572,27 +515,35 @@ pub(crate) fn pread(fd: BorrowedFd<'_>, buf: &mut [u8], offset: u64) -> io::Resu
     file.read_at(buf, offset)
 }
 
-/// Whatever struct statfs is on this architecture starts with f_type, a
-/// signed word; the rest is left to the kernel to fill and never read. The
-/// real structure is at most 120 bytes, there is room for more.
-#[repr(C)]
-struct StatFs {
-    f_type: c_long,
-    _rest: [u64; 64],
+/// The file systems we tell apart, by the magic numbers of
+/// include/uapi/linux/magic.h.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FsKind {
+    Proc,
+    Sysfs,
+    Other,
 }
 
-/// The magic number of the file system `fd` is on, fstatfs(2).
-pub(crate) fn fs_type(fd: BorrowedFd<'_>) -> io::Result<c_long> {
-    let mut st = StatFs {
-        f_type: 0,
-        _rest: [0; 64],
-    };
-    // SAFETY: fstatfs writes one struct statfs through the pointer, which
-    // points at memory larger than any struct statfs there is.
-    if unsafe { fstatfs(fd.as_raw_fd(), &mut st) } < 0 {
+/// The kind of file system `fd` is on, fstatfs(2). fstatfs64() works on
+/// 32-bit targets too when a count of the file system does not fit 32
+/// bits.
+pub(crate) fn fs_kind(fd: BorrowedFd<'_>) -> io::Result<FsKind> {
+    let mut st = MaybeUninit::<libc::statfs64>::uninit();
+    // SAFETY: fstatfs64 writes one struct statfs64 through the pointer.
+    if unsafe { libc::fstatfs64(fd.as_raw_fd(), st.as_mut_ptr()) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(st.f_type)
+    // SAFETY: fstatfs64 succeeded, so it filled in the struct.
+    let st = unsafe { st.assume_init() };
+    // f_type and the magic numbers have the same type, a long or, on
+    // s390x, an unsigned int.
+    Ok(if st.f_type == libc::PROC_SUPER_MAGIC {
+        FsKind::Proc
+    } else if st.f_type == libc::SYSFS_MAGIC {
+        FsKind::Sysfs
+    } else {
+        FsKind::Other
+    })
 }
 
 /// The names in the directory `dir`, in the order the file system hands
@@ -605,19 +556,34 @@ pub(crate) fn list_dir(dir: BorrowedFd<'_>) -> io::Result<Vec<Vec<u8>>> {
     // then d_name, NUL terminated and padded to the record length.
     const HEADER: usize = 8 + 8 + 2 + 1;
     const RECLEN: usize = 8 + 8;
-    let mut buf = vec![0u8; 32 * 1024];
+    // The kernel stores d_ino and d_off of every record at an offset
+    // aligned for them, so the buffer is made of u64: 32 KiB.
+    let mut words = vec![0u64; 4 * 1024];
+    let len = size_of_val(words.as_slice());
     let mut names = Vec::new();
     loop {
         let n = retry(|| {
-            // SAFETY: getdents64 writes at most buf.len() bytes into buf.
-            unsafe { getdents64(dir.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) }
+            // SAFETY: getdents64 writes at most `len` bytes into the
+            // buffer. The libc crate has no getdents64(), and glibc's
+            // syscall() reads every argument after the number as a long.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_getdents64,
+                    c_long::from(dir.as_raw_fd()),
+                    words.as_mut_ptr(),
+                    len as c_long,
+                ) as isize
+            }
         })?;
         if n == 0 {
             return Ok(names);
         }
-        if n > buf.len() {
+        if n > len {
             return Err(errno(EIO));
         }
+        // SAFETY: the bytes of the buffer, all initialized; a u8 has no
+        // alignment and every value is valid.
+        let buf = unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), len) };
         let mut off = 0;
         while off < n {
             if n - off < HEADER {
@@ -649,7 +615,7 @@ pub(crate) fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
         let rest = &mut buf[done..];
         let n = retry(|| {
             // SAFETY: getrandom writes at most rest.len() bytes into rest.
-            unsafe { getrandom(rest.as_mut_ptr().cast(), rest.len(), 0) }
+            unsafe { libc::getrandom(rest.as_mut_ptr().cast(), rest.len(), 0) }
         })?;
         if n == 0 {
             return Err(errno(EIO));
@@ -659,18 +625,13 @@ pub(crate) fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// `flock(2)` operations, include/uapi/asm-generic/fcntl.h.
-const LOCK_SH: c_int = 1;
-const LOCK_EX: c_int = 2;
-const LOCK_NB: c_int = 4;
-
 /// Takes a BSD lock on `fd` without waiting: shared for reading, exclusive
 /// for writing. Returns false when another open file description holds a
 /// conflicting lock.
 pub(crate) fn try_lock(fd: BorrowedFd<'_>, exclusive: bool) -> io::Result<bool> {
-    let operation = if exclusive { LOCK_EX } else { LOCK_SH } | LOCK_NB;
+    let operation = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH } | libc::LOCK_NB;
     // SAFETY: flock takes a descriptor and flags, nothing else.
-    if unsafe { flock(fd.as_raw_fd(), operation) } < 0 {
+    if unsafe { libc::flock(fd.as_raw_fd(), operation) } < 0 {
         let e = io::Error::last_os_error();
         if e.kind() == io::ErrorKind::WouldBlock {
             return Ok(false);
@@ -679,60 +640,6 @@ pub(crate) fn try_lock(fd: BorrowedFd<'_>, exclusive: bool) -> io::Result<bool> 
     }
     Ok(true)
 }
-
-/// The ioctl number encoding of include/uapi/asm-generic/ioctl.h: number,
-/// type, size and direction. powerpc, mips and sparc keep 13 size bits and
-/// three direction bits with NONE 1, READ 2 and WRITE 4 (their
-/// arch/*/include/uapi/asm/ioctl.h); everybody else 14 and two with NONE 0,
-/// READ 2 and WRITE 1.
-mod ioc {
-    use std::ffi::c_ulong;
-    #[cfg(any(
-        target_arch = "powerpc",
-        target_arch = "powerpc64",
-        target_arch = "mips",
-        target_arch = "mips64",
-        target_arch = "sparc",
-        target_arch = "sparc64"
-    ))]
-    mod arch {
-        pub(super) const NONE: super::c_ulong = 1;
-        pub(super) const SIZE_BITS: u32 = 13;
-    }
-    #[cfg(not(any(
-        target_arch = "powerpc",
-        target_arch = "powerpc64",
-        target_arch = "mips",
-        target_arch = "mips64",
-        target_arch = "sparc",
-        target_arch = "sparc64"
-    )))]
-    mod arch {
-        pub(super) const NONE: super::c_ulong = 0;
-        pub(super) const SIZE_BITS: u32 = 14;
-    }
-    pub(super) const NONE: c_ulong = arch::NONE;
-    pub(super) const READ: c_ulong = 2;
-
-    pub(super) const fn number(dir: c_ulong, ty: c_ulong, nr: c_ulong, size: usize) -> c_ulong {
-        (dir << (8 + 8 + arch::SIZE_BITS)) | ((size as c_ulong) << 16) | (ty << 8) | nr
-    }
-}
-
-/// BLKSSZGET, `_IO(0x12, 104)`: the logical block size of a block device.
-const BLKSSZGET: c_ulong = ioc::number(ioc::NONE, 0x12, 104, 0);
-/// BLKGETSIZE64, `_IOR(0x12, 114, size_t)`: the size of a block device in
-/// bytes.
-const BLKGETSIZE64: c_ulong = ioc::number(ioc::READ, 0x12, 114, size_of::<usize>());
-/// BLKZEROOUT, `_IO(0x12, 127)`: zero a range of a block device, with a
-/// write zeroes command where the device has one (block/ioctl.c).
-const BLKZEROOUT: c_ulong = ioc::number(ioc::NONE, 0x12, 127, 0);
-
-/// `fallocate(2)` modes, include/uapi/linux/falloc.h.
-#[cfg(target_pointer_width = "64")]
-const FALLOC_FL_KEEP_SIZE: c_int = 0x01;
-#[cfg(target_pointer_width = "64")]
-const FALLOC_FL_PUNCH_HOLE: c_int = 0x02;
 
 /// Makes `len` bytes at `offset` of `file` read as zeros without writing
 /// them: a hole punched into a regular file (fallocate, which shmem and
@@ -745,20 +652,14 @@ pub(crate) fn zero_range(file: &File, block_device: bool, offset: u64, len: u64)
         let range = [offset, len];
         // SAFETY: BLKZEROOUT reads two u64 through the pointer and nothing
         // else; the array lives for the duration of the call.
-        unsafe { ioctl(fd, BLKZEROOUT, range.as_ptr()) }
+        unsafe { libc::ioctl(fd, uapi::BLKZEROOUT, range.as_ptr()) }
     } else {
-        #[cfg(target_pointer_width = "64")]
-        {
-            let (Ok(offset), Ok(len)) = (i64::try_from(offset), i64::try_from(len)) else {
-                return Ok(false);
-            };
-            // SAFETY: fallocate takes a descriptor, a mode and two offsets.
-            unsafe { fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, len) }
-        }
-        #[cfg(not(target_pointer_width = "64"))]
-        {
+        let (Ok(offset), Ok(len)) = (i64::try_from(offset), i64::try_from(len)) else {
             return Ok(false);
-        }
+        };
+        // SAFETY: fallocate64 takes a descriptor, a mode and two 64-bit
+        // offsets, also on 32-bit targets.
+        unsafe { libc::fallocate64(fd, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, offset, len) }
     };
     if r == 0 {
         return Ok(true);
@@ -776,7 +677,7 @@ pub(crate) fn block_device_size(fd: BorrowedFd<'_>) -> io::Result<u64> {
     let mut size: u64 = 0;
     // SAFETY: BLKGETSIZE64 stores a u64 through the pointer and nothing
     // else; the pointer is valid for the duration of the call.
-    let r = unsafe { ioctl(fd.as_raw_fd(), BLKGETSIZE64, &mut size as *mut u64) };
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), uapi::BLKGETSIZE64, &mut size as *mut u64) };
     if r < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -800,9 +701,7 @@ fn read_sysattr(dir: BorrowedFd<'_>, name: &[u8]) -> io::Result<String> {
 /// The major and minor number of a device number: the split glibc's
 /// gnu_dev_major() and gnu_dev_minor() make.
 fn devnum_parts(dev: u64) -> (u64, u64) {
-    let major = ((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0xfff);
-    let minor = ((dev >> 12) & 0xffff_ff00) | (dev & 0xff);
-    (major, minor)
+    (u64::from(libc::major(dev)), u64::from(libc::minor(dev)))
 }
 
 /// The sysfs directory of the block device with the device number `dev`,
@@ -824,7 +723,7 @@ fn sysfs_block_device(dev: u64) -> io::Result<Option<OwnedFd>> {
         Err(e) if e.raw_os_error() == Some(ENOENT) => return Ok(None),
         Err(e) => return Err(e),
     };
-    if fs_type(dir.as_fd())? != SYSFS_MAGIC {
+    if fs_kind(dir.as_fd())? != FsKind::Sysfs {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "/sys/dev/block is not on sysfs",
@@ -880,7 +779,7 @@ pub(crate) fn block_device_logical_block_size(fd: BorrowedFd<'_>) -> io::Result<
     let mut size: c_int = 0;
     // SAFETY: BLKSSZGET stores an int through the pointer and nothing else;
     // the pointer is valid for the duration of the call.
-    let r = unsafe { ioctl(fd.as_raw_fd(), BLKSSZGET, &mut size as *mut c_int) };
+    let r = unsafe { libc::ioctl(fd.as_raw_fd(), libc::BLKSSZGET, &mut size as *mut c_int) };
     if r < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -896,7 +795,7 @@ pub(crate) fn block_device_logical_block_size(fd: BorrowedFd<'_>) -> io::Result<
 pub(crate) fn make_fifo(path: &Path) -> io::Result<()> {
     let c = CString::new(path.as_os_str().as_bytes())?;
     // SAFETY: a valid NUL terminated path; mkfifo touches nothing else.
-    if unsafe { mkfifo(c.as_ptr(), 0o600) } != 0 {
+    if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -1099,7 +998,7 @@ mod tests {
         assert_eq!(code(chase(root.as_fd(), b"magic", true, false).unwrap_err()), ENOENT);
         // A magic link itself is refused, with the root being /proc.
         let proc = open_path(None, Path::new("/proc"), true).unwrap();
-        if fs_type(proc.as_fd()).unwrap() == PROC_SUPER_MAGIC {
+        if fs_kind(proc.as_fd()).unwrap() == FsKind::Proc {
             assert_eq!(code(chase(proc.as_fd(), b"self/fd/0", true, false).unwrap_err()), ELOOP);
             assert!(fstat(chase(proc.as_fd(), b"self/fd", true, true).unwrap().as_fd())
                 .unwrap()
@@ -1136,6 +1035,57 @@ mod tests {
         assert!(raised > 0);
         // Raised already: the same limit comes back.
         assert_eq!(raise_descriptor_limit().unwrap(), raised);
+        // And it is the limit on open files, RLIMIT_NOFILE, which mips and
+        // sparc number differently.
+        let Ok(limits) = fs::read_to_string("/proc/self/limits") else {
+            return eprintln!("skipping: no /proc/self/limits");
+        };
+        let line = limits.lines().find(|l| l.starts_with("Max open files")).unwrap();
+        assert_eq!(line.split_whitespace().nth(3), Some(raised.to_string().as_str()));
+    }
+
+    /// Whether the running kernel is at least `major.minor`.
+    fn kernel_at_least(major: u32, minor: u32) -> bool {
+        let Ok(release) = fs::read_to_string("/proc/sys/kernel/osrelease") else {
+            return false;
+        };
+        let mut numbers = release.split(|c: char| !c.is_ascii_digit()).map(str::parse::<u32>);
+        match (numbers.next(), numbers.next()) {
+            (Some(Ok(a)), Some(Ok(b))) => (a, b) >= (major, minor),
+            _ => false,
+        }
+    }
+
+    /// F_GETFL shows exactly what a plain open sets: the access mode and
+    /// O_LARGEFILE, which the kernel adds for a 64-bit process and glibc's
+    /// open64() for a 32-bit one. With a wrong O_LARGEFILE every descriptor
+    /// passed to the service would be refused.
+    #[test]
+    fn a_plain_open_has_the_access_mode_and_o_largefile() {
+        let tmp = TempDir::new("flags");
+        let path = tmp.path().join("file");
+        fs::write(&path, b"").unwrap();
+        let file = File::open(&path).unwrap();
+        assert_eq!(descriptor_flags(file.as_fd()).unwrap(), O_RDONLY | O_LARGEFILE);
+    }
+
+    /// From Linux 7.2 on, an empty path with O_EMPTYPATH reopens what a
+    /// descriptor pins, and F_GETFL shows the flag. With a wrong value
+    /// [`reopen`] would fall back to procfs without a word.
+    #[test]
+    fn o_emptypath_reopens_from_linux_7_2() {
+        if !kernel_at_least(7, 2) {
+            return eprintln!("skipping: O_EMPTYPATH needs Linux 7.2");
+        }
+        let tmp = TempDir::new("emptypath");
+        let path = tmp.path().join("file");
+        fs::write(&path, b"").unwrap();
+        let pinned = open_path(None, &path, false).unwrap();
+        let file = open_at(pinned.as_raw_fd(), c"", O_RDONLY | O_EMPTYPATH, 0).unwrap();
+        assert_eq!(
+            descriptor_flags(file.as_fd()).unwrap(),
+            O_RDONLY | O_LARGEFILE | O_EMPTYPATH
+        );
     }
 
     #[test]
@@ -1149,26 +1099,20 @@ mod tests {
     }
 
     #[test]
-    fn fs_type_tells_file_systems_apart() {
+    fn fs_kind_tells_file_systems_apart() {
         let proc = open_path(None, Path::new("/proc"), true).unwrap();
         let sys = open_path(None, Path::new("/sys"), true).unwrap();
         // Either may be missing in a chroot; where it is there it is itself.
-        if let Ok(t) = fs_type(proc.as_fd()) {
-            assert!(t == PROC_SUPER_MAGIC || t != SYSFS_MAGIC);
+        if let Ok(k) = fs_kind(proc.as_fd()) {
+            assert_ne!(k, FsKind::Sysfs);
         }
-        if let Ok(t) = fs_type(sys.as_fd()) {
-            assert!(t == SYSFS_MAGIC || t != PROC_SUPER_MAGIC);
+        if let Ok(k) = fs_kind(sys.as_fd()) {
+            assert_ne!(k, FsKind::Proc);
         }
         let tmp = TempDir::new("fstype");
         let dir = tmp.path();
         let d = open_path(None, dir, true).unwrap();
-        let t = fs_type(d.as_fd()).unwrap();
-        assert!(t != PROC_SUPER_MAGIC && t != SYSFS_MAGIC);
-    }
-
-    /// glibc's gnu_dev_makedev(), the inverse of [`devnum_parts`].
-    fn devnum_join(major: u64, minor: u64) -> u64 {
-        ((major & 0xffff_f000) << 32) | ((major & 0xfff) << 8) | ((minor & 0xffff_ff00) << 12) | (minor & 0xff)
+        assert_eq!(fs_kind(d.as_fd()).unwrap(), FsKind::Other);
     }
 
     /// Every device sysfs lists under /sys/dev/block is found again by its
@@ -1176,20 +1120,20 @@ mod tests {
     /// has is None. Needs no root, sysfs is world readable.
     #[test]
     fn sysfs_block_devices_are_found_by_devnum() {
-        assert_eq!(devnum_parts(devnum_join(8, 17)), (8, 17));
-        assert_eq!(devnum_parts(devnum_join(259, 0x1_2345)), (259, 0x1_2345));
-        assert_eq!(devnum_parts(devnum_join(0xf_ffff, 0xf_ffff)), (0xf_ffff, 0xf_ffff));
+        assert_eq!(devnum_parts(libc::makedev(8, 17)), (8, 17));
+        assert_eq!(devnum_parts(libc::makedev(259, 0x1_2345)), (259, 0x1_2345));
+        assert_eq!(devnum_parts(libc::makedev(0xf_ffff, 0xf_ffff)), (0xf_ffff, 0xf_ffff));
         let Ok(all) = open_path(None, Path::new("/sys/dev/block"), true) else {
             return eprintln!("skipping: no /sys/dev/block");
         };
-        if fs_type(all.as_fd()).unwrap() != SYSFS_MAGIC {
+        if fs_kind(all.as_fd()).unwrap() != FsKind::Sysfs {
             return eprintln!("skipping: /sys is not sysfs");
         }
         let listing = reopen(all.as_fd(), O_RDONLY | O_DIRECTORY).unwrap();
         for name in sorted(list_dir(listing.as_fd()).unwrap()).iter().take(8) {
             let text = std::str::from_utf8(name).unwrap();
             let (major, minor) = text.split_once(':').unwrap();
-            let dev = devnum_join(major.parse().unwrap(), minor.parse().unwrap());
+            let dev = libc::makedev(major.parse().unwrap(), minor.parse().unwrap());
             // Gone between the listing and the open: a device was removed.
             let Some(dir) = sysfs_block_device(dev).unwrap() else {
                 continue;
@@ -1199,8 +1143,8 @@ mod tests {
             assert_eq!(sysfs_partition_start(dir.as_fd()).unwrap() % 512, 0);
         }
         // Major 0 is no block device major; sysfs knows no such device.
-        assert!(sysfs_block_device(devnum_join(0, 0)).unwrap().is_none());
-        assert!(sysfs_block_device(devnum_join(0, 12345)).unwrap().is_none());
+        assert!(sysfs_block_device(libc::makedev(0, 0)).unwrap().is_none());
+        assert!(sysfs_block_device(libc::makedev(0, 12345)).unwrap().is_none());
     }
 
     #[test]

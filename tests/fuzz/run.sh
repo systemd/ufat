@@ -1,13 +1,15 @@
 #!/bin/bash
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
-# The fuzzing campaign, see HACKING.md. The fuzz target runs it as
+# The fuzzing campaign, see HACKING.md:
 #
-#     tests/fuzz/run.sh UFAT FUZZ_SEEDS OUTDIR
+#     cargo build --locked -p ufat -p fuzz-seeds
+#     tests/fuzz/run.sh [UFAT [FUZZ_SEEDS [OUTDIR]]]
 #
 # It builds the seeds, runs the image, manifest, Varlink and targeted
 # campaigns and sums up their reports. It fails when one of them found
-# something.
+# something. UFAT, FUZZ_SEEDS and OUTDIR default to target/debug/ufat,
+# target/debug/fuzz-seeds and target/fuzz of this tree.
 #
 # Environment:
 #   FUZZ_OUT     where seeds, reports and findings go (default: OUTDIR)
@@ -18,9 +20,10 @@
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
-ufat=$1
-seeds=$2
-out=${FUZZ_OUT:-$3}
+repo=$(cd "$here/../.." && pwd)
+ufat=${1:-$repo/target/debug/ufat}
+seeds=${2:-$repo/target/debug/fuzz-seeds}
+out=${FUZZ_OUT:-${3:-$repo/target/fuzz}}
 iterations=${ITERATIONS:-200}
 workers=${WORKERS:-4}
 python=${PYTHON:-python3 -I}

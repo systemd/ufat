@@ -1,9 +1,11 @@
 #!/bin/bash
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
-# Runs the Kani proofs, see HACKING.md. The verify target runs it as
+# Runs the Kani proofs, see HACKING.md:
 #
-#     verify/run.sh verify/lib.rs
+#     verify/run.sh [CRATE]
+#
+# CRATE is the crate root of the proofs, verify/lib.rs by default.
 #
 # Environment:
 #   HARNESS       run this harness only
@@ -18,7 +20,7 @@
 #   KANI_FLAGS    replaces the default flags
 set -eu
 
-crate=$1
+crate=${1:-$(dirname "$0")/lib.rs}
 rustflags="--edition 2021"
 if [ -n "${SLOW:-}" ]; then
     rustflags="$rustflags --cfg slow_proofs"

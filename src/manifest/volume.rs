@@ -772,8 +772,8 @@ mod tests {
         let slot = (0..cluster.len() / 32)
             .find(|&i| {
                 let e = &cluster[i * 32..(i + 1) * 32];
-                let first =
-                    u32::from(u16::from_le_bytes([e[20], e[21]])) << 16 | u32::from(u16::from_le_bytes([e[26], e[27]]));
+                let first = (u32::from(u16::from_le_bytes([e[20], e[21]])) << 16)
+                    | u32::from(u16::from_le_bytes([e[26], e[27]]));
                 e[0] != b'.' && e[11] & crate::dirent::ATTR_DIRECTORY != 0 && first == b.first_cluster
             })
             .unwrap();

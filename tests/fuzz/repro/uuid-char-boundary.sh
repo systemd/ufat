@@ -5,7 +5,7 @@
 # sliced at that byte. The reader no longer slices UUID strings at a byte
 # offset; this is kept as the regression check: `ufat assemble --plan`
 # must exit 1 with "is not a UUID", the script exits 1 otherwise.
-UFAT=${1:-build/ufat}
+UFAT=${1:-target/debug/ufat}
 M=$(mktemp)
 printf '\036{"mediaType":"application/vnd.uapi.16.manifest"}\n\036{"name":"x","size":0,"gptUuid":"urn:uuid\303\251\303\251\303\251\303\251"}\n\036{"mediaType":"application/vnd.uapi.16.trailer"}\n' > "$M"
 "$UFAT" assemble --plan --manifest "$M"; s=$?

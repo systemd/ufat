@@ -1,6 +1,0 @@
-# SPDX-License-Identifier: LGPL-2.1-or-later
-
-option('slow-tests', type : 'boolean', value : false,
-       description : 'run the exhaustive sweeps, which take minutes')
-option('static', type : 'boolean', value : true,
-       description : 'link the ufat binary statically')

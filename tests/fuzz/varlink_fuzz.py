@@ -10,7 +10,7 @@ cleanly (status 0) once the client is gone. A panic (exit 101), a signal, a
 server that does not exit after the client hung up, or an outsized RSS is a
 defect and is saved under OUT/varlink-findings/<signature>/.
 
-    tests/fuzz/varlink_fuzz.py --ufat build/ufat --seeds SEEDS --out OUT [--count N]
+    tests/fuzz/varlink_fuzz.py --ufat target/debug/ufat --seeds SEEDS --out OUT [--count N]
 
 Python 3 standard library only; reuses the mutators of mutate.py.
 """

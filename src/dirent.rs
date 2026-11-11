@@ -78,7 +78,7 @@ impl RawDirEntry {
             create_time: le16(b, 14),
             create_date: le16(b, 16),
             access_date: le16(b, 18),
-            first_cluster: u32::from(le16(b, 20)) << 16 | u32::from(le16(b, 26)),
+            first_cluster: (u32::from(le16(b, 20)) << 16) | u32::from(le16(b, 26)),
             write_time: le16(b, 22),
             write_date: le16(b, 24),
             size: le32(b, 28),

@@ -27,24 +27,22 @@ tool and the service are the same binary.
 - Writes are ordered so that a crash or a power loss leaves every file
   in its old state, its new state, or absent. A file is never left
   damaged.
-- The code uses the Rust standard library only. It has no other
-  dependencies.
+- The code uses the Rust standard library and the libc crate. It has no
+  other dependencies.
 
 ## Building and installing
 
-You need rustc 1.85 or newer, meson 1.4 or newer and ninja. There is no
-cargo build.
+You need rustc and cargo 1.85 or newer, on Linux with glibc.
 
-    meson setup build
-    meson compile -C build
-    meson install -C build
+    cargo build --release --locked
+    cargo install --locked --path . --root /usr/local
 
-This builds the library `build/src/libufat.rlib` and the tool
-`build/ufat`, and installs the tool into /usr/local/bin. The tool is
-linked statically by default. `meson setup -Dstatic=false build` links
-it dynamically.
+This builds the tool `target/release/ufat` and installs it into
+/usr/local/bin. Without `--root` it goes into ~/.cargo/bin. The tool is
+linked statically. `RUSTFLAGS=-Ctarget-feature=-crt-static` links it
+dynamically.
 
-HACKING.md describes the tests and the other targets.
+HACKING.md describes the tests and the other tools.
 
 ## Using the command line tool
 
@@ -249,8 +247,8 @@ When the binary is started with a socket passed in `LISTEN_FDS`, it
 serves the `org.uapi-group.FileSystem` Varlink interface for vfat.
 `varlinkctl` and systemd socket units start it this way:
 
-    varlinkctl call ./build/ufat org.uapi-group.FileSystem.GetCapabilities '{}'
-    varlinkctl call --push-fd=./esp.img ./build/ufat \
+    varlinkctl call ./target/release/ufat org.uapi-group.FileSystem.GetCapabilities '{}'
+    varlinkctl call --push-fd=./esp.img ./target/release/ufat \
         org.uapi-group.FileSystem.Describe '{"image":{"fileDescriptor":0}}'
 
 The service takes every file and directory as a file descriptor passed

@@ -1009,8 +1009,8 @@ mod proofs {
     /// freed: write_entry() and delete() check it themselves under Kani.
     /// The unwind bound covers the longest loops, the 13 units of a long
     /// name slot and the 16 byte table of `valid_short_char`. The solver
-    /// did not finish this within the time the verify target has, so it
-    /// runs with `DIR=1 meson compile verify` only; see HACKING.md.
+    /// did not finish this within the time verify/run.sh gives it, so it
+    /// runs with `DIR=1 verify/run.sh` only; see HACKING.md.
     #[cfg(dir_proofs)]
     #[kani::proof]
     #[kani::unwind(20)]

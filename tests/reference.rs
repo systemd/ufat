@@ -605,7 +605,7 @@ fn real_world_files() -> Vec<(String, Vec<u8>)> {
 fn an_assembled_tree_comes_back_through_mtools() {
     let _serial = common::serial();
     let (Some(ufat), Some(mcopy)) = (ufat(), find_mtool("mcopy")) else {
-        return skip("UFAT or mtools");
+        return skip("ufat or mtools");
     };
     let tree = Temp::dir();
     let files = real_world_files();

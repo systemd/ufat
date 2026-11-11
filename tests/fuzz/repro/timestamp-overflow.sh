@@ -7,7 +7,7 @@
 # check: every command must exit 1 with a message, the script exits 1 when
 # one of them still panics.
 set -u
-UFAT=${1:-build/ufat}
+UFAT=${1:-target/debug/ufat}
 IMG=$(mktemp)
 "$UFAT" assemble --create --size 40M "$IMG" > /dev/null 2>&1
 rc=0

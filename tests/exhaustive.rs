@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! Exhaustive and property sweeps over the pure parts of the library. They
-//! take a few minutes and run only in a build directory set up with
-//! `-Dslow-tests=true`.
+//! take a few minutes and are ignored by default; run them with
+//! `cargo test --locked --test exhaustive -- --ignored`.
 
 use std::thread;
 
@@ -98,6 +98,7 @@ fn sweep_compute(p: LayoutParams, stride: u64) {
 }
 
 #[test]
+#[ignore = "takes minutes, run with --ignored"]
 fn compute_over_every_total() {
     // Every total, for the parameters systemd-repart would use.
     sweep_compute(params(512, None, 2, true, true, None), 1);
@@ -117,6 +118,7 @@ fn compute_over_every_total() {
 }
 
 #[test]
+#[ignore = "takes minutes, run with --ignored"]
 fn minimal_is_the_exact_inverse_of_compute() {
     let needs = || (1u32..=200_000).chain((200_001..=MAX_CLUSTERS).step_by(104_729));
     let mut sets = Vec::new();
@@ -170,6 +172,7 @@ fn minimal_is_the_exact_inverse_of_compute() {
 }
 
 #[test]
+#[ignore = "takes minutes, run with --ignored"]
 fn every_second_round_trips() {
     let n = threads() as i64;
     let span = (FAT_MAX - FAT_EPOCH + 1) / n + 1;
@@ -200,8 +203,9 @@ fn every_second_round_trips() {
 }
 
 #[test]
+#[ignore = "takes minutes, run with --ignored"]
 fn every_timestamp_word_round_trips() {
-    let n = threads() as u64;
+    let n = threads();
     let span = (1u64 << 32) / n;
     thread::scope(|s| {
         for t in 0..n {
@@ -252,6 +256,7 @@ fn days_in_month(year: i64, month: u32) -> u16 {
 }
 
 #[test]
+#[ignore = "takes minutes, run with --ignored"]
 fn case_folding_is_idempotent_over_all_code_points() {
     for c in char::MIN..=char::MAX {
         let s = c.to_string();
@@ -262,6 +267,7 @@ fn case_folding_is_idempotent_over_all_code_points() {
 }
 
 #[test]
+#[ignore = "takes minutes, run with --ignored"]
 fn every_single_character_name_round_trips() {
     for c in char::MIN..=char::MAX {
         let s = c.to_string();
@@ -293,6 +299,7 @@ fn every_single_character_name_round_trips() {
 /// legal, space padded 8.3 name, and the name's long name entries round
 /// trip. 866495 names.
 #[test]
+#[ignore = "takes minutes, run with --ignored"]
 fn every_short_ascii_name_has_a_legal_alias() {
     fn legal(b: u8) -> bool {
         b == b' ' || b.is_ascii_uppercase() || b.is_ascii_digit() || b"!#$%&'()-@^_`{}~".contains(&b)

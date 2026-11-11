@@ -5,15 +5,18 @@
 //! copy files and directory trees into it in a reproducible way, check the
 //! result, and work out beforehand how large the partition has to be. It
 //! implements only FAT32 with long file names, writes files sequentially
-//! only, and runs on Linux only. It uses nothing but the standard library.
+//! only, and runs on Linux only. It uses nothing but the standard library
+//! and the libc crate.
 //!
-//! The crate is built with meson and plain rustc; see HACKING.md.
+//! The crate is built with cargo; see HACKING.md.
 
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-#[cfg(not(target_os = "linux"))]
-compile_error!("ufat supports Linux only");
+// sys.rs calls the LFS64 functions of glibc, such as openat64(), which
+// musl does not have.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+compile_error!("ufat supports Linux with glibc only");
 
 #[macro_use]
 mod error;

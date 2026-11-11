@@ -29,11 +29,6 @@ const IMG: &str = r#"{"image":{"fileDescriptor":0}}"#;
 /// A FAT time with a day: 2023-11-14 22:13:20 UTC.
 const T0: u64 = 1_700_000_000_000_000;
 
-extern "C" {
-    fn dup2(from: c_int, to: c_int) -> c_int;
-    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
-}
-
 /// Makes `fd` the child's fd 3, open across exec: dup2 clears FD_CLOEXEC
 /// on the new descriptor, but not when `fd` is 3 already, so the flag is
 /// cleared explicitly (F_SETFD).
@@ -42,8 +37,7 @@ extern "C" {
 /// Runs in the forked child before exec; dup2 and fcntl are
 /// async-signal-safe and take no pointers.
 unsafe fn install_fd3(fd: c_int) -> std::io::Result<()> {
-    const F_SETFD: c_int = 2;
-    if dup2(fd, 3) < 0 || fcntl(3, F_SETFD, 0) < 0 {
+    if libc::dup2(fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
@@ -466,7 +460,7 @@ fn damage_root_entries(image: &Path) -> usize {
 fn info_and_description_over_fd3() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let mut c = connect_fd3(&ufat);
     let info = reply(c.call("org.varlink.service.GetInfo", Object::new()).unwrap());
@@ -504,7 +498,7 @@ fn info_and_description_over_fd3() {
 fn stdio_carries_no_descriptors() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let mut c = connect_stdio(&ufat);
     reply(c.call("org.varlink.service.GetInfo", Object::new()).unwrap());
@@ -520,7 +514,7 @@ fn stdio_carries_no_descriptors() {
 fn capabilities_describe_vfat() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let mut c = connect_fd3(&ufat);
     let r = reply(call(&mut c, "GetCapabilities", r#"{"fileSystemType":"vfat"}"#, &[]));
@@ -602,7 +596,7 @@ fn capabilities_describe_vfat() {
 fn assemble_plans_from_a_tree_and_a_manifest() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let tree = esp_tree();
     let (manifest, _) = manifest_and_blob(tree.path());
@@ -696,7 +690,7 @@ fn assemble_plans_from_a_tree_and_a_manifest() {
 fn assemble_with_a_tree() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let tree = esp_tree();
     let (image, img) = fresh_image();
@@ -771,7 +765,7 @@ fn assemble_with_a_tree() {
 fn assemble_without_content() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let mut c = connect_fd3(&ufat);
     // 4 KiB clusters need a volume of 65525 of them; 40 MiB would not do.
@@ -872,7 +866,7 @@ fn assemble_without_content() {
 fn assemble_with_a_manifest_and_a_directory() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let base = Temp::dir();
     let tree = base.path().join("tree");
@@ -999,7 +993,7 @@ fn assemble_with_a_manifest_and_a_directory() {
 fn assemble_with_a_manifest_and_a_stream() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let Some(mkfifo) = find_program("mkfifo") else {
         return eprintln!("skipping: mkfifo not found");
@@ -1092,7 +1086,7 @@ fn assemble_with_a_manifest_and_a_stream() {
 fn assemble_hashes_the_image() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let tree = esp_tree();
     let mut c = connect_fd3(&ufat);
@@ -1136,7 +1130,7 @@ fn assemble_hashes_the_image() {
 fn assemble_writes_a_manifest() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let tree = esp_tree();
     let scratch = Temp::dir();
@@ -1199,7 +1193,7 @@ fn assemble_writes_a_manifest() {
 fn assemble_reports_its_phases() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let tree = esp_tree();
     let scratch = Temp::dir();
@@ -1239,7 +1233,7 @@ fn assemble_reports_its_phases() {
 fn long_phases_report_progress() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let Some(mkfifo) = find_program("mkfifo") else {
         return eprintln!("skipping: mkfifo not found");
@@ -1291,7 +1285,7 @@ fn long_phases_report_progress() {
 fn reproducible_images_are_identical() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let tree = esp_tree();
     let mut c = connect_fd3(&ufat);
@@ -1333,7 +1327,7 @@ fn reproducible_images_are_identical() {
 fn describe_with_and_without_a_manifest() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let tree = esp_tree();
     let scratch = Temp::dir();
@@ -1428,7 +1422,7 @@ fn describe_with_and_without_a_manifest() {
 fn populate_puts_content_into_a_volume() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let tree = esp_tree();
     let (manifest, _) = manifest_and_blob(tree.path());
@@ -1626,7 +1620,7 @@ fn populate_puts_content_into_a_volume() {
 fn remove_files_and_directories() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let tree = esp_tree();
     let (image, img) = fresh_image();
@@ -1706,7 +1700,7 @@ fn remove_files_and_directories() {
 fn list_streams_entries() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let tree = esp_tree();
     let (image, img) = fresh_image();
@@ -1808,7 +1802,7 @@ fn list_streams_entries() {
 fn check_finds_damage() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     // Enough files in the root for more findings than one batch holds.
     let tree = Temp::dir();
@@ -1885,7 +1879,7 @@ fn check_finds_damage() {
 fn passed_descriptors_are_vetted() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let image = Temp::image(40 << 20);
     let tree = Temp::dir();
@@ -2020,7 +2014,7 @@ fn passed_descriptors_are_vetted() {
 fn errors_are_typed() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let image = Temp::image(40 << 20);
     let img = rw(image.path());
@@ -2159,7 +2153,7 @@ fn errors_are_typed() {
 fn varlinkctl_can_drive_us() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let Some(varlinkctl) = find_program("varlinkctl") else {
         return eprintln!("skipping: varlinkctl not found");
@@ -2221,7 +2215,7 @@ fn varlinkctl_can_drive_us() {
 fn a_listening_service_finishes_its_connections_after_sigterm() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let (mut child, sock, mut client) = connect_listening(&ufat);
     reply(client.call("org.varlink.service.GetInfo", Object::new()).unwrap());
@@ -2267,7 +2261,7 @@ fn a_listening_service_finishes_its_connections_after_sigterm() {
 fn too_small_images_are_reported() {
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let base = Temp::dir();
     let tree = base.path().join("tree");

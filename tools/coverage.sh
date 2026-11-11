@@ -1,24 +1,32 @@
 #!/bin/bash
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
-# The line coverage report, see HACKING.md. In a build directory set up
-# with -Db_coverage=true, the tests leave their profiles in OUTDIR and the
-# coverage-report target runs
+# The line coverage report, see HACKING.md:
 #
-#     tools/coverage.sh OUTDIR BINARY...
+#     tools/coverage.sh [ARGS...]
 #
-# It merges the profiles into OUTDIR/ufat.profdata, removes them, and
-# reports the line coverage of the BINARYs with llvm-cov into
-# OUTDIR/report.txt. The llvm tools must be at least as new as the LLVM in
-# rustc. The first one found below is used, LLVM_PROFDATA= and LLVM_COV=
-# override.
+# It builds everything with coverage instrumentation into target/coverage,
+# runs `cargo test --locked ARGS...`, merges the profiles the tests leave
+# into target/coverage/ufat.profdata, and reports the line coverage of the
+# test binaries and the tool with llvm-cov into target/coverage/report.txt.
+# The llvm tools must be at least as new as the LLVM in rustc. Those of
+# rustup's llvm-tools component are used when it is installed, otherwise
+# the first one found below. LLVM_PROFDATA= and LLVM_COV= override.
 set -eu -o pipefail
 
-out=$1
-shift
+cd "$(dirname "$0")/.."
+export CARGO_TARGET_DIR=$PWD/target/coverage
+# This replaces the static linking of .cargo/config.toml, which the report
+# does not need.
+export RUSTFLAGS="-C instrument-coverage"
+profiles=$CARGO_TARGET_DIR/profiles
+# Set before the build: the build scripts are instrumented as well and
+# would leave their profiles in the source tree otherwise.
+export LLVM_PROFILE_FILE=$profiles/%p-%m.profraw
 
 if [ -z "${LLVM_PROFDATA:-}" ]; then
-    for t in llvm-profdata-21 llvm-profdata-20 llvm-profdata-19 llvm-profdata; do
+    rustup_tools=$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin
+    for t in "$rustup_tools/llvm-profdata" llvm-profdata-21 llvm-profdata-20 llvm-profdata-19 llvm-profdata; do
         if command -v "$t" > /dev/null; then
             LLVM_PROFDATA=$t
             break
@@ -31,19 +39,16 @@ if [ -z "${LLVM_PROFDATA:-}" ]; then
 fi
 LLVM_COV=${LLVM_COV:-${LLVM_PROFDATA/profdata/cov}}
 
-profiles=("$out"/*.profraw)
-if [ -e "${profiles[0]}" ]; then
-    "$LLVM_PROFDATA" merge -sparse -o "$out/ufat.profdata" "${profiles[@]}"
-    rm -f "${profiles[@]}"
-elif [ ! -e "$out/ufat.profdata" ]; then
-    echo "no profiles in $out, run meson test first" >&2
-    exit 1
-fi
+rm -rf "$profiles"
+cargo test --locked "$@"
 
 objects=()
-for b in "${@:2}"; do
+while read -r b; do
     objects+=(-object "$b")
-done
-# Test code and the toolchain's own sources are left out.
-"$LLVM_COV" report "$1" "${objects[@]}" -instr-profile="$out/ufat.profdata" \
-    --ignore-filename-regex='/rustc/|/\.cargo/|/\.rustup/|(^|/)tests/|tests\.rs$' | tee "$out/report.txt"
+done < <(cargo test --locked --no-run --message-format=json "$@" | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p')
+
+"$LLVM_PROFDATA" merge -sparse -o "$CARGO_TARGET_DIR/ufat.profdata" "$profiles"/*.profraw
+# Test code, build scripts and the toolchain's own sources are left out.
+"$LLVM_COV" report "${objects[@]}" -instr-profile="$CARGO_TARGET_DIR/ufat.profdata" \
+    --ignore-filename-regex='/rustc/|/\.cargo/|/\.rustup/|(^|/)tests/|tests\.rs$|(^|/)build\.rs$' |
+    tee "$CARGO_TARGET_DIR/report.txt"

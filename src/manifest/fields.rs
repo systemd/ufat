@@ -89,7 +89,7 @@ pub(super) fn hex_bytes(text: &str) -> Option<Vec<u8>> {
         let d = c.to_digit(16)? as u8;
         match high.take() {
             None => high = Some(d),
-            Some(h) => out.push(h << 4 | d),
+            Some(h) => out.push((h << 4) | d),
         }
     }
     if high.is_some() {

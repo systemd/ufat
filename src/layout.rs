@@ -753,7 +753,7 @@ mod proofs {
     /// sector count, the FAT count and the alignment too. The solver did
     /// not finish this within half an hour, nor a variant with only the
     /// cluster size and count symbolic within twenty minutes, so it only
-    /// runs with `SLOW=1 meson compile verify`. The slices above prove it for
+    /// runs with `SLOW=1 verify/run.sh`. The slices above prove it for
     /// mkfs.fat's defaults; the exhaustive sweep in tests/exhaustive.rs
     /// covers one FAT, no alignment and a track size for every cluster
     /// count up to 200000.

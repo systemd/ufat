@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-//! The crate root for the verify target: the pure modules of the library, so
+//! The crate root for verify/run.sh: the pure modules of the library, so
 //! that Kani needs neither the json crate nor any I/O. The Kani harnesses
 //! live in `#[cfg(kani)] mod proofs` blocks inside the modules themselves.
 #![allow(dead_code, unused_imports, unreachable_pub)]
+#![cfg_attr(kani, feature(rustc_private))]
+
+// errno.rs takes its values from libc; Kani's sysroot ships std's libc.
+#[cfg(kani)]
+extern crate libc;
 
 #[macro_use]
 #[path = "../src/error.rs"]

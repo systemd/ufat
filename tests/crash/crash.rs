@@ -10,8 +10,12 @@
 //! The generators follow ALICE: every prefix of the trace (model A), every
 //! prefix with its last write torn at a sector boundary (model B), and
 //! within one fsync epoch every pair dropped and every subset (model C).
-//! Runs with `meson test` against a library built with `--cfg ufat_trace`.
+//! Runs with `cargo test` against the library of the ufat-trace package,
+//! which is built with `--cfg ufat_trace`.
 
+extern crate ufat_trace as ufat;
+
+#[path = "../common/mod.rs"]
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -970,7 +974,7 @@ impl Harness {
             Recipe::Subset { epoch, mask } => {
                 let e = &self.epochs[*epoch];
                 (0..e.start)
-                    .chain(e.clone().filter(|&w| mask >> (w - e.start) & 1 == 1))
+                    .chain(e.clone().filter(|&w| (mask >> (w - e.start)) & 1 == 1))
                     .map(|w| self.whole(w))
                     .collect()
             }
@@ -1039,7 +1043,7 @@ impl Harness {
                 let e = &self.epochs[*epoch];
                 let (mut applied, mut dropped) = (Vec::new(), Vec::new());
                 for w in e.clone() {
-                    if mask >> (w - e.start) & 1 == 1 {
+                    if (mask >> (w - e.start)) & 1 == 1 {
                         applied.push(self.describe(w));
                     } else {
                         dropped.push(self.describe(w));
@@ -1064,7 +1068,7 @@ impl Harness {
         self.conflicts[epoch]
             .iter()
             .enumerate()
-            .all(|(i, earlier)| mask >> i & 1 == 0 || earlier.iter().all(|&j| mask >> j & 1 == 1))
+            .all(|(i, earlier)| (mask >> i) & 1 == 0 || earlier.iter().all(|&j| (mask >> j) & 1 == 1))
     }
 
     fn generate(&self, full: bool, cap: usize) -> (Vec<Recipe>, [usize; 4]) {
@@ -1115,7 +1119,7 @@ impl Harness {
                 }
             } else {
                 for _ in 0..cap {
-                    let mask = (u128::from(rng.next()) << 64 | u128::from(rng.next())) & (count - 1);
+                    let mask = ((u128::from(rng.next()) << 64) | u128::from(rng.next())) & (count - 1);
                     if self.valid_subset(epoch, mask) {
                         recipes.push(Recipe::Subset { epoch, mask });
                     } else {
@@ -1514,6 +1518,8 @@ fn threads() -> usize {
 }
 
 fn run(cfg: Config) {
+    // Every run starts a worker per core, so the runs take turns.
+    let _serial = common::serial();
     let started = Instant::now();
     let full = env_flag("UFAT_CRASH_FULL");
     let cap = std::env::var("UFAT_CRASH_CAP")

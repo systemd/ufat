@@ -178,149 +178,37 @@ impl Error {
     }
 }
 
-/// The names of the generic Linux errno values.
-fn errno_name(errno: i32) -> Option<&'static str> {
-    const NAMES: [&str; 134] = [
-        "",
-        "EPERM",
-        "ENOENT",
-        "ESRCH",
-        "EINTR",
-        "EIO",
-        "ENXIO",
-        "E2BIG",
-        "ENOEXEC",
-        "EBADF",
-        "ECHILD",
-        "EAGAIN",
-        "ENOMEM",
-        "EACCES",
-        "EFAULT",
-        "ENOTBLK",
-        "EBUSY",
-        "EEXIST",
-        "EXDEV",
-        "ENODEV",
-        "ENOTDIR",
-        "EISDIR",
-        "EINVAL",
-        "ENFILE",
-        "EMFILE",
-        "ENOTTY",
-        "ETXTBSY",
-        "EFBIG",
-        "ENOSPC",
-        "ESPIPE",
-        "EROFS",
-        "EMLINK",
-        "EPIPE",
-        "EDOM",
-        "ERANGE",
-        "EDEADLK",
-        "ENAMETOOLONG",
-        "ENOLCK",
-        "ENOSYS",
-        "ENOTEMPTY",
-        "ELOOP",
-        "",
-        "ENOMSG",
-        "EIDRM",
-        "ECHRNG",
-        "EL2NSYNC",
-        "EL3HLT",
-        "EL3RST",
-        "ELNRNG",
-        "EUNATCH",
-        "ENOCSI",
-        "EL2HLT",
-        "EBADE",
-        "EBADR",
-        "EXFULL",
-        "ENOANO",
-        "EBADRQC",
-        "EBADSLT",
-        "",
-        "EBFONT",
-        "ENOSTR",
-        "ENODATA",
-        "ETIME",
-        "ENOSR",
-        "ENONET",
-        "ENOPKG",
-        "EREMOTE",
-        "ENOLINK",
-        "EADV",
-        "ESRMNT",
-        "ECOMM",
-        "EPROTO",
-        "EMULTIHOP",
-        "EDOTDOT",
-        "EBADMSG",
-        "EOVERFLOW",
-        "ENOTUNIQ",
-        "EBADFD",
-        "EREMCHG",
-        "ELIBACC",
-        "ELIBBAD",
-        "ELIBSCN",
-        "ELIBMAX",
-        "ELIBEXEC",
-        "EILSEQ",
-        "ERESTART",
-        "ESTRPIPE",
-        "EUSERS",
-        "ENOTSOCK",
-        "EDESTADDRREQ",
-        "EMSGSIZE",
-        "EPROTOTYPE",
-        "ENOPROTOOPT",
-        "EPROTONOSUPPORT",
-        "ESOCKTNOSUPPORT",
-        "EOPNOTSUPP",
-        "EPFNOSUPPORT",
-        "EAFNOSUPPORT",
-        "EADDRINUSE",
-        "EADDRNOTAVAIL",
-        "ENETDOWN",
-        "ENETUNREACH",
-        "ENETRESET",
-        "ECONNABORTED",
-        "ECONNRESET",
-        "ENOBUFS",
-        "EISCONN",
-        "ENOTCONN",
-        "ESHUTDOWN",
-        "ETOOMANYREFS",
-        "ETIMEDOUT",
-        "ECONNREFUSED",
-        "EHOSTDOWN",
-        "EHOSTUNREACH",
-        "EALREADY",
-        "EINPROGRESS",
-        "ESTALE",
-        "EUCLEAN",
-        "ENOTNAM",
-        "ENAVAIL",
-        "EISNAM",
-        "EREMOTEIO",
-        "EDQUOT",
-        "ENOMEDIUM",
-        "EMEDIUMTYPE",
-        "ECANCELED",
-        "ENOKEY",
-        "EKEYEXPIRED",
-        "EKEYREVOKED",
-        "EKEYREJECTED",
-        "EOWNERDEAD",
-        "ENOTRECOVERABLE",
-        "ERFKILL",
-        "EHWPOISON",
-    ];
-    usize::try_from(errno)
-        .ok()
-        .and_then(|i| NAMES.get(i))
-        .filter(|n| !n.is_empty())
-        .copied()
+// The names of systemd's errno list, which leaves out the aliases
+// EWOULDBLOCK, EDEADLOCK, ENOTSUP, ECANCELLED and EREFUSED. The numbers
+// come from libc, so they are this architecture's.
+macro_rules! errno_names {
+    ($($name:ident)*) => {
+        /// The name of an errno value, as systemd's errno_to_name() has it.
+        fn errno_name(errno: i32) -> Option<&'static str> {
+            match errno {
+                $(libc::$name => Some(stringify!($name)),)*
+                _ => None,
+            }
+        }
+
+        /// Every name with its number.
+        #[cfg(test)]
+        const ERRNO_NAMES: &[(&str, i32)] = &[$((stringify!($name), libc::$name)),*];
+    };
+}
+
+errno_names! {
+    EPERM ENOENT ESRCH EINTR EIO ENXIO E2BIG ENOEXEC EBADF ECHILD EAGAIN ENOMEM EACCES EFAULT ENOTBLK EBUSY EEXIST
+    EXDEV ENODEV ENOTDIR EISDIR EINVAL ENFILE EMFILE ENOTTY ETXTBSY EFBIG ENOSPC ESPIPE EROFS EMLINK EPIPE EDOM
+    ERANGE EDEADLK ENAMETOOLONG ENOLCK ENOSYS ENOTEMPTY ELOOP ENOMSG EIDRM ECHRNG EL2NSYNC EL3HLT EL3RST ELNRNG
+    EUNATCH ENOCSI EL2HLT EBADE EBADR EXFULL ENOANO EBADRQC EBADSLT EBFONT ENOSTR ENODATA ETIME ENOSR ENONET ENOPKG
+    EREMOTE ENOLINK EADV ESRMNT ECOMM EPROTO EMULTIHOP EDOTDOT EBADMSG EOVERFLOW ENOTUNIQ EBADFD EREMCHG ELIBACC
+    ELIBBAD ELIBSCN ELIBMAX ELIBEXEC EILSEQ ERESTART ESTRPIPE EUSERS ENOTSOCK EDESTADDRREQ EMSGSIZE EPROTOTYPE
+    ENOPROTOOPT EPROTONOSUPPORT ESOCKTNOSUPPORT EOPNOTSUPP EPFNOSUPPORT EAFNOSUPPORT EADDRINUSE EADDRNOTAVAIL
+    ENETDOWN ENETUNREACH ENETRESET ECONNABORTED ECONNRESET ENOBUFS EISCONN ENOTCONN ESHUTDOWN ETOOMANYREFS ETIMEDOUT
+    ECONNREFUSED EHOSTDOWN EHOSTUNREACH EALREADY EINPROGRESS ESTALE EUCLEAN ENOTNAM ENAVAIL EISNAM EREMOTEIO EDQUOT
+    ENOMEDIUM EMEDIUMTYPE ECANCELED ENOKEY EKEYEXPIRED EKEYREVOKED EKEYREJECTED EOWNERDEAD ENOTRECOVERABLE ERFKILL
+    EHWPOISON
 }
 
 /// What a method handler returns.
@@ -553,8 +441,8 @@ impl Connection {
     /// call is answered.
     pub fn take_fd(&mut self, index: usize) -> io::Result<OwnedFd> {
         match self.fds.get_mut(index) {
-            None => Err(io::Error::from_raw_os_error(sys::ENXIO)),
-            Some(slot) => slot.take().ok_or_else(|| io::Error::from_raw_os_error(sys::EBADF)),
+            None => Err(io::Error::from_raw_os_error(libc::ENXIO)),
+            Some(slot) => slot.take().ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF)),
         }
     }
 
@@ -1258,7 +1146,7 @@ impl Client {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection was upgraded"))?;
         let socket = stream
             .socket()
-            .ok_or_else(|| io::Error::from_raw_os_error(sys::ENOTSOCK))?;
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOTSOCK))?;
         let mut text = m.to_string().into_bytes();
         text.push(0);
         let sent = sys::send_with_fds(socket, &text, fds)?;
@@ -1863,14 +1751,38 @@ error Boom(reason: string)
         assert_eq!(e.parameters.get("errno").unwrap().as_i64(), Some(2));
         assert_eq!(e.parameters.get("errnoName").unwrap().as_str(), Some("ENOENT"));
         assert_eq!(
-            Error::system(133).parameters.get("errnoName").unwrap().as_str(),
+            Error::system(libc::EHWPOISON)
+                .parameters
+                .get("errnoName")
+                .unwrap()
+                .as_str(),
             Some("EHWPOISON")
         );
         assert_eq!(
-            Error::system(124).parameters.get("errnoName").unwrap().as_str(),
+            Error::system(libc::EMEDIUMTYPE)
+                .parameters
+                .get("errnoName")
+                .unwrap()
+                .as_str(),
             Some("EMEDIUMTYPE")
         );
         assert!(!Error::system(9999).parameters.contains_key("errnoName"));
-        assert!(!Error::system(41).parameters.contains_key("errnoName"));
+    }
+
+    /// Every name maps to its number and back, and the aliases have the
+    /// name of what they alias, as in systemd.
+    #[test]
+    fn errno_names() {
+        assert_eq!(ERRNO_NAMES.len(), 131);
+        for &(name, errno) in ERRNO_NAMES {
+            assert_eq!(errno_name(errno), Some(name));
+        }
+        assert_eq!(errno_name(libc::EWOULDBLOCK), Some("EAGAIN"));
+        assert_eq!(errno_name(libc::ENOTSUP), Some("EOPNOTSUPP"));
+        if libc::EDEADLOCK != libc::EDEADLK {
+            assert_eq!(errno_name(libc::EDEADLOCK), None);
+        }
+        assert_eq!(errno_name(0), None);
+        assert_eq!(errno_name(9999), None);
     }
 }

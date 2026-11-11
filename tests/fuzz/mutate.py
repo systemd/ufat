@@ -13,8 +13,8 @@ outsized RSS, any other exit status or an image that changed size is a
 defect and is saved under OUT/findings/<signature>/ together with the
 mutated bytes and the edit list that reproduces it from the seed.
 
-    tests/fuzz/mutate.py images   --ufat build/ufat --seeds SEEDS --out OUT --count N
-    tests/fuzz/mutate.py manifests --ufat build/ufat --seeds SEEDS --out OUT --count N
+    tests/fuzz/mutate.py images   --ufat target/debug/ufat --seeds SEEDS --out OUT --count N
+    tests/fuzz/mutate.py manifests --ufat target/debug/ufat --seeds SEEDS --out OUT --count N
 
 SEEDS is what tests/fuzz/seeds.sh writes. Python 3 standard library only.
 """

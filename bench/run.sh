@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
-# ufat benchmarks, see HACKING.md. Not part of `meson test`.
+# ufat benchmarks, see HACKING.md. Not part of `cargo test`.
 #
 # Builds deterministic inputs on tmpfs, then times mkfs, populate, size,
 # manifest/assemble (directory and stream source), fsck and the Varlink
@@ -16,13 +16,14 @@
 #
 # Usage: bench/run.sh [CASE-REGEX]
 #
-# `meson compile -C build bench` builds the binary and the two helpers and
-# runs this script. CASE-REGEX defaults to BENCH_CASES, or every case.
+# `cargo build --release --locked -p ufat -p bench` builds the binary and
+# the two helpers. CASE-REGEX defaults to BENCH_CASES, or every case.
 #
 # Environment:
 #   UFAT         the binary to measure (default: BUILD/ufat); any ufat
 #                binary works, BUILD only supplies the helpers
-#   BUILD        the meson build directory (default: build/ of this tree)
+#   BUILD        the directory with the helpers (default: target/release of
+#                this tree)
 #   BENCH_DIR    scratch directory, put it on tmpfs (default: $TMPDIR/ufat-bench)
 #   REPEAT       runs per measurement (default 3)
 #   REPEAT_FAST  runs for a measurement whose first run took under 100 ms
@@ -58,7 +59,7 @@
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/.." && pwd)
 
-BUILD=${BUILD:-$repo/build}
+BUILD=${BUILD:-$repo/target/release}
 UFAT=${UFAT:-$BUILD/ufat}
 BENCH_DIR=${BENCH_DIR:-${TMPDIR:-/tmp}/ufat-bench}
 REPEAT=${REPEAT:-3}
@@ -126,10 +127,10 @@ RAW=$OUT/raw.tsv
 say() { printf '%s\n' "$*" >&2; }
 
 # ------------------------------------------------------------------ helpers
-MEASURE=$BUILD/bench/measure
-GENFILE=$BUILD/bench/genfile
+MEASURE=$BUILD/measure
+GENFILE=$BUILD/genfile
 if [ ! -x "$MEASURE" ] || [ ! -x "$GENFILE" ]; then
-    say "no helpers in $BUILD/bench, run meson compile -C $BUILD bench"
+    say "no helpers in $BUILD, run cargo build --release --locked -p ufat -p bench"
     exit 1
 fi
 [ -x "$UFAT" ] || { say "no ufat binary at $UFAT"; exit 1; }

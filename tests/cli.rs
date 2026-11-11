@@ -72,7 +72,7 @@ fn tree(root: &Path) {
 fn assemble_and_populate_take_trees_and_manifests() {
     let _serial = common::serial();
     let Some(bin) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let dir = Temp::dir();
     let root = dir.path();
@@ -216,7 +216,7 @@ fn assemble_and_populate_take_trees_and_manifests() {
 fn too_small_volumes_fail_cleanly() {
     let _serial = common::serial();
     let Some(bin) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let dir = Temp::dir();
     let root = dir.path();
@@ -281,7 +281,7 @@ fn host_paths_need_not_be_utf8() {
     use std::os::unix::ffi::OsStrExt;
     let _serial = common::serial();
     let Some(bin) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let dir = Temp::dir();
     let tree_dir = dir.path().join(OsStr::from_bytes(b"tree-\xfe"));
@@ -328,7 +328,7 @@ fn host_paths_need_not_be_utf8() {
 fn populate_and_remove_work_on_paths() {
     let _serial = common::serial();
     let Some(bin) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let dir = Temp::dir();
     let root = dir.path();
@@ -392,12 +392,9 @@ fn populate_and_remove_work_on_paths() {
 /// Creates a FIFO without spawning mkfifo(1).
 fn sys_mkfifo(path: &Path) {
     use std::os::unix::ffi::OsStrExt;
-    extern "C" {
-        fn mkfifo(path: *const std::ffi::c_char, mode: u32) -> std::ffi::c_int;
-    }
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
     // SAFETY: a valid NUL terminated path; mkfifo touches nothing else.
-    assert_eq!(unsafe { mkfifo(c.as_ptr(), 0o600) }, 0);
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
 }
 
 /// assemble, populate and describe write the UAPI.16 manifest of what the
@@ -406,7 +403,7 @@ fn sys_mkfifo(path: &Path) {
 fn manifests_of_what_was_written() {
     let _serial = common::serial();
     let Some(bin) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let dir = Temp::dir();
     let root = dir.path();
@@ -441,7 +438,7 @@ fn manifests_of_what_was_written() {
 fn hashes_and_capabilities() {
     let _serial = common::serial();
     let Some(bin) = ufat() else {
-        return eprintln!("skipping: UFAT not set");
+        return eprintln!("skipping: no ufat binary");
     };
     let dir = Temp::dir();
     let root = dir.path();

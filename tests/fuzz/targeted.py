@@ -4,7 +4,7 @@
 rather than from random mutation. Each probe prints PASS or DEFECT with the
 observed outcome; exit status 1 when a defect was seen.
 
-    tests/fuzz/targeted.py --ufat build/ufat --seeds SEEDS --work DIR
+    tests/fuzz/targeted.py --ufat target/debug/ufat --seeds SEEDS --work DIR
 """
 
 import argparse

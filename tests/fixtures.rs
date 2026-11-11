@@ -21,10 +21,7 @@ use ufat::plan::{Plan, PlanOptions};
 use ufat::volume::Volume;
 
 fn fixtures() -> PathBuf {
-    match std::env::var("UFAT_FIXTURES") {
-        Ok(dir) => PathBuf::from(dir),
-        Err(_) => Path::new(file!()).parent().unwrap().join("fixtures"),
-    }
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
 fn load(case: &str, name: &str) -> Manifest {

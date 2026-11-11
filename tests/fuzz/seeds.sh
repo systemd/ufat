@@ -9,15 +9,15 @@
 # by the fuzz-seeds helper (tests/fuzz/seeds.rs) and filled with `ufat
 # populate`.
 #
-#     FUZZ_SEEDS=build/tests/fuzz/fuzz-seeds tests/fuzz/seeds.sh OUTDIR [UFAT] [MTOOLS_BIN_DIR]
+#     FUZZ_SEEDS=target/debug/fuzz-seeds tests/fuzz/seeds.sh OUTDIR [UFAT] [MTOOLS_BIN_DIR]
 set -euo pipefail
 
 OUT=${1:?usage: seeds.sh OUTDIR [UFAT] [MTOOLS_BIN_DIR]}
-UFAT=${2:-$(dirname "$0")/../../build/ufat}
+UFAT=${2:-$(dirname "$0")/../../target/debug/ufat}
 MTOOLS=${3:-${UFAT_MTOOLS:-}}
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
-SEEDS=${FUZZ_SEEDS:-$REPO/build/tests/fuzz/fuzz-seeds}
+SEEDS=${FUZZ_SEEDS:-$REPO/target/debug/fuzz-seeds}
 export SOURCE_DATE_EPOCH=1700000000
 export MTOOLS_SKIP_CHECK=1
 export TZ=UTC

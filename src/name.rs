@@ -29,9 +29,8 @@
 //! other, so the same tree would give different images. Linux folds ASCII
 //! only, Windows and FatFs fold by tables of their own, so there is no
 //! external table to match and the pinned one is the floor compiler's.
-//! `meson compile update-fold-table` regenerates it with such a compiler;
-//! moving it to a newer Unicode version is a deliberate change, see
-//! tools/fold-table.rs.
+//! HACKING.md says how to regenerate it with such a compiler; moving it to
+//! a newer Unicode version is a deliberate change, see tools/fold-table.rs.
 
 use crate::bytes::le16;
 use crate::dirent::{

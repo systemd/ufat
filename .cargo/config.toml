@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+# ufat is linked statically against glibc by default. RUSTFLAGS replaces
+# this: RUSTFLAGS=-Ctarget-feature=-crt-static links dynamically.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))']
+rustflags = ["-C", "target-feature=+crt-static"]
