@@ -29,26 +29,6 @@ With rustup, `cargo +1.85.0` selects rustc 1.85:
 
     cargo +1.85.0 build --locked
 
-The tool is linked dynamically against glibc.
-
-## A static binary
-
-A self-contained tool, which needs no shared library at run time, is
-built with:
-
-    RUSTFLAGS='-C target-feature=+crt-static' \
-        cargo build --release --locked --target x86_64-unknown-linux-gnu
-
-It ends up in `target/x86_64-unknown-linux-gnu/release/ufat`. Replace
-the triple with the one of the machine the tool is for. With `--target`,
-the setting applies to ufat and not to the build scripts. `cargo install
---locked --path . --target x86_64-unknown-linux-gnu`, with the same
-`RUSTFLAGS`, installs the static tool.
-
-The static tool is a static PIE where glibc ships rcrt1.o, and a plain
-static executable elsewhere. rustc 1.99 cannot link it on armv7,
-powerpc, powerpc64, powerpc64le and sparc64. rustc 1.100 can.
-
 ## Tests
 
     cargo test --locked
@@ -224,8 +204,6 @@ every push to main and once a week. It runs:
 - the build and the tests with rustc 1.85 and with the current stable
   rustc, on x86_64 and aarch64, with warnings turned into errors,
 - the case folding table check with rustc 1.85,
-- the static build and its tests on x86_64 and aarch64, and a check
-  that the static tool needs no shared library,
 - clippy with rustc 1.85 and with the current stable rustc, for every
   supported architecture,
 - rustfmt,

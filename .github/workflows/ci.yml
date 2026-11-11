@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # The build and the tests with the oldest and the newest rustc on x86_64
-# and aarch64, linked dynamically and statically, the lints for every
-# supported architecture, the build and the tests on the other
-# architectures, the exhaustive sweeps, a fuzzing run, the coverage
-# report, a compile check of the Kani proofs and the dependency check. See
-# HACKING.md.
+# and aarch64, the lints for every supported architecture, the build and
+# the tests on the other architectures, the exhaustive sweeps, a fuzzing
+# run, the coverage report, a compile check of the Kani proofs and the
+# dependency check. See HACKING.md.
 #
 # Warnings fail the build through CARGO_TARGET_<TRIPLE>_RUSTFLAGS and
-# clippy's -D warnings. The static build adds +crt-static to the same
-# variable and passes --target, which keeps it away from the build
-# scripts.
+# clippy's -D warnings.
 
 name: CI
 
@@ -66,13 +63,8 @@ jobs:
           rustup toolchain install "$RUST" --profile minimal
           rustup default "$RUST"
           rustc --version
-          host=$(rustc -vV | sed -n 's/^host: //p')
-          rustflags=CARGO_TARGET_$(echo "$host" | tr 'a-z-' 'A-Z_')_RUSTFLAGS
-          {
-            echo "HOST=$host"
-            echo "HOST_RUSTFLAGS=$rustflags"
-            echo "$rustflags=-D warnings"
-          } >> "$GITHUB_ENV"
+          host=$(rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')
+          echo "CARGO_TARGET_${host}_RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
 
       - name: Check for the reference tools
         # The tests skip what they cannot find. Here they must not.
@@ -94,30 +86,7 @@ jobs:
         run: cargo run --locked -q -p fold-table | diff -u src/name/fold_table.rs -
 
       - name: Build the release binary
-        # Linked dynamically, so it has a program interpreter.
-        run: |
-          cargo build --release --locked
-          file target/release/ufat
-          readelf -lW target/release/ufat | grep INTERP ||
-            { echo "::error::target/release/ufat has no program interpreter"; exit 1; }
-
-      - name: Build and test the static binary
-        # The static build of HACKING.md. The binary must have no program
-        # interpreter and need no shared library.
-        run: |
-          export "$HOST_RUSTFLAGS=-D warnings -C target-feature=+crt-static"
-          cargo test --locked --target "$HOST"
-          cargo build --release --locked --target "$HOST"
-          bin=target/$HOST/release/ufat
-          file "$bin"
-          if readelf -lW "$bin" | grep INTERP; then
-            echo "::error::$bin has a program interpreter"
-            exit 1
-          fi
-          if readelf -dW "$bin" | grep NEEDED; then
-            echo "::error::$bin needs shared libraries"
-            exit 1
-          fi
+        run: cargo build --release --locked
 
   clippy:
     name: clippy (rustc ${{ matrix.rust }})
