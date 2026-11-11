@@ -495,3 +495,102 @@ fn findings_name_what_the_kernel_drops() {
     assert!(!has(&numbers, FindingKind::DeviceNumber, b"d/file-rdev"));
     assert!(!has(&findings("types"), FindingKind::DeviceNumber, b"d/bigdev"));
 }
+
+/// splitmix64, to damage the fixtures the same way on every run.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, limit: usize) -> usize {
+        (self.next() % limit.max(1) as u64) as usize
+    }
+}
+
+/// Nothing that is read is trusted: an archive that is damaged in any
+/// way is an error or a list of findings, never a panic and never a read
+/// outside of the archive. Every fixture is damaged in a few hundred ways
+/// here: bytes changed, digits of header fields changed, cut short, a
+/// part doubled, a part taken out.
+#[test]
+fn damaged_archives_are_read_without_a_panic() {
+    let mut rng = Rng(0x6370_696f);
+    let mut read = 0u64;
+    for (case, (archive, _)) in cases() {
+        if archive.is_empty() {
+            continue;
+        }
+        for round in 0..300 {
+            let mut bytes = archive.clone();
+            match round % 5 {
+                0 => {
+                    for _ in 0..1 + rng.below(4) {
+                        let at = rng.below(bytes.len());
+                        bytes[at] = rng.next() as u8;
+                    }
+                }
+                // A digit of a header: sizes and types that are not what
+                // follows.
+                1 => {
+                    let at = rng.below(bytes.len());
+                    if let Some(digit) = bytes[at..].iter().position(|b| b.is_ascii_hexdigit()) {
+                        bytes[at + digit] = b"0123456789abcdefF"[rng.below(17)];
+                    }
+                }
+                2 => bytes.truncate(rng.below(bytes.len())),
+                3 => {
+                    let from = rng.below(bytes.len());
+                    let len = rng.below(bytes.len() - from).min(4096);
+                    let part = bytes[from..from + len].to_vec();
+                    let at = rng.below(bytes.len());
+                    bytes.splice(at..at, part);
+                }
+                _ => {
+                    let from = rng.below(bytes.len());
+                    let len = rng.below(bytes.len() - from);
+                    bytes.drain(from..from + len);
+                }
+            }
+            // Whatever comes of it, it comes back.
+            let _ = check::check(&bytes[..]);
+            if let Ok((tree, _)) = Tree::replay(&bytes[..], &mut |_| {}) {
+                // What the tree points at is inside the archive.
+                for (name, inode) in tree.entries() {
+                    let end = inode.data_offset + u64::from(inode.size);
+                    assert!(
+                        inode.size == 0 || end <= bytes.len() as u64,
+                        "{} round {}: '{}' has its contents outside of the archive",
+                        case,
+                        round,
+                        String::from_utf8_lossy(&name)
+                    );
+                    // And every name is in a directory of the tree.
+                    let parent = match name.iter().rposition(|&b| b == b'/') {
+                        _ if name == b"." => None,
+                        Some(at) => Some(&name[..at]),
+                        None => Some(&b"."[..]),
+                    };
+                    if let Some(parent) = parent {
+                        assert!(
+                            tree.get(parent).is_some_and(|inode| inode.kind == Kind::Directory),
+                            "{} round {}: the directory of '{}' is not in the tree",
+                            case,
+                            round,
+                            String::from_utf8_lossy(&name)
+                        );
+                    }
+                }
+                let mut out = Vec::new();
+                let _ = tree.write_manifest(&bytes[..], cpio::manifest::Fields::default(), &mut out, &mut |_| {});
+            }
+            read += 1;
+        }
+    }
+    assert!(read > 15_000, "only {} damaged archives were read", read);
+}
