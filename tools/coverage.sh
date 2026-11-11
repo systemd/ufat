@@ -16,8 +16,6 @@ set -eu -o pipefail
 
 cd "$(dirname "$0")/.."
 export CARGO_TARGET_DIR=$PWD/target/coverage
-# This replaces the static linking of .cargo/config.toml, which the report
-# does not need.
 export RUSTFLAGS="-C instrument-coverage"
 profiles=$CARGO_TARGET_DIR/profiles
 # Set before the build: the build scripts are instrumented as well and

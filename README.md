@@ -39,8 +39,20 @@ You need rustc and cargo 1.85 or newer, on Linux with glibc.
 
 This builds the tool `target/release/ufat` and installs it into
 /usr/local/bin. Without `--root` it goes into ~/.cargo/bin. The tool is
-linked statically. `RUSTFLAGS=-Ctarget-feature=-crt-static` links it
-dynamically.
+linked dynamically against glibc.
+
+A self-contained tool, which needs no shared library at run time, is
+built with:
+
+    RUSTFLAGS='-C target-feature=+crt-static' \
+        cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+It ends up in `target/x86_64-unknown-linux-gnu/release/ufat`. Replace
+the triple with the one of the machine the tool is for. `cargo install`
+with the same `RUSTFLAGS` and `--target` installs it. The static tool is
+a static PIE where glibc ships rcrt1.o, and a plain static executable
+elsewhere. rustc 1.99 cannot link it on armv7, powerpc, powerpc64,
+powerpc64le and sparc64. rustc 1.100 can.
 
 HACKING.md describes the tests and the other tools.
 

@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # The build and the tests with the oldest and the newest rustc on x86_64
-# and aarch64, the lints for every supported architecture, the build and
-# the tests on the other architectures, the exhaustive sweeps, a fuzzing
-# run, the coverage report, a compile check of the Kani proofs and the
-# dependency check. See HACKING.md.
+# and aarch64, linked dynamically and statically, the lints for every
+# supported architecture, the build and the tests on the other
+# architectures, the exhaustive sweeps, a fuzzing run, the coverage
+# report, a compile check of the Kani proofs and the dependency check. See
+# HACKING.md.
 #
 # Warnings fail the build through CARGO_TARGET_<TRIPLE>_RUSTFLAGS and
-# clippy's -D warnings. RUSTFLAGS would replace the static linking of
-# .cargo/config.toml.
+# clippy's -D warnings. The static build adds +crt-static to the same
+# variable and passes --target, which keeps it away from the build
+# scripts.
 
 name: CI
 
@@ -64,8 +66,13 @@ jobs:
           rustup toolchain install "$RUST" --profile minimal
           rustup default "$RUST"
           rustc --version
-          host=$(rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')
-          echo "CARGO_TARGET_${host}_RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          rustflags=CARGO_TARGET_$(echo "$host" | tr 'a-z-' 'A-Z_')_RUSTFLAGS
+          {
+            echo "HOST=$host"
+            echo "HOST_RUSTFLAGS=$rustflags"
+            echo "$rustflags=-D warnings"
+          } >> "$GITHUB_ENV"
 
       - name: Check for the reference tools
         # The tests skip what they cannot find. Here they must not.
@@ -87,9 +94,30 @@ jobs:
         run: cargo run --locked -q -p fold-table | diff -u src/name/fold_table.rs -
 
       - name: Build the release binary
+        # Linked dynamically, so it has a program interpreter.
         run: |
           cargo build --release --locked
-          file target/release/ufat | grep -E 'static-pie linked|statically linked'
+          file target/release/ufat
+          readelf -lW target/release/ufat | grep INTERP ||
+            { echo "::error::target/release/ufat has no program interpreter"; exit 1; }
+
+      - name: Build and test the static binary
+        # The static build of HACKING.md. The binary must have no program
+        # interpreter and need no shared library.
+        run: |
+          export "$HOST_RUSTFLAGS=-D warnings -C target-feature=+crt-static"
+          cargo test --locked --target "$HOST"
+          cargo build --release --locked --target "$HOST"
+          bin=target/$HOST/release/ufat
+          file "$bin"
+          if readelf -lW "$bin" | grep INTERP; then
+            echo "::error::$bin has a program interpreter"
+            exit 1
+          fi
+          if readelf -dW "$bin" | grep NEEDED; then
+            echo "::error::$bin needs shared libraries"
+            exit 1
+          fi
 
   clippy:
     name: clippy (rustc ${{ matrix.rust }})
@@ -169,53 +197,64 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # i686 runs on the x86_64 kernel, the others under qemu. The
-          # binaries are static, so qemu needs no sysroot. binfmt_misc
-          # hands the ufat binary the tests run to qemu as well.
+          # i686 runs on the x86_64 kernel with the i386 libraries of the
+          # runner. The others run under qemu with the libraries of the
+          # cross toolchain in /usr/<gcc>. binfmt_misc hands the ufat
+          # binary the tests start to qemu as well, and QEMU_LD_PREFIX
+          # tells qemu where the libraries are.
           - target: i686-unknown-linux-gnu
             gcc: i686-linux-gnu
             libc: i386
             qemu: ''
+            runtime: libc6-i386 lib32gcc-s1
             experimental: false
           - target: armv7-unknown-linux-gnueabihf
             gcc: arm-linux-gnueabihf
             libc: armhf
             qemu: arm
+            runtime: ''
             experimental: false
           - target: powerpc-unknown-linux-gnu
             gcc: powerpc-linux-gnu
             libc: powerpc
             qemu: ppc
+            runtime: ''
             experimental: false
           - target: powerpc64-unknown-linux-gnu
             gcc: powerpc64-linux-gnu
             libc: ppc64
             qemu: ppc64
+            runtime: ''
             experimental: false
           - target: powerpc64le-unknown-linux-gnu
             gcc: powerpc64le-linux-gnu
             libc: ppc64el
             qemu: ppc64le
+            runtime: ''
             experimental: false
           - target: riscv64gc-unknown-linux-gnu
             gcc: riscv64-linux-gnu
             libc: riscv64
             qemu: riscv64
+            runtime: ''
             experimental: false
           - target: s390x-unknown-linux-gnu
             gcc: s390x-linux-gnu
             libc: s390x
             qemu: s390x
+            runtime: ''
             experimental: false
           - target: sparc64-unknown-linux-gnu
             gcc: sparc64-linux-gnu
             libc: sparc64
             qemu: sparc64
+            runtime: ''
             experimental: true
           - target: loongarch64-unknown-linux-gnu
             gcc: loongarch64-linux-gnu
             libc: loong64
             qemu: loongarch64
+            runtime: ''
             experimental: true
     env:
       TARGET: ${{ matrix.target }}
@@ -228,10 +267,13 @@ jobs:
         env:
           GCC: ${{ matrix.gcc }}
           LIBC: ${{ matrix.libc }}
+          RUNTIME: ${{ matrix.runtime }}
         run: |
           sudo apt-get update -q
+          # shellcheck disable=SC2086
           sudo apt-get install -y -q --no-install-recommends \
-            "gcc-$GCC" "libc6-dev-$LIBC-cross" qemu-user qemu-user-binfmt dosfstools mtools
+            "gcc-$GCC" "libc6-dev-$LIBC-cross" "libc6-$LIBC-cross" $RUNTIME \
+            qemu-user qemu-user-binfmt dosfstools mtools
 
       - name: Install rustc
         env:
@@ -247,7 +289,8 @@ jobs:
             echo "CARGO_TARGET_${t}_LINKER=$GCC-gcc"
             echo "CARGO_TARGET_${t}_RUSTFLAGS=-D warnings"
             if [ -n "$QEMU" ]; then
-              echo "CARGO_TARGET_${t}_RUNNER=qemu-$QEMU"
+              echo "CARGO_TARGET_${t}_RUNNER=qemu-$QEMU -L /usr/$GCC"
+              echo "QEMU_LD_PREFIX=/usr/$GCC"
             fi
           } >> "$GITHUB_ENV"
 
@@ -266,9 +309,6 @@ jobs:
             args=(--skip o_emptypath --skip so_passrights --skip sigterm)
           fi
           cargo test --locked --target "$TARGET" -- "${args[@]}"
-
-      - name: Check that the binary is static
-        run: file "target/$TARGET/debug/ufat" | grep -E 'static-pie linked|statically linked'
 
   slow:
     name: Exhaustive sweeps
@@ -359,10 +399,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Kani ${{ env.KANI_VERSION }}
-        # Outside the tree: the static linking .cargo/config.toml asks for
-        # cannot build the proc-macros of Kani.
         run: |
-          cd "$RUNNER_TEMP"
           cargo install --locked kani-verifier --version "$KANI_VERSION"
           cargo kani setup
 

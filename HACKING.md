@@ -29,11 +29,25 @@ With rustup, `cargo +1.85.0` selects rustc 1.85:
 
     cargo +1.85.0 build --locked
 
-The tool is linked statically, as .cargo/config.toml asks. `RUSTFLAGS`
-replaces that setting, so `RUSTFLAGS=-Ctarget-feature=-crt-static`
-links it dynamically. To add compiler flags and keep the static link,
-set `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` instead, for example
-`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS`.
+The tool is linked dynamically against glibc.
+
+## A static binary
+
+A self-contained tool, which needs no shared library at run time, is
+built with:
+
+    RUSTFLAGS='-C target-feature=+crt-static' \
+        cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+It ends up in `target/x86_64-unknown-linux-gnu/release/ufat`. Replace
+the triple with the one of the machine the tool is for. With `--target`,
+the setting applies to ufat and not to the build scripts. `cargo install
+--locked --path . --target x86_64-unknown-linux-gnu`, with the same
+`RUSTFLAGS`, installs the static tool.
+
+The static tool is a static PIE where glibc ships rcrt1.o, and a plain
+static executable elsewhere. rustc 1.99 cannot link it on armv7,
+powerpc, powerpc64, powerpc64le and sparc64. rustc 1.100 can.
 
 ## Tests
 
@@ -110,8 +124,7 @@ minute on 16 cores. Its tests are ignored by default, so a plain
 
 The pure modules contain proofs for the Kani model checker in
 `#[cfg(kani)]` blocks. verify/lib.rs is a crate root that holds only
-these modules. Install Kani outside the ufat tree, whose static linking
-breaks the build of Kani:
+these modules. Install Kani with:
 
     cargo install --locked kani-verifier
     cargo kani setup
@@ -211,7 +224,8 @@ every push to main and once a week. It runs:
 - the build and the tests with rustc 1.85 and with the current stable
   rustc, on x86_64 and aarch64, with warnings turned into errors,
 - the case folding table check with rustc 1.85,
-- a check that the release build of the tool is linked statically,
+- the static build and its tests on x86_64 and aarch64, and a check
+  that the static tool needs no shared library,
 - clippy with rustc 1.85 and with the current stable rustc, for every
   supported architecture,
 - rustfmt,
