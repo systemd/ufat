@@ -27,6 +27,9 @@ pub enum NameProblem {
     TrailingSpaceOrDot,
     /// More than 255 UTF-16 units, or a path longer than PATH_MAX.
     TooLong,
+    /// A name the format keeps for itself, the name of the entry that
+    /// ends a cpio archive.
+    Reserved,
 }
 
 impl NameProblem {
@@ -39,6 +42,7 @@ impl NameProblem {
             NameProblem::LeadingSpace => "leadingSpace",
             NameProblem::TrailingSpaceOrDot => "trailingSpaceOrDot",
             NameProblem::TooLong => "tooLong",
+            NameProblem::Reserved => "reserved",
         }
     }
 }

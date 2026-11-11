@@ -663,6 +663,26 @@ mod tests {
         }
     }
 
+    /// The format has the numbers of Linux. They are spelled out here, so
+    /// that an archive never depends on where it is written.
+    #[test]
+    fn the_numbers_are_the_ones_of_linux() {
+        use crate::sys;
+        assert_eq!(MAX_NAME_SIZE as usize, sys::PATH_MAX);
+        assert_eq!(S_IFMT, sys::S_IFMT);
+        for (kind, bits) in [
+            (Kind::Regular, sys::S_IFREG),
+            (Kind::Directory, sys::S_IFDIR),
+            (Kind::Symlink, sys::S_IFLNK),
+            (Kind::CharDevice, sys::S_IFCHR),
+            (Kind::BlockDevice, sys::S_IFBLK),
+            (Kind::Fifo, sys::S_IFIFO),
+            (Kind::Socket, sys::S_IFSOCK),
+        ] {
+            assert_eq!(kind.bits(), bits);
+        }
+    }
+
     #[test]
     fn kinds_and_type_bits() {
         let kinds = [

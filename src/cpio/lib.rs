@@ -12,4 +12,17 @@
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+// The error type, images, access to the host and the hashes are the
+// shared crate's. They are part of this crate's interface too.
+#[macro_use]
+extern crate shared;
+pub(crate) use shared::sys;
+pub use shared::{bail, err};
+pub use shared::{device, errno, host, progress, sha256, sha512};
+pub use shared::{Context, Detail, Error, NameProblem, Result};
+
 pub mod header;
+pub mod name;
+#[cfg(test)]
+mod test_util;
+pub mod write;

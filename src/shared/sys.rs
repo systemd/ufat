@@ -64,7 +64,28 @@ pub const O_PATH: c_int = libc::O_PATH;
 pub(crate) use uapi::{O_EMPTYPATH, O_LARGEFILE};
 
 /// NAME_MAX, include/uapi/linux/limits.h: the longest file name.
-const NAME_MAX: usize = libc::NAME_MAX as usize;
+pub const NAME_MAX: usize = libc::NAME_MAX as usize;
+/// PATH_MAX, include/uapi/linux/limits.h: the longest path, with its NUL.
+pub const PATH_MAX: usize = libc::PATH_MAX as usize;
+
+// The file type bits of a mode, include/uapi/linux/stat.h. They are the
+// same on every architecture.
+/// The bits of a mode that say what a file is.
+pub const S_IFMT: u32 = libc::S_IFMT;
+/// A regular file.
+pub const S_IFREG: u32 = libc::S_IFREG;
+/// A directory.
+pub const S_IFDIR: u32 = libc::S_IFDIR;
+/// A symbolic link.
+pub const S_IFLNK: u32 = libc::S_IFLNK;
+/// A character device node.
+pub const S_IFCHR: u32 = libc::S_IFCHR;
+/// A block device node.
+pub const S_IFBLK: u32 = libc::S_IFBLK;
+/// A FIFO.
+pub const S_IFIFO: u32 = libc::S_IFIFO;
+/// A socket.
+pub const S_IFSOCK: u32 = libc::S_IFSOCK;
 
 /// Steps a resolution by hand may take before we assume a loop, the
 /// CHASE_MAX of src/basic/chase.h: if people change the tree behind our
