@@ -21,11 +21,16 @@ and the default archive built in.
 
 - tests/cpio_kernel.rs holds what ucpio says an archive unpacks to
   against the listing, for every case.
+- tests/cpio_made.rs writes the `made-*` archives again and holds them
+  against the files, byte for byte.
+- tests/cpio_reference.rs lets GNU cpio, bsdcpio and busybox read the
+  `made-*` archives and holds what they unpack against the listings.
 
 ## The cases
 
-The cases are written by `make-fixtures.py` itself, byte by byte and
-without ucpio. Many of them are archives that no tool writes.
+The cases without the `made-` prefix are written by `make-fixtures.py`
+itself, byte by byte and without ucpio. Many of them are archives that no
+tool writes.
 
 | cases | what is in them |
 | --- | --- |
@@ -43,6 +48,10 @@ without ucpio. Many of them are archives that no tool writes.
 | `crc`, `crc-wrong`, `crc-wrong-link` | the form with checksums |
 | `builtin` | entries below the directories the kernel has before it unpacks anything |
 
+The `made-*` cases are archives ucpio wrote. tests/cpio_made.rs writes
+the files when `UCPIO_BLESS=1` is set. `made-assemble-cut*` are the
+states a crash or a failure leaves of an archive that was being written.
+
 ## Making them again
 
     tests/fixtures/cpio/make-fixtures.py --kernel /boot/vmlinuz-...
@@ -52,6 +61,13 @@ kernel image with `CONFIG_BLK_DEV_INITRD`,
 `CONFIG_INITRAMFS_PRESERVE_MTIME` and a serial console built in. It takes
 the names of cases to make only those. `--keep DIR` keeps the boot images
 and the console logs.
+
+When ucpio writes other bytes than before, tests/cpio_made.rs fails.
+Write the `made-*` archives again and then record what the kernel makes
+of them:
+
+    UCPIO_BLESS=1 cargo test --locked --test cpio_made
+    tests/fixtures/cpio/make-fixtures.py --kernel /boot/vmlinuz-...
 
 ## How a case is booted
 

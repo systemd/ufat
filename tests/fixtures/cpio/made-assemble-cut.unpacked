@@ -1,0 +1,2 @@
+! Initramfs unpacking failed: invalid magic at start of compressed archive
+. d mode=1777 uid=0 gid=0 mtime=boot

@@ -4,11 +4,13 @@
 
     tests/fixtures/cpio/make-fixtures.py --kernel /boot/vmlinuz-...
 
-Every case is an archive written here byte by byte, without ucpio, and
-what a kernel unpacked it to. The archive is appended to a small one that
-holds nothing but an init (init.c), the kernel is booted on the two in
-qemu, and the init lists the root file system. README.md describes the
-files this leaves behind.
+Every case is an archive and what a kernel unpacked it to. The archives
+are written here byte by byte, without ucpio, but for the ones named
+made-*: those are ucpio's own, tests/cpio_made.rs writes them, and they
+are booted as they are. An archive is appended to a small one that holds
+nothing but an init (init.c), the kernel is booted on the two in qemu,
+and the init lists the root file system. README.md describes the files
+this leaves behind.
 
 Needs qemu-system-x86_64, a C compiler that links statically and a kernel
 image with CONFIG_BLK_DEV_INITRD, CONFIG_INITRAMFS_PRESERVE_MTIME and a
@@ -1116,10 +1118,18 @@ def main():
     parser.add_argument("--keep", help="a directory to keep the boot images and logs in")
     parser.add_argument("cases", nargs="*", help="the cases to make, all of them when none is named")
     args = parser.parse_args()
-    unknown = [name for name in args.cases if name not in CASES]
+    # The archives ucpio wrote, see tests/cpio_made.rs. They are booted as
+    # they are.
+    made = {}
+    for entry in sorted(os.listdir(HERE)):
+        stem, extension = os.path.splitext(entry)
+        if stem.startswith("made-") and extension == ".cpio":
+            with open(os.path.join(HERE, entry), "rb") as f:
+                made[stem] = f.read()
+    unknown = [name for name in args.cases if name not in CASES and name not in made]
     if unknown:
         sys.exit("no such case: " + ", ".join(unknown))
-    selected = args.cases or sorted(CASES)
+    selected = args.cases or sorted(CASES) + sorted(made)
 
     with tempfile.TemporaryDirectory() as temporary:
         work = args.keep or temporary
@@ -1133,7 +1143,7 @@ def main():
         baseline = set(line for line in baseline if not line.startswith(". "))
 
         def make(name):
-            archive = CASES[name]()
+            archive = made[name] if name in made else CASES[name]()
             booted, listing = boot(args, work, name, first + archive)
             if booted != version:
                 sys.exit("%s: booted another kernel" % name)
@@ -1142,8 +1152,9 @@ def main():
 
         with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
             for name, archive, listing in pool.map(make, selected):
-                with open(os.path.join(HERE, name + ".cpio"), "wb") as f:
-                    f.write(archive)
+                if name not in made:
+                    with open(os.path.join(HERE, name + ".cpio"), "wb") as f:
+                        f.write(archive)
                 with open(os.path.join(HERE, name + ".unpacked"), "w") as f:
                     f.write("".join(line + "\n" for line in listing))
                 print("%-28s %6d bytes, %3d lines" % (name, len(archive), len(listing)))
@@ -1151,7 +1162,7 @@ def main():
             # Cases that are gone leave no files behind.
             for entry in sorted(os.listdir(HERE)):
                 stem, extension = os.path.splitext(entry)
-                if extension in (".cpio", ".unpacked") and stem not in CASES:
+                if extension in (".cpio", ".unpacked") and stem not in CASES and stem not in made:
                     os.remove(os.path.join(HERE, entry))
             with open(os.path.join(HERE, "VERSION"), "w") as f:
                 f.write(version + "\n")

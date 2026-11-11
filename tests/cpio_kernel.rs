@@ -230,6 +230,9 @@ fn expected(case: &str) -> Expected {
         },
         "end-gap-misaligned" => damaged("Misaligned"),
         "end-magic-old" | "end-magic-none" | "end-stopper" => damaged("Magic"),
+        // An archive that was stopped at its first byte while it was
+        // written: nothing of it is unpacked.
+        "made-assemble-cut-early" | "made-assemble-cut" => damaged("Magic"),
         "end-field" => damaged("Field"),
         "end-unterminated" | "end-unterminated-symlink" => damaged("Unterminated"),
         "end-cut-header" | "end-cut-name" => damaged("Truncated"),

@@ -155,11 +155,17 @@ sha256sum. A test whose tool is not installed is skipped.
 `UFAT_MTOOLS=` points at a directory with mtools binaries, for example a
 local build.
 
+tests/cpio_reference.rs lets GNU cpio, bsdcpio and busybox read archives
+that ucpio wrote. It compares what they unpack with what a kernel
+unpacked, see the next section.
+
 ## The cpio fixtures
 
 tests/fixtures/cpio holds archives and, for each of them, what a kernel
 unpacked it to. tests/cpio_kernel.rs compares that with what ucpio says
-the archive unpacks to. The fixtures are made by booting them in qemu:
+the archive unpacks to. tests/cpio_made.rs checks that ucpio still writes
+the archives that were booted. The fixtures are made by booting them in
+qemu:
 
     tests/fixtures/cpio/make-fixtures.py --kernel /boot/vmlinuz-...
 
