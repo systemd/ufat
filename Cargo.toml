@@ -4,6 +4,7 @@
 members = [
     ".",
     "src/blkid",
+    "src/cpio",
     "src/dlopen",
     "src/dlopen-note",
     "src/fat",
@@ -22,6 +23,7 @@ members = [
 default-members = [
     ".",
     "src/blkid",
+    "src/cpio",
     "src/dlopen",
     "src/dlopen-note",
     "src/fat",
@@ -44,6 +46,7 @@ publish = false
 
 [workspace.dependencies]
 blkid = { path = "src/blkid" }
+cpio = { path = "src/cpio" }
 dlopen = { path = "src/dlopen" }
 dlopen-note = { path = "src/dlopen-note" }
 fat = { path = "src/fat" }

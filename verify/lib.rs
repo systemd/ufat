@@ -26,6 +26,8 @@ pub mod dirent;
 pub mod errno;
 #[path = "../src/fat/fat.rs"]
 pub mod fat;
+#[path = "../src/cpio/header.rs"]
+pub mod header;
 #[path = "../src/fat/layout.rs"]
 pub mod layout;
 #[path = "../src/fat/name.rs"]
