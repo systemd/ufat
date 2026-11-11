@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-//! UAPI.16 manifests and cpio: the entries of an archive from a manifest.
+//! UAPI.16 manifests and cpio: the entries of an archive from a manifest,
+//! and the manifest of what an archive unpacks to.
 //!
 //! The manifests themselves are the business of the `uapi16` crate: the
-//! objects and the reader that checks them against the specification. An
+//! objects, the reader that checks them against the specification and the
+//! writer. An
 //! archive holds what a manifest describes but for extended attributes
 //! and the names of users and groups: directories, regular files,
 //! symbolic links, device nodes, FIFOs and sockets with their owner, mode
@@ -31,16 +33,18 @@ use std::io::{self, Read, Write};
 use std::num::NonZeroU64;
 use std::time::SystemTime;
 
-pub use shared::manifest::{DirectorySource, SourceDirectory};
-use uapi16::{ContentSource, Data, Field};
-pub use uapi16::{FileObject, InodeType, Manifest, Sha256, StreamSource, FILENAME, SUFFIX};
+pub use shared::manifest::{DirectorySource, SourceDirectory, WriteReport};
+use uapi16::{ContentSource, Data, Field, Location, Mode, Sha256Hasher};
+pub use uapi16::{Fields, FileObject, InodeType, Manifest, Sha256, StreamSource, FILENAME, SUFFIX};
 
 use crate::errno::*;
 use crate::header::{DeviceNumber, Kind, MAX_FILE_SIZE, PERMISSIONS};
 use crate::name::{Name, NameBuf};
 use crate::plan::{Contents, Identity, Plan, Planned};
 use crate::progress::Progress;
+use crate::read::Source;
 use crate::times::TimePolicy;
+use crate::tree::{Inode, RootStated, Tree};
 use crate::write::{Attributes, Sink, Writer};
 use crate::{ContentProblem, Detail, ManifestProblem, Result, UnsupportedKind};
 
@@ -554,6 +558,223 @@ impl<'a> Feed<'a> {
             ),
             None => Ok(()),
         }
+    }
+}
+
+impl From<Kind> for InodeType {
+    fn from(kind: Kind) -> InodeType {
+        match kind {
+            Kind::Regular => InodeType::Regular,
+            Kind::Directory => InodeType::Directory,
+            Kind::Symlink => InodeType::Symlink,
+            Kind::Fifo => InodeType::Fifo,
+            Kind::CharDevice => InodeType::CharDevice,
+            Kind::BlockDevice => InodeType::BlockDevice,
+            Kind::Socket => InodeType::Socket,
+        }
+    }
+}
+
+/// How much of a file is read at a time for its hash.
+const HASH_BUFFER: usize = 1024 * 1024;
+
+impl Tree {
+    /// Writes the UAPI.16 manifest of what the archive in `source` unpacks
+    /// to, which is this tree, to `out`: the leading object, one object
+    /// for every name in the order of the archive, the trailer. Each
+    /// record goes out in one write and `out` is flushed at the end, so a
+    /// descriptor wants a `BufWriter` around it.
+    ///
+    /// `fields` chooses what is said of an object beyond its name and its
+    /// type: mode, owner, time, the size and hash of a regular file, the
+    /// target of a symbolic link as a literal, the number of a device node,
+    /// and a token that the names of one hard-linked file share. The
+    /// leading object stands for the root and carries what the archive
+    /// says of it. The hashes are of the contents as they are in the
+    /// archive, read here.
+    ///
+    /// Names a manifest cannot carry are left out with everything below
+    /// them: the ones the specification reserves in the top level for the
+    /// manifest itself and its signatures silently, as `systemd-manifest`
+    /// leaves them out, any other, one that is not UTF-8 for instance,
+    /// counted in the report's `omitted`.
+    pub fn write_manifest<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        fields: Fields,
+        out: impl Write,
+        progress: &mut dyn FnMut(&Progress),
+    ) -> Result<WriteReport> {
+        let stated = self.root_stated();
+        let root = self.root();
+        // The leading object is a directory by definition.
+        let mut top = FileObject::root();
+        if fields.contains(Fields::MODE) && stated.contains(RootStated::MODE) {
+            top.mode = Mode::new(root.mode);
+        }
+        if fields.contains(Fields::UID) && stated.contains(RootStated::OWNER) {
+            top.uid = Some(root.uid);
+        }
+        if fields.contains(Fields::GID) && stated.contains(RootStated::OWNER) {
+            top.gid = Some(root.gid);
+        }
+        if fields.contains(Fields::MTIME) && stated.contains(RootStated::TIME) {
+            top.set_mtime(root.modified());
+        }
+        if fields.contains(Fields::USER_XATTR) {
+            top.user_xattrs = Some(Box::default());
+        }
+        let mut listing = Listing {
+            tree: self,
+            source,
+            fields,
+            writer: uapi16::Writer::begin(out, &top)?,
+            report: WriteReport::default(),
+            tokens: HashMap::new(),
+            hashes: HashMap::new(),
+            buffer: vec![0u8; HASH_BUFFER],
+            progress,
+        };
+        listing.entries()?;
+        listing.writer.finish()?;
+        Ok(listing.report)
+    }
+}
+
+/// The manifest of an archive while it is written.
+struct Listing<'a, S: Source + ?Sized, W: Write> {
+    tree: &'a Tree,
+    source: &'a S,
+    fields: Fields,
+    writer: uapi16::Writer<W>,
+    report: WriteReport,
+    /// The token of every file with several names that was listed, by the
+    /// number the tree has for the file.
+    tokens: HashMap<u32, NonZeroU64>,
+    /// The hash of every such file.
+    hashes: HashMap<u32, Sha256>,
+    /// What a file is read through for its hash.
+    buffer: Vec<u8>,
+    progress: &'a mut dyn FnMut(&Progress),
+}
+
+impl<S: Source + ?Sized, W: Write> Listing<'_, S, W> {
+    /// Writes the object of every name of the tree a manifest can carry.
+    fn entries(&mut self) -> Result<()> {
+        // The directory that was left out last, with the slash behind it.
+        let mut left_out: Option<Vec<u8>> = None;
+        for (name, inode) in self.tree.entries() {
+            if name == Name::ROOT.as_bytes() {
+                continue;
+            }
+            if left_out.as_ref().is_some_and(|prefix| name.starts_with(prefix)) {
+                continue;
+            }
+            let text = std::str::from_utf8(&name).ok();
+            let reserved = text.is_some_and(uapi16::Name::is_reserved);
+            let listed = text.filter(|_| !reserved).and_then(|text| uapi16::Name::new(text).ok());
+            let Some(listed) = listed else {
+                if !reserved {
+                    self.report.omitted += 1;
+                }
+                if inode.kind == Kind::Directory {
+                    left_out = Some([&name[..], b"/"].concat());
+                }
+                continue;
+            };
+            self.entry(listed, self.tree.inode_id(&name), inode)?;
+        }
+        Ok(())
+    }
+
+    /// Writes the object of the file `inode`, the one the tree numbers
+    /// `id`, under the name `name`.
+    fn entry(&mut self, name: uapi16::Name, id: Option<u32>, inode: &Inode) -> Result<()> {
+        let fields = self.fields;
+        let mut object = FileObject::new(name);
+        object.inode_type = InodeType::from(inode.kind);
+        // A symbolic link has neither a mode nor extended attributes in a
+        // manifest.
+        if fields.contains(Fields::MODE) && inode.kind != Kind::Symlink {
+            object.mode = Mode::new(inode.mode);
+        }
+        if fields.contains(Fields::UID) {
+            object.uid = Some(inode.uid);
+        }
+        if fields.contains(Fields::GID) {
+            object.gid = Some(inode.gid);
+        }
+        if fields.contains(Fields::MTIME) {
+            object.set_mtime(inode.modified());
+        }
+        if fields.contains(Fields::USER_XATTR) && inode.kind != Kind::Symlink {
+            object.user_xattrs = Some(Box::default());
+        }
+        // A directory has one name and the kernel never links symbolic
+        // links.
+        let linked = inode.nlink > 1 && !matches!(inode.kind, Kind::Directory | Kind::Symlink);
+        if let Some(id) = id.filter(|_| linked && fields.contains(Fields::HARDLINK)) {
+            let next = NonZeroU64::MIN.saturating_add(self.tokens.len() as u64);
+            object.inode_token = Some(*self.tokens.entry(id).or_insert(next));
+        }
+        match inode.kind {
+            Kind::Regular => {
+                if fields.contains(Fields::SIZE) {
+                    object.size = Some(u64::from(inode.size));
+                }
+                if fields.contains(Fields::HASH) {
+                    object.sha256 = Some(self.hash(id, inode)?);
+                }
+                self.report.files += 1;
+                self.report.bytes += u64::from(inode.size);
+            }
+            Kind::Symlink => {
+                if fields.contains(Fields::SIZE) {
+                    object.size = Some(u64::from(inode.size));
+                }
+                if fields.contains(Fields::SYMLINK) {
+                    let mut target = vec![0u8; inode.size as usize];
+                    self.source.read_at(inode.data_offset, &mut target)?;
+                    object.contents = vec![uapi16::Contents::new(Location::Literal(target))];
+                }
+            }
+            Kind::CharDevice | Kind::BlockDevice => {
+                if fields.contains(Fields::DEVICE) {
+                    object.major = Some(u64::from(inode.rdev.major));
+                    object.minor = Some(u64::from(inode.rdev.minor));
+                }
+            }
+            Kind::Directory => self.report.directories += 1,
+            Kind::Fifo | Kind::Socket => {}
+        }
+        self.writer.file(&object)?;
+        (self.progress)(&self.report.progress());
+        Ok(())
+    }
+
+    /// The hash of the contents of the file `inode`, read from the
+    /// archive. A file with several names is read for the first of them.
+    fn hash(&mut self, id: Option<u32>, inode: &Inode) -> Result<Sha256> {
+        if let Some(known) = id.and_then(|id| self.hashes.get(&id)) {
+            return Ok(*known);
+        }
+        let mut hasher = Sha256Hasher::default();
+        let mut done = self.report.progress();
+        let mut at = inode.data_offset;
+        let end = at + u64::from(inode.size);
+        while at < end {
+            let n = (end - at).min(HASH_BUFFER as u64) as usize;
+            self.source.read_at(at, &mut self.buffer[..n])?;
+            hasher.update(&self.buffer[..n]);
+            at += n as u64;
+            done.bytes += n as u64;
+            (self.progress)(&done);
+        }
+        let digest = hasher.finish();
+        if let Some(id) = id.filter(|_| inode.nlink > 1) {
+            self.hashes.insert(id, digest);
+        }
+        Ok(digest)
     }
 }
 
@@ -1083,5 +1304,123 @@ mod tests {
             plan.retain(&mut |name, _| name != named(left_out.as_bytes()));
             assert_eq!(written(&mut plan).unwrap_err().errno(), EINVAL, "{}", left_out);
         }
+    }
+
+    fn manifest_of(archive: &[u8], fields: Fields) -> (Vec<u8>, WriteReport) {
+        let tree = Tree::open(archive).unwrap();
+        let mut out = Vec::new();
+        let report = tree.write_manifest(archive, fields, &mut out, &mut |_| {}).unwrap();
+        (out, report)
+    }
+
+    #[test]
+    fn the_manifest_of_an_archive_is_the_one_it_was_made_from() {
+        let h = hash(b"hello");
+        let records = [
+            r#"{"name":"d","type":"dir","mode":448,"uid":1,"gid":2,"mTimeNSec":1000000000000}"#.to_string(),
+            format!(
+                r#"{{"name":"d/a","type":"reg","mode":416,"uid":3,"gid":0,"mTimeNSec":2000000000000,"size":5,"sha256":"{}","inodeToken":1}}"#,
+                h
+            ),
+            format!(
+                r#"{{"name":"d/b","type":"reg","mode":416,"uid":3,"gid":0,"mTimeNSec":2000000000000,"size":5,"sha256":"{}","inodeToken":1}}"#,
+                h
+            ),
+            format!(
+                r#"{{"name":"d/empty","type":"reg","mode":420,"uid":0,"gid":0,"mTimeNSec":0,"size":0,"sha256":"{}"}}"#,
+                hash(b"")
+            ),
+            r#"{"name":"d/f1","type":"fifo","mode":420,"uid":0,"gid":0,"mTimeNSec":0,"inodeToken":2}"#.to_string(),
+            r#"{"name":"d/f2","type":"fifo","mode":420,"uid":0,"gid":0,"mTimeNSec":0,"inodeToken":2}"#.to_string(),
+            r#"{"name":"d/link","type":"lnk","uid":4,"gid":5,"mTimeNSec":3000000000000,"size":4,"contents":[{"literal":"ZmlsZQ=="}]}"#.to_string(),
+            r#"{"name":"d/null","type":"chr","mode":438,"uid":0,"gid":0,"mTimeNSec":0,"major":1,"minor":3}"#.to_string(),
+            r#"{"name":"d/sda","type":"blk","mode":432,"uid":0,"gid":6,"mTimeNSec":0,"major":8,"minor":16}"#.to_string(),
+            r#"{"name":"d/sock","type":"sock","mode":384,"uid":0,"gid":0,"mTimeNSec":0}"#.to_string(),
+        ];
+        let records: Vec<&str> = records.iter().map(String::as_str).collect();
+        let given = manifest(&records);
+        let mut plan = Plan::new();
+        plan.add_manifest(
+            Described::in_stream(given.clone(), Cursor::new(b"hellohello".to_vec())),
+            named(b"."),
+            &ManifestOptions::default(),
+        )
+        .unwrap();
+        let archive = written(&mut plan).unwrap();
+        // Everything an archive holds of what a manifest says.
+        let held = Fields::MODE
+            | Fields::UID
+            | Fields::GID
+            | Fields::SIZE
+            | Fields::HASH
+            | Fields::SYMLINK
+            | Fields::DEVICE
+            | Fields::HARDLINK
+            | Fields::MTIME;
+        let (bytes, report) = manifest_of(&archive, held);
+        let back = Manifest::parse(&bytes).unwrap();
+        assert_eq!(back.objects, given.objects);
+        assert_eq!(
+            (report.files, report.directories, report.bytes, report.omitted),
+            (3, 1, 10, 0)
+        );
+        // The root says nothing here, the archive has no entry for it.
+        assert_eq!(
+            (back.root.mode, back.root.uid, back.root.mtime_nsec),
+            (None, None, None)
+        );
+        // Asked for extended attributes, the manifest says that there are
+        // none. A symbolic link has none to speak of.
+        let (bytes, _) = manifest_of(&archive, Fields::ALL);
+        let all = Manifest::parse(&bytes).unwrap();
+        assert_eq!(all.root.user_xattrs, Some(Box::default()));
+        for (object, given) in all.objects.iter().zip(&given.objects) {
+            let none = (object.inode_type != InodeType::Symlink).then(Box::default);
+            assert_eq!(object.user_xattrs, none, "{}", object.name);
+            let mut rest = object.clone();
+            rest.user_xattrs = None;
+            assert_eq!(rest, *given);
+        }
+        // Without fields there are names and types. A regular file is what
+        // an object without a type is.
+        let (bytes, _) = manifest_of(&archive, Fields::NONE);
+        let text = String::from_utf8(bytes).unwrap();
+        let bare: Vec<&str> = text
+            .split(char::from(RECORD_SEPARATOR))
+            .skip(2)
+            .map(str::trim_end)
+            .collect();
+        assert_eq!(bare[0], r#"{"name":"d","type":"dir"}"#);
+        assert_eq!(bare[1], r#"{"name":"d/a"}"#);
+        assert_eq!(bare[6], r#"{"name":"d/link","type":"lnk"}"#);
+        assert_eq!(bare.len(), 11);
+    }
+
+    #[test]
+    fn the_root_and_names_a_manifest_cannot_carry() {
+        use crate::test_util::{archive, Raw};
+        let bytes = archive(&[
+            Raw::new(0o040750, b".").owner(7, 8).mtime(9),
+            Raw::new(0o100644, b"Uapi16Manifest").data(b"m"),
+            Raw::new(0o100644, b"Uapi16Manifest.p7s").data(b"s"),
+            Raw::new(0o100644, b"fine").data(b"f"),
+            Raw::new(0o100644, b"not-utf8-\xff").data(b"x"),
+            Raw::new(0o040755, b"new\nline"),
+            Raw::new(0o100644, b"new\nline/below").data(b"y"),
+            Raw::new(0o100644, b"new\nline/more").data(b"z"),
+            Raw::new(0o040755, b"sub"),
+            Raw::new(0o100644, b"sub/Uapi16Manifest").data(b"k"),
+        ]);
+        let (out, report) = manifest_of(&bytes, Fields::ALL);
+        let m = Manifest::parse(&out).unwrap();
+        let listed: Vec<&str> = m.objects.iter().map(|object| object.name.as_str()).collect();
+        // The reserved names go silently, in the top level only. The
+        // others are counted, a directory with what is in it once.
+        assert_eq!(listed, ["fine", "sub", "sub/Uapi16Manifest"]);
+        assert_eq!(report.omitted, 2);
+        assert_eq!(
+            (m.root.mode.map(Mode::bits), m.root.uid, m.root.gid, m.root.mtime()),
+            (Some(0o750), Some(7), Some(8), Some(UNIX_EPOCH + Duration::from_secs(9)))
+        );
     }
 }

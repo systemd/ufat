@@ -29,6 +29,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::errno::*;
 use crate::header::{DeviceNumber, Format, Header, Kind, MAX_TARGET_LEN, PERMISSIONS, S_IFMT};
@@ -62,6 +63,13 @@ pub struct Inode {
     pub data_offset: u64,
     /// The device number of a device node.
     pub rdev: DeviceNumber,
+}
+
+impl Inode {
+    /// When it was modified, as the system has times.
+    pub fn modified(&self) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(u64::from(self.mtime))
+    }
 }
 
 /// What the kernel does with an entry, or with the archive as a whole,

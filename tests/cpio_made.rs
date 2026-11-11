@@ -27,7 +27,7 @@ use cpio::device::{Access, Device};
 use cpio::header::Format;
 use cpio::header::STOPPER;
 use cpio::host::open_dir;
-use cpio::manifest::{Described, FileObject, InodeType, Manifest, ManifestOptions, Sha256, SourceDirectory};
+use cpio::manifest::{Described, Fields, FileObject, InodeType, Manifest, ManifestOptions, Sha256, SourceDirectory};
 use cpio::name::Name;
 use cpio::plan::{Plan, TreeOptions};
 use cpio::populate;
@@ -451,6 +451,38 @@ fn a_kernel_unpacked_what_the_manifest_describes() {
             if object.inode_token.is_some() && object.inode_type != InodeType::Symlink {
                 assert_eq!(field("nlink="), Some("2"), "{}: {}", archive, line);
             }
+        }
+    }
+}
+
+/// The manifest of an archive that was made from a manifest of systemd's
+/// is that manifest again, as far as an archive holds what it says: all
+/// of it but the extended attributes and the names of users and groups.
+#[test]
+fn the_manifest_of_an_archive_is_the_one_systemd_wrote() {
+    let _serial = common::serial();
+    let held = |object: &FileObject| {
+        let mut held = object.clone();
+        (held.user_name, held.group_name, held.user_xattrs) = (None, None, None);
+        held
+    };
+    for (archive, case) in [
+        ("made-manifest-special", "special"),
+        ("made-manifest-esp-stream", "esp"),
+    ] {
+        let bytes = fs::read(fixture(archive)).unwrap();
+        let tree = Tree::open(&bytes[..]).unwrap();
+        let mut out = Vec::new();
+        let report = tree
+            .write_manifest(&bytes[..], Fields::DEFAULT | Fields::MTIME, &mut out, &mut |_| {})
+            .unwrap();
+        assert_eq!(report.omitted, 0, "{}", archive);
+        let ours = Manifest::parse(&out).unwrap();
+        let theirs = manifest_of(case);
+        assert_eq!(held(&ours.root), held(&theirs.root), "{}", archive);
+        assert_eq!(ours.objects.len(), theirs.objects.len(), "{}", archive);
+        for (ours, theirs) in ours.objects.iter().zip(&theirs.objects) {
+            assert_eq!(held(ours), held(theirs), "{}", archive);
         }
     }
 }
