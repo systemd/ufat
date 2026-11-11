@@ -108,6 +108,12 @@ impl<'a> Name<'a> {
         Ok(Name(bytes))
     }
 
+    /// A name this crate put together from names that were checked.
+    pub(crate) fn from_checked(bytes: &'a [u8]) -> Name<'a> {
+        debug_assert!(Name::new(bytes).is_ok());
+        Name(bytes)
+    }
+
     /// The bytes of the name.
     pub const fn as_bytes(self) -> &'a [u8] {
         self.0
@@ -199,11 +205,24 @@ impl NameBuf {
     pub fn into_bytes(self) -> Vec<u8> {
         self.0
     }
+
+    /// A name this crate put together from names that were checked.
+    pub(crate) fn from_checked(bytes: Vec<u8>) -> NameBuf {
+        debug_assert!(Name::new(&bytes).is_ok());
+        NameBuf(bytes)
+    }
 }
 
 impl From<Name<'_>> for NameBuf {
     fn from(name: Name<'_>) -> NameBuf {
         NameBuf(name.0.to_vec())
+    }
+}
+
+impl From<Name<'_>> for Detail {
+    /// What an error tells a client when it is about what is at `name`.
+    fn from(name: Name<'_>) -> Detail {
+        Detail::Path(name.to_string())
     }
 }
 

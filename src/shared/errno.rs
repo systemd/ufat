@@ -65,6 +65,8 @@ pub const EOVERFLOW: i32 = libc::EOVERFLOW;
 pub const EBADFD: i32 = libc::EBADFD;
 /// `EOPNOTSUPP`
 pub const EOPNOTSUPP: i32 = libc::EOPNOTSUPP;
+/// `ESTALE`
+pub const ESTALE: i32 = libc::ESTALE;
 /// `EUCLEAN`
 pub const EUCLEAN: i32 = libc::EUCLEAN;
 /// `ENOMEDIUM`

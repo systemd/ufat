@@ -18,12 +18,15 @@
 extern crate shared;
 pub(crate) use shared::sys;
 pub use shared::{bail, err};
-pub use shared::{device, errno, host, progress, sha256, sha512};
+pub use shared::{device, errno, host, progress, sha256, sha512, times};
 pub use shared::{Context, CorruptPlace, Detail, Error, NameProblem, NotCpioReason, Result};
 
+pub mod assemble;
 pub mod check;
 pub mod header;
+pub mod image;
 pub mod name;
+pub mod plan;
 pub mod read;
 #[cfg(test)]
 mod test_util;

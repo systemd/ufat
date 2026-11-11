@@ -2,6 +2,13 @@
 //! Entries put together by hand for the tests, without the writer: with
 //! every field as a test wants it, well formed or not.
 
+// The temporary images and directories are the ones the shared crate
+// tests with.
+#[path = "../shared/test_util.rs"]
+mod host_side;
+#[allow(unused_imports)]
+pub(crate) use host_side::{TempDir, TempImage};
+
 use crate::header::DeviceNumber;
 use crate::name::Name;
 
@@ -9,6 +16,7 @@ use crate::name::Name;
 pub(crate) fn named(bytes: &[u8]) -> Name<'_> {
     Name::new(bytes).unwrap()
 }
+
 /// One entry as it is stored.
 #[derive(Clone, Debug)]
 pub(crate) struct Raw {

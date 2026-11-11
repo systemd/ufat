@@ -470,6 +470,13 @@ pub enum Detail {
         /// The largest size FAT32 allows, in bytes.
         maximum: u64,
     },
+    /// The image is smaller than what is to go into it.
+    TooSmall {
+        /// The smallest size that holds it, in bytes.
+        minimal: u64,
+        /// The size of the image, in bytes.
+        actual: u64,
+    },
     /// The volume has no room.
     NoSpace {
         /// What ran out.

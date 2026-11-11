@@ -728,7 +728,7 @@ fn read_sysattr(dir: BorrowedFd<'_>, name: &[u8]) -> io::Result<String> {
 
 /// The major and minor number of a device number: the split glibc's
 /// gnu_dev_major() and gnu_dev_minor() make.
-fn devnum_parts(dev: u64) -> (u64, u64) {
+pub fn devnum_parts(dev: u64) -> (u64, u64) {
     (u64::from(libc::major(dev)), u64::from(libc::minor(dev)))
 }
 

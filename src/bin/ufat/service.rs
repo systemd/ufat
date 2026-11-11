@@ -226,6 +226,10 @@ fn map_error(e: &fat::Error) -> varlink::Error {
             optional(&mut o, "path", path.as_deref());
             interface_error("TooLarge", o)
         }
+        Detail::TooSmall { minimal, actual } => interface_error(
+            "TooSmall",
+            json::object! { "minimalSizeBytes" => *minimal, "sizeBytes" => *actual },
+        ),
         Detail::NoSpace { reason, path } => {
             let mut o = json::object! { "reason" => no_space_reason(*reason) };
             optional(&mut o, "path", path.as_deref());
