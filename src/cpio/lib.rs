@@ -26,4 +26,5 @@ pub mod name;
 pub mod read;
 #[cfg(test)]
 mod test_util;
+pub mod tree;
 pub mod write;
