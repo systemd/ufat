@@ -45,6 +45,10 @@ changes.
 
 ## Using the command line tool
 
+This recording uses the tool to make, change and check an ESP image:
+
+[![ufat command line tool](https://asciinema.org/a/1272219.svg)](https://asciinema.org/a/1272219)
+
 Make an image that fits a directory tree and copy the tree into it:
 
     ufat assemble --create --label ESP esp.img tree/
@@ -255,6 +259,10 @@ with the call, never as a path. docs/varlink.md describes the methods,
 the parameters and the errors. The commands of the command line tool do
 what the methods of the same name do, and `ufat capabilities` prints
 what `GetCapabilities` returns.
+
+This recording uses varlinkctl to make an ESP image from a manifest:
+
+[![ufat Varlink service](https://asciinema.org/a/1272221.svg)](https://asciinema.org/a/1272221)
 
 ## The library
 
