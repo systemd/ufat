@@ -4,6 +4,7 @@ use crate::populate::CopyOptions;
 use crate::progress::Progress;
 use crate::test_util::{volume, TempDir, TempImage};
 use crate::volume::Volume;
+use crate::{ContentProblem, SourceProblem};
 use std::os::fd::AsFd;
 use std::path::Path;
 
@@ -548,6 +549,111 @@ fn contents_are_chosen_by_what_can_be_used() {
         let mut back = String::new();
         v.open_file(name).unwrap().read_to_string(&mut back).unwrap();
         assert_eq!(back, "hello");
+    }
+}
+
+/// A file the manifest takes whole has exactly the size the manifest gives.
+/// One that grew since the manifest was written fails like one that shrank,
+/// when the source is verified and again while it is copied. A part of a
+/// file, at an offset or out of a larger originalSize, only has to fit.
+#[test]
+fn whole_files_have_the_size_of_the_manifest() {
+    let tmp = TempDir::new("manifest-sizes");
+    let dir = tmp.path().to_path_buf();
+    std::fs::write(dir.join("a"), b"hello world").unwrap();
+    let hello = sha256::to_hex(&sha256::digest(b"hello"));
+    let world = sha256::to_hex(&sha256::digest(b"world"));
+    // The manifest was written when `a` held "hello". The file is found by
+    // the entry's name or through a file reference.
+    for record in [
+        format!(r#"{{"name":"a","size":5,"sha256":"{}"}}"#, hello),
+        format!(
+            r#"{{"name":"b","size":5,"sha256":"{}","contents":[{{"file":"a"}}]}}"#,
+            hello
+        ),
+    ] {
+        let m = parse(&seq(&[ROOT, &record, TRAILER])).unwrap();
+        let e = dir_source(&dir).verify(&m).unwrap_err();
+        assert_eq!(e.errno(), EBADMSG);
+        assert!(
+            matches!(
+                e.detail(),
+                Some(Detail::Source {
+                    problem: SourceProblem::Size,
+                    size: Some(11),
+                    expected: Some(5),
+                    ..
+                })
+            ),
+            "{:?}",
+            e
+        );
+        let (_img, mut v) = volume(8 << 20, 512, 512);
+        let e = v
+            .assemble(&m, &mut dir_source(&dir), &AssembleOptions::default())
+            .unwrap_err();
+        assert!(
+            matches!(
+                e.detail(),
+                Some(Detail::Content {
+                    problem: ContentProblem::Size,
+                    size: Some(11),
+                    expected: Some(5),
+                    ..
+                })
+            ),
+            "{:?}",
+            e
+        );
+        assert!(v.read_dir("/").unwrap().is_empty());
+    }
+    // Parts of `a`: the file may go on after them.
+    let m = parse(&seq(&[
+        ROOT,
+        &format!(
+            r#"{{"name":"c","size":5,"sha256":"{}","contents":[{{"file":"a","offset":6}}]}}"#,
+            world
+        ),
+        r#"{"name":"d","size":3,"contents":[{"file":"a","offset":2}]}"#,
+        &format!(
+            r#"{{"name":"e","size":5,"sha256":"{}","contents":[{{"file":"a","originalSize":11}}]}}"#,
+            hello
+        ),
+        r#"{"name":"f","size":11,"contents":[{"file":"a","originalSize":11}]}"#,
+        TRAILER,
+    ]))
+    .unwrap();
+    dir_source(&dir).verify(&m).unwrap();
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    v.assemble(&m, &mut dir_source(&dir), &AssembleOptions::default())
+        .unwrap();
+    for (name, data) in [("/c", "world"), ("/d", "llo"), ("/e", "hello"), ("/f", "hello world")] {
+        let mut back = String::new();
+        v.open_file(name).unwrap().read_to_string(&mut back).unwrap();
+        assert_eq!(back, data, "{}", name);
+    }
+    // A part that runs past the end, and an originalSize that is not the
+    // file's.
+    for record in [
+        r#"{"name":"g","size":6,"contents":[{"file":"a","offset":6}]}"#,
+        r#"{"name":"h","size":5,"contents":[{"file":"a","originalSize":12}]}"#,
+        r#"{"name":"i","size":5,"contents":[{"file":"a","originalSize":5}]}"#,
+    ] {
+        let m = parse(&seq(&[ROOT, record, TRAILER])).unwrap();
+        let e = dir_source(&dir).verify(&m).unwrap_err();
+        assert!(
+            matches!(
+                e.detail(),
+                Some(Detail::Source {
+                    problem: SourceProblem::Size,
+                    size: Some(11),
+                    ..
+                })
+            ),
+            "{}: {:?}",
+            record,
+            e
+        );
     }
 }
 

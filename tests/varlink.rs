@@ -936,6 +936,27 @@ fn assemble_with_a_manifest_and_a_directory() {
     );
     assert_eq!(str_of(&e.parameters, "reason"), "missing");
     assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
+    // So does a file that grew since the manifest was written. The manifest
+    // takes it whole, so it has to have the manifest's size.
+    std::fs::write(tree.join("loader/loader.conf"), b"timeout 5\nconsole-mode max\n").unwrap();
+    let manifest_file = ro(&base.path().join("manifest"));
+    let e = error_of(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        &[fresh_img.as_fd(), manifest_file.as_fd(), source.as_fd()],
+    );
+    assert_eq!(
+        e.name,
+        format!("{}.SourceMismatch", IFACE),
+        "{}",
+        Value::Object(e.parameters.clone())
+    );
+    assert_eq!(str_of(&e.parameters, "reason"), "size");
+    assert_eq!(u64_of(&e.parameters, "sizeBytes"), 27);
+    assert_eq!(u64_of(&e.parameters, "expectedSizeBytes"), 10);
+    assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
+    std::fs::write(tree.join("loader/loader.conf"), b"timeout 5\n").unwrap();
     // A broken manifest is InvalidManifest, with nothing written either.
     let garbage = file_with(base.path(), "garbage", b"garbage");
     let e = error_of(

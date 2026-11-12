@@ -199,8 +199,11 @@ impl Reference {
     /// Checks the length `len` of the file against the manifest, for the
     /// entry `path` of `size` bytes, and returns the size of its data: the
     /// rest of the file after the offset when the manifest gives none.
-    /// `detail` makes the error's detail of the length found and the one
-    /// expected.
+    /// A reference without an offset and without `originalSize` is the
+    /// whole file, which has to be exactly `size` bytes long. A part of a
+    /// file, at an offset or out of a larger `originalSize`, has to fit
+    /// into it. `detail` makes the error's detail of the length found and
+    /// the one expected.
     fn check_len(
         &self,
         path: &str,
@@ -222,6 +225,20 @@ impl Reference {
             }
         }
         let size = size.unwrap_or(len.saturating_sub(self.offset));
+        // Without an offset and without originalSize the file holds the
+        // data and nothing else, as systemd-sysupdate takes it. A file that
+        // grew since the manifest was written would otherwise be cut short.
+        if self.offset == 0 && self.original_size.is_none() && len != size {
+            bail!(
+                EBADMSG,
+                detail(Some(len), Some(size)),
+                "{}: {} is {} bytes, the manifest says {}",
+                path,
+                self.relative,
+                len,
+                size
+            );
+        }
         if self.offset.checked_add(size).is_none_or(|end| end > len) {
             bail!(
                 EBADMSG,

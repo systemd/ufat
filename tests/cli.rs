@@ -248,6 +248,16 @@ fn assemble_and_populate_take_trees_and_manifests() {
         "nowhere",
     );
     assert!(!Path::new(d).exists());
+    // A file that grew since the manifest was written is caught the same
+    // way.
+    fs::write(root.join("tree/EFI/Linux/linux.efi"), b"kernel and more").unwrap();
+    fails(
+        &bin,
+        &["assemble", "--create", "--manifest", m, d, tree_arg],
+        "is 15 bytes, the manifest says 6",
+    );
+    assert!(!Path::new(d).exists());
+    fs::write(root.join("tree/EFI/Linux/linux.efi"), b"kernel").unwrap();
     // Without a SOURCE assemble makes an empty file system, sized for a
     // manifest as well, and takes no --fit with it.
     let c = root.join("c.img");
