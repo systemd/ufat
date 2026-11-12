@@ -177,6 +177,9 @@ fn assemble_and_populate_take_trees_and_manifests() {
     let out = run_in(&bin, &["populate", "--manifest", m, a, "-"], b"kern");
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("ended"));
+    let out = run_in(&bin, &["populate", "--manifest", m, a, "-"], b"kerneltitle x\nmore");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("goes on after the last file"));
     // A SOURCE is a directory, or for populate one file that needs --path;
     // a manifest is named by --manifest.
     fails(&bin, &["populate", a, m], "needs --path");

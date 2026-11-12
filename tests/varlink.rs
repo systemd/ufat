@@ -1099,6 +1099,32 @@ fn assemble_with_a_manifest_and_a_stream() {
         Value::Object(e.parameters.clone())
     );
     assert_eq!(str_of(&e.parameters, "reason"), "streamEnded");
+    // So is a stream that goes on after the last file: that file got more
+    // than the manifest says, by how much is not known.
+    let last = ufat::manifest::parse(&manifest)
+        .unwrap()
+        .entries
+        .into_iter()
+        .rfind(|e| e.is_streamed())
+        .unwrap();
+    let (_image3, img3) = fresh_image();
+    let long = file_with(scratch.path(), "long", &[&blob[..], b"more"].concat());
+    let manifest_file = ro(&scratch.path().join("manifest"));
+    let e = error_of(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        &[img3.as_fd(), manifest_file.as_fd(), long.as_fd()],
+    );
+    assert_eq!(
+        e.name,
+        format!("{}.ContentMismatch", IFACE),
+        "{}",
+        Value::Object(e.parameters.clone())
+    );
+    assert_eq!(str_of(&e.parameters, "reason"), "size");
+    assert_eq!(u64_of(&e.parameters, "expectedSizeBytes"), last.size.unwrap());
+    assert!(e.parameters.get("sizeBytes").is_none());
 }
 
 /// imageHash: the hash of the whole image window as the call leaves it,

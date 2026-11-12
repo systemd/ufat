@@ -399,6 +399,31 @@ fn assembles_from_a_stream() {
     assert!(v.metadata("/EFI/Linux/b.efi").is_err());
     assert_eq!(v.metadata("/EFI/a.txt").unwrap().size, 10);
 
+    // A stream that goes on after the last file fails at that file, which
+    // got more than the manifest says. It is not stored either.
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let long_blob = [&blob[..], b"more"].concat();
+    let mut long: &[u8] = &long_blob;
+    let e = v
+        .assemble(&m, &mut StreamSource::new(&mut long), &AssembleOptions::default())
+        .unwrap_err();
+    assert_eq!(e.errno(), EBADMSG);
+    assert!(
+        matches!(
+            e.detail(),
+            Some(Detail::Content {
+                problem: ContentProblem::Size,
+                size: None,
+                expected: Some(5000),
+                ..
+            })
+        ),
+        "{:?}",
+        e
+    );
+    assert!(v.metadata("/EFI/Linux/b.efi").is_err());
+    assert_eq!(v.metadata("/EFI/a.txt").unwrap().size, 10);
+
     // A corrupted stream fails the hash check. The file it was about to
     // replace survives untouched.
     let mut bad = blob.clone();

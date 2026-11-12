@@ -22,6 +22,13 @@ pub trait ContentSource {
     /// the size is known. `contents` is the contents entry chosen by
     /// [`Entry::fat_contents`], if there is one.
     fn copy(&mut self, entry: &Entry, contents: Option<&Contents>, sink: &mut dyn Write) -> Result<()>;
+
+    /// Called after the data of `last`, the last file whose data comes from
+    /// the source, was copied and checked, before that file is stored. A
+    /// source that has more data than the manifest's files fails here.
+    fn end(&mut self, _last: &Entry) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Size of the buffer a source copies through.
@@ -414,6 +421,23 @@ impl ContentSource for StreamSource<'_> {
         }
         Ok(())
     }
+
+    /// The stream ends with the last file. Anything after it would be data
+    /// the manifest does not describe, so the last file got more than the
+    /// manifest says.
+    fn end(&mut self, last: &Entry) -> Result<()> {
+        let path = last.path();
+        let mut byte = [0u8; 1];
+        if crate::host::read_some(&mut *self.reader, &mut byte)? > 0 {
+            bail!(
+                EBADMSG,
+                differs(&path, ContentProblem::Size, None, last.size),
+                "{}: the stream goes on after the last file",
+                path
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Options for [`Volume::assemble`].
@@ -499,7 +523,8 @@ impl Volume {
     /// name below the root directory. Data comes from `source` for regular
     /// files without literal contents. Sizes and SHA-256 hashes in the
     /// manifest are verified; a mismatch removes the file again and fails
-    /// with EBADMSG. A directory object listed after its children, or for a
+    /// with EBADMSG. So does data the source has after the last file it
+    /// supplies. A directory object listed after its children, or for a
     /// directory that already exists, sets the directory's timestamp.
     pub fn assemble(
         &mut self,
@@ -523,7 +548,9 @@ impl Volume {
         if let Some(now) = options.now_usec {
             manifest.root.check_validity(now)?;
         }
-        for entry in &manifest.entries {
+        // The source has to end with the last file it supplies.
+        let last = manifest.entries.iter().rposition(Entry::is_streamed);
+        for (index, entry) in manifest.entries.iter().enumerate() {
             let name = entry.name.clone().unwrap_or_default();
             let path = format!("/{name}");
             // An invalid directory takes its children with it: the directory
@@ -608,6 +635,9 @@ impl Volume {
                                 path
                             );
                         }
+                    }
+                    if last == Some(index) {
+                        source.end(entry)?;
                     }
                     writer.finish()?;
                     report.files += 1;

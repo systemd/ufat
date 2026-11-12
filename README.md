@@ -140,8 +140,9 @@ manifest instead of a tree:
 
 With `--manifest`, the one SOURCE is the directory that the manifest's
 file references point into. `-` reads the file contents from standard
-input instead, back to back in manifest order. A manifest names its
-paths from the root of the file system, so `--path` does not apply.
+input instead, back to back in manifest order. Standard input has to end
+after the last file. A manifest names its paths from the root of the
+file system, so `--path` does not apply.
 
 When the contents come from a directory, ufat first checks that every
 file the manifest names is there with the size the manifest gives. This

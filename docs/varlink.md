@@ -382,6 +382,11 @@ refer to a sub-manifest, or that have an inode type FAT does not have.
 The sizes and SHA-256 hashes in a manifest are verified while the
 contents are copied. A mismatch fails with `ContentMismatch`.
 
+A stream has to end after the last file. A stream that ends early fails
+with `ContentMismatch` and reason `streamEnded`, for the file it ended
+in. A stream with more data after the last file fails with
+`ContentMismatch` and reason `size`, for the last file.
+
 A `ManifestSink` has a `fileDescriptor` open for writing and optional
 `fields`, the per-file fields in the vocabulary of systemd-manifest:
 `mode`, `uid`, `gid`, `size`, `hash`, `symlink`, `device`, `hardlink`,
