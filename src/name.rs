@@ -19,18 +19,11 @@
 //! upper case form when that form is a single character and is left alone
 //! otherwise: ß, whose upper case is SS, and the Greek letters with
 //! ypogegrammeni, whose upper case adds a capital iota, stay themselves.
-//! That is `char::to_uppercase()` restricted to single character results,
-//! taken not from the compiler's Unicode tables but from the table in
-//! name/fold_table.rs, which is pinned to Unicode 16.0.0. The compiler's
-//! tables move with every release (rustc 1.85 ships Unicode 16.0.0, rustc
-//! 1.97 ships 17.0.0 with 28 more case pairs), and two names that differ
-//! only in the case of a letter the newer version added are one name to a
-//! ufat built with one compiler and two names to a ufat built with the
-//! other, so the same tree would give different images. Linux folds ASCII
-//! only, Windows and FatFs fold by tables of their own, so there is no
-//! external table to match and the pinned one is the floor compiler's.
-//! HACKING.md says how to regenerate it with such a compiler; moving it to
-//! a newer Unicode version is a deliberate change, see tools/fold-table.rs.
+//! The table is name/fold_table.rs, generated from UnicodeData.txt and
+//! SpecialCasing.txt of Unicode 16.0.0. It never changes. A newer Unicode
+//! version would make some names that differ today one name, and the same
+//! tree would give a different image. Case pairs that Unicode added later
+//! are not folded. HACKING.md says how to check the table.
 
 use crate::bytes::le16;
 use crate::dirent::{
@@ -43,9 +36,8 @@ use crate::{Detail, NameProblem};
 #[path = "name/fold_table.rs"]
 mod fold_table;
 
-/// The Unicode version of the case folding table. Folding does not follow
-/// the compiler's Unicode tables, so that every build of ufat tells the same
-/// names apart.
+/// The Unicode version of the case folding table. It never changes, so that
+/// every build and every version of ufat tells the same names apart.
 pub const FOLD_UNICODE_VERSION: (u8, u8, u8) = fold_table::UNICODE_VERSION;
 /// Longest long name, in UTF-16 units.
 pub const MAX_LONG_NAME: usize = 255;
@@ -660,53 +652,54 @@ mod tests {
         }
     }
 
-    /// The table is the compiler's `to_uppercase()` restricted to single
-    /// character results, for a compiler that ships the pinned Unicode
-    /// version. A newer compiler ships a newer table and cannot check this.
+    /// The compiler's `to_uppercase()` gives the same single character for
+    /// every character the table folds. Unicode never changes or removes a
+    /// case pair, so this holds whatever Unicode version the compiler
+    /// ships.
     #[test]
-    fn fold_table_matches_the_pinned_unicode_version() {
-        if char::UNICODE_VERSION != FOLD_UNICODE_VERSION {
-            // Straight to stderr so that it shows without --nocapture.
-            use std::io::Write;
-            let _ = writeln!(
-                std::io::stderr(),
-                "fold_table_matches_the_pinned_unicode_version: skipped, this compiler ships Unicode {:?}, \
-                 the table is pinned to {:?}",
-                char::UNICODE_VERSION,
-                FOLD_UNICODE_VERSION
-            );
-            return;
+    fn fold_table_agrees_with_the_compiler() {
+        for &(lower, upper) in fold_table::PAIRS {
+            let mut u = lower.to_uppercase();
+            assert_eq!((u.next(), u.next()), (Some(upper), None), "{:?}", lower);
         }
-        let mut expected = Vec::new();
-        for c in char::MIN..=char::MAX {
-            let mut upper = c.to_uppercase();
-            if let (Some(u), None) = (upper.next(), upper.next()) {
-                if u != c {
-                    expected.push((c, u));
-                }
-            }
-        }
-        assert_eq!(fold_table::PAIRS, expected.as_slice());
     }
 
-    /// The 28 case pairs Unicode 17.0.0 added (three Latin letters and the
-    /// Beria Erfe alphabet) are not in the pinned table, so two names that
-    /// differ in the case of one of them stay two names whatever Unicode
-    /// version the compiler ships.
+    /// The case pairs Unicode added after 16.0.0 are not folded: the 28 of
+    /// 17.0.0 (three Latin letters and the Beria Erfe alphabet) and the 20
+    /// of 18.0.0. Two names that differ in the case of one of them stay two
+    /// names.
     #[test]
-    fn unicode_17_additions_stay_unfolded() {
-        let added: Vec<char> = ['\u{a7cf}', '\u{a7d3}', '\u{a7d5}']
+    fn later_case_pairs_stay_unfolded() {
+        let unicode_17 = ['\u{a7cf}', '\u{a7d3}', '\u{a7d5}']
             .into_iter()
-            .chain('\u{16ebb}'..='\u{16ed3}')
-            .collect();
-        assert_eq!(added.len(), 28);
+            .chain('\u{16ebb}'..='\u{16ed3}');
+        let unicode_18 = [
+            '\u{0277}',
+            '\u{027c}',
+            '\u{ab4b}',
+            '\u{ab4c}',
+            '\u{1df41}',
+            '\u{1df49}',
+            '\u{1df4b}',
+            '\u{1df4e}',
+            '\u{1df52}',
+            '\u{1df69}',
+            '\u{1df6b}',
+            '\u{1df6d}',
+            '\u{1df6f}',
+            '\u{1df73}',
+            '\u{1df75}',
+            '\u{1df77}',
+            '\u{1df79}',
+            '\u{1df7b}',
+            '\u{1df7d}',
+            '\u{1df7f}',
+        ];
+        let added: Vec<char> = unicode_17.chain(unicode_18).collect();
+        assert_eq!(added.len(), 28 + 20);
         for c in added {
             assert_eq!(fold_char(c), c, "{:?}", c);
             assert!(fold_table::PAIRS.binary_search_by_key(&c, |&(lower, _)| lower).is_err());
-            if char::UNICODE_VERSION >= (17, 0, 0) {
-                // This compiler would fold it; the table must not.
-                assert_ne!(c.to_uppercase().next(), Some(c), "{:?}", c);
-            }
         }
     }
 

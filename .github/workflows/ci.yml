@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # The build and the tests with the oldest and the newest rustc on x86_64
-# and aarch64, the lints for every supported architecture, the build and
-# the tests on the other architectures, the exhaustive sweeps, a fuzzing
-# run, the coverage report, a compile check of the Kani proofs and the
-# dependency check. See HACKING.md.
+# and aarch64, the case folding table, the lints for every supported
+# architecture, the build and the tests on the other architectures, the
+# exhaustive sweeps, a fuzzing run, the coverage report, a compile check of
+# the Kani proofs and the dependency check. See HACKING.md.
 #
 # Warnings fail the build through CARGO_TARGET_<TRIPLE>_RUSTFLAGS and
 # clippy's -D warnings.
@@ -81,12 +81,27 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-      - name: Check the case folding table
-        if: matrix.rust == '1.85.0'
-        run: cargo run --locked -q -p fold-table | diff -u src/name/fold_table.rs -
-
       - name: Build the release binary
         run: cargo build --release --locked
+
+  fold-table:
+    name: Case folding table
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Generate the table from Unicode 16.0.0
+        run: |
+          ucd=$RUNNER_TEMP/ucd
+          mkdir -p "$ucd"
+          for f in UnicodeData.txt SpecialCasing.txt; do
+            curl -sSfL --retry 3 -o "$ucd/$f" "https://www.unicode.org/Public/16.0.0/ucd/$f"
+          done
+          (cd "$ucd" && sha256sum -c "$GITHUB_WORKSPACE/tools/fold-table.sha256")
+          cargo run --locked -q -p fold-table "$ucd" | diff -u src/name/fold_table.rs -
 
   clippy:
     name: clippy (rustc ${{ matrix.rust }})

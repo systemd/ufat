@@ -169,11 +169,11 @@ name is stored as a long name with a generated 8.3 alias. This is what
 mtools and Windows do.
 
 Names are compared without regard to case. ufat folds a character to its
-upper case form when that form is a single character. The table it uses
-is fixed to Unicode 16.0.0, so every build of ufat treats names the same.
-Linux folds only ASCII letters by default. Two names that differ only in
-the case of a non-ASCII letter are one name to ufat and two names to
-Linux.
+upper case form when that form is a single character. The table comes
+from Unicode 16.0.0 and is the same in every build and every version of
+ufat. Case pairs that Unicode added later are not folded. How Linux
+folds depends on the iocharset mount option. The default, iso8859-1,
+folds ASCII and Latin-1 letters.
 
 ## Sizing
 
