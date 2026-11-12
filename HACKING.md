@@ -1,7 +1,7 @@
 # Hacking on ufat
 
-ufat is built with cargo. The libc crate is its only external
-dependency.
+ufat is built with cargo. It depends on the libc, sha2 and lexopt
+crates. lexopt parses the command line of the tool.
 
 ## Requirements
 
@@ -214,10 +214,13 @@ every push to main and once a week. It runs:
 - the coverage report, which is shown in the job summary,
 - Kani with `--only-codegen`, which checks that every proof builds. The
   proofs themselves need more time and memory than the CI has,
-- a check that libc is the only crate from outside the tree.
+- a check that the crates from outside the tree are libc, lexopt, sha2
+  and the crates sha2 needs.
 
 The build jobs fail when mkfs.fat, fsck.fat, mtools or a varlinkctl with
 `--push-fd` is missing, instead of skipping the tests that need them.
 
-Dependabot proposes updates of the actions and of libc once a month. It
-stays on libc 0.2.
+Dependabot proposes updates of the actions and of the crates once a
+month. It keeps libc on 0.2. It updates sha2 and the crates it needs in
+one pull request, and skips sha2 0.11.1 and later, which need rustc
+1.88.

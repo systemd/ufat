@@ -4,7 +4,6 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::SystemTime;
@@ -123,72 +122,51 @@ struct Args {
 }
 
 impl Args {
+    /// Splits `args` with lexopt: `--name=value` or `--name value` for the
+    /// options in `with_value`, `--name` for those in `flags`, and the
+    /// short options every command takes, which can be bundled as in
+    /// `-rl`. `--` ends the options, and `-` is a positional argument.
     fn parse(args: &[OsString], with_value: &[&str], flags: &[&str]) -> Result<Args> {
+        use lexopt::Arg::{Long, Short, Value};
+
         let mut options = Vec::new();
         let mut positional = Vec::new();
-        let mut i = 0;
-        while i < args.len() {
-            let a = &args[i];
-            i += 1;
-            let bytes = a.as_bytes();
-            match bytes {
-                b"--" => {
-                    positional.extend(args[i..].iter().cloned());
-                    break;
+        let mut parser = lexopt::Parser::from_args(args.iter().cloned());
+        loop {
+            let arg = match parser.next() {
+                Ok(Some(arg)) => arg,
+                Ok(None) => break,
+                // A value attached to a short option, as in -r=x.
+                Err(lexopt::Error::UnexpectedValue { option, .. }) => {
+                    bail!(errno::EINVAL, "option {} takes no value", option)
                 }
-                b"-h" | b"--help" => {
-                    options.push(("help".to_string(), None));
-                    continue;
-                }
-                b"-p" => {
-                    options.push(("parents".to_string(), None));
-                    continue;
-                }
-                b"-l" => {
-                    options.push(("long".to_string(), None));
-                    continue;
-                }
-                b"-r" => {
-                    options.push(("recursive".to_string(), None));
-                    continue;
-                }
-                _ => {}
-            }
-            if let Some(rest) = bytes.strip_prefix(b"--") {
-                let (name, inline) = match rest.iter().position(|&b| b == b'=') {
-                    Some(at) => (&rest[..at], Some(OsStr::from_bytes(&rest[at + 1..]).to_os_string())),
-                    None => (rest, None),
-                };
-                let name = std::str::from_utf8(name)
-                    .map_err(|_| err!(errno::EINVAL, "unknown option {}", a.to_string_lossy()))?
-                    .to_string();
-                if with_value.contains(&name.as_str()) {
-                    let value = match inline {
-                        Some(v) => v,
-                        None => {
-                            let Some(v) = args.get(i) else {
-                                bail!(errno::EINVAL, "option --{} needs a value", name);
-                            };
-                            i += 1;
-                            v.clone()
-                        }
-                    };
+                Err(e) => bail!(errno::EINVAL, "{}", e),
+            };
+            match arg {
+                Short('h') | Long("help") => options.push(("help".to_string(), None)),
+                Short('p') => options.push(("parents".to_string(), None)),
+                Short('l') => options.push(("long".to_string(), None)),
+                Short('r') => options.push(("recursive".to_string(), None)),
+                Short(c) => bail!(errno::EINVAL, "unknown option -{}", c),
+                Long(name) if with_value.contains(&name) => {
+                    let name = name.to_string();
+                    let value = parser
+                        .value()
+                        .map_err(|_| err!(errno::EINVAL, "option --{} needs a value", name))?;
                     if !PATH_OPTIONS.contains(&name.as_str()) && value.to_str().is_none() {
                         bail!(errno::EINVAL, "the value of --{} is not valid UTF-8", name);
                     }
                     options.push((name, Some(value)));
-                } else if flags.contains(&name.as_str()) {
-                    if inline.is_some() {
+                }
+                Long(name) if flags.contains(&name) => {
+                    let name = name.to_string();
+                    if parser.optional_value().is_some() {
                         bail!(errno::EINVAL, "option --{} takes no value", name);
                     }
                     options.push((name, None));
-                } else {
-                    bail!(errno::EINVAL, "unknown option --{}", name);
                 }
-            } else if bytes.starts_with(b"-") && bytes.len() > 1 {
-                bail!(errno::EINVAL, "unknown option {}", a.to_string_lossy());
-            } else {
-                positional.push(a.clone());
+                Long(name) => bail!(errno::EINVAL, "unknown option --{}", name),
+                Value(value) => positional.push(value),
             }
         }
         Ok(Args { options, positional })

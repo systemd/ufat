@@ -5,8 +5,8 @@
 //! copy files and directory trees into it in a reproducible way, check the
 //! result, and work out beforehand how large the partition has to be. It
 //! implements only FAT32 with long file names, writes files sequentially
-//! only, and runs on Linux only. It uses nothing but the standard library
-//! and the libc crate.
+//! only, and runs on Linux only. It uses the standard library and the
+//! libc and sha2 crates.
 //!
 //! The crate is built with cargo; see HACKING.md.
 

@@ -307,42 +307,50 @@ pub(super) fn fat_key(name: &str) -> Vec<u16> {
     key
 }
 
-/// Decodes Base64 in either the standard or the URL-safe alphabet, with or
-/// without padding. Whitespace between the digits is skipped, as systemd
-/// skips it.
+/// Decodes Base64 exactly as systemd's unbase64mem() does, which reads the
+/// `literal` contents, the `base64` extended attributes and the signature
+/// `data` of a manifest:
+///
+/// - The digits are those of the standard and of the URL-safe alphabet,
+///   in any mix.
+/// - Space, tab, newline and carriage return are skipped wherever they
+///   are.
+/// - The digits come in groups of four. The last group can end in "=" or
+///   "==", and then the bits the padding leaves over have to be zero.
+///   Nothing but whitespace may follow the padding.
 pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(text.len() * 3 / 4);
-    let mut acc: u32 = 0;
-    let mut bits = 0;
-    let mut padding = 0;
-    for c in text.bytes() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            b'=' => {
-                padding += 1;
-                continue;
+    // The padding character among the digits.
+    const PAD: u8 = 64;
+    let mut digits = text.bytes().filter(|c| !b" \t\n\r".contains(c)).map(|c| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' | b'-' => Some(62),
+        b'/' | b'_' => Some(63),
+        b'=' => Some(PAD),
+        _ => None,
+    });
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    while let Some(a) = digits.next() {
+        // The first two digits of a group are never padding, and the input
+        // never ends in the middle of a group.
+        let a = a.filter(|&a| a != PAD)?;
+        let b = digits.next()?.filter(|&b| b != PAD)?;
+        let c = digits.next()??;
+        let d = digits.next()??;
+        match (c, d) {
+            (PAD, PAD) if b & 15 == 0 && digits.next().is_none() => {
+                out.push((a << 2) | (b >> 4));
+                break;
             }
-            c if c.is_ascii_whitespace() => continue,
-            _ => return None,
-        };
-        if padding > 0 {
-            return None;
+            (PAD, _) => return None,
+            (_, PAD) if c & 3 == 0 && digits.next().is_none() => {
+                out.extend([(a << 2) | (b >> 4), ((b & 15) << 4) | (c >> 2)]);
+                break;
+            }
+            (_, PAD) => return None,
+            _ => out.extend([(a << 2) | (b >> 4), ((b & 15) << 4) | (c >> 2), ((c & 3) << 6) | d]),
         }
-        acc = (acc << 6) | u32::from(v);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-            acc &= (1 << bits) - 1;
-        }
-    }
-    // Leftover bits must be zero padding of less than one byte.
-    if bits >= 6 || acc != 0 || padding > 2 {
-        return None;
     }
     Some(out)
 }

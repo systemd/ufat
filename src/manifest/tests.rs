@@ -44,7 +44,7 @@ fn parses_a_manifest() {
         ),
         r#"{"name":"empty","size":"0"}"#,
         r#"{"contents":[{"literal":"aGVs bG8="}],"name":"literal.txt","mode":"644"}"#,
-        r#"{"contents":[{"literal":"aGVsbG8"}],"name":"link","type":"lnk"}"#,
+        r#"{"contents":[{"literal":"aGVsbG8="}],"name":"link","type":"lnk"}"#,
         r#"{"mediaType":"application/vnd.uapi.16.signature","mechanism":"pkcs7","data":"AAAA"}"#,
         r#"{"mediaType":"application/x-unknown","whatever":1}"#,
         TRAILER,
@@ -134,6 +134,12 @@ fn rejects_broken_manifests() {
             r#"{"name":"x","extendedAttributes":{"user":{"a":{"base64":"!"}}}}"#,
             TRAILER,
         ],
+        &[
+            ROOT,
+            r#"{"name":"x","extendedAttributes":{"user":{"a":{"base64":"Yg"}}}}"#,
+            TRAILER,
+        ],
+        &[ROOT, r#"{"name":"x","contents":[{"literal":"aGVsbG8"}]}"#, TRAILER],
         &[ROOT, r#"{"name":"x","userName":""}"#, TRAILER],
         &[ROOT, r#"{"name":"x","userName":"123"}"#, TRAILER],
         &[ROOT, r#"{"name":"x","userName":"a:b"}"#, TRAILER],
@@ -164,6 +170,11 @@ fn rejects_broken_manifests() {
         &[
             ROOT,
             r#"{"mediaType":"application/vnd.uapi.16.signature","mechanism":"pkcs7","data":"!!"}"#,
+            TRAILER,
+        ],
+        &[
+            ROOT,
+            r#"{"mediaType":"application/vnd.uapi.16.signature","mechanism":"pkcs7","data":"AA="}"#,
             TRAILER,
         ],
         &[
@@ -220,16 +231,103 @@ fn rejects_broken_manifests() {
     assert_eq!(m.entries[0].valid_until_usec, Some(u64::MAX));
 }
 
+/// The test vectors of systemd's unbase64mem() in
+/// src/test/test-hexdecoct.c: what it decodes and what it refuses.
 #[test]
 fn base64() {
-    assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello");
-    assert_eq!(base64_decode("aGVsbG8").unwrap(), b"hello");
-    assert_eq!(base64_decode("").unwrap(), b"");
+    for (text, data) in [
+        ("", ""),
+        ("Zg==", "f"),
+        ("Zm8=", "fo"),
+        ("Zm9v", "foo"),
+        ("Zm9vYg==", "foob"),
+        ("Zm9vYmE=", "fooba"),
+        ("Zm9vYmFy", "foobar"),
+        (" ", ""),
+        (" \n\r ", ""),
+        ("    Zg\n==       ", "f"),
+        (" Zm 8=\r", "fo"),
+        ("  Zm9\n\r\r\nv   ", "foo"),
+        (" Z m9vYg==\n\r", "foob"),
+        (" Zm 9vYmE=   ", "fooba"),
+        ("   Z m9v    YmFy   ", "foobar"),
+        ("aGVs\nbG8 =", "hello"),
+    ] {
+        assert_eq!(base64_decode(text).as_deref(), Some(data.as_bytes()), "{:?}", text);
+    }
+    for text in ["A", "A====", "AAB==", " A A A B = ", " Z m 8 = q u u x "] {
+        assert_eq!(base64_decode(text), None, "{:?}", text);
+    }
+}
+
+/// Both alphabets, in any mix, with the values systemd's unbase64char()
+/// gives the digits, and its test of the two spellings of the same data.
+#[test]
+fn base64_alphabets() {
+    assert_eq!(base64_decode("AZaz").unwrap(), [1, 150, 179]);
+    assert_eq!(base64_decode("09+/").unwrap(), [211, 223, 191]);
+    assert_eq!(base64_decode("09-_").unwrap(), [211, 223, 191]);
     assert_eq!(base64_decode("_-8=").unwrap(), [0xff, 0xef]);
-    assert_eq!(base64_decode("aGVs\nbG8 =").unwrap(), b"hello");
-    assert!(base64_decode("a").is_none());
-    assert!(base64_decode("a=b=").is_none());
-    assert!(base64_decode("!!!!").is_none());
+    let plaintext: &[u8] = &[
+        0xcc, 0xa1, 0x72, 0x22, 0xae, 0xda, 0x66, 0x7e, 0x04, 0xa6, 0xe0, 0x82, 0x9a, 0x97, 0x05, 0xf6, 0x33, 0xe0,
+        0x0f, 0xc2, 0x45, 0x13, 0x58, 0x3f, 0xc5, 0xf4, 0xf4, 0x31, 0xab, 0x3c, 0x5f, 0x83, 0x34, 0x5b, 0x27, 0x32,
+        0x8a, 0x04, 0x6c, 0x43, 0x82, 0x07, 0xe3, 0x2c, 0xac, 0xb9, 0xfb, 0xac, 0xd0, 0x03, 0x91, 0x42, 0xcb, 0xa4,
+        0xde, 0x87, 0x86, 0x85, 0x10, 0xbb, 0xb7, 0x5b, 0x4b, 0xc8, 0xa0, 0xf4, 0x22, 0x1d, 0x15, 0x71, 0x87, 0x9d,
+        0xbf, 0x9f, 0xa9, 0xf1, 0xee, 0xa2, 0xb6, 0xaa, 0xc8, 0xc3, 0x37, 0x9c, 0xbb, 0xdf, 0x3e, 0xac, 0xdc, 0x94,
+        0x54, 0x38, 0x56, 0x07, 0x34, 0xb4, 0x3c, 0xcc, 0x31, 0x13,
+    ];
+    for text in [
+        "zKFyIq7aZn4EpuCCmpcF9jPgD8JFE1g/xfT0Mas8X4M0WycyigRsQ4IH4yysufus0AORQsuk3oeGhRC7t1tLyKD0Ih0VcYedv5+p8e6itqrIwzecu98+rNyUVDhWBzS0PMwxEw==",
+        "zKFyIq7aZn4EpuCCmpcF9jPgD8JFE1g_xfT0Mas8X4M0WycyigRsQ4IH4yysufus0AORQsuk3oeGhRC7t1tLyKD0Ih0VcYedv5-p8e6itqrIwzecu98-rNyUVDhWBzS0PMwxEw==",
+    ] {
+        assert_eq!(base64_decode(text).as_deref(), Some(plaintext));
+    }
+}
+
+/// What systemd refuses: a last group without its padding, incomplete
+/// padding, padding with nothing to pad, padding that leaves bits set,
+/// anything after the padding, and any character that is not a digit,
+/// "=" or one of space, tab, newline and carriage return.
+#[test]
+fn base64_refuses() {
+    for text in [
+        "Zg", "Zm8", "aGVsbG8", "Zg=", "Zm9v=", "Zm9v==", "=", "==", " = ", "Zh==", "Zm9=", "Zg==Zg==", "Zg== x",
+        "Z=g=", "====", "Zm9\x0cv", "Zm9\x0bv", "!!!!", "Zm9v\0",
+    ] {
+        assert_eq!(base64_decode(text), None, "{:?}", text);
+    }
+}
+
+/// Data of every length up to 300 bytes comes back from its padded
+/// encoding broken into lines of any width, the way systemd's
+/// base64mem_full() writes it.
+#[test]
+fn base64_round_trip() {
+    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut x = 1u32;
+    for len in 0..300usize {
+        let data: Vec<u8> = (0..len)
+            .map(|_| {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (x >> 16) as u8
+            })
+            .collect();
+        let mut text = Vec::new();
+        for chunk in data.chunks(3) {
+            let n = chunk.iter().fold(0u32, |n, &b| (n << 8) | u32::from(b)) << (8 * (3 - chunk.len()));
+            for i in 0..4 {
+                let digit = DIGITS[((n >> (18 - 6 * i)) & 63) as usize];
+                text.push(if i <= chunk.len() { digit } else { b'=' });
+            }
+        }
+        let mut lines = Vec::new();
+        for line in text.chunks(1 + len % 77) {
+            lines.extend_from_slice(line);
+            lines.push(b'\n');
+        }
+        let decoded = base64_decode(std::str::from_utf8(&lines).unwrap());
+        assert_eq!(decoded.as_deref(), Some(&data[..]), "{} bytes", len);
+    }
 }
 
 fn manifest_with_tree() -> (Manifest, Vec<u8>) {

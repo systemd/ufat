@@ -27,8 +27,8 @@ tool and the service are the same binary.
 - Writes are ordered so that a crash or a power loss leaves every file
   in its old state, its new state, or absent. A file is never left
   damaged.
-- The code uses the Rust standard library and the libc crate. It has no
-  other dependencies.
+- The code uses the Rust standard library and the crates libc, sha2 and
+  lexopt.
 
 ## Building and installing
 

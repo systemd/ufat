@@ -391,11 +391,15 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Check that libc is the only crate from outside the tree
+      - name: Check the crates from outside the tree
         # Cargo.lock lists every dependency of every package, for all
         # targets and features, the build and test dependencies included.
+        # libc, lexopt, and sha2 with the crates it needs.
+        env:
+          EXPECTED: block-buffer cfg-if cpufeatures crypto-common digest hybrid-array lexopt libc sha2 typenum
         run: |
           deps=$(cargo metadata --locked --format-version 1 |
-            jq -r '.workspace_members as $m | .packages[] | select(.id as $i | $m | index($i) | not) | .name')
+            jq -r '.workspace_members as $m | .packages[] | select(.id as $i | $m | index($i) | not) | .name' |
+            LC_ALL=C sort -u | xargs)
           echo "$deps"
-          [ "$deps" = libc ] || { echo "::error::dependencies besides libc: $deps"; exit 1; }
+          [ "$deps" = "$EXPECTED" ] || { echo "::error::expected the crates $EXPECTED, found $deps"; exit 1; }
