@@ -1944,7 +1944,7 @@ fn passed_descriptors_are_vetted() {
     assert_eq!(m, "wrongType");
     let nonblock = OpenOptions::new()
         .read(true)
-        .custom_flags(0o4000)
+        .custom_flags(libc::O_NONBLOCK)
         .open(tree.path().join("hello.txt"))
         .unwrap();
     let m = bad_fd(
