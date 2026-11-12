@@ -601,7 +601,7 @@ mod tests {
     }
 }
 
-/// Bounded model checking harnesses for the verify target (Kani). They are
+/// Bounded model checking harnesses for Kani. They are
 /// not compiled by rustc. Error message formatting is stubbed out: it is
 /// irrelevant to the properties and dominates the solver's work.
 #[cfg(kani)]

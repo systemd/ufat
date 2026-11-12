@@ -765,7 +765,7 @@ mod tests {
     }
 }
 
-/// Bounded model checking harnesses for the verify target (Kani).
+/// Bounded model checking harnesses for Kani.
 #[cfg(kani)]
 mod proofs {
     use super::*;

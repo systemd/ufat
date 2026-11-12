@@ -936,7 +936,7 @@ mod tests {
     }
 }
 
-/// Bounded model checking harnesses for the verify target (Kani), on a FAT of
+/// Bounded model checking harnesses for Kani, on a FAT of
 /// six clusters in two sectors of four entries. The chain and nibble
 /// harnesses have fully symbolic entries; the write-back harness too, and
 /// it reads through one slot so that its second write, to a fixed cluster

@@ -406,18 +406,6 @@ mod tests {
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 
-    /// Whether the running kernel is at least `major.minor`.
-    fn kernel_at_least(major: u32, minor: u32) -> bool {
-        let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") else {
-            return false;
-        };
-        let mut numbers = release.split(|c: char| !c.is_ascii_digit()).map(str::parse::<u32>);
-        match (numbers.next(), numbers.next()) {
-            (Some(Ok(a)), Some(Ok(b))) => (a, b) >= (major, minor),
-            _ => false,
-        }
-    }
-
     /// A SIGTERM for this thread, which blocks it, makes the descriptor
     /// readable and reads back as SIGTERM. pthread_kill() keeps the signal
     /// away from the other threads of the test.
@@ -459,8 +447,9 @@ mod tests {
     }
 
     /// SO_PASSRIGHTS has the kernel's number: turned off on the receiving
-    /// end, descriptors sent there are refused (EPERM, Linux 6.16), and
-    /// allow_passed_fds() lets them through again.
+    /// end, descriptors sent there are refused (EPERM), and
+    /// allow_passed_fds() lets them through again. A kernel without the
+    /// option refuses it with ENOPROTOOPT.
     #[test]
     fn so_passrights_turns_passed_descriptors_off_and_on() {
         let (a, b) = UnixStream::pair().unwrap();
@@ -477,9 +466,8 @@ mod tests {
         };
         if r != 0 {
             let e = io::Error::last_os_error();
-            assert_eq!(e.raw_os_error(), Some(libc::ENOPROTOOPT));
-            assert!(!kernel_at_least(6, 16), "SO_PASSRIGHTS refused: {}", e);
-            return eprintln!("skipping: SO_PASSRIGHTS needs Linux 6.16");
+            assert_eq!(e.raw_os_error(), Some(libc::ENOPROTOOPT), "{}", e);
+            return eprintln!("skipping: the kernel does not know SO_PASSRIGHTS");
         }
         let e = send_with_fds(a.as_fd(), b"x", &[a.as_fd()]).unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::EPERM));

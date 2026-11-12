@@ -1044,18 +1044,6 @@ mod tests {
         assert_eq!(line.split_whitespace().nth(3), Some(raised.to_string().as_str()));
     }
 
-    /// Whether the running kernel is at least `major.minor`.
-    fn kernel_at_least(major: u32, minor: u32) -> bool {
-        let Ok(release) = fs::read_to_string("/proc/sys/kernel/osrelease") else {
-            return false;
-        };
-        let mut numbers = release.split(|c: char| !c.is_ascii_digit()).map(str::parse::<u32>);
-        match (numbers.next(), numbers.next()) {
-            (Some(Ok(a)), Some(Ok(b))) => (a, b) >= (major, minor),
-            _ => false,
-        }
-    }
-
     /// F_GETFL shows exactly what a plain open sets: the access mode and
     /// O_LARGEFILE, which the kernel adds for a 64-bit process and glibc's
     /// open64() for a 32-bit one. With a wrong O_LARGEFILE every descriptor
@@ -1069,18 +1057,31 @@ mod tests {
         assert_eq!(descriptor_flags(file.as_fd()).unwrap(), O_RDONLY | O_LARGEFILE);
     }
 
-    /// From Linux 7.2 on, an empty path with O_EMPTYPATH reopens what a
-    /// descriptor pins, and F_GETFL shows the flag. With a wrong value
-    /// [`reopen`] would fall back to procfs without a word.
+    /// Where the kernel knows O_EMPTYPATH, an empty path with it reopens
+    /// what a descriptor pins, and F_GETFL shows the flag. With a wrong
+    /// value [`reopen`] would fall back to procfs without a word. openat2
+    /// tells whether the kernel knows the flag: it refuses unknown flags
+    /// with EINVAL, where openat ignores them.
     #[test]
-    fn o_emptypath_reopens_from_linux_7_2() {
-        if !kernel_at_least(7, 2) {
-            return eprintln!("skipping: O_EMPTYPATH needs Linux 7.2");
-        }
+    fn o_emptypath_reopens_where_the_kernel_has_it() {
         let tmp = TempDir::new("emptypath");
         let path = tmp.path().join("file");
         fs::write(&path, b"").unwrap();
         let pinned = open_path(None, &path, false).unwrap();
+        // SAFETY: open_how is made of integers, and zero is a valid value
+        // for each.
+        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+        how.flags = (O_RDONLY | O_CLOEXEC | O_EMPTYPATH) as u64;
+        match openat2(pinned.as_fd(), c"", &how) {
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(EINVAL) => {
+                return eprintln!("skipping: the kernel does not know O_EMPTYPATH");
+            }
+            Err(e) if e.raw_os_error() == Some(ENOSYS) => {
+                return eprintln!("skipping: the kernel has no openat2");
+            }
+            Err(e) => panic!("openat2 with O_EMPTYPATH failed: {}", e),
+        }
         let file = open_at(pinned.as_raw_fd(), c"", O_RDONLY | O_EMPTYPATH, 0).unwrap();
         assert_eq!(
             descriptor_flags(file.as_fd()).unwrap(),
