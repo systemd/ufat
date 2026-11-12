@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! Manifests written by systemd's own tool, fed through the reader, the
-//! planner, the assembler and the generator. See tests/fixtures/README.md
-//! for where they come from.
+//! planner, the assembler, the generator and the volume's manifest writer.
+//! See tests/fixtures/README.md for where they come from.
 
 mod common;
 
@@ -16,6 +16,7 @@ use ufat::dirent::ATTR_READ_ONLY;
 use ufat::errno::{EINVAL, EOPNOTSUPP};
 use ufat::format::{self, FormatOptions};
 use ufat::host;
+use ufat::manifest::volume::Fields;
 use ufat::manifest::{self, AssembleOptions, DirectorySource, InodeType, Manifest, StreamSource};
 use ufat::plan::{Plan, PlanOptions};
 use ufat::volume::Volume;
@@ -393,4 +394,31 @@ fn generator_agrees_with_systemd_manifest() {
         String::from_utf8_lossy(&theirs),
         "the generator and systemd-manifest disagree"
     );
+}
+
+/// The manifest of a volume is what `systemd-manifest make` writes for the
+/// tree the volume was filled from, byte for byte, for the fields FAT has
+/// a notion of: none at all, and size, hash and mtime.
+#[test]
+fn volume_manifest_agrees_with_systemd_manifest() {
+    let m = load("esp", "size-hash-mtime.Uapi16Manifest");
+    let (_img, mut v, _) = planned_volume(&m);
+    v.assemble(&m, &mut source("esp"), &AssembleOptions::default()).unwrap();
+    for (name, fields) in [
+        ("none.Uapi16Manifest", Fields::none()),
+        (
+            "size-hash-mtime.Uapi16Manifest",
+            Fields::from_names(["size", "hash", "mtime"]).unwrap(),
+        ),
+    ] {
+        let mut ours = Vec::new();
+        manifest::volume::write(&v, m.root.mtime(), fields, &mut ours).unwrap();
+        let theirs = std::fs::read(fixtures().join("esp").join(name)).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&ours),
+            String::from_utf8_lossy(&theirs),
+            "the volume's manifest and systemd-manifest's {} disagree",
+            name
+        );
+    }
 }

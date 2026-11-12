@@ -403,10 +403,12 @@ A `ManifestSink` has a `fileDescriptor` open for writing and optional
 `fields`, the per-file fields in the vocabulary of systemd-manifest:
 `mode`, `uid`, `gid`, `size`, `hash`, `symlink`, `device`, `hardlink`,
 `mtime`, `userXattr`, `userName`, `groupName`. Without `fields`, the
-default set of systemd-manifest is used. Fields FAT has no notion of are
-left out. The manifest describes the whole volume, including files that
-were there before the call. Entries whose names a manifest cannot carry
-are left out and counted in `omitted`.
+default set of systemd-manifest is used. FAT has a notion of `size`,
+`hash` and `mtime` only. The other fields are left out. An entry with
+the read-only attribute carries `readOnly`. The manifest describes the
+whole volume, including files that were there before the call. Entries
+whose names a manifest cannot carry are left out and counted in
+`omitted`.
 
 ## The more flag
 

@@ -1,9 +1,10 @@
 # Manifest fixtures
 
 Manifests written by systemd's own `systemd-manifest make`, so that the
-reader, the planner, the assembler and the generator are tested against
-what the reference implementation actually emits rather than against
-records written by hand. `tests/fixtures.rs` runs them.
+reader, the planner, the assembler, the generator and the volume's
+manifest writer are tested against what the reference implementation
+actually emits rather than against records written by hand.
+`tests/fixtures.rs` runs them.
 
 `make-fixtures.sh` builds the trees and writes everything here; `VERSION`
 records the systemd that did it. The fixtures were made with systemd
