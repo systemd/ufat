@@ -127,7 +127,9 @@ impl Args {
     /// and -r for `--parents`, `--long` and `--recursive` where `flags` has
     /// them. Short options can be bundled, as in `-lh`. `--` ends the
     /// options, and `-` is a positional argument. `-h` or `--help` anywhere
-    /// prints the usage and exits, whatever else is on the command line.
+    /// among the options prints the usage and exits, whatever else is on
+    /// the command line. After `--`, or as the value of an option, `-h` is
+    /// an argument like any other.
     fn parse(args: &[OsString], with_value: &[&str], flags: &[&str]) -> Result<Args> {
         use lexopt::Arg::{Long, Short, Value};
 
@@ -1077,7 +1079,9 @@ fn run(argv: &[OsString]) -> Result<ExitCode> {
     let command = command
         .to_str()
         .ok_or_else(|| err!(errno::EINVAL, "unknown command '{}'", command.to_string_lossy()))?;
-    if argv.iter().skip(1).any(|a| a == "-h" || a == "--help") || matches!(command, "help" | "--help" | "-h") {
+    // A -h or --help after the command is left to Args::parse(), which
+    // knows where the options end.
+    if matches!(command, "help" | "--help" | "-h") {
         print!("{}", USAGE);
         return Ok(ExitCode::SUCCESS);
     }
