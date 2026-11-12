@@ -256,7 +256,8 @@ every push to main and once a week. It runs:
   week earlier for the weekly run. It accepts the regressions that the
   `Perf-regression:` trailers of the commits since the base name,
 - a check that every commit of a pull request, and every commit a push
-  adds, carries a `Signed-off-by:` line from its author.
+  adds, carries a `Signed-off-by:` line from its author. Merge commits
+  are left out.
 
 The build jobs fail when mkfs.fat, fsck.fat, mtools or a varlinkctl with
 `--push-fd` is missing, instead of skipping the tests that need them.
@@ -269,6 +270,6 @@ one pull request, and skips sha2 0.11.1 and later, which need rustc
 ## Submitting changes
 
 Changes go in as pull requests on GitHub. Every commit carries a
-`Signed-off-by:` line from its author, merge commits included.
-`git commit -s` adds one. With it the author certifies the Developer
-Certificate of Origin in the file DCO.
+`Signed-off-by:` line from its author. `git commit -s` adds one. With
+it the author certifies the Developer Certificate of Origin in the file
+DCO. Merge commits don't need one.
