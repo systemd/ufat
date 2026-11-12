@@ -107,7 +107,8 @@ below. `cat` and `manifest` have no method.
 - `--write-manifest PATH` writes a UAPI.16 manifest of what the file
   system holds after `assemble` or `populate`, or of what `describe`
   finds. It has the size and the SHA-256 hash of every file, and no
-  times.
+  times. With `-` as PATH the manifest goes to standard output, and
+  what the command prints there otherwise goes to standard error.
 - `--hash sha256` or `--hash sha512` prints the hash of the file system
   `assemble` wrote.
 

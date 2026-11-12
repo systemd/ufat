@@ -581,6 +581,43 @@ fn manifests_of_what_was_written() {
     let p = populated.to_str().unwrap();
     ok(&bin, &["populate", "--path", "/more", "--write-manifest", p, b, t]);
     assert!(String::from_utf8_lossy(&fs::read(&populated).unwrap()).contains("\"more/EFI/Linux/linux.efi\""));
+
+    // "-" is standard output. What the command prints there otherwise, the
+    // description or the hash, goes to standard error then. Nothing named
+    // "-" is created.
+    let run_here = |args: &[&str]| {
+        let out = Command::new(&bin)
+            .args(args)
+            .current_dir(root)
+            .env("SOURCE_DATE_EPOCH", "1700000000")
+            .output()
+            .expect("ufat runs");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "ufat {:?} failed: {}", args, stderr);
+        (out.stdout, stderr)
+    };
+    let (stdout, stderr) = run_here(&["describe", "--write-manifest", "-", a]);
+    assert_eq!(stdout, fs::read(&written).unwrap());
+    assert!(stderr.contains("volume id:"), "{}", stderr);
+    let c = root.join("c.img");
+    let c = c.to_str().unwrap();
+    let (stdout, stderr) = run_here(&[
+        "assemble",
+        "--create",
+        "--hash",
+        "sha256",
+        "--write-manifest",
+        "-",
+        c,
+        t,
+    ]);
+    assert_eq!(stdout, fs::read(&written).unwrap());
+    let mut h = ufat::sha256::Sha256::new();
+    h.update(&fs::read(c).unwrap());
+    assert_eq!(stderr, format!("{}\n", ufat::sha256::to_hex(&h.finalize())));
+    let (stdout, _) = run_here(&["populate", "--path", "/more", "--write-manifest", "-", c, t]);
+    assert_eq!(stdout, fs::read(&populated).unwrap());
+    assert!(!root.join("-").exists());
 }
 
 /// assemble prints the hash of the file system it wrote on request, and

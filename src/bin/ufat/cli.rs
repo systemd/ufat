@@ -96,8 +96,8 @@ Options for assemble and populate:
                         path of a SOURCE file, or the directory to create
   --parents             Create missing parent directories of --path, and
                         accept a directory that exists (populate)
-  --write-manifest PATH Write the UAPI.16 manifest of the file system to PATH
-                        afterwards (also describe)
+  --write-manifest PATH Write the UAPI.16 manifest of the file system to PATH,
+                        or to standard output for -, afterwards (also describe)
   --verbose             Report what was written
 
 Options for remove:
@@ -581,17 +581,30 @@ fn fill(v: &mut Volume, args: &Args, sources: &Sources) -> Result<()> {
     Ok(())
 }
 
+/// Whether `--write-manifest -` puts the manifest on standard output. What
+/// the command prints there otherwise goes to standard error then.
+fn manifest_to_stdout(args: &Args) -> bool {
+    args.path("write-manifest") == Some(Path::new("-"))
+}
+
 /// Writes the UAPI.16 manifest of everything `v` holds to the file `path`,
-/// for `--write-manifest`.
+/// or to standard output for "-", for `--write-manifest`.
 fn write_manifest(v: &Volume, path: &Path) -> Result<()> {
-    let file = std::fs::File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
-    let mut out = std::io::BufWriter::new(file);
-    let report = manifest::volume::write(v, v.root_time()?, manifest::volume::Fields::default(), &mut out)?;
+    let fields = manifest::volume::Fields::default();
+    let (report, shown) = if path == Path::new("-") {
+        let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+        let report = manifest::volume::write(v, v.root_time()?, fields, &mut out)?;
+        (report, "the manifest on standard output".to_string())
+    } else {
+        let file = std::fs::File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
+        let mut out = std::io::BufWriter::new(file);
+        let report = manifest::volume::write(v, v.root_time()?, fields, &mut out)?;
+        (report, path.display().to_string())
+    };
     if report.omitted > 0 {
         eprintln!(
             "ufat: {} entries are not in {}: their names cannot be written in a manifest",
-            report.omitted,
-            path.display()
+            report.omitted, shown
         );
     }
     Ok(())
@@ -786,7 +799,12 @@ fn cmd_assemble(argv: &[OsString]) -> Result<()> {
     v.close()?;
     report_layout(path, &layout, args.flag("verbose"));
     if let Some(hash) = hash {
-        println!("{}", hash.of(&open_image(&args, path, Access::ReadOnly)?, &mut |_| {})?);
+        let digest = hash.of(&open_image(&args, path, Access::ReadOnly)?, &mut |_| {})?;
+        if manifest_to_stdout(&args) {
+            eprintln!("{}", digest);
+        } else {
+            println!("{}", digest);
+        }
     }
     Ok(())
 }
@@ -960,32 +978,48 @@ fn cmd_list(argv: &[OsString]) -> Result<()> {
     Ok(())
 }
 
+/// Prints the geometry, the serial number and the label of `v` to `out`.
+fn print_description(v: &Volume, out: &mut dyn Write) -> Result<()> {
+    let l = v.layout();
+    let bs = v.boot_sector();
+    writeln!(out, "sector size:      {}", l.sector_size)?;
+    writeln!(
+        out,
+        "usable on:        devices with a logical block size up to {} bytes",
+        l.sector_size
+    )?;
+    writeln!(out, "cluster size:     {}", l.cluster_size())?;
+    writeln!(out, "total sectors:    {}", l.total_sectors)?;
+    writeln!(out, "size:             {}", l.size())?;
+    writeln!(out, "reserved sectors: {}", l.reserved_sectors)?;
+    writeln!(out, "FATs:             {} x {} sectors", l.fats, l.fat_sectors)?;
+    writeln!(out, "clusters:         {} ({} free)", l.clusters, v.free_clusters())?;
+    writeln!(out, "root cluster:     {}", bs.root_cluster)?;
+    writeln!(out, "volume id:        {}", VolumeId(bs.volume_id))?;
+    writeln!(out, "volume label:     {}", v.label()?.unwrap_or_default())?;
+    writeln!(
+        out,
+        "OEM name:         {}",
+        String::from_utf8_lossy(&bs.oem_name).trim_end()
+    )?;
+    if l.below_spec_minimum() {
+        writeln!(
+            out,
+            "note:             below the FAT32 minimum of {} clusters",
+            ufat::layout::MIN_CLUSTERS
+        )?;
+    }
+    Ok(())
+}
+
 fn cmd_describe(argv: &[OsString]) -> Result<()> {
     let args = Args::parse(argv, &with(IMAGE_OPTIONS, &["write-manifest"]), &[])?;
     let image = image_arg(&args, "describe")?;
     let v = open_volume(&args, image, Access::ReadOnly)?;
-    let l = v.layout();
-    let bs = v.boot_sector();
-    println!("sector size:      {}", l.sector_size);
-    println!(
-        "usable on:        devices with a logical block size up to {} bytes",
-        l.sector_size
-    );
-    println!("cluster size:     {}", l.cluster_size());
-    println!("total sectors:    {}", l.total_sectors);
-    println!("size:             {}", l.size());
-    println!("reserved sectors: {}", l.reserved_sectors);
-    println!("FATs:             {} x {} sectors", l.fats, l.fat_sectors);
-    println!("clusters:         {} ({} free)", l.clusters, v.free_clusters());
-    println!("root cluster:     {}", bs.root_cluster);
-    println!("volume id:        {}", VolumeId(bs.volume_id));
-    println!("volume label:     {}", v.label()?.unwrap_or_default());
-    println!("OEM name:         {}", String::from_utf8_lossy(&bs.oem_name).trim_end());
-    if l.below_spec_minimum() {
-        println!(
-            "note:             below the FAT32 minimum of {} clusters",
-            ufat::layout::MIN_CLUSTERS
-        );
+    if manifest_to_stdout(&args) {
+        print_description(&v, &mut std::io::stderr().lock())?;
+    } else {
+        print_description(&v, &mut std::io::stdout().lock())?;
     }
     if let Some(m) = args.path("write-manifest") {
         write_manifest(&v, m)?;
