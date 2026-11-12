@@ -311,8 +311,9 @@ every push to main and once a week. It runs:
   adds, carries a `Signed-off-by:` line from its author. Merge commits
   are left out.
 
-The build jobs fail when mkfs.fat, fsck.fat, mtools or a varlinkctl with
-`--push-fd` is missing, instead of skipping the tests that need them.
+The build jobs fail when mkfs.fat, fsck.fat, mtools, GNU cpio, bsdcpio,
+busybox or a varlinkctl with `--push-fd` is missing, instead of skipping
+the tests that need them.
 
 Dependabot proposes updates of the actions and of the crates once a
 month. It keeps libc on 0.2. It updates sha2 and the crates it needs in
