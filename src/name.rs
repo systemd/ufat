@@ -134,7 +134,12 @@ impl LongName {
                 name
             );
         }
-        let units: Vec<u16> = name.encode_utf16().collect();
+        // A name has no more UTF-16 units than UTF-8 bytes, so this is the
+        // only allocation. collect() would size the vector from the
+        // iterator's lower bound, a third of that, and reallocate as it
+        // grows.
+        let mut units = Vec::with_capacity(name.len());
+        units.extend(name.encode_utf16());
         if units.len() > MAX_LONG_NAME {
             bail!(
                 ENAMETOOLONG,

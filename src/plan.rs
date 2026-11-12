@@ -88,10 +88,19 @@ enum Node {
     Dir(Dir),
 }
 
+/// A planned entry: the directory slots its name occupies, worked out
+/// once when it is added since they do not depend on the cluster size,
+/// and what it is.
+#[derive(Debug)]
+struct Entry {
+    slots: u64,
+    node: Node,
+}
+
 /// A planned directory. Entries are keyed by their case folded name.
 #[derive(Debug, Default)]
 struct Dir {
-    entries: BTreeMap<Vec<u16>, (String, Node)>,
+    entries: BTreeMap<Vec<u16>, Entry>,
 }
 
 /// Number of directory slots an entry named `name` occupies.
@@ -114,9 +123,9 @@ struct Totals {
 impl Dir {
     fn count(&self, is_root: bool, label: bool, cluster_size: u64, totals: &mut Totals) -> Result<()> {
         let mut slots: u64 = if is_root { u64::from(label) } else { 2 };
-        for (name, node) in self.entries.values() {
-            slots += entry_slots(&LongName::new(name)?) as u64;
-            match node {
+        for entry in self.entries.values() {
+            slots += entry.slots;
+            match &entry.node {
                 Node::File { size } => {
                     totals.files += 1;
                     totals.bytes += size;
@@ -200,11 +209,11 @@ impl Plan {
         let mut dir = &mut self.root;
         for (i, c) in comps.iter().enumerate() {
             let name = LongName::new(c)?;
-            let (_, node) = dir
-                .entries
-                .entry(name.folded())
-                .or_insert_with(|| (name.as_str().to_string(), Node::Dir(Dir::default())));
-            dir = match node {
+            let entry = dir.entries.entry(name.folded()).or_insert_with(|| Entry {
+                slots: entry_slots(&name) as u64,
+                node: Node::Dir(Dir::default()),
+            });
+            dir = match &mut entry.node {
                 Node::Dir(d) => d,
                 Node::File { .. } => {
                     let p = format!("/{}", comps[..=i].join("/"));
@@ -242,11 +251,15 @@ impl Plan {
         };
         let name = LongName::new(last)?;
         let dir = self.dir_mut(parents)?;
-        if let Some((_, Node::Dir(_))) = dir.entries.get(&name.folded()) {
+        let key = name.folded();
+        if let Some(Entry { node: Node::Dir(_), .. }) = dir.entries.get(&key) {
             bail!(EISDIR, Detail::Path(path.to_string()), "'{}' is a directory", path);
         }
-        dir.entries
-            .insert(name.folded(), (name.as_str().to_string(), Node::File { size }));
+        let entry = Entry {
+            slots: entry_slots(&name) as u64,
+            node: Node::File { size },
+        };
+        dir.entries.insert(key, entry);
         Ok(())
     }
 
