@@ -106,6 +106,7 @@ Options for assemble and populate:
 
 Options for remove:
   --recursive, -r       Remove directories with everything below them
+  --verbose             Report what was removed
 
 Sizes take K, M, G and T suffixes. Timestamps are seconds since the epoch.
 Exit status: 0 on success, 1 on failure. check uses the fsck(8) codes: 0 for a
@@ -945,7 +946,7 @@ fn cmd_populate(argv: &[OsString]) -> Result<()> {
 }
 
 fn cmd_remove(argv: &[OsString]) -> Result<()> {
-    let args = Args::parse(argv, IMAGE_OPTIONS, &["recursive"])?;
+    let args = Args::parse(argv, IMAGE_OPTIONS, &["recursive", "verbose"])?;
     let (image, paths) = match args.positional.split_first() {
         Some((i, p)) if !p.is_empty() => (i, p),
         _ => bail!(errno::EINVAL, "remove takes an IMAGE and at least one PATH"),
@@ -958,12 +959,23 @@ fn cmd_remove(argv: &[OsString]) -> Result<()> {
         if md.name.is_empty() {
             bail!(errno::EBUSY, "the root directory cannot be removed");
         }
-        if !md.is_dir {
+        let (files, directories) = if !md.is_dir {
             v.remove_file(path)?;
+            (1, 0)
         } else if args.flag("recursive") {
-            v.remove_tree(path)?;
+            let report = v.remove_tree(path)?;
+            (report.files, report.directories)
         } else {
             v.remove_dir(path)?;
+            (0, 1)
+        };
+        if args.flag("verbose") {
+            eprintln!(
+                "{}: {}, {}",
+                path,
+                plural(files, "file", "files"),
+                plural(directories, "directory", "directories")
+            );
         }
     }
     v.close()

@@ -80,14 +80,18 @@ fn help_and_short_options() {
     };
     let usage = ok(&bin, &["list", "-h"]);
     assert!(usage.starts_with("Usage: ufat COMMAND"), "{}", usage);
-    // assemble's --verbose is described once, with what it reports.
+    // assemble's --verbose is described once, with what it reports, and so
+    // is the one of remove.
     let verbose: Vec<&str> = usage
         .lines()
         .filter(|l| l.trim_start().starts_with("--verbose"))
         .collect();
     assert_eq!(
         verbose,
-        ["  --verbose             Report the geometry chosen and what was written"]
+        [
+            "  --verbose             Report the geometry chosen and what was written",
+            "  --verbose             Report what was removed"
+        ]
     );
     for args in [
         &["list", "-hl", "x.img"][..],
@@ -553,10 +557,22 @@ fn populate_and_remove_work_on_paths() {
     ok(&bin, &["populate", "--path", "/copy", a, t]);
     assert_eq!(ok(&bin, &["list", a, "/copy/EFI/Linux"]), "linux.efi\n");
     // remove: a file, an empty directory, a tree only with --recursive.
-    ok(&bin, &["remove", a, "/EFI/BOOT/BOOTX64.EFI", "/loader/entries"]);
+    // --verbose says what each PATH took with it, the directory itself
+    // counted.
+    let out = run(
+        &bin,
+        &["remove", "--verbose", a, "/EFI/BOOT/BOOTX64.EFI", "/loader/entries"],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "/EFI/BOOT/BOOTX64.EFI: 1 file, 0 directories\n/loader/entries: 0 files, 1 directory\n"
+    );
     assert_eq!(ok(&bin, &["list", a, "/loader"]), "");
     fails(&bin, &["remove", a, "/copy"], "not empty");
-    ok(&bin, &["remove", "-r", a, "/copy"]);
+    let out = run(&bin, &["remove", "-r", "--verbose", a, "/copy"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "/copy: 2 files, 5 directories\n");
     ok(&bin, &["remove", "--recursive", a, "/EFI"]);
     assert_eq!(ok(&bin, &["list", a, "/"]), "loader/\n");
     fails(&bin, &["remove", "--recursive", a, "/"], "root directory");
