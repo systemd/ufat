@@ -471,6 +471,10 @@ fn info_and_description_over_fd3() {
     assert_eq!(info.get("product").unwrap().as_str(), Some("ufat"));
     // The version is the package's.
     assert_eq!(info.get("version").unwrap().as_str(), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        info.get("url").unwrap().as_str(),
+        Some("https://github.com/systemd/ufat")
+    );
     let d = reply(
         c.call(
             "org.varlink.service.GetInterfaceDescription",

@@ -59,7 +59,7 @@ pub(crate) fn run(activation: Activation) -> std::io::Result<()> {
         vendor: "ufat".into(),
         product: "ufat".into(),
         version: VERSION.into(),
-        url: String::new(),
+        url: "https://github.com/systemd/ufat".into(),
     });
     server
         .add_interface(INTERFACE)
