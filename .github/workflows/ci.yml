@@ -4,7 +4,8 @@
 # and aarch64, the case folding table, the lints for every supported
 # architecture, the build and the tests on the other architectures, the
 # exhaustive sweeps, a fuzzing run, the coverage report, a compile check of
-# the Kani proofs and the dependency check. See HACKING.md.
+# the Kani proofs, the dependency check and the performance comparison.
+# See HACKING.md.
 #
 # Warnings fail the build through CARGO_TARGET_<TRIPLE>_RUSTFLAGS and
 # clippy's -D warnings.
@@ -418,3 +419,76 @@ jobs:
             LC_ALL=C sort -u | xargs)
           echo "$deps"
           [ "$deps" = "$EXPECTED" ] || { echo "::error::expected the crates $EXPECTED, found $deps"; exit 1; }
+
+  perf:
+    name: Performance
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The base, and the commits since, for their trailers.
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends valgrind strace
+
+      - name: Install rustc
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: Pick the base
+        # A pull request is checked out merged into main: the base is main,
+        # the merge's first parent. A push is compared with main before it,
+        # the weekly run with main a week earlier. When there is no such
+        # commit, or the push replaced main's history, the base is the
+        # commit before the last.
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          case $EVENT in
+          pull_request) base=$(git rev-parse HEAD^1) ;;
+          push) base=$BEFORE ;;
+          *) base=$(git rev-list -n 1 --before='7 days ago' HEAD) ;;
+          esac
+          git merge-base --is-ancestor "${base:-none}" HEAD 2>/dev/null || base=$(git rev-parse HEAD^1)
+          git log -1 --oneline "$base"
+          echo "BASE=$base" >> "$GITHUB_ENV"
+          # The workloads the Perf-regression: trailers since then accept.
+          git log --format='%(trailers:key=Perf-regression,valueonly)' "$base..HEAD" |
+            tee "$RUNNER_TEMP/accept"
+
+      - name: Build the base and the head
+        # Separate target directories: in a shared one cargo takes the
+        # binary built from one tree as fresh for the other.
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/base" "$BASE"
+          (cd "$RUNNER_TEMP/base" && CARGO_TARGET_DIR=$RUNNER_TEMP/target-base cargo build --release --locked -p ufat)
+          cargo build --release --locked -p ufat -p bench
+          cp "$RUNNER_TEMP/target-base/release/ufat" "$RUNNER_TEMP/ufat-base"
+          cp target/release/ufat "$RUNNER_TEMP/ufat-head"
+
+      - name: Compare
+        env:
+          BENCH_DIR: /dev/shm/ufat-compare
+        run: |
+          if cmp -s "$RUNNER_TEMP/ufat-base" "$RUNNER_TEMP/ufat-head"; then
+            echo "The base and the head build the same binary." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          bench/compare.sh "$RUNNER_TEMP/ufat-base" "$RUNNER_TEMP/ufat-head"
+          bench/compare.py --accept "$RUNNER_TEMP/accept" --summary "$GITHUB_STEP_SUMMARY" "$BENCH_DIR/out"
+
+      - name: Upload the measurements
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: performance
+          path: /dev/shm/ufat-compare/out/
+          if-no-files-found: ignore

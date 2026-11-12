@@ -198,6 +198,38 @@ checks that `ufat assemble` and `mkfs.fat` write the same bytes.
 are described at the top of bench/run.sh. The results are in
 `$BENCH_DIR/out/summary.txt`.
 
+bench/compare.sh compares two ufat binaries, BASE and HEAD:
+
+    cargo build --release --locked -p ufat -p bench
+    bench/compare.sh BASE HEAD
+    bench/compare.py "$BENCH_DIR/out"
+
+It runs ten small workloads: assemble, populate, check and manifest with
+trees of 10000 files and with an ESP, and two Varlink calls. Every
+workload runs once under cachegrind, which counts the instructions, and
+once under strace, which counts the system calls. Then it runs nine
+times with each binary, alternating, for the wall time, the peak RSS and
+the bytes read and written. It needs valgrind and strace.
+
+bench/compare.py prints the results of HEAD and their change from BASE.
+It fails when HEAD exceeds BASE on a workload by more than a limit:
+
+| Metric | Limit |
+|---|---|
+| Instructions | 3% and 1 million |
+| System calls | 2% and 20 |
+| Bytes written, bytes read | 1% and 4 KiB |
+| Peak RSS | 10% and 1 MiB |
+| Wall time | 50% and 20 ms |
+
+A commit that makes a workload slower on purpose names the workload in a
+`Perf-regression:` trailer. Glob patterns work:
+
+    Perf-regression: populate/* varlink/Populate-wide
+
+`bench/compare.py --accept FILE` reads such names from FILE and reports
+those regressions without failing.
+
 ## Continuous integration
 
 GitHub Actions runs .github/workflows/ci.yml for every pull request, for
@@ -218,7 +250,11 @@ every push to main and once a week. It runs:
 - Kani with `--only-codegen`, which checks that every proof builds. The
   proofs themselves need more time and memory than the CI has,
 - a check that the crates from outside the tree are libc, lexopt, sha2
-  and the crates sha2 needs.
+  and the crates sha2 needs,
+- bench/compare.sh with the release binary and that of the base: the
+  target branch for a pull request, main before a push, and main of a
+  week earlier for the weekly run. It accepts the regressions that the
+  `Perf-regression:` trailers of the commits since the base name.
 
 The build jobs fail when mkfs.fat, fsck.fat, mtools or a varlinkctl with
 `--push-fd` is missing, instead of skipping the tests that need them.
