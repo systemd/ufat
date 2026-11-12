@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::errno::*;
-use crate::host::{walk_tree, Case, FromStart};
+use crate::host::{walk_tree, FromStart};
 use crate::progress::Progress;
 use crate::sys;
 use crate::volume::{Volume, MAX_FILE_SIZE};
@@ -222,17 +222,6 @@ impl Volume {
     /// everything below it is reached by descriptor and nothing is looked
     /// up by path again. The skipped entries are reported relative to
     /// `source`.
-    ///
-    /// FAT compares names without regard to case, so two entries in one
-    /// directory of the tree whose names differ only in case, such as
-    /// "A.txt" and "a.txt", cannot both be stored. The copy fails with
-    /// EEXIST and [`crate::NameProblem::CaseCollision`] when it lists that
-    /// directory, whatever the entries are, also when one of them would be
-    /// skipped: neither of them is copied, and what was copied before
-    /// stays. [`crate::plan::Plan::add_tree`] finds such a pair without
-    /// writing anything. A file in the volume whose name differs only in
-    /// case from one in the tree is replaced like any other, or is EEXIST
-    /// without `replace`.
     pub fn copy_tree(&mut self, source: BorrowedFd<'_>, dest: &str, options: &CopyOptions) -> Result<CopyReport> {
         self.copy_tree_with_progress(source, dest, options, &mut |_| {})
     }
@@ -250,10 +239,9 @@ impl Volume {
         if !md.is_dir() {
             bail!(ENOTDIR, "the source is not a directory");
         }
-        let follow = options.follow_symlinks;
         let mut report = CopyReport::default();
         self.create_dir_all(dest, options.times.resolve(source_mtime(&md)))?;
-        walk_tree(source, dest, follow, Case::Folded, &mut |target, entry| {
+        walk_tree(source, dest, options.follow_symlinks, &mut |target, entry| {
             if entry.is_dir() {
                 let time = options.times.resolve(source_mtime(&entry.metadata));
                 match self.metadata(target) {
@@ -279,130 +267,5 @@ impl Volume {
             }
         })?;
         Ok(report)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::plan::{Plan, PlanOptions};
-    use crate::test_util::{volume, TempDir};
-    use crate::NameProblem;
-    use std::path::Path;
-
-    /// Makes the files below `root`, each holding its own path.
-    fn build(root: &Path, files: &[&str]) {
-        for f in files {
-            let path = root.join(f);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, f.as_bytes()).unwrap();
-        }
-    }
-
-    /// Checks that `e` refuses two names that are one name on FAT, the
-    /// second of them at `name` inside the volume.
-    fn is_collision(e: &Error, name: &str, message: &str) {
-        assert_eq!(e.errno(), EEXIST, "{}", e);
-        assert_eq!(
-            e.detail(),
-            Some(&Detail::Name {
-                name: name.to_string(),
-                problem: NameProblem::CaseCollision,
-            }),
-            "{}",
-            e
-        );
-        assert_eq!(e.to_string(), message);
-    }
-
-    /// Two names in one directory of a tree that differ only in case:
-    /// files, directories, a pair deeper down behind entries that come
-    /// first, letters beyond ASCII, and a pair of which one would be
-    /// skipped. The plan refuses them without writing anything. The copy
-    /// refuses them when it lists their directory, so neither of them is
-    /// copied, and a pair in the top directory leaves the volume as it was.
-    #[test]
-    fn case_collisions_are_refused() {
-        let cases: &[(&[&str], &str, &str)] = &[
-            (
-                &["A.txt", "a.txt"],
-                "/a.txt",
-                "'A.txt' and 'a.txt' are the same name on FAT",
-            ),
-            (&["Dir/f", "dir/g"], "/dir", "'Dir' and 'dir' are the same name on FAT"),
-            (
-                &["aaa.txt", "sub/deeper/X.efi", "sub/deeper/x.efi"],
-                "/sub/deeper/x.efi",
-                "'sub/deeper/X.efi' and 'sub/deeper/x.efi' are the same name on FAT",
-            ),
-            (
-                &["\u{c9}t\u{e9}.txt", "\u{e9}t\u{e9}.txt"],
-                "/\u{e9}t\u{e9}.txt",
-                "'\u{c9}t\u{e9}.txt' and '\u{e9}t\u{e9}.txt' are the same name on FAT",
-            ),
-            (&["A.txt"], "/a.txt", "'A.txt' and 'a.txt' are the same name on FAT"),
-        ];
-        for (i, &(files, name, message)) in cases.iter().enumerate() {
-            let tmp = TempDir::new("collision");
-            build(tmp.path(), files);
-            // The last pair has a socket for its second name, an entry the
-            // copy skips: the names are compared whatever the entries are.
-            let _socket = (i == cases.len() - 1)
-                .then(|| std::os::unix::net::UnixListener::bind(tmp.path().join("a.txt")).unwrap());
-            let source = crate::host::open_dir(tmp.path()).unwrap();
-            let mut plan = Plan::new(PlanOptions::new(512));
-            let e = plan.add_tree(source.as_fd(), "/new", false).unwrap_err();
-            is_collision(&e, &format!("/new{}", name), message);
-            for replace in [true, false] {
-                for follow_symlinks in [false, true] {
-                    let options = CopyOptions {
-                        replace,
-                        follow_symlinks,
-                        ..CopyOptions::default()
-                    };
-                    let (img, v) = volume(8 << 20, 512, 512);
-                    v.close().unwrap();
-                    let before = fs::read(img.path()).unwrap();
-                    let mut v = Volume::open(img.device()).unwrap();
-                    is_collision(&v.copy_tree(source.as_fd(), "/", &options).unwrap_err(), name, message);
-                    // Neither of the two is there, in either case.
-                    assert_eq!(v.metadata(name).unwrap_err().errno(), ENOENT, "{:?}", files);
-                    // What comes before a pair further down is copied.
-                    let nested = name.starts_with("/sub/");
-                    assert_eq!(v.metadata("/aaa.txt").is_ok(), nested, "{:?}", files);
-                    v.close().unwrap();
-                    if !nested {
-                        assert!(fs::read(img.path()).unwrap() == before, "{:?}", files);
-                    }
-                }
-            }
-        }
-    }
-
-    /// A name in the volume that differs only in case from one in the tree
-    /// is the same file: the copy replaces it, or fails with EEXIST without
-    /// replace.
-    #[test]
-    fn a_file_in_the_volume_is_replaced_whatever_the_case_of_its_name() {
-        let (_img, mut v) = volume(8 << 20, 512, 512);
-        v.write_file("/A.txt", &mut &b"old"[..], SystemTime::UNIX_EPOCH, false)
-            .unwrap();
-        let tmp = TempDir::new("replace");
-        fs::write(tmp.path().join("a.txt"), b"new").unwrap();
-        let source = crate::host::open_dir(tmp.path()).unwrap();
-        let keep = CopyOptions {
-            replace: false,
-            ..CopyOptions::default()
-        };
-        let e = v.copy_tree(source.as_fd(), "/", &keep).unwrap_err();
-        assert_eq!(e.errno(), EEXIST, "{}", e);
-        assert_eq!(e.detail(), Some(&Detail::Path("/a.txt".to_string())));
-        let report = v.copy_tree(source.as_fd(), "/", &CopyOptions::default()).unwrap();
-        assert_eq!(report.files, 1);
-        let names: Vec<String> = v.read_dir("/").unwrap().into_iter().map(|m| m.name).collect();
-        assert_eq!(names, ["a.txt"]);
-        let mut data = Vec::new();
-        v.open_file("/A.TXT").unwrap().read_to_end(&mut data).unwrap();
-        assert_eq!(data, b"new");
     }
 }

@@ -27,10 +27,6 @@ pub enum NameProblem {
     TrailingSpaceOrDot,
     /// More than 255 UTF-16 units, or a path longer than PATH_MAX.
     TooLong,
-    /// Another name in the same directory of the source differs from it
-    /// only in case. FAT compares names without regard to case, so the
-    /// two are the same name on it.
-    CaseCollision,
 }
 
 impl NameProblem {
@@ -43,7 +39,6 @@ impl NameProblem {
             NameProblem::LeadingSpace => "leadingSpace",
             NameProblem::TrailingSpaceOrDot => "trailingSpaceOrDot",
             NameProblem::TooLong => "tooLong",
-            NameProblem::CaseCollision => "caseCollision",
         }
     }
 }
@@ -407,9 +402,7 @@ pub enum Detail {
     Path(String),
     /// A name inside the volume is not valid.
     Name {
-        /// The name, or the path when the problem is with a path. For a
-        /// case collision, the path inside the volume of the second of the
-        /// two names in byte order.
+        /// The name, or the path when the problem is with a path.
         name: String,
         /// What is wrong with it.
         problem: NameProblem,

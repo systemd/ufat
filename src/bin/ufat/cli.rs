@@ -458,20 +458,14 @@ fn sources(args: &Args, paths: &[&Path], sizing: bool) -> Result<Sources> {
 }
 
 /// What can be checked before an image is created, formatted or written:
-/// that the manifest and the trees can be stored, and that every file the
-/// manifest names is below the SOURCE with the size it says. A tree with
-/// two names in one directory that differ only in case is refused, and
-/// under `--unsupported fail` so is a tree with anything FAT cannot store.
-/// With `planned` the trees are walked here only for the latter: the plan
-/// that sizes the file system refuses the former before anything is
-/// written.
-fn check_sources(args: &Args, sources: &Sources, planned: bool) -> Result<()> {
-    let fail = fail_unsupported(args)?;
-    if fail || !planned {
+/// that the manifest and, under `--unsupported fail`, the trees can be
+/// stored, and that every file the manifest names is below the SOURCE with
+/// the size it says.
+fn check_sources(args: &Args, sources: &Sources) -> Result<()> {
+    if fail_unsupported(args)? {
         for (path, dir) in &sources.trees {
             let mut plan = Plan::new(PlanOptions::new(MIN_SECTOR_SIZE));
-            let skipped = plan.add_tree(dir.as_fd(), dest(args), true)?;
-            if let (true, Some(skipped)) = (fail, skipped.first()) {
+            if let Some(skipped) = plan.add_tree(dir.as_fd(), dest(args), true)?.first() {
                 bail!(
                     errno::EINVAL,
                     "{} cannot be stored on FAT",
@@ -483,7 +477,7 @@ fn check_sources(args: &Args, sources: &Sources, planned: bool) -> Result<()> {
     let Some(m) = &sources.manifest else {
         return Ok(());
     };
-    if fail {
+    if fail_unsupported(args)? {
         m.manifest.check_supported()?;
     }
     if let Some(Data::Directory { path, dir }) = &m.data {
@@ -713,7 +707,7 @@ fn assemble_filled(args: &Args, path: &Path, paths: &[&Path]) -> Result<Volume> 
     let sources = sources(args, paths, false)?;
     // Better to learn about a bad manifest or tree before an image is sized
     // and formatted.
-    check_sources(args, &sources, true)?;
+    check_sources(args, &sources)?;
     let mut options = format_options(args)?;
     let target = util::Target {
         path,
@@ -864,7 +858,7 @@ fn cmd_populate(argv: &[OsString]) -> Result<()> {
         return v.close();
     }
     let sources = sources(&args, &paths, false)?;
-    check_sources(&args, &sources, false)?;
+    check_sources(&args, &sources)?;
     let mut v = open_volume(&args, image, Access::ReadWrite)?;
     if !sources.trees.is_empty() {
         ensure_dir(&mut v, path, parents, time)?;

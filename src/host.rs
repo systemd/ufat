@@ -18,7 +18,6 @@
 //! it means that what we copy is what we looked at, whatever happens to
 //! the tree meanwhile.
 
-use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -29,10 +28,9 @@ use std::path::{Path, PathBuf};
 
 use crate::device::{Access, Device};
 use crate::errno::*;
-use crate::name::LongName;
 use crate::sys;
 use crate::{Context, Result};
-use crate::{DescriptorProblem, Detail, NameProblem};
+use crate::{DescriptorProblem, Detail};
 
 /// The detail of a passed descriptor that cannot be used.
 fn unusable(problem: DescriptorProblem, flags: Option<i32>) -> Detail {
@@ -385,46 +383,6 @@ fn list_names(dir: BorrowedFd<'_>, dir_path: &Path) -> Result<Vec<Vec<u8>>> {
     Ok(names)
 }
 
-/// What a walk makes of two names in one directory that differ only in
-/// case, such as "A.txt" and "a.txt".
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Case {
-    /// Two entries, as on the host. The manifest generator describes the
-    /// tree as it is.
-    Kept,
-    /// The same name, as on FAT, which compares names without regard to
-    /// case. The walk fails before it visits either of them. The planner
-    /// and the populator walk this way.
-    Folded,
-}
-
-/// Fails when two of the `names` in the directory at `dir_path` below the
-/// root, at `target` inside the volume, are the same name on FAT. The
-/// second would otherwise be copied over the first. The names are sorted
-/// by their bytes and the first two that collide are named. A name that is
-/// not UTF-8, or that FAT cannot store, is left alone here: it fails or is
-/// skipped when the walk reaches it.
-fn refuse_case_collisions(names: &[Vec<u8>], dir_path: &Path, target: &str) -> Result<()> {
-    let mut seen = HashMap::with_capacity(names.len());
-    for name in names {
-        let Ok(text) = std::str::from_utf8(name) else { continue };
-        let Ok(long) = LongName::new(text) else { continue };
-        if let Some(first) = seen.insert(long.folded(), text) {
-            bail!(
-                EEXIST,
-                Detail::Name {
-                    name: crate::path::join(target, text),
-                    problem: NameProblem::CaseCollision,
-                },
-                "'{}' and '{}' are the same name on FAT",
-                dir_path.join(first).display(),
-                dir_path.join(text).display()
-            );
-        }
-    }
-    Ok(())
-}
-
 /// One level of a walk: the directory, pinned, its identity, the names in
 /// it still to visit, and where it is on the host and inside the volume.
 struct Level {
@@ -457,21 +415,14 @@ struct Level {
 /// directory into itself, is ELOOP: the tree would otherwise go on until
 /// the path limit. A name that is not UTF-8 is an error since it could not
 /// be stored as a long name anyway, and so is a path inside the volume
-/// longer than [`crate::path::MAX_PATH`]. With [`Case::Folded`], two
-/// names in one directory that differ only in case fail the walk with
-/// EEXIST and [`NameProblem::CaseCollision`] when the directory is listed,
-/// before any entry in it is visited, whatever the entries are.
+/// longer than [`crate::path::MAX_PATH`].
 pub(crate) fn walk_tree(
     root: BorrowedFd<'_>,
     dest: &str,
     follow_symlinks: bool,
-    case: Case,
     visit: &mut dyn FnMut(&str, &HostEntry) -> Result<bool>,
 ) -> Result<()> {
     let names = list_names(root, Path::new("")).with_context(|| "failed to list the source directory")?;
-    if case == Case::Folded {
-        refuse_case_collisions(&names, Path::new(""), dest)?;
-    }
     let root_md = sys::fstat(root).with_context(|| "failed to stat the source directory")?;
     let mut stack = vec![Level {
         dir: root.try_clone_to_owned()?,
@@ -522,9 +473,6 @@ pub(crate) fn walk_tree(
                 );
             }
             let names = list_names(entry.fd.as_fd(), &entry.path)?;
-            if case == Case::Folded {
-                refuse_case_collisions(&names, &entry.path, &target)?;
-            }
             stack.push(Level {
                 dir: entry.fd,
                 dev,
@@ -582,7 +530,7 @@ mod tests {
     fn walk(root: &Path, follow: bool) -> Result<Vec<(String, char)>> {
         let fd = open_dir(root)?;
         let mut seen = Vec::new();
-        walk_tree(fd.as_fd(), "/", follow, Case::Kept, &mut |target, entry| {
+        walk_tree(fd.as_fd(), "/", follow, &mut |target, entry| {
             let kind = if entry.is_dir() {
                 'd'
             } else if entry.is_file() {
@@ -633,7 +581,7 @@ mod tests {
         assert_eq!(seen.last().unwrap().0, "/\u{e9}");
         // The entries themselves can be opened.
         let fd = open_dir(root).unwrap();
-        walk_tree(fd.as_fd(), "/", false, Case::Kept, &mut |_, entry| {
+        walk_tree(fd.as_fd(), "/", false, &mut |_, entry| {
             if entry.is_file() {
                 entry.open_file().unwrap();
             }
@@ -703,7 +651,7 @@ mod tests {
         let dest = format!("/{}", "d".repeat(3500));
         let fd = open_dir(root).unwrap();
         let mut seen = 0;
-        let err = walk_tree(fd.as_fd(), &dest, false, Case::Kept, &mut |target, entry| {
+        let err = walk_tree(fd.as_fd(), &dest, false, &mut |target, entry| {
             assert!(target.starts_with(&dest) && target.ends_with("/n"));
             assert!(entry.is_dir());
             seen += 1;
@@ -715,7 +663,7 @@ mod tests {
         assert_eq!(seen, (crate::path::MAX_PATH - dest.len()) / 2);
         // Not descending ends the walk after the first level.
         seen = 0;
-        walk_tree(fd.as_fd(), "/", false, Case::Kept, &mut |_, _| {
+        walk_tree(fd.as_fd(), "/", false, &mut |_, _| {
             seen += 1;
             Ok(false)
         })
@@ -733,7 +681,7 @@ mod tests {
         symlink(".", root.join("loop")).unwrap();
         let fd = open_dir(root).unwrap();
         let mut seen = 0;
-        let err = walk_tree(fd.as_fd(), "/", true, Case::Kept, &mut |_, entry| {
+        let err = walk_tree(fd.as_fd(), "/", true, &mut |_, entry| {
             assert!(entry.is_dir());
             seen += 1;
             Ok(true)
@@ -754,7 +702,7 @@ mod tests {
         fs::remove_dir_all(root.join("a")).unwrap();
         // Without following links the link is one entry, not a directory.
         seen = 0;
-        walk_tree(fd.as_fd(), "/", false, Case::Kept, &mut |_, entry| {
+        walk_tree(fd.as_fd(), "/", false, &mut |_, entry| {
             assert!(!entry.is_dir() && !entry.is_file());
             seen += 1;
             Ok(true)
@@ -853,7 +801,7 @@ mod tests {
         let fd = open_dir(root).unwrap();
         let mut seen = 0;
         let mut most = 0;
-        walk_tree(fd.as_fd(), "/", false, Case::Kept, &mut |_, entry| {
+        walk_tree(fd.as_fd(), "/", false, &mut |_, entry| {
             if entry.is_file() {
                 let mut text = String::new();
                 entry.open_file().unwrap().read_to_string(&mut text).unwrap();
@@ -882,7 +830,7 @@ mod tests {
         }
         let fd = open_dir(root).unwrap();
         let mut seen = Vec::new();
-        walk_tree(fd.as_fd(), "/", false, Case::Kept, &mut |target, _| {
+        walk_tree(fd.as_fd(), "/", false, &mut |target, _| {
             if target == "/a1" {
                 fs::remove_file(root.join("a2")).unwrap();
             }
@@ -908,7 +856,7 @@ mod tests {
         }
         let fd = open_dir(root).unwrap();
         let mut contents = Vec::new();
-        walk_tree(fd.as_fd(), "/", true, Case::Kept, &mut |target, entry| {
+        walk_tree(fd.as_fd(), "/", true, &mut |target, entry| {
             if target == "/d" {
                 // "d" is pinned; now root/d is what used to be root/c.
                 fs::rename(root.join("d"), root.join("e")).unwrap();
@@ -1040,44 +988,5 @@ mod tests {
             PassedSource::Stream(_)
         ));
         assert_eq!(passed_source(open("file", sys::O_RDWR)).unwrap_err().errno(), EBADFD);
-    }
-
-    /// A walk for FAT refuses two names in one directory that differ only
-    /// in case when it lists the directory, before it visits either of
-    /// them. Names FAT cannot store are left to the visit. A walk that keeps
-    /// the host's names visits both.
-    #[test]
-    fn names_that_differ_only_in_case_are_one_name_on_fat() {
-        let tmp = TempDir::new("walk-case");
-        let root = tmp.path();
-        fs::create_dir_all(root.join("sub/deeper")).unwrap();
-        for name in ["aaa", "a:b", "A:B", "sub/deeper/X.efi", "sub/deeper/x.efi"] {
-            fs::write(root.join(name), b"").unwrap();
-        }
-        let fd = open_dir(root).unwrap();
-        let mut seen = Vec::new();
-        let e = walk_tree(fd.as_fd(), "/boot", false, Case::Folded, &mut |target, _| {
-            seen.push(target.to_string());
-            Ok(true)
-        })
-        .unwrap_err();
-        assert_eq!(e.errno(), EEXIST);
-        assert_eq!(
-            e.detail(),
-            Some(&Detail::Name {
-                name: "/boot/sub/deeper/x.efi".to_string(),
-                problem: NameProblem::CaseCollision,
-            })
-        );
-        assert_eq!(
-            e.to_string(),
-            "'sub/deeper/X.efi' and 'sub/deeper/x.efi' are the same name on FAT"
-        );
-        assert_eq!(
-            seen,
-            ["/boot/A:B", "/boot/a:b", "/boot/aaa", "/boot/sub", "/boot/sub/deeper"]
-        );
-        let kept: Vec<String> = walk(root, false).unwrap().into_iter().map(|(t, _)| t).collect();
-        assert_eq!(kept[kept.len() - 2..], ["/sub/deeper/X.efi", "/sub/deeper/x.efi"]);
     }
 }

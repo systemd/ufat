@@ -175,15 +175,6 @@ ufat. Case pairs that Unicode added later are not folded. How Linux
 folds depends on the iocharset mount option. The default, iso8859-1,
 folds ASCII and Latin-1 letters.
 
-Two entries in one directory of a tree whose names differ only in case,
-such as `A.txt` and `a.txt`, would be one file on FAT. `assemble` and
-`populate` refuse such a tree before they change the image. This includes
-a pair where one entry is a FIFO, socket or device node that would
-otherwise be skipped. A manifest that lists two such names is refused as
-well. A file in the file system whose name differs only in case from one
-in the tree is replaced like any other file, unless `--no-replace` is
-given.
-
 ## Sizing
 
 A FAT32 file system needs at least 65525 clusters. EDK2 firmware refuses

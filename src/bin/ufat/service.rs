@@ -1043,10 +1043,9 @@ impl Content {
         self.manifest_mtime.or(self.source_mtime)
     }
 
-    /// Puts the content into `plan`, at the root. A tree with two names in
-    /// one directory that differ only in case is refused here, before
-    /// anything is written, and so under UnsupportedPolicy fail is a tree
-    /// with entries FAT cannot hold.
+    /// Puts the content into `plan`, at the root. Under UnsupportedPolicy
+    /// fail a tree with entries FAT cannot hold is refused here, before
+    /// anything is written.
     fn plan(&self, plan: &mut Plan) -> ufat::Result<()> {
         match &self.fill {
             Some(Fill::Tree(dir)) => {
@@ -1068,17 +1067,13 @@ impl Content {
         Ok(())
     }
 
-    /// Walks a tree that is to go below `dest` before anything is copied,
-    /// so that two names in one directory that differ only in case and,
-    /// under UnsupportedPolicy fail, an entry FAT cannot hold fail the call
-    /// with nothing written.
+    /// Under UnsupportedPolicy fail, walks a tree that is to go below
+    /// `dest` before anything is copied, so that an entry FAT cannot hold
+    /// fails the call with nothing written.
     fn check_tree(&self, dest: &str) -> Outcome<()> {
-        if let Some(Fill::Tree(dir)) = &self.fill {
+        if let (true, Some(Fill::Tree(dir))) = (self.fail_unsupported, &self.fill) {
             let mut plan = Plan::new(PlanOptions::new(MIN_SECTOR_SIZE));
-            let skipped = plan.add_tree(dir.as_fd(), dest, true)?;
-            if self.fail_unsupported {
-                refuse_skipped(&skipped)?;
-            }
+            refuse_skipped(&plan.add_tree(dir.as_fd(), dest, true)?)?;
         }
         Ok(())
     }
