@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use json::{Object, Value};
 
 use super::{valid_name, MEDIA_TYPE, RECORD_SEPARATOR, TRAILER_MEDIA_TYPE};
+use crate::host::Case;
 use crate::sha256::{self, Sha256};
 use crate::sys;
 use crate::Result;
@@ -37,7 +38,8 @@ pub(crate) fn time_nsec(time: SystemTime) -> Option<u64> {
 /// its path to, with [`crate::host::open_dir`] when it has a path, and may
 /// be O_PATH; everything below it is reached by descriptor. Only regular
 /// files and directories are listed, and a manifest stored in the tree's
-/// top level is left out since its name is reserved.
+/// top level is left out since its name is reserved. Names that differ
+/// only in case are listed as they are, the way the host has them.
 pub fn generate(root: BorrowedFd<'_>) -> Result<Vec<u8>> {
     fn mtime_nsec(md: &std::fs::Metadata) -> Option<u64> {
         md.modified().ok().and_then(time_nsec)
@@ -51,7 +53,7 @@ pub fn generate(root: BorrowedFd<'_>) -> Result<Vec<u8>> {
     top.insert("mediaType", MEDIA_TYPE);
     write_record(&mut out, top)?;
     let mut buf = vec![0u8; 1024 * 1024];
-    crate::host::walk_tree(root, "", false, &mut |target, entry| {
+    crate::host::walk_tree(root, "", false, Case::Kept, &mut |target, entry| {
         let md = &entry.metadata;
         // walk_tree joins with a leading slash; manifests want none.
         let path = &target[1..];

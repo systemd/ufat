@@ -364,6 +364,16 @@ fails the call with `SourceMismatch` before the image is changed.
 Symbolic links below a source directory are followed. They are resolved
 below that directory and never lead out of it.
 
+FAT compares names without regard to case. Two entries in one directory
+of a source tree whose names differ only in case, such as `A.txt` and
+`a.txt`, fail the call with `InvalidName` and reason `caseCollision`
+before the image is changed. `name` is the path of the second of the two
+in byte order. This holds whatever the entries are, also when one of them
+would be skipped. A manifest that lists two such names fails with
+`InvalidManifest` and reason `duplicateName`. A file in the file system
+whose name differs only in case from one in the content is replaced like
+any other file, or fails with `FileExists` when `replace` is false.
+
 The other fields of `Content`:
 
 | Field | Meaning |
@@ -475,7 +485,7 @@ The service returns no text. Every error is a name with typed fields.
 | `NotADirectory` | A path component is a file. | `path` |
 | `IsADirectory` | `Populate` of a single file at a path that is a directory. | `path` |
 | `DirectoryNotEmpty` | `Remove` of a directory with entries, without `recursive`. | `path` |
-| `InvalidName` | A name FAT cannot store. | `name`, `reason` (`empty`, `dotComponent`, `invalidCharacter`, `leadingSpace`, `trailingSpaceOrDot`, `tooLong`) |
+| `InvalidName` | A name FAT cannot store, or two names in one directory of a source tree that differ only in case. | `name`, `reason` (`empty`, `dotComponent`, `invalidCharacter`, `leadingSpace`, `trailingSpaceOrDot`, `tooLong`, `caseCollision`) |
 | `InvalidLabel` | A label that breaks the label rules. | `label`, `reason` (`tooLong`, `invalidCharacter`) |
 | `InvalidIdentifier` | A serial number that is not `XXXX-XXXX` or eight hex digits. | `identifier`, `reason` (`malformed`) |
 | `InvalidManifest` | The manifest cannot be parsed or is inconsistent. | `reason`, `record`, `name`, `field` |

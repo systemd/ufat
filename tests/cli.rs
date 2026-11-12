@@ -428,6 +428,112 @@ fn sys_mkfifo(path: &Path) {
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
 }
 
+/// Two names in one directory of a tree that differ only in case are one
+/// name on FAT: assemble, assemble --plan and populate refuse the tree
+/// before the image is touched, however deep the pair is and whatever the
+/// entries are. A file in the file system whose name differs only in case
+/// from one in the tree is replaced, or kept with --no-replace. A manifest
+/// that lists two such names is refused when it is read.
+#[test]
+fn case_collisions_are_refused() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    let img = root.join("a.img");
+    let a = img.to_str().unwrap();
+    ok(&bin, &["assemble", "--create", "--size", "40M", a]);
+    let before = fs::read(&img).unwrap();
+    let fresh = root.join("fresh.img");
+    let f = fresh.to_str().unwrap();
+    let cases: &[(&str, &[&str], &str)] = &[
+        (
+            "files",
+            &["A.txt", "a.txt"],
+            "ufat: 'A.txt' and 'a.txt' are the same name on FAT\n",
+        ),
+        (
+            "dirs",
+            &["Dir/f", "dir/g"],
+            "ufat: 'Dir' and 'dir' are the same name on FAT\n",
+        ),
+        (
+            "nested",
+            &["aaa.txt", "sub/deeper/X.efi", "sub/deeper/x.efi"],
+            "ufat: 'sub/deeper/X.efi' and 'sub/deeper/x.efi' are the same name on FAT\n",
+        ),
+    ];
+    for &(name, files, message) in cases {
+        let t = root.join(name);
+        for file in files {
+            let p = t.join(file);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, file).unwrap();
+        }
+        let t = t.to_str().unwrap();
+        for args in [
+            &["assemble", "--create", f, t][..],
+            &["assemble", "--plan", t],
+            &["populate", a, t],
+            &["populate", "--no-replace", "--path", "/new", a, t],
+        ] {
+            let out = run(&bin, args);
+            assert_eq!(out.status.code(), Some(1), "ufat {:?}", args);
+            assert_eq!(String::from_utf8_lossy(&out.stderr), message, "ufat {:?}", args);
+            assert!(!fresh.exists(), "ufat {:?}", args);
+            assert!(fs::read(&img).unwrap() == before, "ufat {:?}", args);
+        }
+    }
+    // A FIFO is left out of a copy, but its name still is the name of the
+    // file next to it.
+    let t = root.join("fifo");
+    fs::create_dir(&t).unwrap();
+    fs::write(t.join("A.txt"), b"file").unwrap();
+    sys_mkfifo(&t.join("a.txt"));
+    let t = t.to_str().unwrap();
+    fails(
+        &bin,
+        &["populate", a, t],
+        "'A.txt' and 'a.txt' are the same name on FAT",
+    );
+    fails(
+        &bin,
+        &["populate", "--unsupported", "fail", a, t],
+        "'A.txt' and 'a.txt' are the same name on FAT",
+    );
+    assert!(fs::read(&img).unwrap() == before);
+    // A file already in the file system is the same file.
+    let upper = root.join("upper");
+    fs::create_dir(&upper).unwrap();
+    fs::write(upper.join("A.txt"), b"old").unwrap();
+    let lower = root.join("lower");
+    fs::create_dir(&lower).unwrap();
+    fs::write(lower.join("a.txt"), b"new").unwrap();
+    ok(&bin, &["populate", a, upper.to_str().unwrap()]);
+    fails(
+        &bin,
+        &["populate", "--no-replace", a, lower.to_str().unwrap()],
+        "'/a.txt' exists",
+    );
+    assert_eq!(ok(&bin, &["cat", a, "/a.txt"]), "old");
+    ok(&bin, &["populate", a, lower.to_str().unwrap()]);
+    assert_eq!(ok(&bin, &["cat", a, "/A.TXT"]), "new");
+    assert_eq!(ok(&bin, &["list", a, "/"]), "a.txt\n");
+    // The manifest of a tree lists its names as the host has them, both of
+    // them. FAT cannot hold that.
+    let manifest = run(&bin, &["manifest", root.join("files").to_str().unwrap()]);
+    assert!(manifest.status.success());
+    let m = root.join("m.json");
+    fs::write(&m, manifest.stdout).unwrap();
+    fails(
+        &bin,
+        &["assemble", "--plan", "--manifest", m.to_str().unwrap()],
+        "manifest lists 'A.txt' and 'a.txt', which FAT cannot tell apart",
+    );
+}
+
 /// assemble, populate and describe write the UAPI.16 manifest of what the
 /// file system holds on request, one that builds the same content again.
 #[test]

@@ -16,7 +16,7 @@ use crate::dir::MAX_SLOTS;
 use crate::dirent::DIR_ENTRY_SIZE;
 use crate::errno::*;
 use crate::format::{encode_label, FormatOptions};
-use crate::host::walk_tree;
+use crate::host::{walk_tree, Case};
 use crate::layout::{self, Layout, LayoutParams, MAX_CLUSTERS, MAX_CLUSTER_SIZE, MAX_SECTORS_PER_CLUSTER};
 use crate::name::{Alias, LongName};
 use crate::path::components;
@@ -263,7 +263,9 @@ impl Plan {
     /// resolved its path to, with [`crate::host::open_dir`] when it has a
     /// path, and may be O_PATH; nothing below it is looked up by path.
     /// Returns the entries that would be skipped because they are neither
-    /// regular files nor directories, relative to `source`.
+    /// regular files nor directories, relative to `source`. Two names in one
+    /// directory that differ only in case fail as they fail the copy, with
+    /// EEXIST and [`crate::NameProblem::CaseCollision`].
     pub fn add_tree(&mut self, source: BorrowedFd<'_>, dest: &str, follow_symlinks: bool) -> Result<Vec<PathBuf>> {
         let md = sys::fstat(source).with_context(|| "failed to stat the source directory")?;
         if !md.is_dir() {
@@ -271,7 +273,7 @@ impl Plan {
         }
         self.add_dir(dest)?;
         let mut skipped = Vec::new();
-        walk_tree(source, dest, follow_symlinks, &mut |target, entry| {
+        walk_tree(source, dest, follow_symlinks, Case::Folded, &mut |target, entry| {
             if entry.is_dir() {
                 self.add_dir(target)?;
                 Ok(true)
