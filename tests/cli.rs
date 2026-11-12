@@ -68,9 +68,10 @@ fn tree(root: &Path) {
     fs::write(root.join("loader/entries/x.conf"), b"title x\n").unwrap();
 }
 
-/// -h and --help print the usage and exit 0 wherever they are, alone or
-/// in a bundle of short options, whatever else is on the command line.
-/// Every other short option in a bundle is either applied or refused.
+/// -h and --help print the usage and exit 0 wherever they are among the
+/// options, alone or in a bundle of short options, whatever else is on the
+/// command line. Every other short option in a bundle is either applied or
+/// refused.
 #[test]
 fn help_and_short_options() {
     let _serial = common::serial();
@@ -97,6 +98,36 @@ fn help_and_short_options() {
     fails(&bin, &["check", "-p", "x.img"], "unknown option -p");
     fails(&bin, &["list", "-lx", "x.img"], "unknown option -x");
     fails(&bin, &["list", "-l=1", "x.img"], "option -l takes no value");
+}
+
+/// After `--`, and as the value of an option, -h is an argument like any
+/// other.
+#[test]
+fn help_after_the_options_is_an_argument() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    fs::create_dir(root.join("-h")).unwrap();
+    fs::write(root.join("-h/x"), b"x").unwrap();
+    let source = root.join("-h");
+    let source = source.to_str().unwrap();
+    let expected = ok(&bin, &["manifest", source]);
+    let out = Command::new(&bin)
+        .args(["manifest", "--", "-h"])
+        .current_dir(root)
+        .env("SOURCE_DATE_EPOCH", "1700000000")
+        .output()
+        .expect("ufat runs");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    fails(
+        &bin,
+        &["assemble", "--plan", "--size", "-h", source],
+        "unknown size suffix in '-h'",
+    );
 }
 
 #[test]
