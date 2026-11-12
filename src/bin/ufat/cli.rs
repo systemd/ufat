@@ -275,6 +275,21 @@ fn volume_path(arg: &OsStr) -> Result<&str> {
     })
 }
 
+/// `n` followed by `one` or `many`, as the count asks for.
+fn plural(n: u64, one: &str, many: &str) -> String {
+    format!("{} {}", n, if n == 1 { one } else { many })
+}
+
+/// What a copy wrote, or what a plan found, for `--verbose`.
+fn contents(files: u64, directories: u64, bytes: u64) -> String {
+    format!(
+        "{}, {}, {}",
+        plural(files, "file", "files"),
+        plural(directories, "directory", "directories"),
+        plural(bytes, "byte", "bytes")
+    )
+}
+
 const IMAGE_OPTIONS: &[&str] = &["offset", "size"];
 const FORMAT_VALUES: &[&str] = &[
     "sector-size",
@@ -550,11 +565,9 @@ fn fill(v: &mut Volume, args: &Args, sources: &Sources) -> Result<()> {
         let report = v.copy_tree(dir.as_fd(), dest(args), &copy)?;
         if args.flag("verbose") {
             eprintln!(
-                "{}: {} files, {} directories, {} bytes",
+                "{}: {}",
                 path.display(),
-                report.files,
-                report.directories,
-                report.bytes
+                contents(report.files, report.directories, report.bytes)
             );
         }
         for skipped in report.skipped {
@@ -581,8 +594,9 @@ fn fill(v: &mut Volume, args: &Args, sources: &Sources) -> Result<()> {
         };
         if args.flag("verbose") {
             eprintln!(
-                "{}: {} files, {} directories, {} bytes",
-                m.name, report.files, report.directories, report.bytes
+                "{}: {}",
+                m.name,
+                contents(report.files, report.directories, report.bytes)
             );
         }
         for skipped in report.skipped {
@@ -612,11 +626,16 @@ fn write_manifest(v: &Volume, path: &Path) -> Result<()> {
         let report = manifest::volume::write(v, v.root_time()?, fields, &mut out)?;
         (report, path.display().to_string())
     };
-    if report.omitted > 0 {
-        eprintln!(
+    match report.omitted {
+        0 => {}
+        1 => eprintln!(
+            "ufat: 1 entry is not in {}: its name cannot be written in a manifest",
+            shown
+        ),
+        n => eprintln!(
             "ufat: {} entries are not in {}: their names cannot be written in a manifest",
-            report.omitted, shown
-        );
+            n, shown
+        ),
     }
     Ok(())
 }
@@ -625,14 +644,14 @@ fn write_manifest(v: &Volume, path: &Path) -> Result<()> {
 fn report_layout(image: &Path, layout: &ufat::layout::Layout, verbose: bool) {
     if verbose {
         eprintln!(
-            "{}: {} sectors of {} bytes, {} clusters of {} bytes, {} reserved sectors, {} FATs of {} sectors",
+            "{}: {} sectors of {} bytes, {} clusters of {} bytes, {} reserved sectors, {} of {} sectors",
             image.display(),
             layout.total_sectors,
             layout.sector_size,
             layout.clusters,
             layout.cluster_size(),
             layout.reserved_sectors,
-            layout.fats,
+            plural(u64::from(layout.fats), "FAT", "FATs"),
             layout.fat_sectors
         );
     }
@@ -677,11 +696,9 @@ fn plan(args: &Args) -> Result<()> {
     println!("{}", e.size());
     if args.flag("verbose") {
         eprintln!(
-            "{} files, {} directories, {} bytes: {} clusters of {} bytes, {} sector size",
-            e.files,
-            e.directories,
-            e.bytes,
-            e.data_clusters,
+            "{}: {} of {} bytes, {} sector size",
+            contents(e.files, e.directories, e.bytes),
+            plural(u64::from(e.data_clusters), "cluster", "clusters"),
             e.layout.cluster_size(),
             e.layout.sector_size
         );
@@ -762,11 +779,11 @@ fn unfinished(v: Volume, e: ufat::Error) -> ufat::Error {
 fn report_estimate(args: &Args, path: &Path, estimate: &ufat::plan::Estimate) {
     if args.flag("verbose") {
         eprintln!(
-            "{}: {} files and {} directories in {} bytes need a {} byte file system with {} byte clusters",
+            "{}: {} and {} in {} need a {} byte file system with {} byte clusters",
             path.display(),
-            estimate.files,
-            estimate.directories,
-            estimate.bytes,
+            plural(estimate.files, "file", "files"),
+            plural(estimate.directories, "directory", "directories"),
+            plural(estimate.bytes, "byte", "bytes"),
             estimate.size(),
             estimate.layout.cluster_size()
         );
@@ -1100,18 +1117,21 @@ fn cmd_check(argv: &[OsString]) -> Result<ExitCode> {
         );
     }
     if report.dropped > 0 {
-        println!("... and {} more problems not shown", report.dropped);
+        println!(
+            "... and {} not shown",
+            plural(report.dropped as u64, "more problem", "more problems")
+        );
     }
     println!(
-        "{}: {} files, {} directories, {} clusters used, {} free, {} lost; {} errors, {} warnings",
+        "{}: {}, {}, {} used, {} free, {} lost; {}, {}",
         image.display(),
-        report.files,
-        report.directories,
-        report.used_clusters,
+        plural(report.files, "file", "files"),
+        plural(report.directories, "directory", "directories"),
+        plural(u64::from(report.used_clusters), "cluster", "clusters"),
         report.free_clusters,
         report.lost_clusters,
-        report.errors(),
-        report.warnings()
+        plural(report.errors() as u64, "error", "errors"),
+        plural(report.warnings() as u64, "warning", "warnings")
     );
     Ok(if report.errors() > 0 {
         ExitCode::from(FSCK_ERRORS_LEFT_UNCORRECTED)

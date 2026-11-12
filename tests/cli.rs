@@ -683,6 +683,96 @@ fn manifests_of_what_was_written() {
     assert!(!root.join("-").exists());
 }
 
+/// A count of one is said in the singular: in the summary of check, in
+/// what --verbose reports and in the note about entries a manifest leaves
+/// out.
+#[test]
+fn counts_of_one() {
+    use std::os::unix::fs::FileExt;
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    fs::create_dir_all(root.join("tree/d")).unwrap();
+    fs::write(root.join("tree/d/f"), b"x").unwrap();
+    let t = root.join("tree");
+    let t = t.to_str().unwrap();
+    let a = root.join("a.img");
+    let a = a.to_str().unwrap();
+    let out = run(&bin, &["assemble", "--create", "--verbose", "--fats", "1", a, t]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{}", stderr);
+    assert!(
+        stderr.contains(": 1 file and 1 directory in 1 byte need a "),
+        "{}",
+        stderr
+    );
+    assert!(
+        stderr.contains(&format!("{}: 1 file, 1 directory, 1 byte\n", t)),
+        "{}",
+        stderr
+    );
+    assert!(stderr.contains(" reserved sectors, 1 FAT of "), "{}", stderr);
+    let out = run(&bin, &["assemble", "--plan", "--verbose", t]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.starts_with("1 file, 1 directory, 1 byte: 3 clusters of 512 bytes"),
+        "{}",
+        stderr
+    );
+
+    // FAT entry 0 without the media byte in the first of two FATs is one
+    // error, and the one byte the second FAT differs in is one warning.
+    let b = root.join("b.img");
+    ok(&bin, &["assemble", "--create", b.to_str().unwrap(), t]);
+    let image = fs::OpenOptions::new().read(true).write(true).open(&b).unwrap();
+    let mut sector = [0u8; 512];
+    image.read_exact_at(&mut sector, 0).unwrap();
+    let layout = ufat::boot::BootSector::parse(&sector).unwrap().layout().unwrap();
+    image.write_all_at(&[0xf0], layout.fat_offset(0)).unwrap();
+    drop(image);
+    let out = run(&bin, &["check", b.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(4));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let summary = stdout.lines().last().unwrap();
+    assert!(
+        summary.starts_with(&format!("{}: 1 file, 1 directory, 3 clusters used, ", b.display())),
+        "{}",
+        stdout
+    );
+    assert!(summary.ends_with(" free, 0 lost; 1 error, 1 warning"), "{}", stdout);
+
+    // An empty volume uses the one cluster of its root directory. A name
+    // of 100 three-byte characters fits FAT but no manifest.
+    let e = root.join("e.img");
+    let e = e.to_str().unwrap();
+    ok(&bin, &["assemble", "--create", "--size", "40M", e]);
+    let summary = ok(&bin, &["check", e]);
+    assert!(
+        summary.contains(": 0 files, 0 directories, 1 cluster used, "),
+        "{}",
+        summary
+    );
+    let device = ufat::device::Device::open(Path::new(e), ufat::device::Access::ReadWrite).unwrap();
+    let mut v = ufat::volume::Volume::open(device).unwrap();
+    let long: String = std::iter::repeat_n('\u{20ac}', 100).collect();
+    v.create_dir(&format!("/{}", long), std::time::SystemTime::now())
+        .unwrap();
+    v.close().unwrap();
+    let m = root.join("e.manifest");
+    let out = run(&bin, &["describe", "--write-manifest", m.to_str().unwrap(), e]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{}", stderr);
+    assert!(
+        stderr.contains(": its name cannot be written in a manifest"),
+        "{}",
+        stderr
+    );
+    assert!(stderr.starts_with("ufat: 1 entry is not in "), "{}", stderr);
+}
+
 /// assemble prints the hash of the file system it wrote on request, and
 /// capabilities prints what GetCapabilities answers.
 #[test]
