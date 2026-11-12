@@ -155,8 +155,8 @@ What the fields mean for vfat:
 | `content` | What to copy into the new file system, see "Content". |
 | `imageHash` | `sha256` or `sha512`. Hashes the image after formatting. |
 
-Mode `format` creates the file system and copies the content into it, in
-one call. Mode `plan` computes the geometry and the size the content
+Mode `assemble` creates the file system and copies the content into it,
+in one call. Mode `plan` computes the geometry and the size the content
 needs. It writes nothing.
 
 How the image is sized:
