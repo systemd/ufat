@@ -130,6 +130,58 @@ fn help_after_the_options_is_an_argument() {
     );
 }
 
+/// Output into a pipe whose reader is gone ends ufat with SIGPIPE, as it
+/// ends other command line tools, without a panic.
+#[test]
+fn a_closed_pipe_ends_ufat_quietly() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let image = dir.path().join("a.img");
+    let image = image.to_str().unwrap();
+    ok(&bin, &["assemble", "--create", "--size", "40M", image]);
+    for args in [
+        &["describe", image][..],
+        &["capabilities"],
+        &["--help"],
+        &["list", "-h"],
+    ] {
+        let mut fds = [0; 2];
+        // SAFETY: pipe2() stores two new descriptors in the array.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: both descriptors were just created and nothing else owns
+        // them.
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        // The reader is gone before ufat starts, so its first write fails.
+        drop(read);
+        let out = Command::new(&bin)
+            .args(args)
+            .stdout(Stdio::from(write))
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ufat runs");
+        assert_eq!(
+            out.status.signal(),
+            Some(libc::SIGPIPE),
+            "ufat {:?}: {:?}",
+            args,
+            out.status
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "ufat {:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 #[test]
 fn assemble_and_populate_take_trees_and_manifests() {
     let _serial = common::serial();

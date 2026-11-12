@@ -1103,6 +1103,14 @@ fn run(argv: &[OsString]) -> Result<ExitCode> {
 
 /// Runs the command line interface.
 pub(crate) fn main() -> ExitCode {
+    // Rust starts programs with SIGPIPE ignored, so writing to a pipe whose
+    // reader is gone fails with EPIPE, and print!() panics on that, as in
+    // `ufat describe IMAGE | head -1`. Let the signal end the tool quietly
+    // instead, as it ends other command line tools. The service keeps
+    // ignoring it: it writes its replies to the socket with plain writes.
+    // SAFETY: signal() only sets how SIGPIPE is handled, and SIG_DFL is a
+    // valid disposition.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let argv: Vec<OsString> = std::env::args_os().skip(1).collect();
     match run(&argv) {
         Ok(code) => code,
