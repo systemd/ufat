@@ -269,6 +269,22 @@ fn assemble_and_populate_take_trees_and_manifests() {
         "ufat: 'EFI/Linux/linux.efi' does not match the hash in the manifest",
     );
     fs::write(root.join("tree/EFI/Linux/linux.efi"), b"kernel").unwrap();
+    // What a failed assemble wrote is left the way a crash would leave it:
+    // the files that were complete, in a file system marked as not cleanly
+    // unmounted. check reports the mark.
+    fs::write(root.join("tree/loader/entries/x.conf"), b"title y\n").unwrap();
+    let e = root.join("e.img");
+    let e = e.to_str().unwrap();
+    fails(
+        &bin,
+        &["assemble", "--create", "--manifest", m, e, tree_arg],
+        "'loader/entries/x.conf' does not match the hash",
+    );
+    assert_eq!(ok(&bin, &["cat", e, "/EFI/Linux/linux.efi"]), "kernel");
+    let report = ok(&bin, &["check", e]);
+    assert!(report.contains("marked dirty"), "{}", report);
+    assert!(report.contains("0 errors, 2 warnings"), "{}", report);
+    fs::write(root.join("tree/loader/entries/x.conf"), b"title x\n").unwrap();
     // Without a SOURCE assemble makes an empty file system, sized for a
     // manifest as well, and takes no --fit with it.
     let c = root.join("c.img");

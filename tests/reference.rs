@@ -698,3 +698,42 @@ fn an_assembled_tree_comes_back_through_mtools() {
     assert!(listing.contains("photo.jpeg  (PHOTO~1.JPE)"), "{}", listing);
     assert!(listing.lines().any(|l| l.ends_with(" a.jpg")), "{}", listing);
 }
+
+/// An `assemble` that fails while it copies leaves the file system marked
+/// as not cleanly unmounted, and fsck.fat says so.
+#[test]
+fn fsck_fat_sees_a_failed_assemble() {
+    let _serial = common::serial();
+    let (Some(ufat), Some(fsck)) = (ufat(), find_program("fsck.fat")) else {
+        return skip("ufat or fsck.fat");
+    };
+    let tree = Temp::dir();
+    build_tree(tree.path(), &[("a.txt", b"first"), ("b.txt", b"second")]);
+    let src = tree.path().to_str().unwrap();
+    let manifest = Temp::new(".manifest");
+    std::fs::write(manifest.path(), run(&ufat, &["manifest", src], &[])).unwrap();
+    // b.txt changes after the manifest was written and keeps its size.
+    std::fs::write(tree.path().join("b.txt"), b"SECOND").unwrap();
+    let image = Temp::new(".img");
+    let img = image.0.to_str().unwrap();
+    let out = std::process::Command::new(&ufat)
+        .args([
+            "assemble",
+            "--create",
+            "--manifest",
+            manifest.0.to_str().unwrap(),
+            img,
+            src,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = std::process::Command::new(&fsck).args(["-n", img]).output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{}", text);
+    assert!(text.contains("Dirty bit is set"), "{}", text);
+}

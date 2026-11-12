@@ -241,6 +241,13 @@ unmounted, the way Linux, Windows and EDK2 expect. ufat removes the mark
 when it closes the volume. After a crash, the mark tells readers and
 `ufat check` to look at the volume.
 
+When `assemble` fails after it has formatted the file system, ufat
+leaves the file system marked as not cleanly unmounted, as after a
+crash. It holds the files that were complete when the command failed.
+`ufat check` and fsck.fat report the mark, and Linux warns about it when
+it mounts the file system read-write. Running `assemble` again formats
+the file system anew.
+
 A crash can leave a state that readers resolve in different ways. A
 replaced file can briefly exist twice, and a long name can lose its long
 form. `ufat check` reports both. Every reader still finds a complete file.
