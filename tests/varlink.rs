@@ -668,7 +668,7 @@ fn methods_on_an_image_take_the_file_system_type() {
     assert_eq!(u64_of(&r, "directories"), 1);
     let r = reply(call(&mut c, "Check", &with("vfat", ""), &[img.as_fd()]));
     assert!(bool_of(&r, "clean"));
-    // An image that holds another file system fails with vfat given as it
+    // An image that holds no FAT32 file system fails with vfat given as it
     // does without a type.
     let mut bytes = vec![0x55u8; 1 << 20];
     bytes[ufat::boot::field::BYTES_PER_SECTOR].copy_from_slice(&common::SECTOR_SIZE.to_le_bytes());
@@ -678,7 +678,7 @@ fn methods_on_an_image_take_the_file_system_type() {
     for (m, rest) in methods {
         let e = error_of(&mut c, m, &with("vfat", rest), &[other.as_fd()]);
         assert_eq!(e.name, format!("{}.NotFileSystem", IFACE), "{}", m);
-        assert_eq!(str_of(&e.parameters, "reason"), "otherFileSystem");
+        assert_eq!(str_of(&e.parameters, "reason"), "unknown");
     }
 }
 
@@ -1621,18 +1621,38 @@ fn describe_with_and_without_a_manifest() {
     let e = error_of(&mut c, "Describe", IMG, &[blank_ro.as_fd()]);
     assert_eq!(e.name, format!("{}.NotFileSystem", IFACE));
     assert_eq!(str_of(&e.parameters, "reason"), "blank");
+    // Data, with a sector size and a FAT size in the places of a boot
+    // sector's, but no boot sector: not blank, and nothing ufat
+    // recognizes.
     let mut bytes = vec![0x55u8; 1 << 20];
     let garbage = file_with(scratch.path(), "garbage", &bytes);
     let e = error_of(&mut c, "Describe", IMG, &[garbage.as_fd()]);
     assert_eq!(e.name, format!("{}.NotFileSystem", IFACE));
-    assert_eq!(str_of(&e.parameters, "reason"), "sectorSize");
-    assert_eq!(u64_of(&e.parameters, "sectorSize"), 0x5555);
-    // A plausible sector size and a FAT16 style FAT size: something else.
+    assert_eq!(str_of(&e.parameters, "reason"), "unknown");
+    assert!(e.parameters.get("sectorSize").is_none());
     bytes[ufat::boot::field::BYTES_PER_SECTOR].copy_from_slice(&common::SECTOR_SIZE.to_le_bytes());
     let other = file_with(scratch.path(), "other", &bytes);
     let e = error_of(&mut c, "Describe", IMG, &[other.as_fd()]);
     assert_eq!(e.name, format!("{}.NotFileSystem", IFACE));
-    assert_eq!(str_of(&e.parameters, "reason"), "otherFileSystem");
+    assert_eq!(str_of(&e.parameters, "reason"), "unknown");
+    // An ext2 superblock behind a first sector of zeros is not blank.
+    let mut bytes = vec![0u8; 1 << 20];
+    bytes[common::EXT2_MAGIC_FIELD].copy_from_slice(&common::EXT2_SUPER_MAGIC.to_le_bytes());
+    let ext2 = file_with(scratch.path(), "ext2", &bytes);
+    let e = error_of(&mut c, "Describe", IMG, &[ext2.as_fd()]);
+    assert_eq!(e.name, format!("{}.NotFileSystem", IFACE));
+    assert_eq!(str_of(&e.parameters, "reason"), "unknown");
+    // A FAT boot sector with a sector size ufat does not support.
+    let mut bytes = vec![0u8; 1 << 20];
+    bytes[ufat::boot::field::JUMP].copy_from_slice(&ufat::boot::BOOT_JUMP);
+    bytes[ufat::boot::field::BYTES_PER_SECTOR].copy_from_slice(&common::ODD_SECTOR_SIZE.to_le_bytes());
+    bytes[ufat::boot::field::FATS] = ufat::layout::DEFAULT_FATS as u8;
+    bytes[ufat::boot::field::MEDIA] = ufat::boot::MEDIA_FIXED;
+    let odd = file_with(scratch.path(), "odd", &bytes);
+    let e = error_of(&mut c, "Describe", IMG, &[odd.as_fd()]);
+    assert_eq!(e.name, format!("{}.NotFileSystem", IFACE));
+    assert_eq!(str_of(&e.parameters, "reason"), "sectorSize");
+    assert_eq!(u64_of(&e.parameters, "sectorSize"), u64::from(common::ODD_SECTOR_SIZE));
     let tiny = file_with(scratch.path(), "tiny", b"tiny");
     let e = error_of(&mut c, "Describe", IMG, &[tiny.as_fd()]);
     assert_eq!(str_of(&e.parameters, "reason"), "tooSmall");

@@ -986,9 +986,11 @@ pub fn check_with_progress(device: &Device, progress: &mut dyn FnMut(&Progress))
     }
     let mut sector = [0u8; BOOT_SECTOR_SIZE];
     device.read_at(0, &mut sector)?;
-    let boot = BootSector::parse(&sector)?;
+    let boot = BootSector::parse(&sector).map_err(|e| crate::probe::refine(e, device, &sector))?;
     if let Err(e) = boot.validate() {
-        if e.errno() == EMEDIUMTYPE {
+        // Not FAT32 at all, or the device could not be read.
+        let e = crate::probe::refine(e, device, &sector);
+        if e.errno() != EUCLEAN {
             return Err(e);
         }
         report.error(|| boot_sector_problem(&e));

@@ -2,6 +2,7 @@
 //! Helpers shared by the integration tests.
 #![allow(dead_code, unreachable_pub)]
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,9 +10,17 @@ use std::sync::{Mutex, MutexGuard};
 
 /// The sector size the tests write into boot sectors, the smallest one.
 pub const SECTOR_SIZE: u16 = ufat::layout::MIN_SECTOR_SIZE as u16;
+/// A sector size no FAT file system has, as it is not a power of two.
+pub const ODD_SECTOR_SIZE: u16 = 1000;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 static SERIAL: Mutex<()> = Mutex::new(());
+
+/// Where an ext2, ext3 or ext4 file system keeps its magic number: the
+/// s_magic field of the superblock, which starts 1024 bytes in.
+pub const EXT2_MAGIC_FIELD: Range<usize> = 1080..1082;
+/// The magic number of an ext2, ext3 or ext4 superblock.
+pub const EXT2_SUPER_MAGIC: u16 = 0xEF53;
 
 /// Runs the tests of a binary one at a time. A child process inherits every
 /// descriptor open at the moment it is forked, and with it the lock on an

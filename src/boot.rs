@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! The FAT32 boot sector (BPB) and the FSInfo sector.
 
+use std::ops::RangeInclusive;
+
 use crate::bytes::{bytes_at, le16_at, le32_at, size};
 use crate::errno::*;
 use crate::layout::Layout;
@@ -58,7 +60,19 @@ pub const EXT_FLAGS_NO_MIRRORING: u16 = 0x80;
 /// The BIOS drive number of the first fixed disk.
 pub const DRIVE_NUMBER_FIXED: u8 = 0x80;
 /// The jump over the BPB to the boot code that mkfs.fat writes.
-pub const BOOT_JUMP: [u8; size(field::JUMP)] = [0xEB, 0x58, 0x90];
+pub const BOOT_JUMP: [u8; size(field::JUMP)] = short_jump(field::BOOT_CODE.start);
+/// The opcode of a short jump, which BS_jmpBoot holds as EB xx 90.
+pub const JMP_SHORT: u8 = 0xEB;
+/// The size of a short jump: the opcode and the displacement, which
+/// counts from the end of the jump.
+const JMP_SHORT_SIZE: usize = 2;
+/// The no-op that follows a short jump in BS_jmpBoot.
+pub const NOP: u8 = 0x90;
+/// The opcode of a near jump, which BS_jmpBoot holds as E9 xx xx.
+pub const JMP_NEAR: u8 = 0xE9;
+/// How many FATs a boot sector has to claim to look like the one of a FAT
+/// volume: one, or the two the FAT specification recommends.
+const LIKELY_FATS: RangeInclusive<u8> = 1..=2;
 /// Size of the boot code area in a FAT32 boot sector.
 pub const BOOT_CODE_SIZE: usize = size(field::BOOT_CODE);
 /// Lead signature of the FSInfo sector ("RRaA").
@@ -167,6 +181,17 @@ const BOOT_CODE_HEAD: [u8; 29] = [
 const BOOT_MESSAGE: &[u8] =
     b"This is not a bootable disk.  Please insert a bootable floppy and\r\npress any key to try again ... \r\n";
 
+/// BS_jmpBoot as mkfs.fat writes it: a short jump to the boot code at
+/// `boot_code` bytes into the boot sector, and a no-op.
+pub const fn short_jump(boot_code: usize) -> [u8; size(field::JUMP)] {
+    let displacement = boot_code - field::JUMP.start - JMP_SHORT_SIZE;
+    assert!(
+        displacement <= i8::MAX as usize,
+        "the boot code is out of the reach of a short jump"
+    );
+    [JMP_SHORT, displacement as u8, NOP]
+}
+
 /// Returns the boot code mkfs.fat writes into FAT32 boot sectors.
 pub fn default_boot_code() -> [u8; BOOT_CODE_SIZE] {
     let mut code = [0u8; BOOT_CODE_SIZE];
@@ -240,6 +265,17 @@ pub struct BootSector {
 }
 
 impl BootSector {
+    /// Whether `b` looks like the boot sector of a FAT volume, whatever
+    /// its FAT type: the jump instruction the FAT specification asks for,
+    /// a media descriptor and one or two FATs. A master boot record can
+    /// start with the same jump, but it has no media descriptor in its
+    /// place.
+    pub(crate) fn looks_like_fat(b: &[u8; BOOT_SECTOR_SIZE]) -> bool {
+        matches!(b[field::JUMP], [JMP_SHORT, _, NOP] | [JMP_NEAR, _, _])
+            && valid_media(b[field::MEDIA])
+            && LIKELY_FATS.contains(&b[field::FATS])
+    }
+
     /// Decodes a boot sector from at least 512 bytes. No validation is done,
     /// use [`BootSector::validate`] for that.
     pub fn parse(b: &[u8]) -> Result<BootSector> {

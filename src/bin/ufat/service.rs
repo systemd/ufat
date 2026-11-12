@@ -174,16 +174,15 @@ fn no_space_reason(reason: NoSpaceReason) -> &'static str {
 }
 
 /// Why the image holds no FAT32 volume, as the interface's
-/// `NotFileSystemReason`. A boot sector that is not blank and not FAT32
-/// belongs to something else, a FAT12 or FAT16 volume or another file
-/// system altogether, which is `otherFileSystem`; the library does not
-/// say what it found, so `found` stays unset.
+/// `NotFileSystemReason`. The library does not say what else an image
+/// holds, so `found` stays unset.
 fn not_file_system_reason(reason: NotFat32Reason) -> &'static str {
     match reason {
         NotFat32Reason::Blank => "blank",
         NotFat32Reason::NotFat32 => "otherFileSystem",
         NotFat32Reason::SectorSize => "sectorSize",
         NotFat32Reason::TooSmall => "tooSmall",
+        NotFat32Reason::Unknown => "unknown",
     }
 }
 

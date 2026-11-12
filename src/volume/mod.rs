@@ -255,8 +255,8 @@ impl Volume {
         }
         let mut sector = [0u8; BOOT_SECTOR_SIZE];
         device.read_at(0, &mut sector)?;
-        let boot = BootSector::parse(&sector)?;
-        let layout = boot.layout()?;
+        let boot = BootSector::parse(&sector).map_err(|e| crate::probe::refine(e, &device, &sector))?;
+        let layout = boot.layout().map_err(|e| crate::probe::refine(e, &device, &sector))?;
         if layout.size() > device.len() {
             bail!(
                 EUCLEAN,
