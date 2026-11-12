@@ -88,7 +88,7 @@ The reply does not depend on the call. It is:
       "capabilities" : {
         "fileSystemType" : "vfat",
         "implementation" : "ufat",
-        "version" : "0.1",
+        "version" : "0.1.0",
         "readOnly" : false,
         "operations" : [ "plan", "assembleWithContent", "populate", "remove",
                          "list", "check", "label", "identifier", "reproducible",

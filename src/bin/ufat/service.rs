@@ -44,7 +44,8 @@ use crate::util;
 /// The interface description, served verbatim.
 pub(crate) const INTERFACE: &str = include_str!("../../../docs/org.uapi-group.FileSystem.varlink");
 const INTERFACE_NAME: &str = "org.uapi-group.FileSystem";
-const VERSION: &str = "0.1";
+/// The version of the package, which GetInfo and GetCapabilities report.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The one file system type this service makes, as the kernel names it.
 const FILE_SYSTEM_TYPE: &str = "vfat";
 /// Findings per intermediate reply of Check.

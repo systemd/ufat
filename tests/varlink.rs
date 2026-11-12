@@ -469,6 +469,8 @@ fn info_and_description_over_fd3() {
         vec!["io.systemd", IFACE, "org.varlink.service"]
     );
     assert_eq!(info.get("product").unwrap().as_str(), Some("ufat"));
+    // The version is the package's.
+    assert_eq!(info.get("version").unwrap().as_str(), Some(env!("CARGO_PKG_VERSION")));
     let d = reply(
         c.call(
             "org.varlink.service.GetInterfaceDescription",
@@ -521,7 +523,7 @@ fn capabilities_describe_vfat() {
     let caps = object_of(&r, "capabilities");
     assert_eq!(str_of(caps, "fileSystemType"), "vfat");
     assert_eq!(str_of(caps, "implementation"), "ufat");
-    assert!(!str_of(caps, "version").is_empty());
+    assert_eq!(str_of(caps, "version"), env!("CARGO_PKG_VERSION"));
     assert!(!bool_of(caps, "readOnly"));
     assert_eq!(
         strings_of(caps, "operations"),
