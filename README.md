@@ -148,6 +148,9 @@ input instead, back to back in manifest order. Standard input has to end
 after the last file. A manifest names its paths from the root of the
 file system, so `--path` does not apply.
 
+`--manifest -` reads the manifest from standard input. The file
+contents then have to come from a directory.
+
 When the contents come from a directory, ufat first checks that every
 file the manifest names is there with the size the manifest gives. This
 happens before the image is changed. While copying, ufat verifies the

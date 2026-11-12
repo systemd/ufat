@@ -232,6 +232,20 @@ fn assemble_and_populate_take_trees_and_manifests() {
     let out = run_in(&bin, &["populate", "--manifest", m, a, "-"], b"kerneltitle x\nmore");
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("goes on after the last file"));
+    // --manifest - reads the manifest from standard input, which then
+    // cannot carry the file contents as well.
+    let manifest_bytes = fs::read(&manifest).unwrap();
+    let out = run_in(&bin, &["assemble", "--plan", "--manifest", "-"], &manifest_bytes);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), tree_size);
+    let out = run_in(&bin, &["populate", "--manifest", "-", a, tree_arg], &manifest_bytes);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = run_in(&bin, &["populate", "--manifest", "-", a, "-"], b"");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot both read standard input"));
+    let out = run_in(&bin, &["assemble", "--plan", "--manifest", "-"], b"not a manifest");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("standard input is not a UAPI.16 manifest"));
     // A SOURCE is a directory, or for populate one file that needs --path;
     // a manifest is named by --manifest.
     fails(&bin, &["populate", a, m], "needs --path");

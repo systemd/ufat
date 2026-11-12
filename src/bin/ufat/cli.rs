@@ -53,7 +53,8 @@ Without a SOURCE it creates the directory --path.
 A SOURCE is a directory tree, or for populate one file. With --manifest the
 one SOURCE is the tree the manifest describes, where its file contents are
 read, or - for the contents on standard input, back to back in manifest order:
-  --manifest PATH       Build what the UAPI.16 manifest at PATH describes
+  --manifest PATH       Build what the UAPI.16 manifest at PATH, or on standard
+                        input for -, describes
   --no-check-validity   Accept revoked and expired manifest entries
   --unsupported POLICY  What to do with what FAT cannot store: skip (default)
                         or fail
@@ -382,7 +383,8 @@ enum Data {
 
 /// The manifest `--manifest` named, read once, and where its data is.
 struct ManifestSource {
-    path: PathBuf,
+    /// How messages name the manifest: its path, or standard input.
+    name: String,
     manifest: manifest::Manifest,
     /// None for the commands that only size.
     data: Option<Data>,
@@ -396,16 +398,24 @@ struct Sources {
     manifest: Option<ManifestSource>,
 }
 
-/// Reads and parses the manifest `path` names.
-fn read_manifest(path: &Path) -> Result<manifest::Manifest> {
-    let file = host::open_file(path)?;
-    util::read_manifest(file).map_err(|e| {
+/// Reads and parses the manifest `path` names, or the one on standard input
+/// for "-". Returns it with the name messages give it.
+fn read_manifest(path: &Path) -> Result<(manifest::Manifest, String)> {
+    let (file, name) = if path == Path::new("-") {
+        // A descriptor of our own, since the reader closes it.
+        let fd = std::io::stdin().as_fd().try_clone_to_owned()?;
+        (std::fs::File::from(fd), "standard input".to_string())
+    } else {
+        (host::open_file(path)?, path.display().to_string())
+    };
+    let manifest = util::read_manifest(file).map_err(|e| {
         if e.is_manifest() {
-            e.context(format_args!("{} is not a UAPI.16 manifest", path.display()))
+            e.context(format_args!("{} is not a UAPI.16 manifest", name))
         } else {
-            e.context(format_args!("cannot read {} as a manifest", path.display()))
+            e.context(format_args!("cannot read {} as a manifest", name))
         }
-    })
+    })?;
+    Ok((manifest, name))
 }
 
 /// Resolves the SOURCE arguments (the `--fit` directories for an empty
@@ -428,7 +438,13 @@ fn sources(args: &Args, paths: &[&Path], sizing: bool) -> Result<Sources> {
         }
         return Ok(Sources { trees, manifest: None });
     };
-    let manifest = read_manifest(m)?;
+    if m == Path::new("-") && !sizing && matches!(paths, [p] if *p == Path::new("-")) {
+        bail!(
+            errno::EINVAL,
+            "--manifest - and a SOURCE of - cannot both read standard input"
+        );
+    }
+    let (manifest, name) = read_manifest(m)?;
     if dest(args) != "/" {
         bail!(
             errno::EINVAL,
@@ -453,11 +469,7 @@ fn sources(args: &Args, paths: &[&Path], sizing: bool) -> Result<Sources> {
     };
     Ok(Sources {
         trees: Vec::new(),
-        manifest: Some(ManifestSource {
-            path: m.to_path_buf(),
-            manifest,
-            data,
-        }),
+        manifest: Some(ManifestSource { name, manifest, data }),
     })
 }
 
@@ -491,7 +503,7 @@ fn check_sources(args: &Args, sources: &Sources) -> Result<()> {
             .map_err(|e| {
                 e.context(format!(
                     "the files {} describes are not all below {}",
-                    m.path.display(),
+                    m.name,
                     path.display()
                 ))
             })?;
@@ -570,10 +582,7 @@ fn fill(v: &mut Volume, args: &Args, sources: &Sources) -> Result<()> {
         if args.flag("verbose") {
             eprintln!(
                 "{}: {} files, {} directories, {} bytes",
-                m.path.display(),
-                report.files,
-                report.directories,
-                report.bytes
+                m.name, report.files, report.directories, report.bytes
             );
         }
         for skipped in report.skipped {
