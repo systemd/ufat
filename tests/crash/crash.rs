@@ -1348,8 +1348,8 @@ impl<'a> Worker<'a> {
         };
         let mut dirs: BTreeSet<String> = ["/".to_string()].into_iter().collect();
         let mut children: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for j in lo..=hi {
-            for (path, node) in &h.boundaries[j].tree {
+        for boundary in &h.boundaries[lo..=hi] {
+            for (path, node) in &boundary.tree {
                 if *node == Node::Dir {
                     dirs.insert(path.clone());
                 }
