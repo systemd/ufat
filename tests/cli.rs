@@ -182,6 +182,18 @@ fn a_closed_pipe_ends_ufat_quietly() {
     }
 }
 
+/// --version, and version like help, print the version of the package.
+#[test]
+fn version() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let version = format!("ufat {}\n", env!("CARGO_PKG_VERSION"));
+    assert_eq!(ok(&bin, &["--version"]), version);
+    assert_eq!(ok(&bin, &["version"]), version);
+}
+
 #[test]
 fn assemble_and_populate_take_trees_and_manifests() {
     let _serial = common::serial();

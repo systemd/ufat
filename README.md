@@ -90,7 +90,8 @@ The commands are:
 The commands are named after the methods of the Varlink service, see
 below. `cat` and `manifest` have no method.
 
-`ufat --help` lists all options. The most common ones:
+`ufat --version` prints the version. `ufat --help` lists all options.
+The most common ones:
 
 - `--offset BYTES` and `--size BYTES` select a file system inside a larger
   image, for example one partition of a disk image.

@@ -26,6 +26,8 @@ use crate::util;
 
 const USAGE: &str = "\
 Usage: ufat COMMAND [OPTIONS...] ARGS...
+       ufat --help
+       ufat --version
 
 Commands:
   assemble [OPTIONS] IMAGE [SOURCE...]   Create a FAT32 file system sized to fit
@@ -1173,6 +1175,10 @@ fn run(argv: &[OsString]) -> Result<ExitCode> {
     // knows where the options end.
     if matches!(command, "help" | "--help" | "-h") {
         print!("{}", USAGE);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if matches!(command, "version" | "--version") {
+        println!("ufat {}", env!("CARGO_PKG_VERSION"));
         return Ok(ExitCode::SUCCESS);
     }
     let rest = &argv[1..];
