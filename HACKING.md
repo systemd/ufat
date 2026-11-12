@@ -263,3 +263,10 @@ Dependabot proposes updates of the actions and of the crates once a
 month. It keeps libc on 0.2. It updates sha2 and the crates it needs in
 one pull request, and skips sha2 0.11.1 and later, which need rustc
 1.88.
+
+## Submitting changes
+
+Changes go in as pull requests on GitHub. Every commit carries a
+`Signed-off-by:` line from its author, merge commits included.
+`git commit -s` adds one. With it the author certifies the Developer
+Certificate of Origin in the file DCO.
