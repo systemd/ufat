@@ -80,6 +80,15 @@ fn help_and_short_options() {
     };
     let usage = ok(&bin, &["list", "-h"]);
     assert!(usage.starts_with("Usage: ufat COMMAND"), "{}", usage);
+    // assemble's --verbose is described once, with what it reports.
+    let verbose: Vec<&str> = usage
+        .lines()
+        .filter(|l| l.trim_start().starts_with("--verbose"))
+        .collect();
+    assert_eq!(
+        verbose,
+        ["  --verbose             Report the geometry chosen and what was written"]
+    );
     for args in [
         &["list", "-hl", "x.img"][..],
         &["list", "-lh", "x.img"],

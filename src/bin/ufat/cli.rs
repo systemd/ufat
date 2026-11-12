@@ -89,7 +89,6 @@ Options for assemble:
                         written
   --write-hash PATH     Write that hash to PATH instead, or to standard output
                         for -
-  --verbose             Report the geometry chosen
 
 Options for assemble and populate:
   --timestamp SECONDS   Time to stamp, default $SOURCE_DATE_EPOCH, else now;
@@ -103,7 +102,7 @@ Options for assemble and populate:
                         accept a directory that exists (populate)
   --write-manifest PATH Write the UAPI.16 manifest of the file system to PATH,
                         or to standard output for -, afterwards (also describe)
-  --verbose             Report what was written
+  --verbose             Report the geometry chosen and what was written
 
 Options for remove:
   --recursive, -r       Remove directories with everything below them
