@@ -387,6 +387,9 @@ with `ContentMismatch` and reason `streamEnded`, for the file it ended
 in. A stream with more data after the last file fails with
 `ContentMismatch` and reason `size`, for the last file.
 
+The `name` of `SourceMismatch` and `ContentMismatch` is the name of the
+file's record in the manifest, such as `loader/loader.conf`.
+
 A `ManifestSink` has a `fileDescriptor` open for writing and optional
 `fields`, the per-file fields in the vocabulary of systemd-manifest:
 `mode`, `uid`, `gid`, `size`, `hash`, `symlink`, `device`, `hardlink`,

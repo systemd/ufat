@@ -257,9 +257,17 @@ fn assemble_and_populate_take_trees_and_manifests() {
     fails(
         &bin,
         &["assemble", "--create", "--manifest", m, d, tree_arg],
-        "is 15 bytes, the manifest says 6",
+        ": EFI/Linux/linux.efi: EFI/Linux/linux.efi is 15 bytes, the manifest says 6",
     );
     assert!(!Path::new(d).exists());
+    // One whose contents changed fails while it is copied. The messages
+    // name the file the way the manifest does.
+    fs::write(root.join("tree/EFI/Linux/linux.efi"), b"kernal").unwrap();
+    fails(
+        &bin,
+        &["assemble", "--create", "--manifest", m, d, tree_arg],
+        "ufat: 'EFI/Linux/linux.efi' does not match the hash in the manifest",
+    );
     fs::write(root.join("tree/EFI/Linux/linux.efi"), b"kernel").unwrap();
     // Without a SOURCE assemble makes an empty file system, sized for a
     // manifest as well, and takes no --fit with it.

@@ -158,11 +158,11 @@ impl DirectorySource {
             let Ok(source) = reference(entry, contents) else {
                 continue;
             };
-            let path = entry.path();
+            let name = entry.name.as_deref().unwrap_or_default();
             let failed = |e: std::io::Error| {
                 source_failure(
                     Error::from(e).context(format_args!("failed to open {}", source.relative)),
-                    &path,
+                    name,
                 )
             };
             let pinned = sys::chase(
@@ -176,14 +176,14 @@ impl DirectorySource {
             if !md.is_file() {
                 bail!(
                     EINVAL,
-                    mismatch(&path, SourceProblem::NotRegular, None, None),
+                    mismatch(name, SourceProblem::NotRegular, None, None),
                     "{}: {} is not a regular file",
-                    path,
+                    name,
                     source.relative
                 );
             }
-            source.check_len(&path, md.len(), entry.size, |found, expected| {
-                mismatch(&path, SourceProblem::Size, found, expected)
+            source.check_len(name, md.len(), entry.size, |found, expected| {
+                mismatch(name, SourceProblem::Size, found, expected)
             })?;
         }
         Ok(())
@@ -204,7 +204,7 @@ struct Reference {
 
 impl Reference {
     /// Checks the length `len` of the file against the manifest, for the
-    /// entry `path` of `size` bytes, and returns the size of its data: the
+    /// entry `name` of `size` bytes, and returns the size of its data: the
     /// rest of the file after the offset when the manifest gives none.
     /// A reference without an offset and without `originalSize` is the
     /// whole file, which has to be exactly `size` bytes long. A part of a
@@ -213,7 +213,7 @@ impl Reference {
     /// the one expected.
     fn check_len(
         &self,
-        path: &str,
+        name: &str,
         len: u64,
         size: Option<u64>,
         detail: impl Fn(Option<u64>, Option<u64>) -> Detail,
@@ -224,7 +224,7 @@ impl Reference {
                     EBADMSG,
                     detail(Some(len), Some(total)),
                     "{}: {} is {} bytes, the manifest says {}",
-                    path,
+                    name,
                     self.relative,
                     len,
                     total
@@ -240,7 +240,7 @@ impl Reference {
                 EBADMSG,
                 detail(Some(len), Some(size)),
                 "{}: {} is {} bytes, the manifest says {}",
-                path,
+                name,
                 self.relative,
                 len,
                 size
@@ -251,7 +251,7 @@ impl Reference {
                 EBADMSG,
                 detail(Some(len), self.offset.checked_add(size)),
                 "{}: {} is too short for offset {} and size {}",
-                path,
+                name,
                 self.relative,
                 self.offset,
                 size
@@ -302,11 +302,11 @@ fn reference(entry: &Entry, contents: Option<&Contents>) -> Result<Reference> {
 
 impl ContentSource for DirectorySource {
     fn copy(&mut self, entry: &Entry, contents: Option<&Contents>, sink: &mut dyn Write) -> Result<()> {
-        let path = entry.path();
+        let name = entry.name.as_deref().unwrap_or_default();
         let source = reference(entry, contents)?;
-        let (mut file, md) = self.open(&source.relative).map_err(|e| source_failure(e, &path))?;
-        let size = source.check_len(&path, md.len(), entry.size, |found, expected| {
-            differs(&path, ContentProblem::Size, found, expected)
+        let (mut file, md) = self.open(&source.relative).map_err(|e| source_failure(e, name))?;
+        let size = source.check_len(name, md.len(), entry.size, |found, expected| {
+            differs(name, ContentProblem::Size, found, expected)
         })?;
         let offset = source.offset;
         // The hash of the whole source, when given, is checked by reading
@@ -337,9 +337,9 @@ impl ContentSource for DirectorySource {
             if h.finalize() != expected {
                 bail!(
                     EBADMSG,
-                    differs(&path, ContentProblem::Hash, None, None),
+                    differs(name, ContentProblem::Hash, None, None),
                     "{}: {} does not match the hash in the manifest",
-                    path,
+                    name,
                     source.relative
                 );
             }
@@ -408,11 +408,12 @@ impl ContentSource for StreamSource<'_> {
             let want = (buf.len() as u64).min(remaining) as usize;
             let n = crate::host::read_some(&mut *self.reader, &mut buf[..want])?;
             if n == 0 {
+                let name = entry.name.as_deref().unwrap_or_default();
                 bail!(
                     EBADMSG,
-                    differs(&path, ContentProblem::StreamEnded, Some(total - remaining), Some(total)),
+                    differs(name, ContentProblem::StreamEnded, Some(total - remaining), Some(total)),
                     "{}: the stream ended {} bytes early",
-                    path,
+                    name,
                     remaining
                 );
             }
@@ -426,14 +427,14 @@ impl ContentSource for StreamSource<'_> {
     /// the manifest does not describe, so the last file got more than the
     /// manifest says.
     fn end(&mut self, last: &Entry) -> Result<()> {
-        let path = last.path();
         let mut byte = [0u8; 1];
         if crate::host::read_some(&mut *self.reader, &mut byte)? > 0 {
+            let name = last.name.as_deref().unwrap_or_default();
             bail!(
                 EBADMSG,
-                differs(&path, ContentProblem::Size, None, last.size),
+                differs(name, ContentProblem::Size, None, last.size),
                 "{}: the stream goes on after the last file",
-                path
+                name
             );
         }
         Ok(())
@@ -618,9 +619,9 @@ impl Volume {
                         if written != size {
                             bail!(
                                 EBADMSG,
-                                differs(&path, ContentProblem::Size, Some(written), Some(size)),
+                                differs(&name, ContentProblem::Size, Some(written), Some(size)),
                                 "'{}' is {} bytes, the manifest says {}",
-                                path,
+                                name,
                                 written,
                                 size
                             );
@@ -630,9 +631,9 @@ impl Volume {
                         if digest != expected {
                             bail!(
                                 EBADMSG,
-                                differs(&path, ContentProblem::Hash, None, None),
+                                differs(&name, ContentProblem::Hash, None, None),
                                 "'{}' does not match the hash in the manifest",
-                                path
+                                name
                             );
                         }
                     }

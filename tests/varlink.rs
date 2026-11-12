@@ -935,6 +935,8 @@ fn assemble_with_a_manifest_and_a_directory() {
         Value::Object(e.parameters.clone())
     );
     assert_eq!(str_of(&e.parameters, "reason"), "missing");
+    // The file as the manifest names it, not as a path in the volume.
+    assert_eq!(str_of(&e.parameters, "name"), "EFI/BOOT/BOOTX64.EFI");
     assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
     // So does a file that grew since the manifest was written. The manifest
     // takes it whole, so it has to have the manifest's size.
@@ -953,6 +955,7 @@ fn assemble_with_a_manifest_and_a_directory() {
         Value::Object(e.parameters.clone())
     );
     assert_eq!(str_of(&e.parameters, "reason"), "size");
+    assert_eq!(str_of(&e.parameters, "name"), "loader/loader.conf");
     assert_eq!(u64_of(&e.parameters, "sizeBytes"), 27);
     assert_eq!(u64_of(&e.parameters, "expectedSizeBytes"), 10);
     assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
@@ -1099,6 +1102,7 @@ fn assemble_with_a_manifest_and_a_stream() {
         Value::Object(e.parameters.clone())
     );
     assert_eq!(str_of(&e.parameters, "reason"), "streamEnded");
+    assert_eq!(str_of(&e.parameters, "name"), "EFI/BOOT/BOOTX64.EFI");
     // So is a stream that goes on after the last file: that file got more
     // than the manifest says, by how much is not known.
     let last = ufat::manifest::parse(&manifest)
@@ -1123,6 +1127,7 @@ fn assemble_with_a_manifest_and_a_stream() {
         Value::Object(e.parameters.clone())
     );
     assert_eq!(str_of(&e.parameters, "reason"), "size");
+    assert_eq!(Some(str_of(&e.parameters, "name")), last.name.as_deref());
     assert_eq!(u64_of(&e.parameters, "expectedSizeBytes"), last.size.unwrap());
     assert!(e.parameters.get("sizeBytes").is_none());
 }

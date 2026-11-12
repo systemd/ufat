@@ -682,6 +682,71 @@ fn whole_files_have_the_size_of_the_manifest() {
     }
 }
 
+/// Source and content mismatches name the file the way its record in the
+/// manifest does, not as a path in the volume.
+#[test]
+fn mismatches_name_the_record() {
+    let tmp = TempDir::new("manifest-names");
+    let dir = tmp.path().to_path_buf();
+    std::fs::create_dir_all(dir.join("loader/entries")).unwrap();
+    std::fs::write(dir.join("loader/loader.conf"), b"timeout 3\n").unwrap();
+    let conf = sha256::to_hex(&sha256::digest(b"timeout 3\n"));
+    let other = sha256::to_hex(&sha256::digest(b"timeout 5\n"));
+    // In the detail and in the message.
+    let named = |e: crate::Error, name: &str| {
+        match e.detail() {
+            Some(Detail::Source { name: n, .. } | Detail::Content { name: n, .. }) => assert_eq!(n, name, "{:?}", e),
+            _ => panic!("{:?}", e),
+        }
+        let text = e.to_string();
+        assert!(text.contains(name) && !text.contains(&format!("/{}", name)), "{}", text);
+    };
+    // Found before anything is written: missing, not a regular file, of
+    // another size.
+    for (record, name) in [
+        (r#"{"name":"loader/entries/a.conf","size":1}"#, "loader/entries/a.conf"),
+        (
+            r#"{"name":"x/y","size":1,"contents":[{"file":"loader/entries"}]}"#,
+            "x/y",
+        ),
+        (r#"{"name":"loader/loader.conf","size":5}"#, "loader/loader.conf"),
+    ] {
+        let m = parse(&seq(&[ROOT, record, TRAILER])).unwrap();
+        named(dir_source(&dir).verify(&m).unwrap_err(), name);
+    }
+    // Found while copying: the hash of the file, and that of the whole
+    // source.
+    for record in [
+        format!(r#"{{"name":"loader/loader.conf","size":10,"sha256":"{}"}}"#, other),
+        format!(
+            r#"{{"name":"loader/loader.conf","size":5,"contents":[{{"originalSize":10,"originalSha256":"{}"}}]}}"#,
+            other
+        ),
+    ] {
+        let m = parse(&seq(&[ROOT, &record, TRAILER])).unwrap();
+        let (_img, mut v) = volume(8 << 20, 512, 512);
+        let e = v
+            .assemble(&m, &mut dir_source(&dir), &AssembleOptions::default())
+            .unwrap_err();
+        named(e, "loader/loader.conf");
+    }
+    // From a stream that ends early or goes on after the last file.
+    let m = parse(&seq(&[
+        ROOT,
+        &format!(r#"{{"name":"loader/loader.conf","size":10,"sha256":"{}"}}"#, conf),
+        TRAILER,
+    ]))
+    .unwrap();
+    for data in [&b"timeout"[..], &b"timeout 3\nmore"[..]] {
+        let (_img, mut v) = volume(8 << 20, 512, 512);
+        let mut stream = data;
+        let e = v
+            .assemble(&m, &mut StreamSource::new(&mut stream), &AssembleOptions::default())
+            .unwrap_err();
+        named(e, "loader/loader.conf");
+    }
+}
+
 #[test]
 fn source_files_stay_inside_the_source_directory() {
     let tmp = TempDir::new("manifest-beneath");
