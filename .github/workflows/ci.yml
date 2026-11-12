@@ -453,7 +453,9 @@ jobs:
           BEFORE: ${{ github.event.before }}
         run: |
           case $EVENT in
-          pull_request) base=$(git rev-parse HEAD^1) ;;
+          # For now: PR #2's target is the old meson tree, so compare with
+          # the pull request's parent commit instead.
+          pull_request) base=$(git rev-parse HEAD^2^) ;;
           push) base=$BEFORE ;;
           *) base=$(git rev-list -n 1 --before='7 days ago' HEAD) ;;
           esac
@@ -484,6 +486,19 @@ jobs:
           fi
           bench/compare.sh "$RUNNER_TEMP/ufat-base" "$RUNNER_TEMP/ufat-head"
           bench/compare.py --accept "$RUNNER_TEMP/accept" --summary "$GITHUB_STEP_SUMMARY" "$BENCH_DIR/out"
+
+      - name: Compare the head with itself, for now
+        env:
+          BENCH_DIR: /dev/shm/ufat-compare-again
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/again" HEAD
+          (cd "$RUNNER_TEMP/again" && CARGO_TARGET_DIR=$RUNNER_TEMP/target-again cargo build --release --locked -p ufat)
+          if cmp "$RUNNER_TEMP/target-again/release/ufat" "$RUNNER_TEMP/ufat-head"; then
+            echo "Two builds of the head from different directories are the same binary." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "# The head against itself" >> "$GITHUB_STEP_SUMMARY"
+          bench/compare.sh "$RUNNER_TEMP/ufat-head" "$RUNNER_TEMP/target-again/release/ufat"
+          bench/compare.py --summary "$GITHUB_STEP_SUMMARY" "$BENCH_DIR/out"
 
       - name: Upload the measurements
         if: always()
