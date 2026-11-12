@@ -68,6 +68,37 @@ fn tree(root: &Path) {
     fs::write(root.join("loader/entries/x.conf"), b"title x\n").unwrap();
 }
 
+/// -h and --help print the usage and exit 0 wherever they are, alone or
+/// in a bundle of short options, whatever else is on the command line.
+/// Every other short option in a bundle is either applied or refused.
+#[test]
+fn help_and_short_options() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let usage = ok(&bin, &["list", "-h"]);
+    assert!(usage.starts_with("Usage: ufat COMMAND"), "{}", usage);
+    for args in [
+        &["list", "-hl", "x.img"][..],
+        &["list", "-lh", "x.img"],
+        &["list", "x.img", "-lh"],
+        &["remove", "-rh", "x.img", "/a"],
+        &["populate", "-ph", "x.img"],
+        &["check", "-rh", "x.img"],
+        &["list", "--bogus", "-hl", "x.img"],
+        &["describe", "--help", "x.img"],
+    ] {
+        assert_eq!(ok(&bin, args), usage, "ufat {:?}", args);
+    }
+    fails(&bin, &["list", "-lr", "x.img"], "unknown option -r");
+    fails(&bin, &["list", "-rl", "x.img"], "unknown option -r");
+    fails(&bin, &["remove", "-rl", "x.img", "/a"], "unknown option -l");
+    fails(&bin, &["check", "-p", "x.img"], "unknown option -p");
+    fails(&bin, &["list", "-lx", "x.img"], "unknown option -x");
+    fails(&bin, &["list", "-l=1", "x.img"], "option -l takes no value");
+}
+
 #[test]
 fn assemble_and_populate_take_trees_and_manifests() {
     let _serial = common::serial();

@@ -123,53 +123,77 @@ struct Args {
 
 impl Args {
     /// Splits `args` with lexopt: `--name=value` or `--name value` for the
-    /// options in `with_value`, `--name` for those in `flags`, and the
-    /// short options every command takes, which can be bundled as in
-    /// `-rl`. `--` ends the options, and `-` is a positional argument.
+    /// options in `with_value`, `--name` for those in `flags`, and -p, -l
+    /// and -r for `--parents`, `--long` and `--recursive` where `flags` has
+    /// them. Short options can be bundled, as in `-lh`. `--` ends the
+    /// options, and `-` is a positional argument. `-h` or `--help` anywhere
+    /// prints the usage and exits, whatever else is on the command line.
     fn parse(args: &[OsString], with_value: &[&str], flags: &[&str]) -> Result<Args> {
         use lexopt::Arg::{Long, Short, Value};
 
         let mut options = Vec::new();
         let mut positional = Vec::new();
+        let mut help = false;
+        let mut problem = None;
         let mut parser = lexopt::Parser::from_args(args.iter().cloned());
         loop {
-            let arg = match parser.next() {
-                Ok(Some(arg)) => arg,
+            let error = match parser.next() {
                 Ok(None) => break,
-                // A value attached to a short option, as in -r=x.
-                Err(lexopt::Error::UnexpectedValue { option, .. }) => {
-                    bail!(errno::EINVAL, "option {} takes no value", option)
+                Ok(Some(Short('h') | Long("help"))) => {
+                    help = true;
+                    continue;
                 }
-                Err(e) => bail!(errno::EINVAL, "{}", e),
-            };
-            match arg {
-                Short('h') | Long("help") => options.push(("help".to_string(), None)),
-                Short('p') => options.push(("parents".to_string(), None)),
-                Short('l') => options.push(("long".to_string(), None)),
-                Short('r') => options.push(("recursive".to_string(), None)),
-                Short(c) => bail!(errno::EINVAL, "unknown option -{}", c),
-                Long(name) if with_value.contains(&name) => {
-                    let name = name.to_string();
-                    let value = parser
-                        .value()
-                        .map_err(|_| err!(errno::EINVAL, "option --{} needs a value", name))?;
-                    if !PATH_OPTIONS.contains(&name.as_str()) && value.to_str().is_none() {
-                        bail!(errno::EINVAL, "the value of --{} is not valid UTF-8", name);
+                Ok(Some(Short(c))) => match short_option(c).filter(|name| flags.contains(name)) {
+                    Some(name) => {
+                        options.push((name.to_string(), None));
+                        continue;
                     }
-                    options.push((name, Some(value)));
+                    None => err!(errno::EINVAL, "unknown option -{}", c),
+                },
+                Ok(Some(Long(name))) if with_value.contains(&name) => {
+                    let name = name.to_string();
+                    match parser.value() {
+                        Err(_) => err!(errno::EINVAL, "option --{} needs a value", name),
+                        Ok(value) if !PATH_OPTIONS.contains(&name.as_str()) && value.to_str().is_none() => {
+                            err!(errno::EINVAL, "the value of --{} is not valid UTF-8", name)
+                        }
+                        Ok(value) => {
+                            options.push((name, Some(value)));
+                            continue;
+                        }
+                    }
                 }
-                Long(name) if flags.contains(&name) => {
+                Ok(Some(Long(name))) if flags.contains(&name) => {
                     let name = name.to_string();
                     if parser.optional_value().is_some() {
-                        bail!(errno::EINVAL, "option --{} takes no value", name);
+                        err!(errno::EINVAL, "option --{} takes no value", name)
+                    } else {
+                        options.push((name, None));
+                        continue;
                     }
-                    options.push((name, None));
                 }
-                Long(name) => bail!(errno::EINVAL, "unknown option --{}", name),
-                Value(value) => positional.push(value),
-            }
+                Ok(Some(Long(name))) => err!(errno::EINVAL, "unknown option --{}", name),
+                Ok(Some(Value(value))) => {
+                    positional.push(value);
+                    continue;
+                }
+                // A value attached to a short option, as in -r=x.
+                Err(lexopt::Error::UnexpectedValue { option, .. }) => {
+                    err!(errno::EINVAL, "option {} takes no value", option)
+                }
+                Err(e) => err!(errno::EINVAL, "{}", e),
+            };
+            problem.get_or_insert(error);
         }
-        Ok(Args { options, positional })
+        if help {
+            print!("{}", USAGE);
+            let _ = std::io::stdout().flush();
+            std::process::exit(0);
+        }
+        match problem {
+            Some(e) => Err(e),
+            None => Ok(Args { options, positional }),
+        }
     }
 
     /// The last value given to the option `name`.
@@ -221,6 +245,16 @@ impl Args {
     /// The positional arguments as paths on the host.
     fn positional_paths(&self) -> Vec<&Path> {
         self.positional.iter().map(Path::new).collect()
+    }
+}
+
+/// The long option a short option stands for.
+fn short_option(c: char) -> Option<&'static str> {
+    match c {
+        'p' => Some("parents"),
+        'l' => Some("long"),
+        'r' => Some("recursive"),
+        _ => None,
     }
 }
 
