@@ -55,7 +55,10 @@ writing, let the shell open it:
 ## Common parameters
 
 Every method takes an optional `fileSystemType`. ufat serves `vfat` only.
-Any other value fails with `FileSystemTypeNotSupported`.
+Any other value fails with `FileSystemTypeNotSupported`. For `Describe`,
+`Populate`, `Remove`, `List` and `Check` it is the type the image has to
+hold. An image that holds no FAT32 file system fails with
+`NotFileSystem`, with or without `fileSystemType`.
 
 Every method except `GetCapabilities` works on an `Image`:
 

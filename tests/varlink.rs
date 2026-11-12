@@ -590,6 +590,81 @@ fn capabilities_describe_vfat() {
     assert_eq!(e.name, format!("{}.FileSystemTypeNotSupported", IFACE));
 }
 
+/// The methods that work on an existing file system take the type as
+/// well: another one is not served, and vfat is what the image has to
+/// hold.
+#[test]
+fn methods_on_an_image_take_the_file_system_type() {
+    let _serial = common::serial();
+    let Some(ufat) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let tree = esp_tree();
+    let scratch = Temp::dir();
+    let (_image, img) = fresh_image();
+    let mut c = connect_fd3(&ufat);
+    let source = ro(tree.path());
+    reply(call(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1}}"#,
+        &[img.as_fd(), source.as_fd()],
+    ));
+    // Each method with what it needs besides the type and the image.
+    let methods = [
+        ("Describe", ""),
+        ("Populate", r#","path":"/new""#),
+        ("List", r#","path":"/loader/loader.conf""#),
+        ("Remove", r#","path":"/new""#),
+        ("Check", ""),
+    ];
+    let with = |t: &str, rest: &str| format!(r#"{{"fileSystemType":"{}","image":{{"fileDescriptor":0}}{}}}"#, t, rest);
+    // Another type fails before anything is written: the Populate below
+    // still finds no /new.
+    for (m, rest) in methods {
+        let e = error_of(&mut c, m, &with("ext4", rest), &[img.as_fd()]);
+        assert_eq!(e.name, format!("{}.FileSystemTypeNotSupported", IFACE), "{}", m);
+        assert_eq!(str_of(&e.parameters, "fileSystemType"), "ext4");
+    }
+    let r = reply(call(&mut c, "Describe", &with("vfat", ""), &[img.as_fd()]));
+    assert_eq!(str_of(object_of(&r, "description"), "fileSystemType"), "vfat");
+    let r = reply(call(
+        &mut c,
+        "Populate",
+        &with("vfat", r#","path":"/new""#),
+        &[img.as_fd()],
+    ));
+    assert_eq!(u64_of(&r, "directories"), 1);
+    let r = reply(call(
+        &mut c,
+        "List",
+        &with("vfat", r#","path":"/loader/loader.conf""#),
+        &[img.as_fd()],
+    ));
+    assert_eq!(str_of(object_of(&r, "entry"), "name"), "loader.conf");
+    let r = reply(call(
+        &mut c,
+        "Remove",
+        &with("vfat", r#","path":"/new""#),
+        &[img.as_fd()],
+    ));
+    assert_eq!(u64_of(&r, "directories"), 1);
+    let r = reply(call(&mut c, "Check", &with("vfat", ""), &[img.as_fd()]));
+    assert!(bool_of(&r, "clean"));
+    // An image that holds another file system fails with vfat given as it
+    // does without a type.
+    let mut bytes = vec![0x55u8; 1 << 20];
+    bytes[11..13].copy_from_slice(&512u16.to_le_bytes());
+    let path = scratch.path().join("other");
+    std::fs::write(&path, &bytes).unwrap();
+    let other = rw(&path);
+    for (m, rest) in methods {
+        let e = error_of(&mut c, m, &with("vfat", rest), &[other.as_fd()]);
+        assert_eq!(e.name, format!("{}.NotFileSystem", IFACE), "{}", m);
+        assert_eq!(str_of(&e.parameters, "reason"), "otherFileSystem");
+    }
+}
+
 /// Assemble with mode plan: the size the content needs, from a tree or from
 /// its manifest alike, and what Assemble then makes.
 #[test]
@@ -2209,6 +2284,28 @@ fn varlinkctl_can_drive_us() {
         "{}",
         text
     );
+    // A description sd-varlink cannot parse is shown as it is, with a
+    // warning only. validate-idl fails on it.
+    let mut validate = Command::new(&varlinkctl)
+        .arg("validate-idl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    validate.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+    let out = validate.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // Every method takes the file system type.
+    let parsed = varlink::idl::parse(&text).unwrap();
+    assert_eq!(parsed.methods.len(), interface().methods.len());
+    let file_system_type = varlink::idl::Field {
+        name: "fileSystemType".into(),
+        ty: varlink::idl::Type::Nullable(Box::new(varlink::idl::Type::String)),
+    };
+    for (name, m) in &parsed.methods {
+        assert!(m.input.contains(&file_system_type), "{} takes no fileSystemType", name);
+    }
 }
 
 #[test]
