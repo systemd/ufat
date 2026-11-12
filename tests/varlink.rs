@@ -1384,18 +1384,54 @@ fn describe_with_and_without_a_manifest() {
     let e = error_of(&mut c, "Describe", IMG, &[blank_ro.as_fd()]);
     assert_eq!(e.name, format!("{}.NotFileSystem", IFACE));
     assert_eq!(str_of(&e.parameters, "reason"), "blank");
-    let mut bytes = vec![0x55u8; 1 << 20];
-    let garbage = file_with(scratch.path(), "garbage", &bytes);
+    // Data but no boot sector: not blank, and nothing ufat recognizes.
+    let garbage = file_with(scratch.path(), "garbage", &vec![0x55u8; 1 << 20]);
     let e = error_of(&mut c, "Describe", IMG, &[garbage.as_fd()]);
     assert_eq!(e.name, format!("{}.NotFileSystem", IFACE));
-    assert_eq!(str_of(&e.parameters, "reason"), "sectorSize");
-    assert_eq!(u64_of(&e.parameters, "sectorSize"), 0x5555);
-    // A plausible sector size and a FAT16 style FAT size: something else.
+    assert_eq!(str_of(&e.parameters, "reason"), "unknown");
+    // An ext2 superblock behind a first sector of zeros: not blank.
+    let mut bytes = vec![0u8; 1 << 20];
+    bytes[1080..1082].copy_from_slice(&0xef53u16.to_le_bytes());
+    let ext2 = file_with(scratch.path(), "ext2", &bytes);
+    let e = error_of(&mut c, "Describe", IMG, &[ext2.as_fd()]);
+    assert_eq!(str_of(&e.parameters, "reason"), "otherFileSystem");
+    assert_eq!(str_of(&e.parameters, "found"), "ext2");
+    // A FAT16 boot sector, then the same with a sector size ufat does not
+    // support.
+    let mut bytes = vec![0u8; 1 << 20];
+    bytes[..3].copy_from_slice(&[0xeb, 0x3c, 0x90]);
     bytes[11..13].copy_from_slice(&512u16.to_le_bytes());
-    let other = file_with(scratch.path(), "other", &bytes);
-    let e = error_of(&mut c, "Describe", IMG, &[other.as_fd()]);
+    bytes[13] = 4;
+    bytes[14..16].copy_from_slice(&1u16.to_le_bytes());
+    bytes[16] = 2;
+    bytes[17..19].copy_from_slice(&512u16.to_le_bytes());
+    bytes[19..21].copy_from_slice(&65535u16.to_le_bytes());
+    bytes[21] = 0xf8;
+    bytes[22..24].copy_from_slice(&64u16.to_le_bytes());
+    let fat16 = file_with(scratch.path(), "fat16", &bytes);
+    let e = error_of(&mut c, "Describe", IMG, &[fat16.as_fd()]);
     assert_eq!(e.name, format!("{}.NotFileSystem", IFACE));
     assert_eq!(str_of(&e.parameters, "reason"), "otherFileSystem");
+    assert_eq!(str_of(&e.parameters, "found"), "fat16");
+    bytes[11..13].copy_from_slice(&1000u16.to_le_bytes());
+    let odd = file_with(scratch.path(), "odd", &bytes);
+    let e = error_of(&mut c, "Describe", IMG, &[odd.as_fd()]);
+    assert_eq!(str_of(&e.parameters, "reason"), "sectorSize");
+    assert_eq!(u64_of(&e.parameters, "sectorSize"), 1000);
+    // An NTFS boot sector reads like a FAT32 one with a reserved sector
+    // count of 0, but it is NTFS.
+    let mut bytes = vec![0u8; 1 << 20];
+    bytes[..3].copy_from_slice(&[0xeb, 0x52, 0x90]);
+    bytes[3..11].copy_from_slice(b"NTFS    ");
+    bytes[11..13].copy_from_slice(&512u16.to_le_bytes());
+    bytes[13] = 8;
+    bytes[21] = 0xf8;
+    bytes[36..40].copy_from_slice(&0x0080_0080u32.to_le_bytes());
+    bytes[510..512].copy_from_slice(b"\x55\xaa");
+    let ntfs = file_with(scratch.path(), "ntfs", &bytes);
+    let e = error_of(&mut c, "Describe", IMG, &[ntfs.as_fd()]);
+    assert_eq!(e.name, format!("{}.NotFileSystem", IFACE));
+    assert_eq!(str_of(&e.parameters, "found"), "ntfs");
     let tiny = file_with(scratch.path(), "tiny", b"tiny");
     let e = error_of(&mut c, "Describe", IMG, &[tiny.as_fd()]);
     assert_eq!(str_of(&e.parameters, "reason"), "tooSmall");

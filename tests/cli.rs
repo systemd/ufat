@@ -99,6 +99,51 @@ fn help_and_short_options() {
     fails(&bin, &["list", "-l=1", "x.img"], "option -l takes no value");
 }
 
+/// describe says what an image holds when it holds no FAT32 file system,
+/// for the images that the mkfs tools of other file systems make. Only an
+/// image of zeros is blank.
+#[test]
+fn describe_names_other_file_systems() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let cases: &[(&str, &[&str], u64, &str)] = &[
+        ("mkfs.ext4", &["-q", "-F"], 64 << 20, "an ext4 file system"),
+        ("mkfs.xfs", &["-q", "-f"], 300 << 20, "an XFS file system"),
+        ("mkfs.btrfs", &["-q", "-f"], 300 << 20, "a btrfs file system"),
+        ("mkswap", &[], 64 << 20, "swap space"),
+        ("mkfs.fat", &["-F", "16"], 64 << 20, "a FAT16 file system"),
+        ("mkfs.exfat", &[], 64 << 20, "an exFAT file system"),
+        ("mkfs.ntfs", &["-q", "-F", "-f"], 64 << 20, "an NTFS file system"),
+    ];
+    for &(tool, args, size, what) in cases {
+        let Some(mkfs) = common::find_program(tool) else {
+            eprintln!("skipping {}: not found", tool);
+            continue;
+        };
+        let image = dir.path().join(format!("{}.img", tool));
+        fs::File::create(&image).unwrap().set_len(size).unwrap();
+        let out = Command::new(&mkfs).args(args).arg(&image).output().expect("mkfs runs");
+        assert!(
+            out.status.success(),
+            "{}: {}",
+            tool,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let expected = format!("the image holds {}, not a FAT32 file system", what);
+        fails(&bin, &["describe", image.to_str().unwrap()], &expected);
+    }
+    let blank = dir.path().join("blank.img");
+    fs::File::create(&blank).unwrap().set_len(64 << 20).unwrap();
+    fails(
+        &bin,
+        &["describe", blank.to_str().unwrap()],
+        "no file system found, the image is blank",
+    );
+}
+
 #[test]
 fn assemble_and_populate_take_trees_and_manifests() {
     let _serial = common::serial();

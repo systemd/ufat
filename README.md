@@ -217,6 +217,11 @@ The exit status follows fsck(8):
 | 4 | Errors were found and left uncorrected. |
 | 8 | The image could not be checked. |
 
+An image that holds no FAT32 file system cannot be checked. The message
+says what it holds instead: another file system or a partition table by
+name, such as ext4 or a GPT partition table, or that the image is blank.
+Blank means that its first 256 KiB are zeros.
+
 ## Crash safety
 
 ufat writes data and the allocation table before the directory entry

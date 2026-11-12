@@ -173,16 +173,16 @@ fn no_space_reason(reason: NoSpaceReason) -> &'static str {
 }
 
 /// Why the image holds no FAT32 volume, as the interface's
-/// `NotFileSystemReason`. A boot sector that is not blank and not FAT32
-/// belongs to something else, a FAT12 or FAT16 volume or another file
-/// system altogether, which is `otherFileSystem`; the library does not
-/// say what it found, so `found` stays unset.
+/// `NotFileSystemReason`. Another file system or a partition table, a
+/// FAT12 or FAT16 volume included, is `otherFileSystem`, and `found` names
+/// it.
 fn not_file_system_reason(reason: NotFat32Reason) -> &'static str {
     match reason {
         NotFat32Reason::Blank => "blank",
         NotFat32Reason::NotFat32 => "otherFileSystem",
         NotFat32Reason::SectorSize => "sectorSize",
         NotFat32Reason::TooSmall => "tooSmall",
+        NotFat32Reason::Unknown => "unknown",
     }
 }
 
@@ -226,8 +226,13 @@ fn map_error(e: &ufat::Error) -> varlink::Error {
             optional(&mut o, "path", path.as_deref());
             interface_error("NoSpaceLeft", o)
         }
-        Detail::NotFat32 { reason, sector_size } => {
+        Detail::NotFat32 {
+            reason,
+            found,
+            sector_size,
+        } => {
             let mut o = json::object! { "reason" => not_file_system_reason(*reason) };
+            optional(&mut o, "found", *found);
             optional(&mut o, "sectorSize", *sector_size);
             interface_error("NotFileSystem", o)
         }

@@ -162,6 +162,7 @@ impl BootSector {
                 EMEDIUMTYPE,
                 Detail::NotFat32 {
                     reason: NotFat32Reason::Blank,
+                    found: None,
                     sector_size: None,
                 },
                 "no file system found, the boot sector is blank"
@@ -271,6 +272,7 @@ impl BootSector {
                 EMEDIUMTYPE,
                 Detail::NotFat32 {
                     reason: NotFat32Reason::SectorSize,
+                    found: None,
                     sector_size: Some(ss),
                 },
                 "unsupported sector size {}",
@@ -282,6 +284,7 @@ impl BootSector {
                 EMEDIUMTYPE,
                 Detail::NotFat32 {
                     reason: NotFat32Reason::NotFat32,
+                    found: None,
                     sector_size: None,
                 },
                 "not a FAT32 file system"

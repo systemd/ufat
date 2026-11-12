@@ -121,14 +121,20 @@ impl NoSpaceReason {
 /// Why an image holds no FAT32 file system we can work with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NotFat32Reason {
-    /// The boot sector is all zeros.
+    /// Nothing is there. [`crate::boot::BootSector::parse`] says so for a
+    /// boot sector of zeros. Opening or checking a volume says so only when
+    /// the first 256 KiB of the image are zeros, which is where file
+    /// systems and partition tables keep their signatures.
     Blank,
-    /// A FAT12 or FAT16 volume, or no FAT at all.
+    /// Another file system or a partition table, a FAT12 or FAT16 volume
+    /// included. Opening or checking a volume names it in `found`.
     NotFat32,
-    /// A sector size this crate does not support.
+    /// A FAT boot sector with a sector size this crate does not support.
     SectorSize,
     /// The image is too small to hold a file system.
     TooSmall,
+    /// The image is not blank, and holds nothing this crate recognizes.
+    Unknown,
 }
 
 impl NotFat32Reason {
@@ -139,6 +145,7 @@ impl NotFat32Reason {
             NotFat32Reason::NotFat32 => "notFat32",
             NotFat32Reason::SectorSize => "sectorSize",
             NotFat32Reason::TooSmall => "tooSmall",
+            NotFat32Reason::Unknown => "unknown",
         }
     }
 }
@@ -441,6 +448,10 @@ pub enum Detail {
     NotFat32 {
         /// Why not.
         reason: NotFat32Reason,
+        /// What the image holds instead, named the way blkid names it, such
+        /// as `ext4`, `btrfs` or `gpt`. FAT12 and FAT16 volumes are `fat12`
+        /// and `fat16`.
+        found: Option<&'static str>,
         /// The sector size found, when that is the reason.
         sector_size: Option<u32>,
     },

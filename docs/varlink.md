@@ -465,7 +465,7 @@ The service returns no text. Every error is a name with typed fields.
 | `FileSystemTypeNotSupported` | A `fileSystemType` other than `vfat`. | `fileSystemType` |
 | `OperationNotSupported` | `discard`, features or `repair` were requested. | `operation` |
 | `SizeRequired` | `Assemble` without content into an empty file without a `size`. | none |
-| `NotFileSystem` | The image holds no FAT32 file system. | `reason` (`blank`, `otherFileSystem`, `sectorSize`, `tooSmall`), `sectorSize` |
+| `NotFileSystem` | The image holds no FAT32 file system. | `reason` (`blank`, `otherFileSystem`, `sectorSize`, `tooSmall`, `unknown`), `found`, `sectorSize` |
 | `Corrupt` | The file system is damaged where the operation needs it. | `where` (`superblock`, `allocation`, `chain`, `directory`), `field`, `path`, `block` |
 | `NoSpaceLeft` | The file system is full, or the cluster size leaves fewer than 65525 clusters. | `reason` (`blocks`, `directoryEntries`, `names`, `volume`), `path` |
 | `TooSmall` | The content does not fit the `size` given to `Assemble`. | `minimalSizeBytes`, `sizeBytes` |
@@ -486,6 +486,19 @@ The service returns no text. Every error is a name with typed fields.
 | `NotReproducible` | `reproducible` without `identifier` or `timestampUSec`. | `reason` (`identifierRequired`, `timestampRequired`) |
 | `ImageBusy` | The block device is mounted or claimed by another process. | none |
 | `io.systemd.System` | Any other failure, such as an I/O error. | `errno`, `errnoName` |
+
+`NotFileSystem` says what the image holds instead:
+
+- `blank`: the first 256 KiB of the image are zeros. File systems and
+  partition tables keep their signatures there.
+- `otherFileSystem`: the signature of another file system or of a
+  partition table. `found` names it the way blkid does, such as `ext4`,
+  `btrfs`, `crypto_LUKS`, `swap` or `gpt`. FAT12 and FAT16 volumes are
+  `fat12` and `fat16`.
+- `sectorSize`: a FAT boot sector with a sector size ufat does not
+  support, which `sectorSize` gives.
+- `tooSmall`: the image is too small to hold a file system.
+- `unknown`: data ufat does not recognize. The image is not blank.
 
 The interface also declares `ContentRequired` and `ToolFailed`. The vfat
 implementation never returns them.
