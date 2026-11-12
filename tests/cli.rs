@@ -752,12 +752,16 @@ fn counts_of_one() {
         stderr
     );
     assert!(stderr.contains(" reserved sectors, 1 FAT of "), "{}", stderr);
+    // A plan says what it found, the clusters it needs and the sectors.
     let out = run(&bin, &["assemble", "--plan", "--verbose", t]);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.starts_with("1 file, 1 directory, 1 byte: 3 clusters of 512 bytes"),
-        "{}",
-        stderr
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "1 file, 1 directory, 1 byte: 3 clusters of 512 bytes, 512 byte sectors\n"
+    );
+    let out = run(&bin, &["assemble", "--plan", "--verbose", "--sector-size", "4096", t]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "1 file, 1 directory, 1 byte: 3 clusters of 4096 bytes, 4096 byte sectors\n"
     );
 
     // FAT entry 0 without the media byte in the first of two FATs is one

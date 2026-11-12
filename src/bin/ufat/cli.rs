@@ -698,7 +698,7 @@ fn plan(args: &Args) -> Result<()> {
     println!("{}", e.size());
     if args.flag("verbose") {
         eprintln!(
-            "{}: {} of {} bytes, {} sector size",
+            "{}: {} of {} bytes, {} byte sectors",
             contents(e.files, e.directories, e.bytes),
             plural(u64::from(e.data_clusters), "cluster", "clusters"),
             e.layout.cluster_size(),
