@@ -254,7 +254,9 @@ every push to main and once a week. It runs:
 - bench/compare.sh with the release binary and that of the base: the
   target branch for a pull request, main before a push, and main of a
   week earlier for the weekly run. It accepts the regressions that the
-  `Perf-regression:` trailers of the commits since the base name.
+  `Perf-regression:` trailers of the commits since the base name,
+- a check that every commit of a pull request, and every commit a push
+  adds, carries a `Signed-off-by:` line from its author.
 
 The build jobs fail when mkfs.fat, fsck.fat, mtools or a varlinkctl with
 `--push-fd` is missing, instead of skipping the tests that need them.
@@ -263,3 +265,10 @@ Dependabot proposes updates of the actions and of the crates once a
 month. It keeps libc on 0.2. It updates sha2 and the crates it needs in
 one pull request, and skips sha2 0.11.1 and later, which need rustc
 1.88.
+
+## Submitting changes
+
+Changes go in as pull requests on GitHub. Every commit carries a
+`Signed-off-by:` line from its author, merge commits included.
+`git commit -s` adds one. With it the author certifies the Developer
+Certificate of Origin in the file DCO.

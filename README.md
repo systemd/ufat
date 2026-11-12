@@ -40,7 +40,8 @@ You need rustc and cargo 1.85 or newer, on Linux with glibc.
 This builds the tool `target/release/ufat` and installs it into
 /usr/local/bin. Without `--root` it goes into ~/.cargo/bin.
 
-HACKING.md describes the tests and the other tools.
+HACKING.md describes the tests and the other tools, and how to submit
+changes.
 
 ## Using the command line tool
 
