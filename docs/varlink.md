@@ -342,6 +342,10 @@ A problem carries:
   `slots`, `block` and `blocks` (clusters), `sizeBytes`, `value`,
   `expected`, `name`, `otherName`, `field`, `copy` and `count`.
 
+For `fatCopyDiffers`, `copy` is the FAT copy that differs from the first
+one. The copies are counted from 1. For `backupBootSectorDiffers`, `copy`
+is the sector of the backup boot sector.
+
 The service returns no text. A client turns the kind and its facts into
 a message.
 

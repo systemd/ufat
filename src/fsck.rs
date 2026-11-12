@@ -143,8 +143,8 @@ pub enum ProblemKind {
     FatHardwareErrorFlag,
     /// FAT entry 1 is not an end of chain marker: `value`.
     FatEntry1,
-    /// A FAT copy differs from the first: `copy`, `count` the differing
-    /// bytes.
+    /// A FAT copy differs from the first: `copy` the copy, counting from 1,
+    /// `count` the differing bytes.
     FatCopyDiffers,
     /// A chain points at an invalid cluster: `path`, `cluster`.
     ChainInvalidCluster,
@@ -436,7 +436,7 @@ pub struct Problem {
     pub other_name: Option<String>,
     /// A boot sector field or a timestamp field.
     pub field: Option<&'static str>,
-    /// A FAT copy or a sector number.
+    /// A FAT copy, counting from 1, or a sector number.
     pub copy: Option<u32>,
     /// A count of things.
     pub count: Option<u64>,
@@ -617,7 +617,7 @@ impl fmt::Display for Problem {
             FatEntry1 => write!(f, "FAT entry 1 is 0x{:08x}, expected an end of chain marker", value),
             FatCopyDiffers => write!(
                 f,
-                "FAT copy {} differs from the first FAT in {}; Linux and EDK2 read the first copy, fsck.fat copies it over the others",
+                "FAT copy {} differs from FAT copy 1 in {}; Linux and EDK2 read copy 1, fsck.fat copies it over the others",
                 copy,
                 plural(count, "byte", "bytes")
             ),
@@ -1325,9 +1325,10 @@ impl<'a> Checker<'a> {
                     // Linux and EDK2 read the first copy and never the
                     // others; fsck.fat offers to copy the first over them.
                     // A crash between the two writes leaves this behind.
+                    // The finding counts copies from 1, as people do.
                     self.warning(|| {
                         Problem::new(ProblemKind::FatCopyDiffers)
-                            .copy(i)
+                            .copy(i + 1)
                             .count(differing as u64)
                     });
                 }
@@ -2023,7 +2024,7 @@ mod tests {
         assert!(r
             .problems
             .iter()
-            .any(|p| p.kind == ProblemKind::FatCopyDiffers && p.copy == Some(1)));
+            .any(|p| p.kind == ProblemKind::FatCopyDiffers && p.copy == Some(2)));
         assert!(r.problems.iter().any(|p| {
             p.kind == ProblemKind::TooFewClusters && p.clusters == Some(1) && p.clusters_needed == Some(5)
         }));
@@ -2112,8 +2113,8 @@ mod tests {
                 "the FSInfo free cluster count is 1 but 2 clusters are free",
             ),
             (
-                Problem::new(FatCopyDiffers).copy(1).count(1),
-                "FAT copy 1 differs from the first FAT in 1 byte; Linux and EDK2 read the first copy, fsck.fat copies it over the others",
+                Problem::new(FatCopyDiffers).copy(2).count(1),
+                "FAT copy 2 differs from FAT copy 1 in 1 byte; Linux and EDK2 read copy 1, fsck.fat copies it over the others",
             ),
             (
                 Problem::new(CrossLinkedMore).count(1),
