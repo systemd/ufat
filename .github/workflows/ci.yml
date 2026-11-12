@@ -433,8 +433,9 @@ jobs:
       - name: Check that every commit is signed off
         # Every commit carries a Signed-off-by: line from its author, merge
         # commits included: the commits of a pull request, and those a push
-        # added. Only the address is compared, the name in a sign-off can
-        # say more than the author's name.
+        # added. A sign-off counts when its address or its name is the
+        # author's: an affiliation in parentheses changes the name, and
+        # dependabot signs off with another address than it commits with.
         env:
           EVENT: ${{ github.event_name }}
           BEFORE: ${{ github.event.before }}
@@ -449,13 +450,21 @@ jobs:
           *) exit 0 ;;
           esac
           # A range git can't list fails the step here.
-          commits=$(git log --format='%H %ae' "$range")
+          commits=$(git log --format='%H %ae %an' "$range")
           bad=0
-          while read -r commit email; do
+          while read -r commit email name; do
             [ -n "$commit" ] || continue
-            signoffs=$(git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$commit")
-            if ! grep -qiF "<$email>" <<< "$signoffs"; then
-              echo "::error::$(git log -1 --format='%h %s' "$commit"): no Signed-off-by: from <$email>"
+            ok=0
+            while read -r signoff; do
+              signoff_name=${signoff%% <*}
+              signoff_email=${signoff##*<}
+              signoff_email=${signoff_email%%>*}
+              if [ "${signoff_email,,}" = "${email,,}" ] || [ "${signoff_name,,}" = "${name,,}" ]; then
+                ok=1
+              fi
+            done < <(git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$commit")
+            if [ "$ok" = 0 ]; then
+              echo "::error::$(git log -1 --format='%h %s' "$commit"): no Signed-off-by: from $name <$email>"
               bad=1
             fi
           done <<< "$commits"
