@@ -254,7 +254,9 @@ every push to main and once a week. It runs:
 - bench/compare.sh with the release binary and that of the base: the
   target branch for a pull request, main before a push, and main of a
   week earlier for the weekly run. It accepts the regressions that the
-  `Perf-regression:` trailers of the commits since the base name.
+  `Perf-regression:` trailers of the commits since the base name,
+- a check that every commit of a pull request, and every commit a push
+  adds, carries a `Signed-off-by:` line from its author.
 
 The build jobs fail when mkfs.fat, fsck.fat, mtools or a varlinkctl with
 `--push-fd` is missing, instead of skipping the tests that need them.

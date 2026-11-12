@@ -4,8 +4,8 @@
 # and aarch64, the case folding table, the lints for every supported
 # architecture, the build and the tests on the other architectures, the
 # exhaustive sweeps, a fuzzing run, the coverage report, a compile check of
-# the Kani proofs, the dependency check and the performance comparison.
-# See HACKING.md.
+# the Kani proofs, the dependency check, the performance comparison and the
+# sign-offs. See HACKING.md.
 #
 # Warnings fail the build through CARGO_TARGET_<TRIPLE>_RUSTFLAGS and
 # clippy's -D warnings.
@@ -419,6 +419,47 @@ jobs:
             LC_ALL=C sort -u | xargs)
           echo "$deps"
           [ "$deps" = "$EXPECTED" ] || { echo "::error::expected the crates $EXPECTED, found $deps"; exit 1; }
+
+  signoff:
+    name: Sign-off
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check that every commit is signed off
+        # Every commit carries a Signed-off-by: line from its author, merge
+        # commits included: the commits of a pull request, and those a push
+        # added. Only the address is compared, the name in a sign-off can
+        # say more than the author's name.
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          case $EVENT in
+          pull_request) range=HEAD^1..HEAD^2 ;;
+          push)
+            range=$BEFORE..HEAD
+            # A new branch or a push that replaced the history: all of it.
+            git merge-base --is-ancestor "$BEFORE" HEAD 2>/dev/null || range=HEAD
+            ;;
+          *) exit 0 ;;
+          esac
+          # A range git can't list fails the step here.
+          commits=$(git log --format='%H %ae' "$range")
+          bad=0
+          while read -r commit email; do
+            [ -n "$commit" ] || continue
+            signoffs=$(git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$commit")
+            if ! grep -qiF "<$email>" <<< "$signoffs"; then
+              echo "::error::$(git log -1 --format='%h %s' "$commit"): no Signed-off-by: from <$email>"
+              bad=1
+            fi
+          done <<< "$commits"
+          exit "$bad"
 
   perf:
     name: Performance
