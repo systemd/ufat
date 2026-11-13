@@ -15,7 +15,9 @@
 //! - [`FileObject`], [`Contents`] and [`Signature`] are the objects, and
 //!   [`Name`], [`InodeType`], [`Mode`], [`Sha256`] and [`Uuid`] what their
 //!   fields hold.
-//! - [`Sha256Hasher`] computes the hash of a file while it is read.
+//! - [`Writer`] writes a manifest record by record. [`Fields`] names what a
+//!   writer can be asked to record, and [`Sha256Hasher`] computes the hash
+//!   of a file while it is read.
 //!
 //! A manifest is input from outside. Reading one takes time in proportion
 //! to its size and keeps one record in memory, which is at most
@@ -46,6 +48,7 @@ mod manifest;
 mod name;
 mod object;
 mod reader;
+mod writer;
 
 pub use digest::{Digest, InvalidDigest, Sha256, Sha256Hasher};
 pub use error::{ContentProblem, Error, ErrorKind, Field, Invalid, Problem, SourceProblem, Unsupported};
@@ -55,6 +58,7 @@ pub use object::{
     Contents, FileObject, Gpt, InodeType, InvalidUuid, Location, Mode, Signature, UnknownInodeType, Uuid, Validity,
 };
 pub use reader::{Reader, Record};
+pub use writer::{Fields, UnknownField, Writer};
 
 /// The media type of a manifest, which its first object carries.
 pub const MEDIA_TYPE: &str = "application/vnd.uapi.16.manifest";

@@ -212,6 +212,10 @@ mod tests {
         for (name, bytes, objects, signatures) in fixtures {
             let m = Manifest::parse(bytes).unwrap_or_else(|e| panic!("{}: {}", name, e));
             assert_eq!((m.objects.len(), m.signatures.len()), (objects, signatures), "{}", name);
+            // What is written for a manifest reads back as the same manifest.
+            let mut written = Vec::new();
+            m.write(&mut written).unwrap();
+            assert_eq!(Manifest::parse(&written).unwrap(), m, "{}", name);
         }
     }
 }

@@ -30,8 +30,6 @@ const CHUNK_GROUPS: usize = 16;
 
 /// Bytes that print as Base64 in the standard alphabet with padding, the
 /// way systemd writes them.
-// The writer is what prints Base64.
-#[allow(dead_code)]
 pub(crate) struct Base64<'a>(pub(crate) &'a [u8]);
 
 impl Base64<'_> {
