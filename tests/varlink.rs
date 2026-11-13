@@ -710,7 +710,7 @@ fn assemble_with_a_tree() {
     assert_eq!(u64_of(&r, "directories"), 3);
     assert_eq!(u64_of(&r, "bytes"), 5010);
     assert_eq!(u64_of(&r, "skipped"), 0);
-    assert_eq!(u64_of(&r, "omitted"), 0);
+    assert!(r.get("omitted").is_none());
     assert!(r.get("imageHash").is_none());
     let d = object_of(&r, "description");
     assert_eq!(str_of(d, "fileSystemType"), "vfat");

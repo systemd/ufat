@@ -171,9 +171,9 @@ How the image is sized:
 
 The reply carries a `description` with the label and the serial number
 as stored, the sector size, the cluster size (`blockSize`), the size and
-the free space. With content, the counts `files`, `directories`, `bytes`,
-`skipped` and `omitted` follow. `exact` is true when the size was
-computed to fit the content.
+the free space. With content, the counts `files`, `directories`, `bytes`
+and `skipped` follow, and with a `manifestSink` also `omitted`. `exact`
+is true when the size was computed to fit the content.
 
 Mode `plan` answers with `minimalSizeBytes` in place of `freeBytes`:
 
@@ -269,8 +269,8 @@ manifest names its paths from the root, so with a manifest `path` has to
 be `/`. Without content, `Populate` creates an empty directory at `path`.
 With `parents`, an existing directory at `path` is accepted.
 
-The reply carries the counts `files`, `directories`, `bytes`, `skipped`
-and `omitted`.
+The reply carries the counts `files`, `directories`, `bytes` and
+`skipped`, and with a `manifestSink` also `omitted`.
 
 ### Remove
 
