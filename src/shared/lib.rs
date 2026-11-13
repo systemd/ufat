@@ -23,6 +23,7 @@ pub use error::{
 
 pub mod device;
 pub mod errno;
+mod flags;
 pub mod host;
 mod manifest;
 pub mod path;
