@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! What the command line tools of this repository have in common: the
 //! parsing of a command line and of the sizes and the times given on it,
-//! and the wording of a count.
+//! the wording of a count and the format of the times of a listing.
 //!
 //! This crate is not an interface of its own and changes with the tools.
 //! It uses the standard library and the lexopt and shared crates.
@@ -14,6 +14,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use shared::times::civil_from_days;
 use shared::{bail, err, errno, Result};
 
 /// Parsed command line: options with optional values plus positional
@@ -222,4 +223,22 @@ pub fn parse_size(s: &str) -> Result<u64> {
         .map_err(|_| err!(errno::EINVAL, "invalid size '{}'", s))?;
     n.checked_mul(mult)
         .ok_or_else(|| err!(errno::ERANGE, "size '{}' is too large", s))
+}
+
+/// A time as a listing shows it: `YYYY-MM-DD HH:MM:SS`, in UTC.
+pub fn format_time(t: SystemTime) -> String {
+    let secs = t
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let sod = secs.rem_euclid(86_400);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        y,
+        m,
+        d,
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60
+    )
 }

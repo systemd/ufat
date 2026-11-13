@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::SystemTime;
 
-use ::cli::{plural, Args};
+use ::cli::{format_time, plural, Args};
 use fat::device::{Access, Device};
 use fat::errno;
 use fat::format::{self, FormatOptions, VolumeId};
@@ -21,7 +21,6 @@ use fat::manifest::{
 use fat::plan::{Plan, PlanOptions};
 use fat::populate::{CopyOptions, TimePolicy};
 use fat::probe::Prober;
-use fat::time::civil_from_days;
 use fat::volume::Volume;
 use fat::{bail, err, Context, Detail, Error, Result};
 
@@ -864,23 +863,6 @@ fn cmd_remove(argv: &[OsString]) -> Result<()> {
         }
     }
     v.close()
-}
-
-fn format_time(t: SystemTime) -> String {
-    let secs = t
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
-    let sod = secs.rem_euclid(86_400);
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        y,
-        m,
-        d,
-        sod / 3600,
-        (sod % 3600) / 60,
-        sod % 60
-    )
 }
 
 fn cmd_list(argv: &[OsString]) -> Result<()> {
