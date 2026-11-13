@@ -1180,6 +1180,7 @@ impl FileSystemService {
     }
 
     fn describe(&self, p: &Params<'_>, c: &mut Connection, more: bool) -> Outcome<Object> {
+        check_type(p)?;
         let image = Image::take(p, c)?;
         let sink = match p.object("manifestSink") {
             None => None,
@@ -1199,6 +1200,7 @@ impl FileSystemService {
     }
 
     fn populate(&self, p: &Params<'_>, c: &mut Connection, more: bool) -> Outcome<Object> {
+        check_type(p)?;
         let image = Image::take(p, c)?;
         let path = p.string("path")?;
         let parents = p.bool("parents", false);
@@ -1259,6 +1261,7 @@ impl FileSystemService {
     }
 
     fn remove(&self, p: &Params<'_>, c: &mut Connection, more: bool) -> Outcome<Object> {
+        check_type(p)?;
         let image = Image::take(p, c)?;
         let path = p.string("path")?;
         let recursive = p.bool("recursive", false);
@@ -1284,6 +1287,7 @@ impl FileSystemService {
     }
 
     fn list(&self, p: &Params<'_>, c: &mut Connection, more: bool) -> Outcome<Object> {
+        check_type(p)?;
         let image = Image::take(p, c)?;
         let path = p.str("path").unwrap_or("/");
         let v = image.open_volume(Access::ReadOnly)?;
@@ -1309,6 +1313,7 @@ impl FileSystemService {
     }
 
     fn check(&self, p: &Params<'_>, c: &mut Connection, more: bool) -> Outcome<Object> {
+        check_type(p)?;
         let image = Image::take(p, c)?;
         match p.str("repair") {
             None | Some("none") => {}

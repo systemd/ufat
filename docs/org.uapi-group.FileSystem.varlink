@@ -504,6 +504,7 @@ method Assemble(
 # writeManifest is among Capabilities.operations.
 # [Supports 'more' flag]: intermediate replies carry the phase.
 method Describe(
+	fileSystemType: ?string,
 	image: Image,
 	# The UAPI.16 manifest of what the filesystem holds, if wanted
 	manifestSink: ?ManifestSink
@@ -523,6 +524,7 @@ method Describe(
 # [Supports 'more' flag]: intermediate replies carry the phase and the
 # counts so far.
 method Populate(
+	fileSystemType: ?string,
 	image: Image,
 	# The path inside the filesystem; for a tree the directory its entries
 	# go below, created when missing; for one file the file's path; for a
@@ -549,6 +551,7 @@ method Populate(
 # [Supports 'more' flag]: intermediate replies carry the phase and the
 # counts so far.
 method Remove(
+	fileSystemType: ?string,
 	image: Image,
 	path: string,
 	recursive: ?bool
@@ -566,6 +569,7 @@ method Remove(
 # Capabilities.operations.
 # [Supports 'more' flag]
 method List(
+	fileSystemType: ?string,
 	image: Image,
 	# The directory, the root by default, or a file
 	path: ?string
@@ -580,6 +584,7 @@ method List(
 # [Supports 'more' flag]: intermediate replies carry the phase and batches
 # of findings; without it the list is capped and dropped counts the rest.
 method Check(
+	fileSystemType: ?string,
 	image: Image,
 	repair: ?RepairMode
 ) -> (
