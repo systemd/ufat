@@ -18,8 +18,12 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 
+use ::service::{
+    bad, fail, fd_param, invalid, optional, phase, required_fd, Failure, Image, ManifestSink, Outcome, Params,
+    Reporter, Shown, INTERFACE, INTERFACE_NAME,
+};
 use fat::device::{Access, Device};
 use fat::dirent::{ATTR_ARCHIVE, ATTR_HIDDEN, ATTR_READ_ONLY, ATTR_SYSTEM};
 use fat::errno;
@@ -28,33 +32,27 @@ use fat::fsck::{self, Problem};
 use fat::host;
 use fat::layout::{self, LayoutParams, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE, MIN_CLUSTERS, MIN_SECTOR_SIZE};
 use fat::manifest::{
-    AssembleFlags, AssembleOptions, AssembleReport, DirectorySource, Fields, Manifest, SourceDirectory, StreamSource,
+    AssembleFlags, AssembleOptions, AssembleReport, DirectorySource, Manifest, SourceDirectory, StreamSource,
     WriteReport,
 };
 use fat::plan::{Plan, PlanOptions};
 use fat::populate::{CopyOptions, CopyReport, TimePolicy};
 use fat::probe::Prober;
 use fat::progress::Progress;
-use fat::sha256::Sha256;
-use fat::sha512::Sha512;
 use fat::volume::{Metadata, Volume};
-use fat::{CorruptPlace, Detail, NoSpaceReason, NotFat32Reason, UnsupportedKind};
+use fat::{Detail, UnsupportedKind};
 use json::{Object, Value};
+pub(crate) use shared::hash::Hash;
 use varlink::{Activation, Call, Connection, Info, Reply, Server, Service};
 
 use crate::util;
 
-/// The interface description, served verbatim.
-pub(crate) const INTERFACE: &str = include_str!("../../../docs/org.uapi-group.FileSystem.varlink");
-const INTERFACE_NAME: &str = "org.uapi-group.FileSystem";
 /// The version of the package, which GetInfo and GetCapabilities report.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The one file system type this service makes, as the kernel names it.
 const FILE_SYSTEM_TYPE: &str = "vfat";
 /// Findings per intermediate reply of Check.
 const PROBLEM_BATCH: usize = 100;
-/// Bytes read at a time when the image is hashed.
-const HASH_STEP: usize = 1 << 20;
 
 /// Serves the interface on whatever the environment handed over.
 pub(crate) fn run(activation: Activation) -> std::io::Result<()> {
@@ -71,281 +69,6 @@ pub(crate) fn run(activation: Activation) -> std::io::Result<()> {
 }
 
 struct FileSystemService;
-
-/// Why a call failed, as the interface reports it. No error carries text:
-/// every one is a name with typed fields, and the client puts them into
-/// words. What the library's error says in words goes to the service's
-/// own log at most; what it says in its [`Detail`] becomes the fields.
-enum Failure {
-    /// A parameter is missing, of the wrong shape or out of range:
-    /// `org.varlink.service.InvalidParameter` with its name.
-    Invalid(String),
-    /// A descriptor passed with the call is not usable as the parameter
-    /// names it: `BadFileDescriptor`.
-    BadDescriptor { parameter: String, error: fat::Error },
-    /// The image cannot hold what the content needs.
-    TooSmall { minimal: u64, actual: u64 },
-    /// What was asked for is not among the operations vfat offers.
-    Unsupported(&'static str),
-    /// Another file system type than vfat was asked for.
-    FileSystemType(String),
-    /// Reproducible output was asked for without what it needs.
-    NotReproducible(&'static str),
-    /// Nothing says how large the file system is to be.
-    SizeRequired,
-    /// The image is claimed by something else, a mount most likely.
-    Busy,
-    /// A directory listing was asked for without the more flag.
-    ExpectedMore,
-    /// Anything else, mapped by its detail, or by its errno when it has
-    /// none.
-    Other(fat::Error),
-}
-
-impl From<fat::Error> for Failure {
-    fn from(e: fat::Error) -> Failure {
-        Failure::Other(e)
-    }
-}
-
-impl From<std::io::Error> for Failure {
-    fn from(e: std::io::Error) -> Failure {
-        Failure::Other(fat::Error::from(e))
-    }
-}
-
-type Outcome<T> = Result<T, Failure>;
-
-fn invalid(parameter: &str) -> Failure {
-    Failure::Invalid(parameter.to_string())
-}
-
-/// Turns the vetting error of a passed descriptor into the interface's
-/// error for it, naming the parameter; anything else passes through.
-fn bad(parameter: &str) -> impl Fn(fat::Error) -> Failure + '_ {
-    move |e| {
-        if e.errno() == errno::EBADFD {
-            Failure::BadDescriptor {
-                parameter: parameter.to_string(),
-                error: e,
-            }
-        } else {
-            Failure::Other(e)
-        }
-    }
-}
-
-fn interface_error(name: &str, parameters: Object) -> varlink::Error {
-    varlink::Error::new(format!("{}.{}", INTERFACE_NAME, name), parameters)
-}
-
-/// Adds `value` to `o` under `key` when there is one.
-fn optional<T: Into<Value>>(o: &mut Object, key: &str, value: Option<T>) {
-    if let Some(v) = value {
-        o.insert(key, v);
-    }
-}
-
-/// The interface's name for an option the library refuses: the library
-/// speaks of the cluster size where the interface says block size.
-fn option_name(name: &str) -> &str {
-    match name {
-        "clusterSize" => "blockSize",
-        other => other,
-    }
-}
-
-/// The library's damaged structure as the interface's `CorruptPlace`.
-fn corrupt_place(place: CorruptPlace) -> &'static str {
-    match place {
-        CorruptPlace::BootSector => "superblock",
-        CorruptPlace::Fat => "allocation",
-        CorruptPlace::Chain => "chain",
-        // An entry of a cpio archive, which this service never reads.
-        CorruptPlace::Directory | CorruptPlace::Entry => "directory",
-    }
-}
-
-/// What ran out, as the interface's `NoSpaceReason`: clusters are its
-/// blocks, short name tails its names.
-fn no_space_reason(reason: NoSpaceReason) -> &'static str {
-    match reason {
-        NoSpaceReason::Clusters => "blocks",
-        NoSpaceReason::Volume => "volume",
-        NoSpaceReason::DirectoryEntries => "directoryEntries",
-        NoSpaceReason::ShortNames => "names",
-    }
-}
-
-/// Why the image holds no FAT32 volume, as the interface's
-/// `NotFileSystemReason`. Another file system, a partition table or
-/// anything else libblkid recognizes, a FAT12 or FAT16 volume included, is
-/// `foreignImageType`, and `found` names it.
-fn not_file_system_reason(reason: NotFat32Reason) -> &'static str {
-    match reason {
-        NotFat32Reason::Blank => "blank",
-        NotFat32Reason::NotFat32 => "foreignImageType",
-        NotFat32Reason::SectorSize => "sectorSize",
-        NotFat32Reason::TooSmall => "tooSmall",
-        NotFat32Reason::Unknown => "unknown",
-    }
-}
-
-/// Maps a library error to the interface's errors by its detail, falling
-/// back to the generic errno error systemd tools use when it has none.
-fn map_error(e: &fat::Error) -> varlink::Error {
-    let Some(detail) = e.detail() else {
-        return varlink::Error::system(e.errno());
-    };
-    match detail {
-        Detail::Path(path) => {
-            let name = match e.errno() {
-                errno::ENOENT => "NoSuchFile",
-                errno::EEXIST => "FileExists",
-                errno::ENOTDIR => "NotADirectory",
-                errno::EISDIR => "IsADirectory",
-                errno::ENOTEMPTY => "DirectoryNotEmpty",
-                other => return varlink::Error::system(other),
-            };
-            interface_error(name, json::object! { "path" => path.as_str() })
-        }
-        Detail::Name { name, problem } => interface_error(
-            "InvalidName",
-            json::object! { "name" => name.as_str(), "reason" => problem.as_str() },
-        ),
-        Detail::Label { label, problem } => interface_error(
-            "InvalidLabel",
-            json::object! { "label" => label.as_str(), "reason" => problem.as_str() },
-        ),
-        Detail::Identifier { identifier, problem } => interface_error(
-            "InvalidIdentifier",
-            json::object! { "identifier" => identifier.as_str(), "reason" => problem.as_str() },
-        ),
-        Detail::TooLarge { path, size, maximum } => {
-            let mut o = json::object! { "sizeBytes" => *size, "sizeMaxBytes" => *maximum };
-            optional(&mut o, "path", path.as_deref());
-            interface_error("TooLarge", o)
-        }
-        Detail::TooSmall { minimal, actual } => interface_error(
-            "TooSmall",
-            json::object! { "minimalSizeBytes" => *minimal, "sizeBytes" => *actual },
-        ),
-        Detail::NoSpace { reason, path } => {
-            let mut o = json::object! { "reason" => no_space_reason(*reason) };
-            optional(&mut o, "path", path.as_deref());
-            interface_error("NoSpaceLeft", o)
-        }
-        Detail::NotFat32 {
-            reason,
-            found,
-            sector_size,
-        } => {
-            let mut o = json::object! { "reason" => not_file_system_reason(*reason) };
-            optional(&mut o, "found", found.as_deref());
-            optional(&mut o, "sectorSize", *sector_size);
-            interface_error("NotFileSystem", o)
-        }
-        Detail::NotEmpty { found } => interface_error("ImageNotEmpty", json::object! { "found" => found.as_str() }),
-        Detail::NotCpio { reason, found } => {
-            let mut o = json::object! { "reason" => reason.as_str() };
-            optional(&mut o, "found", *found);
-            interface_error("NotFileSystem", o)
-        }
-        Detail::Corrupt {
-            place,
-            field,
-            path,
-            cluster,
-        } => {
-            let mut o = json::object! { "where" => corrupt_place(*place) };
-            optional(&mut o, "field", *field);
-            optional(&mut o, "path", path.as_deref());
-            optional(&mut o, "block", *cluster);
-            interface_error("Corrupt", o)
-        }
-        // A descriptor problem is reported by the method that knows which
-        // parameter it came with, see `bad`; one without is a plain errno.
-        Detail::Descriptor { .. } => varlink::Error::system(e.errno()),
-        Detail::Manifest {
-            problem,
-            record,
-            name,
-            field,
-        } => {
-            let mut o = json::object! { "reason" => problem.as_str() };
-            optional(&mut o, "record", *record);
-            optional(&mut o, "name", name.as_deref());
-            optional(&mut o, "field", field.as_deref());
-            interface_error("InvalidManifest", o)
-        }
-        Detail::Source {
-            name,
-            problem,
-            size,
-            expected,
-        } => {
-            let mut o = json::object! { "name" => name.as_str(), "reason" => problem.as_str() };
-            optional(&mut o, "sizeBytes", *size);
-            optional(&mut o, "expectedSizeBytes", *expected);
-            interface_error("SourceMismatch", o)
-        }
-        Detail::Content {
-            name,
-            problem,
-            size,
-            expected,
-        } => {
-            let mut o = json::object! { "name" => name.as_str(), "reason" => problem.as_str() };
-            optional(&mut o, "sizeBytes", *size);
-            optional(&mut o, "expectedSizeBytes", *expected);
-            interface_error("ContentMismatch", o)
-        }
-        Detail::Unsupported { name, what, value } => {
-            let mut o = json::object! { "what" => what.as_str() };
-            optional(&mut o, "name", name.as_deref());
-            optional(&mut o, "value", value.as_deref());
-            interface_error("ContentNotSupported", o)
-        }
-        Detail::Validity { name, problem } => interface_error(
-            "EntryNotValid",
-            json::object! { "name" => name.as_str(), "reason" => problem.as_str() },
-        ),
-        Detail::InvalidOption(name) => varlink::Error::invalid_parameter(option_name(name)),
-    }
-}
-
-fn fail(f: Failure) -> varlink::Error {
-    match f {
-        Failure::Invalid(parameter) => varlink::Error::invalid_parameter(&parameter),
-        Failure::BadDescriptor { parameter, error } => {
-            let (problem, flags) = match error.detail() {
-                Some(Detail::Descriptor { problem, flags }) => (problem.as_str(), *flags),
-                _ => ("wrongType", None),
-            };
-            let mut o = json::object! { "parameter" => parameter, "reason" => problem };
-            optional(&mut o, "flags", flags);
-            interface_error("BadFileDescriptor", o)
-        }
-        Failure::TooSmall { minimal, actual } => interface_error(
-            "TooSmall",
-            json::object! {
-                "minimalSizeBytes" => minimal,
-                "sizeBytes" => actual,
-            },
-        ),
-        Failure::Unsupported(operation) => {
-            interface_error("OperationNotSupported", json::object! { "operation" => operation })
-        }
-        Failure::FileSystemType(t) => {
-            interface_error("FileSystemTypeNotSupported", json::object! { "fileSystemType" => t })
-        }
-        Failure::NotReproducible(reason) => interface_error("NotReproducible", json::object! { "reason" => reason }),
-        Failure::SizeRequired => interface_error("SizeRequired", Object::new()),
-        Failure::Busy => interface_error("ImageBusy", Object::new()),
-        Failure::ExpectedMore => varlink::Error::expected_more(),
-        Failure::Other(e) => map_error(&e),
-    }
-}
 
 /// The error of the fit, as a failure of the call.
 fn fit_error(e: util::FitError) -> Failure {
@@ -381,75 +104,6 @@ fn problem(p: &Problem) -> Object {
     o
 }
 
-/// Typed access to validated parameters. A value that is there but out of
-/// range is InvalidParameter with the parameter's name, as in systemd.
-struct Params<'a>(&'a Object);
-
-impl Params<'_> {
-    fn str(&self, key: &str) -> Option<&str> {
-        self.0.get(key).and_then(Value::as_str)
-    }
-
-    fn string(&self, key: &str) -> Outcome<&str> {
-        self.str(key).ok_or_else(|| invalid(key))
-    }
-
-    fn u64(&self, key: &str) -> Outcome<Option<u64>> {
-        match self.0.get(key) {
-            None | Some(Value::Null) => Ok(None),
-            Some(Value::Int(i)) => u64::try_from(*i).map(Some).map_err(|_| invalid(key)),
-            Some(Value::String(s)) => s.parse::<u64>().map(Some).map_err(|_| invalid(key)),
-            Some(_) => Err(invalid(key)),
-        }
-    }
-
-    fn u32(&self, key: &str) -> Outcome<Option<u32>> {
-        self.u64(key)?.map(u32::try_from).transpose().map_err(|_| invalid(key))
-    }
-
-    /// The index an `...FileDescriptor` parameter carries.
-    fn index(&self, key: &str) -> Outcome<Option<usize>> {
-        self.u64(key)?
-            .map(|v| usize::try_from(v).map_err(|_| invalid(key)))
-            .transpose()
-    }
-
-    /// The strings of an array parameter, none when it is absent.
-    fn strings(&self, key: &str) -> Outcome<Vec<&str>> {
-        match self.0.get(key) {
-            None | Some(Value::Null) => Ok(Vec::new()),
-            Some(Value::Array(a)) => a.iter().map(|v| v.as_str().ok_or_else(|| invalid(key))).collect(),
-            Some(_) => Err(invalid(key)),
-        }
-    }
-
-    fn bool(&self, key: &str, default: bool) -> bool {
-        self.0.get(key).and_then(Value::as_bool).unwrap_or(default)
-    }
-
-    fn object(&self, key: &str) -> Option<Params<'_>> {
-        self.0.get(key).and_then(Value::as_object).map(Params)
-    }
-
-    fn time(&self, key: &str) -> Outcome<Option<SystemTime>> {
-        Ok(self.u64(key)?.map(fat::time::from_usec))
-    }
-}
-
-/// Takes the descriptor the parameter `key` names from the call, if the
-/// parameter is there. An index that names no descriptor is as wrong as a
-/// value out of range.
-fn fd_param(c: &mut Connection, p: &Params<'_>, key: &str) -> Outcome<Option<OwnedFd>> {
-    match p.index(key)? {
-        None => Ok(None),
-        Some(i) => c.take_fd(i).map(Some).map_err(|_| invalid(key)),
-    }
-}
-
-fn required_fd(c: &mut Connection, p: &Params<'_>, key: &str) -> Outcome<OwnedFd> {
-    fd_param(c, p, key)?.ok_or_else(|| invalid(key))
-}
-
 /// Refuses any file system type but vfat, the one this service makes.
 fn check_type(p: &Params<'_>) -> Outcome<()> {
     match p.str("fileSystemType") {
@@ -458,134 +112,9 @@ fn check_type(p: &Params<'_>) -> Outcome<()> {
     }
 }
 
-/// Tells a client that asked for intermediate replies which step begins.
-fn phase(c: &mut Connection, more: bool, phase: &str) -> Outcome<()> {
-    if more {
-        c.notify(json::object! { "phase" => phase })?;
-    }
-    Ok(())
-}
-
-/// How often a call made with the more flag hears how far a phase got.
-const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
-
-/// What a progress reply shows beside the phase: the counts the method's
-/// final reply has fields for, if any.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Shown {
-    PhaseOnly,
-    Entries,
-    EntriesAndBytes,
-}
-
-/// The intermediate replies of a phase that does long work, for a call
-/// made with the more flag: the phase when it starts, then the phase again
-/// at most once per PROGRESS_INTERVAL while it lasts, with the counts so
-/// far. So a caller sees how far the phase got, and the connection is
-/// never quiet long enough for the caller's idle timeout to fire.
-struct Reporter<'c> {
-    connection: &'c mut Connection,
-    more: bool,
-    phase: &'static str,
-    shown: Shown,
-    last: Instant,
-    /// The caller stopped taking replies. It is not told again; the final
-    /// reply finds out.
-    gone: bool,
-}
-
-impl<'c> Reporter<'c> {
-    /// Enters `phase` and tells the caller, as [`phase`] does.
-    fn start(connection: &'c mut Connection, more: bool, phase: &'static str, shown: Shown) -> Outcome<Reporter<'c>> {
-        if more {
-            connection.notify(json::object! { "phase" => phase })?;
-        }
-        Ok(Reporter {
-            connection,
-            more,
-            phase,
-            shown,
-            last: Instant::now(),
-            gone: false,
-        })
-    }
-
-    /// Tells the caller how far the phase got, once PROGRESS_INTERVAL has
-    /// passed since the last reply.
-    fn tick(&mut self, progress: &Progress) {
-        if !self.more || self.gone || self.last.elapsed() < PROGRESS_INTERVAL {
-            return;
-        }
-        let mut o = json::object! { "phase" => self.phase };
-        if self.shown != Shown::PhaseOnly {
-            o.insert("files", progress.files);
-            o.insert("directories", progress.directories);
-        }
-        if self.shown == Shown::EntriesAndBytes {
-            o.insert("bytes", progress.bytes);
-        }
-        self.gone = self.connection.notify(o).is_err();
-        self.last = Instant::now();
-    }
-}
-
-/// The image parameter: the descriptor passed for it plus the byte range.
-struct Image {
-    fd: OwnedFd,
-    offset: u64,
-    size: Option<u64>,
-}
-
-impl Image {
-    /// The `image` parameter, which has to be there.
-    fn take(p: &Params<'_>, c: &mut Connection) -> Outcome<Image> {
-        Image::take_optional(p, c)?.ok_or_else(|| invalid("image"))
-    }
-
-    /// The `image` parameter, when there is one.
-    fn take_optional(p: &Params<'_>, c: &mut Connection) -> Outcome<Option<Image>> {
-        let Some(image) = p.object("image") else {
-            return Ok(None);
-        };
-        // Whatever is wrong inside is reported for the parameter as a whole.
-        let inside = |_| invalid("image");
-        let fd = required_fd(c, &image, "fileDescriptor").map_err(inside)?;
-        Ok(Some(Image {
-            fd,
-            offset: image.u64("offset").map_err(inside)?.unwrap_or(0),
-            size: image.u64("size").map_err(inside)?,
-        }))
-    }
-
-    /// A second descriptor of the image, to read it back once the volume
-    /// is closed.
-    fn reader(&self) -> Outcome<OwnedFd> {
-        Ok(self.fd.try_clone()?)
-    }
-
-    /// The whole image, vetted and claimed, with the window still to apply.
-    /// A block device that is mounted or claimed by another process is
-    /// `ImageBusy`.
-    fn device(self, access: Access) -> Outcome<(Device, u64, Option<u64>)> {
-        let device = host::passed_image(self.fd, access).map_err(|e| {
-            if e.errno() == errno::EBUSY {
-                Failure::Busy
-            } else {
-                bad("image")(e)
-            }
-        })?;
-        Ok((device, self.offset, self.size))
-    }
-
-    /// The file system's byte range of the image.
-    fn open(self, access: Access) -> Outcome<Device> {
-        let (device, offset, size) = self.device(access)?;
-        Ok(device.window(offset, size)?)
-    }
-
-    fn open_volume(self, access: Access) -> Outcome<Volume> {
-        Ok(Volume::open(self.open(access)?)?)
-    }
+/// The volume in the file system's byte range of the image.
+fn open_volume(image: Image, access: Access) -> Outcome<Volume> {
+    Ok(Volume::open(image.open(access)?)?)
 }
 
 /// Assemble's options as the library takes them, plus what the service has
@@ -794,70 +323,11 @@ pub(crate) fn capabilities() -> fat::Result<Object> {
     })
 }
 
-/// The hash of a file system as it is in its image, as `imageHash` asks
-/// for it.
-pub(crate) enum Hash {
-    Sha256(Sha256),
-    Sha512(Sha512),
-}
-
-impl Hash {
-    pub(crate) fn new(algorithm: &str) -> Option<Hash> {
-        match algorithm {
-            "sha256" => Some(Hash::Sha256(Sha256::new())),
-            "sha512" => Some(Hash::Sha512(Sha512::new())),
-            _ => None,
-        }
-    }
-
-    /// Reads all of `device` back and returns the hash in lowercase hex,
-    /// telling `progress` how many bytes it read so far after every read.
-    pub(crate) fn of(mut self, device: &Device, progress: &mut dyn FnMut(&Progress)) -> fat::Result<String> {
-        let mut buf = vec![0u8; HASH_STEP];
-        let mut offset = 0;
-        while offset < device.len() {
-            let n = (device.len() - offset).min(HASH_STEP as u64) as usize;
-            device.read_at(offset, &mut buf[..n])?;
-            match &mut self {
-                Hash::Sha256(h) => h.update(&buf[..n]),
-                Hash::Sha512(h) => h.update(&buf[..n]),
-            }
-            offset += n as u64;
-            progress(&Progress {
-                bytes: offset,
-                ..Progress::default()
-            });
-        }
-        Ok(match self {
-            Hash::Sha256(h) => fat::sha256::to_hex(&h.finalize()),
-            Hash::Sha512(h) => fat::sha512::to_hex(&h.finalize()),
-        })
-    }
-}
-
-/// The manifest sink: the descriptor and the fields the manifest carries.
-struct Sink {
-    file: File,
-    fields: Fields,
-}
-
-impl Sink {
-    fn take(p: &Params<'_>, c: &mut Connection) -> Outcome<Sink> {
-        let fd = required_fd(c, p, "fileDescriptor").map_err(|_| invalid("manifestSink"))?;
-        let file = host::passed_sink(fd).map_err(bad("manifestSink"))?;
-        let fields = match p.0.get("fields") {
-            None | Some(Value::Null) => Fields::default(),
-            Some(_) => Fields::from_names(p.strings("fields")?).map_err(|_| invalid("manifestSink"))?,
-        };
-        Ok(Sink { file, fields })
-    }
-
-    /// Writes the manifest of everything `volume` holds, telling `progress`
-    /// what it covered so far.
-    fn write(self, volume: &Volume, progress: &mut dyn FnMut(&Progress)) -> Outcome<WriteReport> {
-        let mut out = BufWriter::new(self.file);
-        Ok(volume.write_manifest_with_progress(volume.root_time()?, self.fields, &mut out, progress)?)
-    }
+/// Writes the manifest of everything `volume` holds to the sink, telling
+/// `progress` what it covered so far.
+fn write_manifest(sink: ManifestSink, volume: &Volume, progress: &mut dyn FnMut(&Progress)) -> Outcome<WriteReport> {
+    let mut out = BufWriter::new(sink.file);
+    Ok(volume.write_manifest_with_progress(volume.root_time()?, sink.fields, &mut out, progress)?)
 }
 
 /// What goes into the file system once the content is vetted; the fill
@@ -965,7 +435,7 @@ struct Content {
     /// leaving it out.
     fail_unsupported: bool,
     check_validity: bool,
-    sink: Option<Sink>,
+    sink: Option<ManifestSink>,
     /// The source directory's modification time, for the root.
     source_mtime: Option<SystemTime>,
     /// The manifest's root object's time, for the root.
@@ -993,7 +463,7 @@ impl Content {
         };
         let sink = match p.object("manifestSink") {
             None => None,
-            Some(s) => Some(Sink::take(&s, c)?),
+            Some(s) => Some(ManifestSink::take(&s, c)?),
         };
         let times = match p.str("times").unwrap_or("preserve") {
             "fixed" => TimePolicy::Fixed(time),
@@ -1209,13 +679,13 @@ impl FileSystemService {
         let image = Image::take(p, c)?;
         let sink = match p.object("manifestSink") {
             None => None,
-            Some(s) => Some(Sink::take(&s, c)?),
+            Some(s) => Some(ManifestSink::take(&s, c)?),
         };
-        let volume = image.open_volume(Access::ReadOnly)?;
+        let volume = open_volume(image, Access::ReadOnly)?;
         let mut o = json::object! { "description" => description(&volume)? };
         if let Some(sink) = sink {
             let mut r = Reporter::start(c, more, "reading", Shown::EntriesAndBytes)?;
-            let w = sink.write(&volume, &mut |p| r.tick(p))?;
+            let w = write_manifest(sink, &volume, &mut |p| r.tick(p))?;
             o.insert("files", w.files);
             o.insert("directories", w.directories);
             o.insert("bytes", w.bytes);
@@ -1238,7 +708,7 @@ impl FileSystemService {
         if matches!(content.as_ref().map(Content::shape), Some(Shape::Manifest)) && path != "/" {
             return Err(invalid("path"));
         }
-        let mut v = image.open_volume(Access::ReadWrite)?;
+        let mut v = open_volume(image, Access::ReadWrite)?;
         let mut r = Reporter::start(c, more, "populating", Shown::EntriesAndBytes)?;
         let counts = match content.as_mut() {
             Some(ct) if !matches!(ct.shape(), Shape::Nothing) => {
@@ -1275,7 +745,7 @@ impl FileSystemService {
             None => None,
             Some(sink) => {
                 let mut r = Reporter::start(c, more, "reading", Shown::PhaseOnly)?;
-                Some(sink.write(&v, &mut |p| r.tick(p))?.omitted)
+                Some(write_manifest(sink, &v, &mut |p| r.tick(p))?.omitted)
             }
         };
         v.close()?;
@@ -1290,7 +760,7 @@ impl FileSystemService {
         let image = Image::take(p, c)?;
         let path = p.string("path")?;
         let recursive = p.bool("recursive", false);
-        let mut v = image.open_volume(Access::ReadWrite)?;
+        let mut v = open_volume(image, Access::ReadWrite)?;
         let md = v.metadata(path)?;
         // The root directory itself stays.
         if md.name.is_empty() {
@@ -1315,7 +785,7 @@ impl FileSystemService {
         check_type(p)?;
         let image = Image::take(p, c)?;
         let path = p.str("path").unwrap_or("/");
-        let v = image.open_volume(Access::ReadOnly)?;
+        let v = open_volume(image, Access::ReadOnly)?;
         let md = v.metadata(path)?;
         if !md.is_dir {
             return Ok(json::object! { "entry" => entry(&md) });
@@ -1439,7 +909,7 @@ fn fill_image(
         None => None,
         Some(sink) => {
             let mut r = Reporter::start(c, more, "reading", Shown::PhaseOnly)?;
-            Some(sink.write(volume, &mut |p| r.tick(p))?.omitted)
+            Some(write_manifest(sink, volume, &mut |p| r.tick(p))?.omitted)
         }
     };
     Ok((counts, omitted, description(volume)?))

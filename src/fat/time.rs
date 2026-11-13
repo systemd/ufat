@@ -8,6 +8,10 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// The conversions that are not about FAT live in the shared crate. They
+// are part of this module under the names they always had.
+pub use crate::times::{from_usec, to_usec};
+
 /// A FAT timestamp: a date word, a time word and the creation-time
 /// hundredths field.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -279,19 +283,6 @@ pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * YEARS_PER_ERA + i64::from(month <= FEBRUARY);
     (year, month as u32, day)
-}
-
-/// Converts microseconds since the epoch, as Varlink carries times, to a
-/// system time.
-pub fn from_usec(usec: u64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_micros(usec)
-}
-
-/// Converts a system time to microseconds since the epoch, saturating at
-/// both ends.
-pub fn to_usec(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]

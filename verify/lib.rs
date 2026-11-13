@@ -34,3 +34,5 @@ pub mod layout;
 pub mod name;
 #[path = "../src/fat/time.rs"]
 pub mod time;
+#[path = "../src/shared/times.rs"]
+pub mod times;

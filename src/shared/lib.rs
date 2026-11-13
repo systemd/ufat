@@ -24,6 +24,7 @@ pub use error::{
 pub mod device;
 pub mod errno;
 mod flags;
+pub mod hash;
 pub mod host;
 pub mod manifest;
 pub mod path;

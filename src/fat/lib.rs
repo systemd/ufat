@@ -20,7 +20,7 @@
 extern crate shared;
 pub use shared::{bail, err};
 pub use shared::{device, errno, host, progress, sha256, sha512};
-pub(crate) use shared::{path, sys};
+pub(crate) use shared::{path, sys, times};
 pub use shared::{
     ContentProblem, Context, CorruptPlace, DescriptorProblem, Detail, Error, IdentifierProblem, LabelProblem,
     ManifestProblem, NameProblem, NoSpaceReason, NotFat32Reason, Result, SourceProblem, UnsupportedKind,

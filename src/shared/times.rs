@@ -2,7 +2,7 @@
 //! What time a copy of a file gets, and what the tools share to handle
 //! times.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How copied files and directories get their timestamps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,4 +30,17 @@ impl TimePolicy {
 /// The current time.
 pub fn now() -> SystemTime {
     SystemTime::now()
+}
+
+/// Converts microseconds since the epoch, as Varlink carries times, to a
+/// system time.
+pub fn from_usec(usec: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_micros(usec)
+}
+
+/// Converts a system time to microseconds since the epoch, saturating at
+/// both ends.
+pub fn to_usec(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }

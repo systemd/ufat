@@ -155,6 +155,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "service"
+version = "0.1.0"
+dependencies = [
+ "json",
+ "shared",
+ "uapi16",
+ "varlink",
+]
+
+[[package]]
 name = "sha2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -207,6 +217,7 @@ dependencies = [
  "fat",
  "json",
  "libc",
+ "service",
  "shared",
  "varlink",
 ]

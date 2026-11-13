@@ -10,6 +10,7 @@ members = [
     "src/dlopen-note",
     "src/fat",
     "src/json",
+    "src/service",
     "src/shared",
     "src/uapi16",
     "src/varlink",
@@ -31,6 +32,7 @@ default-members = [
     "src/dlopen-note",
     "src/fat",
     "src/json",
+    "src/service",
     "src/shared",
     "src/uapi16",
     "src/varlink",
@@ -60,6 +62,7 @@ lexopt = "0.3.2"
 # The _IO and _IOR helpers came with 0.2.172. Stay on 0.2: 1.0 may drop
 # the LFS64 functions such as openat64 and fstatfs64.
 libc = "0.2.191"
+service = { path = "src/service" }
 # 0.11.1 and later need rustc 1.88.
 sha2 = { version = "0.11.0", default-features = false }
 shared = { path = "src/shared" }
@@ -84,6 +87,7 @@ cli.workspace = true
 fat.workspace = true
 json.workspace = true
 libc.workspace = true
+service.workspace = true
 shared.workspace = true
 varlink.workspace = true
 
