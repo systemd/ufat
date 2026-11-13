@@ -317,7 +317,8 @@ The crate `fat` provides the same operations as the tool:
 - `populate` copies directory trees from the host into a volume.
 - `plan` computes the size a set of files needs.
 - `manifest` reads UAPI.16 manifests, builds volumes from them and writes
-  manifests.
+  manifests. The manifests themselves are read and written by the crate
+  `uapi16` in the same tree, which knows nothing of FAT.
 - `fsck` checks a volume.
 
 A path on the host is resolved once. Everything below it is reached

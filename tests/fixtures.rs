@@ -16,8 +16,10 @@ use fat::dirent::ATTR_READ_ONLY;
 use fat::errno::{EINVAL, EOPNOTSUPP};
 use fat::format::{self, FormatOptions};
 use fat::host;
-use fat::manifest::volume::Fields;
-use fat::manifest::{self, AssembleOptions, DirectorySource, InodeType, Manifest, StreamSource};
+use fat::manifest::{
+    AssembleFlags, AssembleOptions, DirectorySource, Fields, HostTree, InodeType, Manifest, SourceDirectory,
+    StreamSource,
+};
 use fat::plan::{Plan, PlanOptions};
 use fat::volume::Volume;
 
@@ -28,7 +30,7 @@ fn fixtures() -> PathBuf {
 fn load(case: &str, name: &str) -> Manifest {
     let path = fixtures().join(case).join(name);
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
-    manifest::parse(&bytes).unwrap_or_else(|e| panic!("{}: {}", path.display(), e))
+    Manifest::parse(&bytes).unwrap_or_else(|e| panic!("{}: {}", path.display(), e))
 }
 
 fn tree(case: &str) -> PathBuf {
@@ -37,7 +39,7 @@ fn tree(case: &str) -> PathBuf {
 
 /// The fixture's tree as a content source: the directory resolved once.
 fn source(case: &str) -> DirectorySource {
-    DirectorySource::new(host::open_dir(&tree(case)).unwrap())
+    DirectorySource::new(SourceDirectory::new(host::open_dir(&tree(case)).unwrap()))
 }
 
 fn time(nsec: u64) -> SystemTime {
@@ -45,7 +47,7 @@ fn time(nsec: u64) -> SystemTime {
 }
 
 fn names(m: &Manifest) -> Vec<&str> {
-    m.entries.iter().filter_map(|e| e.name.as_deref()).collect()
+    m.entries.iter().map(|e| e.name.as_str()).collect()
 }
 
 /// Formats an image of exactly the planned size and returns it open.
@@ -77,8 +79,8 @@ fn read_back(v: &Volume, path: &str) -> Vec<u8> {
 /// contents and the manifest's time; every directory object is there too.
 fn check_against_tree(m: &Manifest, v: &Volume, tree: &Path) {
     for e in &m.entries {
-        let name = e.name.as_deref().unwrap();
-        let path = e.path();
+        let name = e.name.as_str();
+        let path = format!("/{}", name);
         match e.inode_type {
             InodeType::Regular => {
                 let md = v.metadata(&path).unwrap_or_else(|err| panic!("{}: {}", path, err));
@@ -145,7 +147,7 @@ fn every_fixture_parses() {
     );
     let uki = &esp.entries[4];
     assert_eq!(uki.size, Some(6395));
-    assert_eq!(uki.mode, Some(0o664));
+    assert_eq!(uki.mode.map(u32::from), Some(0o664));
     assert_eq!(uki.mtime_nsec, Some(1_700_000_002_000_000_000));
     assert!(!uki.is_read_only());
     assert!(uki.contents.is_empty());
@@ -182,20 +184,16 @@ fn every_fixture_parses() {
         .iter()
         .find(|e| e.inode_type == InodeType::Symlink)
         .unwrap();
-    assert_eq!(link.contents[0].literal.as_deref(), Some(&b"a.txt"[..]));
+    assert_eq!(link.contents[0].literal(), Some(&b"a.txt"[..]));
     let hardlinks: Vec<&str> = special
         .entries
         .iter()
         .filter(|e| e.inode_token.is_some())
-        .filter_map(|e| e.name.as_deref())
+        .map(|e| e.name.as_str())
         .collect();
     assert_eq!(hardlinks, vec!["sub/hl_a", "sub/hl_b"]);
-    let readonly = special
-        .entries
-        .iter()
-        .find(|e| e.name.as_deref() == Some("sub/readonly.bin"))
-        .unwrap();
-    assert_eq!(readonly.mode, Some(0o444));
+    let readonly = special.entries.iter().find(|e| e.name == "sub/readonly.bin").unwrap();
+    assert_eq!(readonly.mode.map(u32::from), Some(0o444));
     assert!(readonly.is_read_only());
     assert!(names(&special).contains(&"sub/\u{fc}mlaut \u{221e}.txt"));
 
@@ -235,7 +233,7 @@ fn esp_assembles_from_a_stream() {
     let mut blob = Vec::new();
     for e in &m.entries {
         if e.is_streamed() {
-            blob.extend(std::fs::read(tree("esp").join(e.name.as_deref().unwrap())).unwrap());
+            blob.extend(std::fs::read(tree("esp").join(e.name.as_str())).unwrap());
         }
     }
     assert_eq!(m.streamed_bytes().unwrap(), blob.len() as u64);
@@ -277,7 +275,7 @@ fn special_skips_what_fat_cannot_hold() {
     assert_eq!(e.errno(), EOPNOTSUPP);
     assert!(e.message().contains("link"), "{}", e);
     let options = AssembleOptions {
-        skip_unsupported: true,
+        flags: AssembleFlags::REPLACE | AssembleFlags::SKIP_UNSUPPORTED,
         ..AssembleOptions::default()
     };
     let report = v.assemble(&m, &mut source("special"), &options).unwrap();
@@ -344,7 +342,7 @@ fn empty_manifest_is_an_empty_volume() {
     // Git keeps no empty directory, so the empty tree is made here; the
     // source is resolved once, before the assembly, like any other.
     let tree = Temp::dir();
-    let mut source = DirectorySource::new(host::open_dir(tree.path()).unwrap());
+    let mut source = DirectorySource::new(SourceDirectory::new(host::open_dir(tree.path()).unwrap()));
     let report = v.assemble(&m, &mut source, &AssembleOptions::default()).unwrap();
     assert_eq!((report.files, report.directories, report.bytes), (0, 0, 0));
     assert!(v.read_dir("/").unwrap().is_empty());
@@ -363,7 +361,7 @@ fn generator_agrees_with_systemd_manifest() {
     let src = tree("esp");
     let mut dirs: Vec<(PathBuf, u64)> = Vec::new();
     for e in &m.entries {
-        let name = e.name.as_deref().unwrap();
+        let name = e.name.as_str();
         let dest = copy.path().join(name);
         match e.inode_type {
             InodeType::Directory => {
@@ -387,7 +385,10 @@ fn generator_agrees_with_systemd_manifest() {
     for (dir, nsec) in dirs {
         std::fs::File::open(&dir).unwrap().set_modified(time(nsec)).unwrap();
     }
-    let ours = manifest::generate(host::open_dir(copy.path()).unwrap().as_fd()).unwrap();
+    let mut ours = Vec::new();
+    HostTree::new(host::open_dir(copy.path()).unwrap().as_fd())
+        .write_manifest(&mut ours)
+        .unwrap();
     let theirs = std::fs::read(fixtures().join("esp/size-hash-mtime.Uapi16Manifest")).unwrap();
     assert_eq!(
         String::from_utf8_lossy(&ours),
@@ -405,14 +406,14 @@ fn volume_manifest_agrees_with_systemd_manifest() {
     let (_img, mut v, _) = planned_volume(&m);
     v.assemble(&m, &mut source("esp"), &AssembleOptions::default()).unwrap();
     for (name, fields) in [
-        ("none.Uapi16Manifest", Fields::none()),
+        ("none.Uapi16Manifest", Fields::NONE),
         (
             "size-hash-mtime.Uapi16Manifest",
             Fields::from_names(["size", "hash", "mtime"]).unwrap(),
         ),
     ] {
         let mut ours = Vec::new();
-        manifest::volume::write(&v, m.root.mtime(), fields, &mut ours).unwrap();
+        v.write_manifest(m.root.mtime(), fields, &mut ours).unwrap();
         let theirs = std::fs::read(fixtures().join("esp").join(name)).unwrap();
         assert_eq!(
             String::from_utf8_lossy(&ours),

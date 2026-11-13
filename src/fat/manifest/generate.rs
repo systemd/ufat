@@ -2,91 +2,122 @@
 //! Writing a manifest for a host tree, the way `systemd-manifest make`
 //! writes it.
 
-use std::io::{self, Write};
+use std::io::Write;
 use std::os::fd::BorrowedFd;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
-use json::{Object, Value};
+use json::ObjectWriter;
+use uapi16::{Field, FileObject, InodeType, Name, Sha256, Writer, RECORD_SEPARATOR};
 
-use super::{valid_name, MEDIA_TYPE, RECORD_SEPARATOR, TRAILER_MEDIA_TYPE};
-use crate::sha256::{self, Sha256};
+use crate::host::HostEntry;
+use crate::sha256;
 use crate::sys;
 use crate::Result;
 
-/// Writes one record of the JSON text sequence: the record separator, the
-/// object with its keys sorted and without whitespace, a newline. The host
-/// tree generator and the volume writer frame their records here, so both
-/// write what `systemd-manifest` writes. Each record goes out in one write.
-pub(crate) fn write_record(out: &mut dyn Write, mut o: Object) -> io::Result<()> {
-    o.sort();
-    let record = format!("{}{}\n", char::from(RECORD_SEPARATOR), Value::Object(o));
-    out.write_all(record.as_bytes())
+/// How much of a file is read at a time for its hash.
+const READ_SIZE: usize = 1024 * 1024;
+
+/// A directory tree on the host, by the open directory at its top.
+///
+/// The descriptor is what the caller resolved its path to, with
+/// [`crate::host::open_dir`] when it has a path, and may be O_PATH.
+/// Everything below it is reached by descriptor.
+#[derive(Clone, Copy, Debug)]
+pub struct HostTree<'a> {
+    root: BorrowedFd<'a>,
 }
 
-/// A time as `mTimeNSec` carries it: nanoseconds since the epoch. None for
-/// a time the field cannot express, before the epoch or after the year
-/// 2554.
-pub(crate) fn time_nsec(time: SystemTime) -> Option<u64> {
-    let since = time.duration_since(UNIX_EPOCH).ok()?;
-    u64::try_from(since.as_nanos()).ok()
+impl<'a> HostTree<'a> {
+    /// The tree below the open directory `root`.
+    pub fn new(root: BorrowedFd<'a>) -> HostTree<'a> {
+        HostTree { root }
+    }
+
+    /// Writes the manifest of the tree to `out` the way `systemd-manifest
+    /// make --field=size,hash,mtime` would, for tests and for the command
+    /// line tool. Only regular files and directories are listed, and a
+    /// manifest stored in the tree's top level is left out since its name
+    /// is reserved.
+    pub fn write_manifest(&self, out: impl Write) -> Result<()> {
+        // The leading object carries the tree's own time, as systemd's does.
+        let mut top = FileObject::root();
+        if let Ok(time) = sys::fstat(self.root)?.modified() {
+            top.set_mtime(time);
+        }
+        let mut listing = Listing {
+            writer: Writer::begin(out, &top)?,
+            buffer: vec![0u8; READ_SIZE],
+        };
+        crate::host::walk_tree(self.root, "", false, &mut |target, entry| listing.entry(target, entry))?;
+        listing.writer.finish()?;
+        Ok(())
+    }
 }
 
-/// Builds a manifest for the host tree below the open directory `root` the
-/// way `systemd-manifest make --field=size,hash,mtime` would, for tests and
-/// for the command line tool. The descriptor is what the caller resolved
-/// its path to, with [`crate::host::open_dir`] when it has a path, and may
-/// be O_PATH; everything below it is reached by descriptor. Only regular
-/// files and directories are listed, and a manifest stored in the tree's
-/// top level is left out since its name is reserved.
-pub fn generate(root: BorrowedFd<'_>) -> Result<Vec<u8>> {
-    fn mtime_nsec(md: &std::fs::Metadata) -> Option<u64> {
-        md.modified().ok().and_then(time_nsec)
-    }
-    let mut out = Vec::new();
-    // The leading object carries the tree's own time, as systemd's does.
-    let mut top = Object::new();
-    if let Some(m) = mtime_nsec(&sys::fstat(root)?) {
-        top.insert("mTimeNSec", m);
-    }
-    top.insert("mediaType", MEDIA_TYPE);
-    write_record(&mut out, top)?;
-    let mut buf = vec![0u8; 1024 * 1024];
-    crate::host::walk_tree(root, "", false, &mut |target, entry| {
+/// The manifest of a host tree while it is written.
+struct Listing<W: Write> {
+    writer: Writer<W>,
+    /// What a file is read through for its hash.
+    buffer: Vec<u8>,
+}
+
+impl<W: Write> Listing<W> {
+    /// Writes the object of the entry that gets the path `target` inside
+    /// a volume, and says whether the walk is to go into it.
+    fn entry(&mut self, target: &str, entry: &HostEntry) -> Result<bool> {
         let md = &entry.metadata;
         // walk_tree joins with a leading slash; manifests want none.
         let path = &target[1..];
-        if md.is_file() && !valid_name(path) {
-            return Ok(false);
-        }
-        let mtime = mtime_nsec(md);
-        let mut o = Object::new();
-        if md.is_dir() {
-            if let Some(m) = mtime {
-                o.insert("mTimeNSec", m);
+        let mut object = match Name::new(path) {
+            Ok(name) => FileObject::new(name),
+            Err(_) if md.is_dir() => {
+                self.unnameable_directory(path, md)?;
+                return Ok(true);
             }
-            o.insert("name", path);
-            o.insert("type", "dir");
-            write_record(&mut out, o)?;
+            Err(_) => return Ok(false),
+        };
+        if let Ok(time) = md.modified() {
+            object.set_mtime(time);
+        }
+        if md.is_dir() {
+            object.inode_type = InodeType::Directory;
         } else if md.is_file() {
             let mut file = entry.open_file()?;
-            let mut hasher = Sha256::new();
+            let mut hasher = sha256::Sha256::new();
             loop {
-                let n = crate::host::read_some(&mut file, &mut buf)?;
+                let n = crate::host::read_some(&mut file, &mut self.buffer)?;
                 if n == 0 {
                     break;
                 }
-                hasher.update(&buf[..n]);
+                hasher.update(&self.buffer[..n]);
             }
-            if let Some(m) = mtime {
-                o.insert("mTimeNSec", m);
-            }
-            o.insert("name", path);
-            o.insert("sha256", sha256::to_hex(&hasher.finalize()));
-            o.insert("size", md.len());
-            write_record(&mut out, o)?;
+            object.sha256 = Some(Sha256::from(hasher.finalize()));
+            object.size = Some(md.len());
+        } else {
+            return Ok(false);
         }
+        self.writer.file(&object)?;
         Ok(md.is_dir())
-    })?;
-    write_record(&mut out, json::object! { "mediaType" => TRAILER_MEDIA_TYPE })?;
-    Ok(out)
+    }
+
+    /// Writes the object of a directory whose name no manifest can carry:
+    /// one with a control character in it, or one that is reserved for
+    /// the manifest itself. No reader takes such an object. It is written
+    /// all the same, as it was before file objects had checked names, and
+    /// the walk goes on below it. `systemd-manifest` leaves such a
+    /// directory out with everything in it.
+    fn unnameable_directory(&mut self, path: &str, md: &std::fs::Metadata) -> Result<()> {
+        let since_epoch = md.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok());
+        let mut record = String::from(char::from(RECORD_SEPARATOR));
+        let mut object = ObjectWriter::new(&mut record);
+        if let Some(nsec) = since_epoch.and_then(|since| u64::try_from(since.as_nanos()).ok()) {
+            object.key(Field::MTimeNSec.as_str()).unsigned(nsec);
+        }
+        object.key(Field::Name.as_str()).string(path);
+        object.key(Field::Type.as_str()).string(InodeType::Directory.as_str());
+        drop(object);
+        record.push('\n');
+        self.writer.get_mut().write_all(record.as_bytes())?;
+        Ok(())
+    }
 }

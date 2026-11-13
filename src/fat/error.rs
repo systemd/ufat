@@ -608,19 +608,17 @@ impl Error {
         self
     }
 
-    /// Fills in the record index and the object's name of a manifest
-    /// error that lacks them.
-    #[must_use]
-    pub fn in_record(mut self, index: u64, object: Option<&str>) -> Self {
-        if let Some(Detail::Manifest { record, name, .. }) = &mut self.0.detail {
-            if record.is_none() {
-                *record = Some(index);
-            }
-            if name.is_none() {
-                *name = object.map(str::to_string);
-            }
+    /// The errno an I/O error stands for: the one the system gave, or the
+    /// one that fits its kind.
+    pub(crate) fn errno_of(e: &std::io::Error) -> i32 {
+        match e.raw_os_error() {
+            Some(n) => n,
+            None => match e.kind() {
+                std::io::ErrorKind::InvalidInput => EINVAL,
+                std::io::ErrorKind::OutOfMemory => ENOMEM,
+                _ => EIO,
+            },
         }
-        self
     }
 
     /// The message describing this error.
@@ -652,15 +650,7 @@ impl From<std::io::Error> for Error {
         if let Some(inner) = e.get_ref().and_then(|i| i.downcast_ref::<Error>()) {
             return inner.clone();
         }
-        let errno = match e.raw_os_error() {
-            Some(n) => n,
-            None => match e.kind() {
-                std::io::ErrorKind::InvalidInput => EINVAL,
-                std::io::ErrorKind::OutOfMemory => ENOMEM,
-                _ => EIO,
-            },
-        };
-        Error::new(errno, e.to_string())
+        Error::new(Error::errno_of(&e), e.to_string())
     }
 }
 

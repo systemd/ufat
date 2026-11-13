@@ -4,19 +4,41 @@ use crate::populate::CopyOptions;
 use crate::progress::Progress;
 use crate::test_util::{volume, TempDir, TempImage};
 use crate::volume::Volume;
-use crate::{ContentProblem, SourceProblem};
+use crate::{sha256, ContentProblem, SourceProblem};
+use std::io::Read;
 use std::os::fd::AsFd;
 use std::path::Path;
+use std::time::{Duration, UNIX_EPOCH};
+use uapi16::{Data, Digest, Mode, MAX_RECORD_SIZE, RECORD_SEPARATOR};
 
 /// A directory resolved once, the way the tool resolves the SOURCE of a
 /// manifest.
+fn source_dir(path: &Path) -> SourceDirectory {
+    SourceDirectory::new(crate::host::open_dir(path).unwrap())
+}
+
 fn dir_source(path: &Path) -> DirectorySource {
-    DirectorySource::new(crate::host::open_dir(path).unwrap())
+    DirectorySource::new(source_dir(path))
+}
+
+/// Checks the files of `manifest` in the directory at `path` before any of
+/// them is read.
+fn verify(path: &Path, manifest: &Manifest) -> Result<()> {
+    Ok(dir_source(path).verify(&manifest.entries)?)
 }
 
 /// The manifest the generator writes for the tree at `path`.
 fn generated(path: &Path) -> Vec<u8> {
-    generate(crate::host::open_dir(path).unwrap().as_fd()).unwrap()
+    let mut out = Vec::new();
+    HostTree::new(crate::host::open_dir(path).unwrap().as_fd())
+        .write_manifest(&mut out)
+        .unwrap();
+    out
+}
+
+/// Reads a manifest that is held in memory.
+fn parse(bytes: &[u8]) -> Result<Manifest> {
+    Manifest::parse(bytes)
 }
 
 fn seq(records: &[&str]) -> Vec<u8> {
@@ -52,19 +74,19 @@ fn parses_a_manifest() {
     ]))
     .unwrap();
     assert_eq!(m.entries.len(), 6);
-    assert_eq!(m.entries[4].mode, Some(0o644));
+    assert_eq!(m.entries[4].mode.map(Mode::bits), Some(0o644));
     assert_eq!(m.signatures, 1);
     assert_eq!(m.root.inode_type, InodeType::Directory);
     let boot = &m.entries[2];
-    assert_eq!(boot.name.as_deref(), Some("EFI/BOOT/BOOTX64.EFI"));
+    assert_eq!(boot.name, "EFI/BOOT/BOOTX64.EFI");
     assert_eq!(boot.size, Some(5));
     assert_eq!(boot.mtime(), Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)));
     assert!(!boot.is_read_only());
     assert!(boot.is_streamed());
     let empty = &m.entries[3];
-    assert_eq!(empty.sha256, Some(sha256::EMPTY));
+    assert_eq!(empty.sha256, Some(Sha256::EMPTY));
     let literal = &m.entries[4];
-    assert_eq!(literal.contents[0].literal.as_deref(), Some(&b"hello"[..]));
+    assert_eq!(literal.contents[0].literal(), Some(&b"hello"[..]));
     assert_eq!(literal.size, Some(5));
     assert!(!literal.is_streamed());
     assert_eq!(m.streamed_bytes().unwrap(), 5);
@@ -228,107 +250,8 @@ fn rejects_broken_manifests() {
     ]))
     .unwrap();
     assert_eq!(m.entries[0].size, Some(5));
-    assert_eq!(m.entries[0].sha256, Some(sha256::digest(b"hello")));
+    assert_eq!(m.entries[0].sha256, Some(Sha256::of(b"hello")));
     assert_eq!(m.entries[0].valid_until_usec, Some(u64::MAX));
-}
-
-/// The test vectors of systemd's unbase64mem() in
-/// src/test/test-hexdecoct.c: what it decodes and what it refuses.
-#[test]
-fn base64() {
-    for (text, data) in [
-        ("", ""),
-        ("Zg==", "f"),
-        ("Zm8=", "fo"),
-        ("Zm9v", "foo"),
-        ("Zm9vYg==", "foob"),
-        ("Zm9vYmE=", "fooba"),
-        ("Zm9vYmFy", "foobar"),
-        (" ", ""),
-        (" \n\r ", ""),
-        ("    Zg\n==       ", "f"),
-        (" Zm 8=\r", "fo"),
-        ("  Zm9\n\r\r\nv   ", "foo"),
-        (" Z m9vYg==\n\r", "foob"),
-        (" Zm 9vYmE=   ", "fooba"),
-        ("   Z m9v    YmFy   ", "foobar"),
-        ("aGVs\nbG8 =", "hello"),
-    ] {
-        assert_eq!(base64_decode(text).as_deref(), Some(data.as_bytes()), "{:?}", text);
-    }
-    for text in ["A", "A====", "AAB==", " A A A B = ", " Z m 8 = q u u x "] {
-        assert_eq!(base64_decode(text), None, "{:?}", text);
-    }
-}
-
-/// Both alphabets, in any mix, with the values systemd's unbase64char()
-/// gives the digits, and its test of the two spellings of the same data.
-#[test]
-fn base64_alphabets() {
-    assert_eq!(base64_decode("AZaz").unwrap(), [1, 150, 179]);
-    assert_eq!(base64_decode("09+/").unwrap(), [211, 223, 191]);
-    assert_eq!(base64_decode("09-_").unwrap(), [211, 223, 191]);
-    assert_eq!(base64_decode("_-8=").unwrap(), [0xff, 0xef]);
-    let plaintext: &[u8] = &[
-        0xcc, 0xa1, 0x72, 0x22, 0xae, 0xda, 0x66, 0x7e, 0x04, 0xa6, 0xe0, 0x82, 0x9a, 0x97, 0x05, 0xf6, 0x33, 0xe0,
-        0x0f, 0xc2, 0x45, 0x13, 0x58, 0x3f, 0xc5, 0xf4, 0xf4, 0x31, 0xab, 0x3c, 0x5f, 0x83, 0x34, 0x5b, 0x27, 0x32,
-        0x8a, 0x04, 0x6c, 0x43, 0x82, 0x07, 0xe3, 0x2c, 0xac, 0xb9, 0xfb, 0xac, 0xd0, 0x03, 0x91, 0x42, 0xcb, 0xa4,
-        0xde, 0x87, 0x86, 0x85, 0x10, 0xbb, 0xb7, 0x5b, 0x4b, 0xc8, 0xa0, 0xf4, 0x22, 0x1d, 0x15, 0x71, 0x87, 0x9d,
-        0xbf, 0x9f, 0xa9, 0xf1, 0xee, 0xa2, 0xb6, 0xaa, 0xc8, 0xc3, 0x37, 0x9c, 0xbb, 0xdf, 0x3e, 0xac, 0xdc, 0x94,
-        0x54, 0x38, 0x56, 0x07, 0x34, 0xb4, 0x3c, 0xcc, 0x31, 0x13,
-    ];
-    for text in [
-        "zKFyIq7aZn4EpuCCmpcF9jPgD8JFE1g/xfT0Mas8X4M0WycyigRsQ4IH4yysufus0AORQsuk3oeGhRC7t1tLyKD0Ih0VcYedv5+p8e6itqrIwzecu98+rNyUVDhWBzS0PMwxEw==",
-        "zKFyIq7aZn4EpuCCmpcF9jPgD8JFE1g_xfT0Mas8X4M0WycyigRsQ4IH4yysufus0AORQsuk3oeGhRC7t1tLyKD0Ih0VcYedv5-p8e6itqrIwzecu98-rNyUVDhWBzS0PMwxEw==",
-    ] {
-        assert_eq!(base64_decode(text).as_deref(), Some(plaintext));
-    }
-}
-
-/// What systemd refuses: a last group without its padding, incomplete
-/// padding, padding with nothing to pad, padding that leaves bits set,
-/// anything after the padding, and any character that is not a digit,
-/// "=" or one of space, tab, newline and carriage return.
-#[test]
-fn base64_refuses() {
-    for text in [
-        "Zg", "Zm8", "aGVsbG8", "Zg=", "Zm9v=", "Zm9v==", "=", "==", " = ", "Zh==", "Zm9=", "Zg==Zg==", "Zg== x",
-        "Z=g=", "====", "Zm9\x0cv", "Zm9\x0bv", "!!!!", "Zm9v\0",
-    ] {
-        assert_eq!(base64_decode(text), None, "{:?}", text);
-    }
-}
-
-/// Data of every length up to 300 bytes comes back from its padded
-/// encoding broken into lines of any width, the way systemd's
-/// base64mem_full() writes it.
-#[test]
-fn base64_round_trip() {
-    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut x = 1u32;
-    for len in 0..300usize {
-        let data: Vec<u8> = (0..len)
-            .map(|_| {
-                x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                (x >> 16) as u8
-            })
-            .collect();
-        let mut text = Vec::new();
-        for chunk in data.chunks(3) {
-            let n = chunk.iter().fold(0u32, |n, &b| (n << 8) | u32::from(b)) << (8 * (3 - chunk.len()));
-            for i in 0..4 {
-                let digit = DIGITS[((n >> (18 - 6 * i)) & 63) as usize];
-                text.push(if i <= chunk.len() { digit } else { b'=' });
-            }
-        }
-        let mut lines = Vec::new();
-        for line in text.chunks(1 + len % 77) {
-            lines.extend_from_slice(line);
-            lines.push(b'\n');
-        }
-        let decoded = base64_decode(std::str::from_utf8(&lines).unwrap());
-        assert_eq!(decoded.as_deref(), Some(&data[..]), "{} bytes", len);
-    }
 }
 
 fn manifest_with_tree() -> (Manifest, Vec<u8>) {
@@ -465,7 +388,7 @@ fn assembles_from_a_directory() {
     let generated = generated(&dir);
     let g = parse(&generated).unwrap();
     assert_eq!(
-        g.entries.iter().filter_map(|e| e.name.clone()).collect::<Vec<_>>(),
+        g.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
         vec!["EFI", "EFI/Linux", "EFI/Linux/b.efi", "EFI/a.txt"]
     );
     let mut plan = crate::plan::Plan::new(crate::plan::PlanOptions {
@@ -504,8 +427,8 @@ fn unsupported_entries() {
     let unsupported: Vec<String> = m
         .entries
         .iter()
-        .filter(|e| e.check_supported().is_err())
-        .map(|e| e.name.clone().unwrap())
+        .filter(|e| Storable::try_from(*e).is_err())
+        .map(|e| e.name.to_string())
         .collect();
     assert_eq!(unsupported, vec!["a/b/link", "encoded", "remote", "sub"]);
     assert_eq!(m.check_supported().unwrap_err().errno(), EOPNOTSUPP);
@@ -523,7 +446,7 @@ fn unsupported_entries() {
             &m,
             &mut StreamSource::new(&mut empty),
             &AssembleOptions {
-                skip_unsupported: true,
+                flags: AssembleFlags::REPLACE | AssembleFlags::SKIP_UNSUPPORTED,
                 ..Default::default()
             },
         )
@@ -551,15 +474,9 @@ fn contents_are_chosen_by_what_can_be_used() {
         TRAILER,
     ]))
     .unwrap();
-    assert_eq!(
-        m.entries[0].fat_contents().unwrap().unwrap().literal.as_deref(),
-        Some(&b"hello"[..])
-    );
+    assert_eq!(m.entries[0].data().unwrap(), Data::Literal(b"hello"));
     assert!(!m.entries[0].is_streamed());
-    assert_eq!(
-        m.entries[1].fat_contents().unwrap().unwrap().file.as_deref(),
-        Some("data/y.bin")
-    );
+    assert!(matches!(m.entries[1].data(), Ok(Data::External(reference)) if reference.file == "data/y.bin"));
     assert!(m.entries[1].is_streamed());
     let tmp = TempDir::new("manifest-contents");
     let dir = tmp.path().to_path_buf();
@@ -598,7 +515,7 @@ fn whole_files_have_the_size_of_the_manifest() {
         ),
     ] {
         let m = parse(&seq(&[ROOT, &record, TRAILER])).unwrap();
-        let e = dir_source(&dir).verify(&m).unwrap_err();
+        let e = verify(&dir, &m).unwrap_err();
         assert_eq!(e.errno(), EBADMSG);
         assert!(
             matches!(
@@ -648,7 +565,7 @@ fn whole_files_have_the_size_of_the_manifest() {
         TRAILER,
     ]))
     .unwrap();
-    dir_source(&dir).verify(&m).unwrap();
+    verify(&dir, &m).unwrap();
     let (_img, mut v) = volume(8 << 20, 512, 512);
     v.assemble(&m, &mut dir_source(&dir), &AssembleOptions::default())
         .unwrap();
@@ -665,7 +582,7 @@ fn whole_files_have_the_size_of_the_manifest() {
         r#"{"name":"i","size":5,"contents":[{"file":"a","originalSize":5}]}"#,
     ] {
         let m = parse(&seq(&[ROOT, record, TRAILER])).unwrap();
-        let e = dir_source(&dir).verify(&m).unwrap_err();
+        let e = verify(&dir, &m).unwrap_err();
         assert!(
             matches!(
                 e.detail(),
@@ -693,7 +610,7 @@ fn mismatches_name_the_record() {
     let conf = sha256::to_hex(&sha256::digest(b"timeout 3\n"));
     let other = sha256::to_hex(&sha256::digest(b"timeout 5\n"));
     // In the detail and in the message.
-    let named = |e: crate::Error, name: &str| {
+    let named = |e: Error, name: &str| {
         match e.detail() {
             Some(Detail::Source { name: n, .. } | Detail::Content { name: n, .. }) => assert_eq!(n, name, "{:?}", e),
             _ => panic!("{:?}", e),
@@ -712,7 +629,7 @@ fn mismatches_name_the_record() {
         (r#"{"name":"loader/loader.conf","size":5}"#, "loader/loader.conf"),
     ] {
         let m = parse(&seq(&[ROOT, record, TRAILER])).unwrap();
-        named(dir_source(&dir).verify(&m).unwrap_err(), name);
+        named(verify(&dir, &m).unwrap_err(), name);
     }
     // Found while copying: the hash of the file, and that of the whole
     // source.
@@ -771,7 +688,7 @@ fn source_files_stay_inside_the_source_directory() {
         .is_err());
     v.assemble(
         &m,
-        &mut dir_source(&base).follow_symlinks(true),
+        &mut DirectorySource::new(source_dir(&base).follow_symlinks(true)),
         &AssembleOptions::default(),
     )
     .unwrap();
@@ -781,7 +698,7 @@ fn source_files_stay_inside_the_source_directory() {
         assert!(
             v.assemble(
                 &m,
-                &mut dir_source(&base).follow_symlinks(true),
+                &mut DirectorySource::new(source_dir(&base).follow_symlinks(true)),
                 &AssembleOptions::default()
             )
             .is_err(),
@@ -829,7 +746,7 @@ fn generator_leaves_the_manifest_out() {
     std::fs::write(dir.join("Uapi16Manifest2"), b"kept").unwrap();
     std::fs::write(dir.join("sub/Uapi16Manifest"), b"kept").unwrap();
     let m = parse(&generated(&dir)).unwrap();
-    let names: Vec<&str> = m.entries.iter().filter_map(|e| e.name.as_deref()).collect();
+    let names: Vec<&str> = m.entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, vec!["Uapi16Manifest2", "sub", "sub/Uapi16Manifest"]);
 }
 
@@ -870,18 +787,6 @@ fn validity() {
         ..Default::default()
     };
     assert!(v.assemble(&m, &mut StreamSource::new(&mut empty), &opts).is_ok());
-}
-
-/// mTimeNSec holds nanoseconds since the epoch in 64 bits: up to the year
-/// 2554, and nothing before 1970.
-#[test]
-fn times_outside_mtime_nsec_have_none() {
-    use std::time::{Duration, UNIX_EPOCH};
-    let last = UNIX_EPOCH + Duration::from_nanos(u64::MAX);
-    assert_eq!(generate::time_nsec(UNIX_EPOCH), Some(0));
-    assert_eq!(generate::time_nsec(last), Some(u64::MAX));
-    assert_eq!(generate::time_nsec(last + Duration::from_nanos(1)), None);
-    assert_eq!(generate::time_nsec(UNIX_EPOCH - Duration::from_secs(1)), None);
 }
 
 /// Checks the progress a long operation reported: the counts only grow
@@ -925,10 +830,9 @@ fn long_operations_report_progress() {
     );
 
     seen.clear();
-    let w = volume::write_with_progress(&v, None, volume::Fields::default(), &mut Vec::new(), &mut |p| {
-        seen.push(*p)
-    })
-    .unwrap();
+    let w = v
+        .write_manifest_with_progress(None, Fields::default(), &mut Vec::new(), &mut |p| seen.push(*p))
+        .unwrap();
     assert!(seen.iter().any(|p| p.files == 0 && p.bytes > 0), "{:?}", seen);
     reported(
         &seen,
@@ -971,4 +875,32 @@ fn long_operations_report_progress() {
         },
     );
     assert_eq!((removed.files, removed.directories), (2, 2));
+}
+
+#[test]
+fn assemble_flags() {
+    let both = AssembleFlags::REPLACE | AssembleFlags::SKIP_UNSUPPORTED;
+    assert_eq!(AssembleFlags::default(), AssembleFlags::REPLACE);
+    assert_eq!(AssembleOptions::default().flags, AssembleFlags::REPLACE);
+    assert!(both.contains(AssembleFlags::REPLACE) && both.contains(AssembleFlags::SKIP_UNSUPPORTED));
+    assert!(both.contains(both) && both.contains(AssembleFlags::NONE));
+    assert!(!AssembleFlags::REPLACE.contains(AssembleFlags::SKIP_UNSUPPORTED));
+    assert!(!AssembleFlags::NONE.contains(AssembleFlags::REPLACE));
+    for (replace, skip) in [(false, false), (false, true), (true, false), (true, true)] {
+        let flags = AssembleFlags::NONE
+            .with(AssembleFlags::REPLACE, replace)
+            .with(AssembleFlags::SKIP_UNSUPPORTED, skip);
+        assert_eq!(flags.contains(AssembleFlags::REPLACE), replace);
+        assert_eq!(flags.contains(AssembleFlags::SKIP_UNSUPPORTED), skip);
+        assert_eq!(
+            both.with(AssembleFlags::REPLACE, replace)
+                .with(AssembleFlags::SKIP_UNSUPPORTED, skip),
+            flags
+        );
+    }
+    let mut flags = AssembleFlags::NONE;
+    flags |= AssembleFlags::SKIP_UNSUPPORTED;
+    assert_eq!(format!("{:?}", flags), "AssembleFlags(SKIP_UNSUPPORTED)");
+    assert_eq!(format!("{:?}", both), "AssembleFlags(REPLACE | SKIP_UNSUPPORTED)");
+    assert_eq!(format!("{:?}", AssembleFlags::NONE), "AssembleFlags()");
 }

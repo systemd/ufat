@@ -27,8 +27,10 @@ use fat::format::{self, FormatOptions, VolumeId};
 use fat::fsck::{self, Problem};
 use fat::host;
 use fat::layout::{self, LayoutParams, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE, MIN_CLUSTERS, MIN_SECTOR_SIZE};
-use fat::manifest::volume::{Fields, WriteReport};
-use fat::manifest::{AssembleOptions, AssembleReport, DirectorySource, Manifest, StreamSource};
+use fat::manifest::{
+    AssembleFlags, AssembleOptions, AssembleReport, DirectorySource, Fields, Manifest, SourceDirectory, StreamSource,
+    WriteReport,
+};
 use fat::plan::{Plan, PlanOptions};
 use fat::populate::{CopyOptions, CopyReport, TimePolicy};
 use fat::probe::Prober;
@@ -835,7 +837,7 @@ impl Sink {
         let file = host::passed_sink(fd).map_err(bad("manifestSink"))?;
         let fields = match p.0.get("fields") {
             None | Some(Value::Null) => Fields::default(),
-            Some(_) => Fields::from_names(p.strings("fields")?).ok_or_else(|| invalid("manifestSink"))?,
+            Some(_) => Fields::from_names(p.strings("fields")?).map_err(|_| invalid("manifestSink"))?,
         };
         Ok(Sink { file, fields })
     }
@@ -844,13 +846,7 @@ impl Sink {
     /// what it covered so far.
     fn write(self, volume: &Volume, progress: &mut dyn FnMut(&Progress)) -> Outcome<WriteReport> {
         let mut out = BufWriter::new(self.file);
-        Ok(fat::manifest::volume::write_with_progress(
-            volume,
-            volume.root_time()?,
-            self.fields,
-            &mut out,
-            progress,
-        )?)
+        Ok(volume.write_manifest_with_progress(volume.root_time()?, self.fields, &mut out, progress)?)
     }
 }
 
@@ -1027,8 +1023,8 @@ impl Content {
                 // Symbolic links are followed, resolved below the source
                 // directory and never outside it; the interface has no
                 // switch for that.
-                let source = DirectorySource::new(dir).follow_symlinks(true);
-                source.verify(&m)?;
+                let source = DirectorySource::new(SourceDirectory::new(dir).follow_symlinks(true));
+                source.verify(&m.entries).map_err(fat::Error::from)?;
                 Some(Fill::FromDirectory(m, source))
             }
             (Some(host::PassedSource::Stream(file)), Some(m)) => Some(Fill::FromStream(m, file)),
@@ -1106,8 +1102,9 @@ impl Content {
         };
         let assembly = AssembleOptions {
             default_time: self.time,
-            replace: self.replace,
-            skip_unsupported: !self.fail_unsupported,
+            flags: AssembleFlags::NONE
+                .with(AssembleFlags::REPLACE, self.replace)
+                .with(AssembleFlags::SKIP_UNSUPPORTED, !self.fail_unsupported),
             now_usec: if self.check_validity {
                 Some(fat::time::to_usec(util::now()))
             } else {

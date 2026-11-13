@@ -2,6 +2,11 @@
 //! A small, strict JSON implementation: a value type, an RFC 8259 parser and
 //! a compact serializer.
 //!
+//! [`parse`] reads a text into a [`Value`], and a `Value` prints itself as
+//! compact text. [`Parser`] reads a text value by value, and
+//! [`ObjectWriter`] and [`ArrayWriter`] write one member by member, for a
+//! caller that has types of its own and does not want a `Value` in between.
+//!
 //! Numbers keep their nature: anything written without a fraction or an
 //! exponent that fits into 128 bits stays an integer, so 64-bit sizes and
 //! offsets survive a round trip exactly. Objects keep their insertion order
@@ -10,6 +15,9 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::convert::Infallible;
 use std::fmt;
 use std::str::FromStr;
 
@@ -305,12 +313,246 @@ impl std::error::Error for ParseError {}
 /// Nesting deeper than this is refused, to bound stack use.
 const MAX_DEPTH: usize = 128;
 
-struct Parser<'a> {
-    bytes: &'a [u8],
-    pos: usize,
+/// The most arrays and objects a parser is inside of at once: the value at
+/// the top and one at every level of nesting below it.
+const MAX_OPEN: usize = MAX_DEPTH + 1;
+
+/// The keys of an object are checked for duplicates by looking through
+/// them, which is right for the small objects this crate builds and
+/// receives. The parser keeps this many keys at hand for that. An object
+/// that needs more gets a set, so that a parser fed a large hostile object
+/// does not go quadratic over it.
+const SCAN_UP_TO: usize = 32;
+
+/// Eight bytes of a text in one integer, the first of them in its lowest
+/// bits. A string is searched for its end a word at a time.
+#[derive(Clone, Copy)]
+struct Word(u64);
+
+impl Word {
+    /// How many bytes a word holds.
+    const SIZE: usize = size_of::<u64>();
+    /// The lowest bit of every byte, and the highest.
+    const LOW_BITS: u64 = u64::from_ne_bytes([0x01; Word::SIZE]);
+    const HIGH_BITS: u64 = u64::from_ne_bytes([0x80; Word::SIZE]);
+
+    fn new(bytes: [u8; Word::SIZE]) -> Word {
+        Word(u64::from_le_bytes(bytes))
+    }
+
+    /// The high bit of every byte that is below `limit`, which is no more
+    /// than 0x80. Only the lowest bit set is to be relied on: a byte after
+    /// the first one below the limit can be marked wrongly.
+    const fn below(self, limit: u8) -> u64 {
+        self.0.wrapping_sub(Word::LOW_BITS * limit as u64) & !self.0 & Word::HIGH_BITS
+    }
+
+    /// The high bit of every byte that is `byte`, to be relied on like
+    /// that of [`Word::below`].
+    const fn equal(self, byte: u8) -> u64 {
+        Word(self.0 ^ (Word::LOW_BITS * byte as u64)).below(1)
+    }
+
+    /// Where the first byte is that does not stand for itself in a
+    /// string, if the word has one.
+    fn first_special(self) -> Option<usize> {
+        let special = self.equal(QUOTE) | self.equal(ESCAPE) | self.below(FIRST_PRINTABLE);
+        (special != 0).then(|| (special.trailing_zeros() / u8::BITS) as usize)
+    }
+
+    /// How many bytes at the start of `bytes` stand for themselves in a
+    /// string: all up to the first quote, backslash or control character.
+    fn plain_run(bytes: &[u8]) -> usize {
+        let mut rest = bytes;
+        while let Some((word, behind)) = rest.split_first_chunk() {
+            if let Some(at) = Word::new(*word).first_special() {
+                return bytes.len() - rest.len() + at;
+            }
+            rest = behind;
+        }
+        let plain = |b: &&u8| **b != QUOTE && **b != ESCAPE && **b >= FIRST_PRINTABLE;
+        bytes.len() - rest.len() + rest.iter().take_while(plain).count()
+    }
 }
 
-impl Parser<'_> {
+/// The first byte of a string and its last.
+const QUOTE: u8 = b'"';
+/// The byte that starts an escape inside a string.
+const ESCAPE: u8 = b'\\';
+/// The bytes below this one are control characters. A string has to
+/// escape them.
+const FIRST_PRINTABLE: u8 = 0x20;
+/// What a `\u` escape starts with, and how many hex digits follow.
+const UNICODE_ESCAPE: &[u8] = b"\\u";
+const UNICODE_ESCAPE_DIGITS: usize = 4;
+/// The base of those digits.
+const HEX: u32 = 16;
+/// The base a number is written in, and how many digits the largest u64
+/// has in it. A number of fewer digits fits into a u64.
+const DECIMAL: u64 = 10;
+const U64_DIGITS: usize = 20;
+/// The UTF-16 units that are one half of a pair: the high surrogates, which
+/// come first, and the low ones.
+const HIGH_SURROGATES: std::ops::Range<u32> = 0xD800..0xDC00;
+const LOW_SURROGATES: std::ops::Range<u32> = 0xDC00..0xE000;
+/// The first character a surrogate pair stands for.
+const FIRST_SUPPLEMENTARY: u32 = 0x10000;
+/// The bits of a character one surrogate carries.
+const SURROGATE_BITS: u32 = 10;
+
+/// The kind of a JSON value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// `null`
+    Null,
+    /// `true` or `false`
+    Bool,
+    /// A number.
+    Number,
+    /// A string.
+    String,
+    /// An array.
+    Array,
+    /// An object.
+    Object,
+}
+
+/// A JSON number. One written without a fraction or an exponent that fits
+/// into 128 bits is an integer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Number {
+    /// A number without fraction or exponent.
+    Int(i128),
+    /// Any other number.
+    Float(f64),
+}
+
+impl Number {
+    /// The number as u64, if it is a non-negative integer in range.
+    pub fn as_u64(self) -> Option<u64> {
+        match self {
+            Number::Int(i) => u64::try_from(i).ok(),
+            Number::Float(_) => None,
+        }
+    }
+
+    /// The number as i64, if it is an integer in range.
+    pub fn as_i64(self) -> Option<i64> {
+        match self {
+            Number::Int(i) => i64::try_from(i).ok(),
+            Number::Float(_) => None,
+        }
+    }
+
+    /// The number as f64, integers included.
+    pub fn as_f64(self) -> f64 {
+        match self {
+            Number::Int(i) => i as f64,
+            Number::Float(f) => f,
+        }
+    }
+}
+
+impl From<Number> for Value {
+    fn from(n: Number) -> Value {
+        match n {
+            Number::Int(i) => Value::Int(i),
+            Number::Float(f) => Value::Float(f),
+        }
+    }
+}
+
+/// What the parser is inside of.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Open {
+    /// An array.
+    Array,
+    /// An object. Its keys are among the ones the parser keeps at hand.
+    Object,
+    /// An object with more keys than the parser keeps at hand. They are in
+    /// a set.
+    Wide,
+}
+
+/// One array or object the parser is inside of.
+#[derive(Clone, Copy)]
+struct Level {
+    open: Open,
+    /// How many keys the parser had at hand when it went in. Those of an
+    /// object come after them.
+    first_key: u8,
+}
+
+/// Reads a JSON text value by value, without building a [`Value`].
+///
+/// The parser stands in front of a value. [`Parser::peek`] says what kind
+/// it is. The methods named after a kind read the value if it is of that
+/// kind, and leave it alone if it is not. [`Parser::skip`] reads a value of
+/// any kind. An array is entered with [`Parser::array`], and then
+/// [`Parser::element`] says before every element whether there is one. An
+/// object is entered with [`Parser::object`], and then [`Parser::key`]
+/// returns the key of every member, whose value is read next.
+///
+/// A text the parser reads to its end without an error is one [`parse`]
+/// takes, and the other way around.
+///
+/// ```
+/// let mut parser = json::Parser::new(r#"{"name":"a","size":3,"more":[1,2]}"#);
+/// let mut size = None;
+/// assert!(parser.object()?);
+/// while let Some(key) = parser.key()? {
+///     match key.as_ref() {
+///         "size" => size = parser.number()?.and_then(json::Number::as_u64),
+///         _ => parser.skip()?,
+///     }
+/// }
+/// parser.end()?;
+/// assert_eq!(size, Some(3));
+/// # Ok::<(), json::ParseError>(())
+/// ```
+pub struct Parser<'a> {
+    text: &'a str,
+    pos: usize,
+    /// The arrays and objects the parser is inside of, outermost first.
+    levels: [Level; MAX_OPEN],
+    depth: usize,
+    /// Whether the innermost of them has no member so far.
+    empty: bool,
+    /// The keys of the objects in `open` that are looked through. They
+    /// are parts of the text.
+    keys: [&'a str; SCAN_UP_TO],
+    key_count: usize,
+    /// The keys of the objects in `open` that have a set, outermost first.
+    sets: Vec<HashSet<Cow<'a, str>>>,
+    /// How deep the object is whose last key it had before. That is an
+    /// error once the value of the key was read.
+    duplicate: Option<usize>,
+}
+
+impl<'a> Parser<'a> {
+    /// A parser in front of the value `text` holds.
+    pub fn new(text: &'a str) -> Parser<'a> {
+        Parser {
+            text,
+            pos: 0,
+            levels: [Level {
+                open: Open::Array,
+                first_key: 0,
+            }; MAX_OPEN],
+            depth: 0,
+            empty: false,
+            keys: [""; SCAN_UP_TO],
+            key_count: 0,
+            sets: Vec::new(),
+            duplicate: None,
+        }
+    }
+
+    /// How many bytes of the text the parser has read.
+    pub fn offset(&self) -> usize {
+        self.pos
+    }
+
     fn error(&self, message: &'static str) -> ParseError {
         ParseError {
             offset: self.pos,
@@ -318,8 +560,12 @@ impl Parser<'_> {
         }
     }
 
+    fn bytes(&self) -> &'a [u8] {
+        self.text.as_bytes()
+    }
+
     fn skip_whitespace(&mut self) {
-        while let Some(&b) = self.bytes.get(self.pos) {
+        while let Some(&b) = self.bytes().get(self.pos) {
             if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
                 self.pos += 1;
             } else {
@@ -328,12 +574,12 @@ impl Parser<'_> {
         }
     }
 
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
+    fn byte(&self) -> Option<u8> {
+        self.bytes().get(self.pos).copied()
     }
 
     fn expect(&mut self, b: u8) -> Result<(), ParseError> {
-        if self.peek() == Some(b) {
+        if self.byte() == Some(b) {
             self.pos += 1;
             Ok(())
         } else {
@@ -341,270 +587,532 @@ impl Parser<'_> {
         }
     }
 
-    fn value(&mut self, depth: usize) -> Result<Value, ParseError> {
-        if depth > MAX_DEPTH {
+    /// The kind of the value the parser stands in front of. It is an
+    /// error when there is no value.
+    pub fn peek(&mut self) -> Result<Kind, ParseError> {
+        if self.depth > MAX_DEPTH {
             return Err(self.error("nesting too deep"));
         }
         self.skip_whitespace();
-        match self.peek() {
+        match self.byte() {
             None => Err(self.error("unexpected end of input")),
-            Some(b'{') => self.object(depth),
-            Some(b'[') => self.array(depth),
-            Some(b'"') => Ok(Value::String(self.string()?)),
-            Some(b't') => self.literal("true", Value::Bool(true)),
-            Some(b'f') => self.literal("false", Value::Bool(false)),
-            Some(b'n') => self.literal("null", Value::Null),
-            Some(b'-' | b'0'..=b'9') => self.number(),
+            Some(b'{') => Ok(Kind::Object),
+            Some(b'[') => Ok(Kind::Array),
+            Some(QUOTE) => Ok(Kind::String),
+            Some(b't' | b'f') => Ok(Kind::Bool),
+            Some(b'n') => Ok(Kind::Null),
+            Some(b'-' | b'0'..=b'9') => Ok(Kind::Number),
             Some(_) => Err(self.error("unexpected character")),
         }
     }
 
-    fn literal(&mut self, word: &str, value: Value) -> Result<Value, ParseError> {
-        if self.bytes[self.pos..].starts_with(word.as_bytes()) {
+    fn literal(&mut self, word: &str) -> Result<(), ParseError> {
+        if self.bytes()[self.pos..].starts_with(word.as_bytes()) {
             self.pos += word.len();
-            Ok(value)
+            Ok(())
         } else {
             Err(self.error("invalid literal"))
         }
     }
 
-    fn object(&mut self, depth: usize) -> Result<Value, ParseError> {
-        self.expect(b'{')?;
-        let mut object = Object::new();
-        self.skip_whitespace();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            return Ok(Value::Object(object));
+    /// Reads the value if it is `null`, and says whether it was.
+    pub fn null(&mut self) -> Result<bool, ParseError> {
+        if self.peek()? != Kind::Null {
+            return Ok(false);
         }
-        // Duplicate keys are refused. The object itself is a list, which is
-        // right for the small objects this crate builds and receives, and
-        // those are checked by looking through the keys so far. Past a few
-        // dozen keys a set takes over, so that a parser fed a large hostile
-        // object does not go quadratic over it.
-        const SCAN_UP_TO: usize = 32;
-        let mut seen: Option<std::collections::HashSet<String>> = None;
-        loop {
-            self.skip_whitespace();
-            if self.peek() != Some(b'"') {
-                return Err(self.error("expected a string key"));
-            }
-            let key = self.string()?;
-            self.skip_whitespace();
-            self.expect(b':')?;
-            let value = self.value(depth + 1)?;
-            let duplicate = match seen.as_mut() {
-                Some(set) => !set.insert(key.clone()),
-                None => object.entries.iter().any(|(k, _)| *k == key),
-            };
-            if duplicate {
-                return Err(self.error("duplicate key"));
-            }
-            object.entries.push((key, value));
-            if seen.is_none() && object.entries.len() >= SCAN_UP_TO {
-                seen = Some(object.entries.iter().map(|(k, _)| k.clone()).collect());
-            }
-            self.skip_whitespace();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b'}') => {
-                    self.pos += 1;
-                    return Ok(Value::Object(object));
-                }
-                _ => return Err(self.error("expected ',' or '}'")),
-            }
-        }
+        self.literal("null")?;
+        Ok(true)
     }
 
-    fn array(&mut self, depth: usize) -> Result<Value, ParseError> {
-        self.expect(b'[')?;
-        let mut items = Vec::new();
-        self.skip_whitespace();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(Value::Array(items));
-        }
-        loop {
-            items.push(self.value(depth + 1)?);
-            self.skip_whitespace();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(Value::Array(items));
-                }
-                _ => return Err(self.error("expected ',' or ']'")),
-            }
-        }
+    /// Reads the boolean the parser stands in front of.
+    fn bool_token(&mut self) -> Result<bool, ParseError> {
+        let value = self.byte() == Some(b't');
+        self.literal(if value { "true" } else { "false" })?;
+        Ok(value)
     }
 
-    fn hex4(&mut self) -> Result<u32, ParseError> {
-        let s = self
-            .bytes
-            .get(self.pos..self.pos + 4)
-            .ok_or_else(|| self.error("truncated unicode escape"))?;
-        // from_str_radix would also take a sign; only hex digits are JSON.
-        if !s.iter().all(u8::is_ascii_hexdigit) {
-            return Err(self.error("invalid unicode escape"));
+    /// Reads the value if it is a boolean.
+    pub fn bool(&mut self) -> Result<Option<bool>, ParseError> {
+        if self.peek()? != Kind::Bool {
+            return Ok(None);
         }
-        let text = std::str::from_utf8(s).map_err(|_| self.error("invalid unicode escape"))?;
-        let v = u32::from_str_radix(text, 16).map_err(|_| self.error("invalid unicode escape"))?;
-        self.pos += 4;
-        Ok(v)
+        self.bool_token().map(Some)
     }
 
-    fn string(&mut self) -> Result<String, ParseError> {
-        self.expect(b'"')?;
-        let mut out = Vec::new();
-        loop {
-            let start = self.pos;
-            while let Some(&b) = self.bytes.get(self.pos) {
-                if b == b'"' || b == b'\\' || b < 0x20 {
-                    break;
-                }
-                self.pos += 1;
-            }
-            out.extend_from_slice(&self.bytes[start..self.pos]);
-            match self.peek() {
-                None => return Err(self.error("unterminated string")),
-                Some(b'"') => {
-                    self.pos += 1;
-                    break;
-                }
-                Some(b'\\') => {
-                    self.pos += 1;
-                    let esc = self.peek().ok_or_else(|| self.error("unterminated string"))?;
-                    self.pos += 1;
-                    match esc {
-                        b'"' => out.push(b'"'),
-                        b'\\' => out.push(b'\\'),
-                        b'/' => out.push(b'/'),
-                        b'b' => out.push(0x08),
-                        b'f' => out.push(0x0c),
-                        b'n' => out.push(b'\n'),
-                        b'r' => out.push(b'\r'),
-                        b't' => out.push(b'\t'),
-                        b'u' => {
-                            let mut code = self.hex4()?;
-                            if (0xD800..0xDC00).contains(&code) {
-                                // A high surrogate must be followed by a low one.
-                                if self.bytes.get(self.pos..self.pos + 2) != Some(b"\\u") {
-                                    return Err(self.error("unpaired surrogate"));
-                                }
-                                self.pos += 2;
-                                let low = self.hex4()?;
-                                if !(0xDC00..0xE000).contains(&low) {
-                                    return Err(self.error("unpaired surrogate"));
-                                }
-                                code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
-                            } else if (0xDC00..0xE000).contains(&code) {
-                                return Err(self.error("unpaired surrogate"));
-                            }
-                            let c = char::from_u32(code).ok_or_else(|| self.error("invalid unicode escape"))?;
-                            let mut buf = [0u8; 4];
-                            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-                        }
-                        _ => return Err(self.error("invalid escape")),
-                    }
-                }
-                Some(_) => return Err(self.error("control character in string")),
-            }
+    /// Reads the value if it is a number.
+    pub fn number(&mut self) -> Result<Option<Number>, ParseError> {
+        if self.peek()? != Kind::Number {
+            return Ok(None);
         }
-        String::from_utf8(out).map_err(|_| self.error("invalid UTF-8 in string"))
+        self.number_token().map(Some)
     }
 
-    fn number(&mut self) -> Result<Value, ParseError> {
+    /// Moves over a run of digits and says whether there was one.
+    fn digits(&mut self) -> bool {
+        let run = self.bytes()[self.pos..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        self.pos += run;
+        run > 0
+    }
+
+    /// Reads the number the parser stands in front of.
+    fn number_token(&mut self) -> Result<Number, ParseError> {
         let start = self.pos;
-        if self.peek() == Some(b'-') {
+        let negative = self.byte() == Some(b'-');
+        if negative {
             self.pos += 1;
         }
-        match self.peek() {
+        // The digits in front of a fraction, and their value if they are
+        // few enough to fit into a u64 whatever they are.
+        let mut magnitude = Some(0u64);
+        match self.byte() {
             Some(b'0') => self.pos += 1,
             Some(b'1'..=b'9') => {
-                while matches!(self.peek(), Some(b'0'..=b'9')) {
-                    self.pos += 1;
-                }
+                let digits = self.bytes()[self.pos..].iter().map(|b| b.wrapping_sub(b'0'));
+                // With too many digits the value wraps around. It is not
+                // used then.
+                let (value, run) = digits
+                    .take_while(|&digit| u64::from(digit) < DECIMAL)
+                    .fold((0u64, 0), |(value, run), digit| {
+                        (value.wrapping_mul(DECIMAL).wrapping_add(u64::from(digit)), run + 1)
+                    });
+                self.pos += run;
+                magnitude = (run < U64_DIGITS).then_some(value);
             }
             _ => return Err(self.error("invalid number")),
         }
         let mut is_float = false;
-        if self.peek() == Some(b'.') {
+        if self.byte() == Some(b'.') {
             is_float = true;
             self.pos += 1;
-            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+            if !self.digits() {
                 return Err(self.error("invalid number"));
             }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
         }
-        if matches!(self.peek(), Some(b'e' | b'E')) {
+        if matches!(self.byte(), Some(b'e' | b'E')) {
             is_float = true;
             self.pos += 1;
-            if matches!(self.peek(), Some(b'+' | b'-')) {
+            if matches!(self.byte(), Some(b'+' | b'-')) {
                 self.pos += 1;
             }
-            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+            if !self.digits() {
                 return Err(self.error("invalid number"));
             }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
         }
-        let text = std::str::from_utf8(&self.bytes[start..self.pos]).expect("ASCII digits");
+        let text = &self.text[start..self.pos];
         if !is_float {
+            if let Some(magnitude) = magnitude {
+                let magnitude = i128::from(magnitude);
+                return Ok(Number::Int(if negative { -magnitude } else { magnitude }));
+            }
             if let Ok(i) = text.parse::<i128>() {
-                return Ok(Value::Int(i));
+                return Ok(Number::Int(i));
             }
         }
         let f: f64 = text.parse().map_err(|_| self.error("invalid number"))?;
         if !f.is_finite() {
             return Err(self.error("number out of range"));
         }
-        Ok(Value::Float(f))
+        Ok(Number::Float(f))
+    }
+
+    fn hex4(&mut self) -> Result<u32, ParseError> {
+        let s = self
+            .bytes()
+            .get(self.pos..self.pos + UNICODE_ESCAPE_DIGITS)
+            .ok_or_else(|| self.error("truncated unicode escape"))?;
+        // from_str_radix would also take a sign; only hex digits are JSON.
+        if !s.iter().all(u8::is_ascii_hexdigit) {
+            return Err(self.error("invalid unicode escape"));
+        }
+        let text = std::str::from_utf8(s).map_err(|_| self.error("invalid unicode escape"))?;
+        let v = u32::from_str_radix(text, HEX).map_err(|_| self.error("invalid unicode escape"))?;
+        self.pos += UNICODE_ESCAPE_DIGITS;
+        Ok(v)
+    }
+
+    /// Moves over the bytes of a string that stand for themselves.
+    fn plain_run(&mut self) {
+        self.pos += Word::plain_run(&self.bytes()[self.pos..]);
+    }
+
+    /// Reads the string the parser stands in front of. A string without
+    /// an escape is a part of the text.
+    fn string_token(&mut self) -> Result<Cow<'a, str>, ParseError> {
+        self.expect(QUOTE)?;
+        let start = self.pos;
+        self.plain_run();
+        if self.byte() == Some(QUOTE) {
+            let plain = &self.text[start..self.pos];
+            self.pos += 1;
+            return Ok(Cow::Borrowed(plain));
+        }
+        let mut out = String::from(&self.text[start..self.pos]);
+        loop {
+            match self.byte() {
+                None => return Err(self.error("unterminated string")),
+                Some(QUOTE) => {
+                    self.pos += 1;
+                    break;
+                }
+                Some(ESCAPE) => {
+                    self.pos += 1;
+                    let esc = self.byte().ok_or_else(|| self.error("unterminated string"))?;
+                    self.pos += 1;
+                    match esc {
+                        QUOTE => out.push('"'),
+                        ESCAPE => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\u{08}'),
+                        b'f' => out.push('\u{0c}'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => {
+                            let mut code = self.hex4()?;
+                            if HIGH_SURROGATES.contains(&code) {
+                                // A high surrogate must be followed by a low one.
+                                if !self.bytes()[self.pos..].starts_with(UNICODE_ESCAPE) {
+                                    return Err(self.error("unpaired surrogate"));
+                                }
+                                self.pos += UNICODE_ESCAPE.len();
+                                let low = self.hex4()?;
+                                if !LOW_SURROGATES.contains(&low) {
+                                    return Err(self.error("unpaired surrogate"));
+                                }
+                                code = FIRST_SUPPLEMENTARY
+                                    + ((code - HIGH_SURROGATES.start) << SURROGATE_BITS)
+                                    + (low - LOW_SURROGATES.start);
+                            } else if LOW_SURROGATES.contains(&code) {
+                                return Err(self.error("unpaired surrogate"));
+                            }
+                            out.push(char::from_u32(code).ok_or_else(|| self.error("invalid unicode escape"))?);
+                        }
+                        _ => return Err(self.error("invalid escape")),
+                    }
+                }
+                Some(_) => return Err(self.error("control character in string")),
+            }
+            let start = self.pos;
+            self.plain_run();
+            out.push_str(&self.text[start..self.pos]);
+        }
+        Ok(Cow::Owned(out))
+    }
+
+    /// Reads the value if it is a string. A string without an escape is
+    /// returned as the part of the text it is.
+    pub fn string(&mut self) -> Result<Option<Cow<'a, str>>, ParseError> {
+        if self.peek()? != Kind::String {
+            return Ok(None);
+        }
+        self.string_token().map(Some)
+    }
+
+    /// Goes into the array or object the parser stands in front of.
+    fn enter(&mut self, open: Open) {
+        self.pos += 1;
+        self.levels[self.depth] = Level {
+            open,
+            // Never more than SCAN_UP_TO keys are at hand, so the count fits.
+            first_key: self.key_count as u8,
+        };
+        self.depth += 1;
+        self.empty = true;
+    }
+
+    /// Leaves the innermost array or object at its closing bracket.
+    fn leave(&mut self) {
+        self.pos += 1;
+        self.depth -= 1;
+        let level = self.levels[self.depth];
+        match level.open {
+            Open::Array => {}
+            Open::Object => self.key_count = usize::from(level.first_key),
+            Open::Wide => {
+                self.sets.pop();
+            }
+        }
+        self.empty = false;
+    }
+
+    /// Goes into the value if it is an array, and says whether it is one.
+    /// [`Parser::element`] is to be asked before every element then.
+    pub fn array(&mut self) -> Result<bool, ParseError> {
+        if self.peek()? != Kind::Array {
+            return Ok(false);
+        }
+        self.enter(Open::Array);
+        Ok(true)
+    }
+
+    /// Whether the array the parser is in has another element. The parser
+    /// stands in front of it then. Otherwise it has left the array.
+    pub fn element(&mut self) -> Result<bool, ParseError> {
+        debug_assert!(self.depth > 0 && self.levels[self.depth - 1].open == Open::Array);
+        self.skip_whitespace();
+        if self.empty {
+            if self.byte() == Some(b']') {
+                self.leave();
+                return Ok(false);
+            }
+            self.empty = false;
+            return Ok(true);
+        }
+        match self.byte() {
+            Some(b',') => {
+                self.pos += 1;
+                Ok(true)
+            }
+            Some(b']') => {
+                self.leave();
+                Ok(false)
+            }
+            _ => Err(self.error("expected ',' or ']'")),
+        }
+    }
+
+    /// Goes into the value if it is an object, and says whether it is
+    /// one. [`Parser::key`] returns the key of every member then.
+    pub fn object(&mut self) -> Result<bool, ParseError> {
+        if self.peek()? != Kind::Object {
+            return Ok(false);
+        }
+        self.enter(Open::Object);
+        Ok(true)
+    }
+
+    /// The key of the next member of the object the parser is in. The
+    /// parser stands in front of the member's value then. Without another
+    /// member it has left the object. A key the object had before is an
+    /// error, which is reported after the value of that key.
+    pub fn key(&mut self) -> Result<Option<Cow<'a, str>>, ParseError> {
+        debug_assert!(self.depth > 0 && self.levels[self.depth - 1].open != Open::Array);
+        if self.empty {
+            self.skip_whitespace();
+            if self.byte() == Some(b'}') {
+                self.leave();
+                return Ok(None);
+            }
+        } else {
+            if self.duplicate == Some(self.depth) {
+                return Err(self.error("duplicate key"));
+            }
+            self.skip_whitespace();
+            match self.byte() {
+                Some(b',') => self.pos += 1,
+                Some(b'}') => {
+                    self.leave();
+                    return Ok(None);
+                }
+                _ => return Err(self.error("expected ',' or '}'")),
+            }
+        }
+        self.skip_whitespace();
+        if self.byte() != Some(QUOTE) {
+            return Err(self.error("expected a string key"));
+        }
+        let key = self.string_token()?;
+        self.skip_whitespace();
+        self.expect(b':')?;
+        let new = match key {
+            Cow::Borrowed(plain) => self.remember(plain),
+            Cow::Owned(ref escaped) => self.remember_escaped(escaped),
+        };
+        if !new {
+            self.duplicate = Some(self.depth);
+        }
+        self.empty = false;
+        Ok(Some(key))
+    }
+
+    /// Notes `key`, a part of the text, as a key of the innermost object.
+    /// Returns false when the object had the key before.
+    fn remember(&mut self, key: &'a str) -> bool {
+        let level = self.levels[self.depth - 1];
+        match level.open {
+            Open::Array => return true,
+            Open::Wide => {}
+            Open::Object => {
+                if self.keys[usize::from(level.first_key)..self.key_count].contains(&key) {
+                    return false;
+                }
+                if self.key_count < SCAN_UP_TO {
+                    self.keys[self.key_count] = key;
+                    self.key_count += 1;
+                    return true;
+                }
+                // No room at hand.
+                self.widen();
+            }
+        }
+        self.sets.last_mut().is_some_and(|set| set.insert(Cow::Borrowed(key)))
+    }
+
+    /// Notes a key that was written with an escape as a key of the
+    /// innermost object. Such a key is no part of the text, so the object
+    /// gets a set. Returns false when the object had the key before.
+    fn remember_escaped(&mut self, key: &str) -> bool {
+        match self.levels[self.depth - 1].open {
+            Open::Array => return true,
+            Open::Wide => {}
+            Open::Object => self.widen(),
+        }
+        self.sets
+            .last_mut()
+            .is_some_and(|set| set.insert(Cow::Owned(key.into())))
+    }
+
+    /// Moves the keys of the innermost object from those at hand into a
+    /// set.
+    fn widen(&mut self) {
+        let level = &mut self.levels[self.depth - 1];
+        let first = usize::from(level.first_key);
+        level.open = Open::Wide;
+        let keys = &self.keys[first..self.key_count];
+        self.sets.push(keys.iter().map(|&key| Cow::Borrowed(key)).collect());
+        self.key_count = first;
+    }
+
+    /// Reads the value, whatever kind it is.
+    pub fn skip(&mut self) -> Result<(), ParseError> {
+        match self.peek()? {
+            Kind::Null => self.literal("null"),
+            Kind::Bool => self.bool_token().map(drop),
+            Kind::Number => self.number_token().map(drop),
+            Kind::String => self.string_token().map(drop),
+            Kind::Array => {
+                self.enter(Open::Array);
+                while self.element()? {
+                    self.skip()?;
+                }
+                Ok(())
+            }
+            Kind::Object => {
+                self.enter(Open::Object);
+                while self.key()?.is_some() {
+                    self.skip()?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Reads the value into a [`Value`].
+    pub fn value(&mut self) -> Result<Value, ParseError> {
+        Ok(match self.peek()? {
+            Kind::Null => {
+                self.literal("null")?;
+                Value::Null
+            }
+            Kind::Bool => Value::Bool(self.bool_token()?),
+            Kind::Number => self.number_token()?.into(),
+            Kind::String => Value::String(self.string_token()?.into_owned()),
+            Kind::Array => {
+                self.enter(Open::Array);
+                let mut items = Vec::new();
+                while self.element()? {
+                    items.push(self.value()?);
+                }
+                Value::Array(items)
+            }
+            Kind::Object => {
+                self.enter(Open::Object);
+                let mut object = Object::new();
+                while let Some(key) = self.key()? {
+                    let value = self.value()?;
+                    object.entries.push((key.into_owned(), value));
+                }
+                Value::Object(object)
+            }
+        })
+    }
+
+    /// Checks that the value at the top was read whole and that nothing
+    /// but whitespace is left of the text.
+    pub fn end(&mut self) -> Result<(), ParseError> {
+        self.skip_whitespace();
+        if self.depth != 0 {
+            return Err(self.error("unexpected end of input"));
+        }
+        if self.pos != self.text.len() {
+            return Err(self.error("trailing characters"));
+        }
+        Ok(())
     }
 }
 
 /// Parses a complete JSON text. Leading and trailing whitespace is allowed,
 /// anything else after the value is an error.
 pub fn parse(text: &str) -> Result<Value, ParseError> {
-    let mut p = Parser {
-        bytes: text.as_bytes(),
-        pos: 0,
-    };
-    let v = p.value(0)?;
-    p.skip_whitespace();
-    if p.pos != p.bytes.len() {
-        return Err(p.error("trailing characters"));
-    }
-    Ok(v)
+    let mut parser = Parser::new(text);
+    let value = parser.value()?;
+    parser.end()?;
+    Ok(value)
 }
 
-/// Writes `s` as a JSON string. The runs between escapes go out as they
-/// are.
+/// The escapes with a letter of their own.
+const BACKSPACE: u8 = 0x08;
+const FORM_FEED: u8 = 0x0c;
+/// The digits of a `\u` escape, and how a byte splits into two of them.
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+const NIBBLE_BITS: u32 = 4;
+const NIBBLE_MASK: u8 = 0x0f;
+
+/// Hands the inside of the JSON string for `s` to `emit`: the runs between
+/// escapes as they are, and an escape for every character that needs one.
+fn escape<E>(s: &str, mut emit: impl FnMut(&str) -> Result<(), E>) -> Result<(), E> {
+    let bytes = s.as_bytes();
+    let mut plain = 0;
+    loop {
+        let at = plain + Word::plain_run(&bytes[plain..]);
+        let Some(&b) = bytes.get(at) else {
+            return emit(&s[plain..]);
+        };
+        let unicode;
+        let escaped = match b {
+            QUOTE => "\\\"",
+            ESCAPE => "\\\\",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            b'\t' => "\\t",
+            BACKSPACE => "\\b",
+            FORM_FEED => "\\f",
+            _ => {
+                unicode = [
+                    ESCAPE,
+                    b'u',
+                    b'0',
+                    b'0',
+                    HEX_DIGITS[usize::from(b >> NIBBLE_BITS)],
+                    HEX_DIGITS[usize::from(b & NIBBLE_MASK)],
+                ];
+                std::str::from_utf8(&unicode).expect("ASCII")
+            }
+        };
+        emit(&s[plain..at])?;
+        emit(escaped)?;
+        plain = at + 1;
+    }
+}
+
+/// Writes `s` as a JSON string.
 fn write_string<W: fmt::Write + ?Sized>(out: &mut W, s: &str) -> fmt::Result {
     out.write_char('"')?;
-    let mut plain = 0;
-    for (i, c) in s.char_indices() {
-        let escape = match c {
-            '"' => Some("\\\""),
-            '\\' => Some("\\\\"),
-            '\n' => Some("\\n"),
-            '\r' => Some("\\r"),
-            '\t' => Some("\\t"),
-            '\u{08}' => Some("\\b"),
-            '\u{0c}' => Some("\\f"),
-            c if u32::from(c) < 0x20 => None,
-            _ => continue,
-        };
-        out.write_str(&s[plain..i])?;
-        match escape {
-            Some(escape) => out.write_str(escape)?,
-            None => write!(out, "\\u{:04x}", u32::from(c))?,
-        }
-        plain = i + c.len_utf8();
-    }
-    out.write_str(&s[plain..])?;
+    escape(s, |piece| out.write_str(piece))?;
     out.write_char('"')
+}
+
+/// Appends `s` to `out` as a JSON string.
+fn push_string(out: &mut String, s: &str) {
+    out.push('"');
+    let Ok(()) = escape(s, |piece| {
+        out.push_str(piece);
+        Ok::<(), Infallible>(())
+    });
+    out.push('"');
 }
 
 fn write_value<W: fmt::Write + ?Sized>(out: &mut W, v: &Value) -> fmt::Result {
@@ -656,6 +1164,155 @@ impl fmt::Display for Object {
     /// Compact serialization without any whitespace.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_object(f, self)
+    }
+}
+
+/// Writes a JSON object into a string member by member, without a
+/// [`Value`] in between. The object is closed when the writer is dropped.
+///
+/// ```
+/// let mut text = String::new();
+/// let mut object = json::ObjectWriter::new(&mut text);
+/// object.key("name").string("a\"b");
+/// object.key("sizes").array().element().unsigned(3);
+/// drop(object);
+/// assert_eq!(text, r#"{"name":"a\"b","sizes":[3]}"#);
+/// ```
+#[derive(Debug)]
+pub struct ObjectWriter<'a> {
+    out: &'a mut String,
+    /// Whether a member was written, so the next one needs a comma.
+    members: bool,
+}
+
+impl<'a> ObjectWriter<'a> {
+    /// Opens an object at the end of `out`.
+    pub fn new(out: &'a mut String) -> ObjectWriter<'a> {
+        out.push('{');
+        ObjectWriter { out, members: false }
+    }
+
+    /// Starts the member `key`. What is returned writes its value. The
+    /// caller keeps the keys of an object distinct.
+    pub fn key(&mut self, key: &str) -> ValueWriter<'_> {
+        if self.members {
+            self.out.push(',');
+        }
+        self.members = true;
+        push_string(self.out, key);
+        self.out.push(':');
+        ValueWriter { out: self.out }
+    }
+}
+
+impl Drop for ObjectWriter<'_> {
+    fn drop(&mut self) {
+        self.out.push('}');
+    }
+}
+
+/// Writes a JSON array into a string element by element, without a
+/// [`Value`] in between. The array is closed when the writer is dropped.
+#[derive(Debug)]
+pub struct ArrayWriter<'a> {
+    out: &'a mut String,
+    /// Whether an element was written, so the next one needs a comma.
+    elements: bool,
+}
+
+impl<'a> ArrayWriter<'a> {
+    /// Opens an array at the end of `out`.
+    pub fn new(out: &'a mut String) -> ArrayWriter<'a> {
+        out.push('[');
+        ArrayWriter { out, elements: false }
+    }
+
+    /// Starts an element. What is returned writes its value.
+    pub fn element(&mut self) -> ValueWriter<'_> {
+        if self.elements {
+            self.out.push(',');
+        }
+        self.elements = true;
+        ValueWriter { out: self.out }
+    }
+}
+
+impl Drop for ArrayWriter<'_> {
+    fn drop(&mut self) {
+        self.out.push(']');
+    }
+}
+
+/// The place of one value in the text an [`ObjectWriter`] or an
+/// [`ArrayWriter`] writes. Every method writes the value.
+#[derive(Debug)]
+#[must_use = "a member or an element needs its value"]
+pub struct ValueWriter<'a> {
+    out: &'a mut String,
+}
+
+impl<'a> ValueWriter<'a> {
+    /// Writes `null`.
+    pub fn null(self) {
+        self.out.push_str("null");
+    }
+
+    /// Writes `true` or `false`.
+    pub fn bool(self, value: bool) {
+        self.out.push_str(if value { "true" } else { "false" });
+    }
+
+    /// Writes an integer.
+    pub fn unsigned(self, mut value: u64) {
+        let mut digits = [b'0'; U64_DIGITS];
+        let mut first = U64_DIGITS;
+        loop {
+            first -= 1;
+            // A remainder of a division by ten is one digit.
+            digits[first] = b'0' + (value % DECIMAL) as u8;
+            value /= DECIMAL;
+            if value == 0 {
+                break;
+            }
+        }
+        self.out
+            .push_str(std::str::from_utf8(&digits[first..]).expect("ASCII digits"));
+    }
+
+    /// Writes a string.
+    pub fn string(self, value: &str) {
+        push_string(self.out, value);
+    }
+
+    /// Writes what `value` prints as a string.
+    pub fn display(self, value: impl fmt::Display) {
+        /// Escapes what is written to it.
+        struct Escaping<'a>(&'a mut String);
+
+        impl fmt::Write for Escaping<'_> {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                let Ok(()) = escape(s, |piece| {
+                    self.0.push_str(piece);
+                    Ok::<(), Infallible>(())
+                });
+                Ok(())
+            }
+        }
+
+        self.out.push('"');
+        fmt::Write::write_fmt(&mut Escaping(self.out), format_args!("{}", value))
+            .expect("a Display implementation returned an error");
+        self.out.push('"');
+    }
+
+    /// Opens an object as the value.
+    pub fn object(self) -> ObjectWriter<'a> {
+        ObjectWriter::new(self.out)
+    }
+
+    /// Opens an array as the value.
+    pub fn array(self) -> ArrayWriter<'a> {
+        ArrayWriter::new(self.out)
     }
 }
 
@@ -804,5 +1461,517 @@ mod tests {
         let v = Value::from("a\"b\\c\n\t\u{01}é");
         assert_eq!(v.to_string(), "\"a\\\"b\\\\c\\n\\t\\u0001é\"");
         assert_eq!(parse(&v.to_string()).unwrap(), v);
+        // Every control character has an escape, the ones with a letter
+        // of their own use it.
+        let all: String = (0u8..0x20).map(char::from).collect();
+        let text = Value::from(all.as_str()).to_string();
+        assert!(text.starts_with("\"\\u0000\\u0001") && text.contains("\\b\\t\\n\\u000b\\f\\r\\u000e"));
+        assert!(text.ends_with("\\u001f\""), "{}", text);
+        assert_eq!(parse(&text).unwrap().as_str(), Some(all.as_str()));
+        // What needs an escape gets it wherever it is in the string, and
+        // nothing else does.
+        let escape_of = |c: char| match c {
+            '"' => "\\\"".to_string(),
+            '\\' => "\\\\".to_string(),
+            '\n' => "\\n".to_string(),
+            '\u{1}' => "\\u0001".to_string(),
+            c => c.to_string(),
+        };
+        for filler in [
+            "a",
+            " ",
+            "!",
+            "#",
+            "[",
+            "]",
+            "\x7f",
+            "\u{e9}",
+            "\u{a2}",
+            "\u{9f}",
+            "\u{70c}",
+            "\u{1f600}",
+        ] {
+            for before in 0..(2 * Word::SIZE + 2) {
+                for special in ['"', '\\', '\n', '\u{1}', 'x'] {
+                    for behind in ["", "y", "the rest of the string"] {
+                        let string = format!("{}{}{}{}", filler.repeat(before), special, behind, special);
+                        let escaped: String = string.chars().map(escape_of).collect();
+                        let text = Value::from(string.as_str()).to_string();
+                        assert_eq!(text, format!("\"{}\"", escaped), "{:?}", string);
+                        assert_eq!(parse(&text).unwrap().as_str(), Some(string.as_str()));
+                        let mut written = String::new();
+                        ObjectWriter::new(&mut written).key(&string).display(&string);
+                        assert_eq!(written, format!("{{\"{}\":\"{}\"}}", escaped, escaped), "{:?}", string);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reads `text` with the methods named after the kinds and writes what
+    /// they return back out.
+    fn walk(p: &mut Parser<'_>, out: &mut String) -> Result<(), ParseError> {
+        match p.peek()? {
+            Kind::Null => {
+                assert!(p.null()?);
+                out.push_str("null");
+            }
+            Kind::Bool => out.push_str(if p.bool()?.unwrap() { "true" } else { "false" }),
+            Kind::Number => out.push_str(&Value::from(p.number()?.unwrap()).to_string()),
+            Kind::String => out.push_str(&Value::from(p.string()?.unwrap().as_ref()).to_string()),
+            Kind::Array => {
+                assert!(p.array()?);
+                out.push('[');
+                let mut elements = 0;
+                while p.element()? {
+                    if elements > 0 {
+                        out.push(',');
+                    }
+                    elements += 1;
+                    walk(p, out)?;
+                }
+                out.push(']');
+            }
+            Kind::Object => {
+                assert!(p.object()?);
+                out.push('{');
+                let mut members = 0;
+                while let Some(key) = p.key()? {
+                    if members > 0 {
+                        out.push(',');
+                    }
+                    members += 1;
+                    out.push_str(&Value::from(key.as_ref()).to_string());
+                    out.push(':');
+                    walk(p, out)?;
+                }
+                out.push('}');
+            }
+        }
+        Ok(())
+    }
+
+    /// What [`parse`] says about `text`, what skipping over it says and what
+    /// reading it value by value says: the same value or the same error.
+    fn three_ways(text: &str) -> Result<String, ParseError> {
+        let parsed = parse(text).map(|v| v.to_string());
+        let mut p = Parser::new(text);
+        let skipped = p.skip().and_then(|()| p.end());
+        assert_eq!(skipped, parsed.clone().map(drop), "{:?}", text);
+        let mut p = Parser::new(text);
+        let mut out = String::new();
+        let walked = walk(&mut p, &mut out).and_then(|()| p.end()).map(|()| out);
+        assert_eq!(walked, parsed, "{:?}", text);
+        parsed
+    }
+
+    #[test]
+    fn parser_reads_value_by_value() {
+        let text = r#" {"name" : "a/b", "esc":"x\ny", "size":18446744073709551615, "neg":-1, "f":1.5,
+            "list":[1,[],{}, null ,true,false], "o":{"k":"v"}, "n":null} "#;
+        let mut p = Parser::new(text);
+        assert_eq!(p.peek(), Ok(Kind::Object));
+        // A method of another kind reads nothing.
+        assert_eq!(p.string(), Ok(None));
+        assert_eq!(p.number(), Ok(None));
+        assert_eq!(p.bool(), Ok(None));
+        assert_eq!(p.null(), Ok(false));
+        assert_eq!(p.array(), Ok(false));
+        assert_eq!(p.offset(), 1);
+        assert_eq!(p.object(), Ok(true));
+        assert_eq!(p.key().unwrap().as_deref(), Some("name"));
+        assert_eq!(p.object(), Ok(false));
+        // A string without an escape is a part of the text, one with an
+        // escape is not.
+        assert!(matches!(p.string(), Ok(Some(Cow::Borrowed("a/b")))));
+        assert_eq!(p.key().unwrap().as_deref(), Some("esc"));
+        assert!(matches!(p.string(), Ok(Some(Cow::Owned(s))) if s == "x\ny"));
+        assert_eq!(p.key().unwrap().as_deref(), Some("size"));
+        assert_eq!(p.number().unwrap().and_then(Number::as_u64), Some(u64::MAX));
+        assert_eq!(p.key().unwrap().as_deref(), Some("neg"));
+        let neg = p.number().unwrap().unwrap();
+        assert_eq!((neg.as_u64(), neg.as_i64(), neg.as_f64()), (None, Some(-1), -1.0));
+        assert_eq!(p.key().unwrap().as_deref(), Some("f"));
+        let f = p.number().unwrap().unwrap();
+        assert_eq!(
+            (f, f.as_u64(), f.as_i64(), f.as_f64()),
+            (Number::Float(1.5), None, None, 1.5)
+        );
+        assert_eq!(p.key().unwrap().as_deref(), Some("list"));
+        assert_eq!(p.array(), Ok(true));
+        let mut kinds = Vec::new();
+        while p.element().unwrap() {
+            kinds.push(p.peek().unwrap());
+            p.skip().unwrap();
+        }
+        assert_eq!(
+            kinds,
+            [
+                Kind::Number,
+                Kind::Array,
+                Kind::Object,
+                Kind::Null,
+                Kind::Bool,
+                Kind::Bool
+            ]
+        );
+        assert_eq!(p.key().unwrap().as_deref(), Some("o"));
+        assert_eq!(p.value().unwrap().to_string(), r#"{"k":"v"}"#);
+        assert_eq!(p.key().unwrap().as_deref(), Some("n"));
+        assert_eq!(p.null(), Ok(true));
+        assert_eq!(p.key(), Ok(None));
+        assert_eq!(p.end(), Ok(()));
+        assert_eq!(p.offset(), text.len());
+        assert_eq!(
+            three_ways(text).unwrap(),
+            r#"{"name":"a/b","esc":"x\ny","size":18446744073709551615,"neg":-1,"f":1.5,"list":[1,[],{},null,true,false],"o":{"k":"v"},"n":null}"#
+        );
+        // An array or an object that was not read to its end is not the
+        // end of the text.
+        let mut p = Parser::new("[1]");
+        assert_eq!(p.array(), Ok(true));
+        assert_eq!(p.element(), Ok(true));
+        assert_eq!(p.skip(), Ok(()));
+        assert!(p.end().is_err());
+        assert_eq!(p.element(), Ok(false));
+        assert_eq!(p.end(), Ok(()));
+    }
+
+    #[test]
+    fn parser_agrees_with_parse() {
+        for text in [
+            "null",
+            " true ",
+            "false",
+            "0",
+            "-0",
+            "1e5",
+            "\"\"",
+            "\"a\\u00e9\\ud83d\\ude00\"",
+            "[]",
+            "[ ]",
+            "{}",
+            "{ }",
+            "[[[]],{\"a\":{\"a\":[{}]}}]",
+            "{\"a\":1,\"b\":{\"a\":1},\"c\":[{\"a\":1},{\"a\":2}]}",
+        ] {
+            assert!(three_ways(text).is_ok(), "{:?}", text);
+        }
+        // The errors, with where they are found.
+        for (text, offset, message) in [
+            ("", 0, "unexpected end of input"),
+            ("  ", 2, "unexpected end of input"),
+            ("x", 0, "unexpected character"),
+            ("tru", 0, "invalid literal"),
+            ("nul", 0, "invalid literal"),
+            ("-", 1, "invalid number"),
+            ("1.", 2, "invalid number"),
+            ("1e", 2, "invalid number"),
+            ("1e999", 5, "number out of range"),
+            ("01", 1, "trailing characters"),
+            ("\"abc", 4, "unterminated string"),
+            ("\"a\\", 3, "unterminated string"),
+            ("\"a\u{1}\"", 2, "control character in string"),
+            ("\"\\x\"", 3, "invalid escape"),
+            ("\"\\u12\"", 3, "truncated unicode escape"),
+            ("\"\\u12x4\"", 3, "invalid unicode escape"),
+            ("\"\\ud83d\"", 7, "unpaired surrogate"),
+            ("\"\\ud83d\\u0041\"", 13, "unpaired surrogate"),
+            ("\"\\ude00\"", 7, "unpaired surrogate"),
+            ("[1,]", 3, "unexpected character"),
+            ("[1 2]", 3, "expected ',' or ']'"),
+            ("[1", 2, "expected ',' or ']'"),
+            ("{\"a\":1,}", 7, "expected a string key"),
+            ("{a:1}", 1, "expected a string key"),
+            ("{\"a\" 1}", 5, "unexpected character"),
+            ("{\"a\":1 \"b\":2}", 7, "expected ',' or '}'"),
+            ("{\"a\":}", 5, "unexpected character"),
+            ("[1] x", 4, "trailing characters"),
+            ("{\"a\":1,\"a\":2}", 12, "duplicate key"),
+            ("{\"a\":1,\"\\u0061\":[1, 2] ,\"b\":3}", 22, "duplicate key"),
+            // What is wrong inside the value of a repeated key comes first.
+            ("{\"a\":1,\"a\":[}", 12, "unexpected character"),
+            ("{\"a\":1,\"a\":{\"b\":1,\"b\":2},\"c\":}", 23, "duplicate key"),
+            // The same key in another object is no duplicate.
+            ("{\"a\":{\"a\":1},\"b\":[{\"a\":1}],\"a\":2}", 32, "duplicate key"),
+        ] {
+            assert_eq!(three_ways(text), Err(ParseError { offset, message }), "{:?}", text);
+        }
+    }
+
+    #[test]
+    fn parser_limits_nesting() {
+        // A value has at most MAX_DEPTH arrays and objects around it.
+        for (open, close) in [("[", "]"), ("{\"k\":", "}")] {
+            let nested = |n: usize, inner: &str| format!("{}{}{}", open.repeat(n), inner, close.repeat(n));
+            assert!(three_ways(&nested(MAX_DEPTH, "1")).is_ok());
+            assert!(three_ways(&nested(MAX_DEPTH, "[]")).is_ok());
+            assert!(three_ways(&nested(MAX_DEPTH, "{}")).is_ok());
+            for inner in ["1", "[]", "{}"] {
+                let e = three_ways(&nested(MAX_DEPTH + 1, inner)).unwrap_err();
+                assert_eq!(e.message, "nesting too deep", "{}", inner);
+                assert_eq!(e.offset, open.len() * (MAX_DEPTH + 1));
+            }
+        }
+    }
+
+    #[test]
+    fn parser_finds_duplicates_in_wide_and_nested_objects() {
+        // Objects inside each other share the keys the parser has at hand.
+        // An object that finds no room there, or has more keys than are
+        // looked through, is checked all the same.
+        let members = |prefix: &str, n: usize| -> String {
+            (0..n)
+                .map(|i| format!("\"{}{}\":{}", prefix, i, i))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        for outer in [0, 1, SCAN_UP_TO - 1, SCAN_UP_TO, SCAN_UP_TO + 1, 3 * SCAN_UP_TO] {
+            for inner in [1, 2, SCAN_UP_TO - 1, SCAN_UP_TO, SCAN_UP_TO + 1, 3 * SCAN_UP_TO] {
+                let comma = if outer > 0 { "," } else { "" };
+                let unique = format!(
+                    "{{{}{}\"in\":{{{}}},\"last\":[{{{}}}]}}",
+                    members("o", outer),
+                    comma,
+                    members("i", inner),
+                    members("i", inner)
+                );
+                let value = three_ways(&unique).unwrap();
+                assert_eq!(parse(&value).unwrap().as_object().unwrap().len(), outer + 2);
+                for at in [0, inner / 2, inner - 1] {
+                    let repeated = format!(
+                        "{{{}{}\"in\":{{{},\"i{}\":0}}}}",
+                        members("o", outer),
+                        comma,
+                        members("i", inner),
+                        at
+                    );
+                    assert_eq!(three_ways(&repeated).unwrap_err().message, "duplicate key");
+                }
+                if outer > 0 {
+                    // The outer object still knows its keys after the inner one.
+                    let repeated = format!(
+                        "{{{},\"in\":{{{}}},\"o{}\":0}}",
+                        members("o", outer),
+                        members("i", inner),
+                        outer - 1
+                    );
+                    assert_eq!(three_ways(&repeated).unwrap_err().message, "duplicate key");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parser_knows_keys_written_with_an_escape() {
+        // A key with an escape is the key it stands for.
+        for text in [
+            r#"{"a":1,"a":2}"#,
+            r#"{"a":1,"a":2}"#,
+            r#"{"a":1,"a":2}"#,
+            r#"{"a\n":1,"b":2,"a\u000a":3}"#,
+            r#"{"x":{"a":1,"b":2,"a":3}}"#,
+            r#"{"a":1,"x":{"b":1},"a":2}"#,
+            r#"{"a":1,"x":{"b":1,"c":{}},"a":2}"#,
+        ] {
+            assert_eq!(three_ways(text).unwrap_err().message, "duplicate key", "{}", text);
+        }
+        for text in [
+            r#"{"a":1,"b":2}"#,
+            r#"{"a":1,"b":2,"c":3}"#,
+            r#"{"a":{"a":{"a":1}},"b":{"a":1,"b":2},"c":[{"a":1,"b":2}]}"#,
+        ] {
+            assert!(three_ways(text).is_ok(), "{}", text);
+        }
+        // With many keys around it, before the object has a set and after.
+        for plain in [0, 1, SCAN_UP_TO - 1, SCAN_UP_TO, SCAN_UP_TO + 1, 3 * SCAN_UP_TO] {
+            let keys: Vec<String> = (0..plain).map(|i| format!("\"k{}\":{}", i, i)).collect();
+            for at in [0, plain / 2, plain] {
+                let mut members = keys.clone();
+                members.insert(at, r#""k":0"#.to_string());
+                assert!(three_ways(&format!("{{{}}}", members.join(","))).is_ok());
+                for repeated in [r#""k":1"#, r#""k":1"#] {
+                    for again in [0, members.len() / 2, members.len()] {
+                        let mut members = members.clone();
+                        members.insert(again, repeated.to_string());
+                        let text = format!("{{{}}}", members.join(","));
+                        assert_eq!(three_ways(&text).unwrap_err().message, "duplicate key", "{}", text);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parser_finds_the_end_of_a_string() {
+        // What a string can hold, some of it one bit away from what ends
+        // it: 0xa2 and 0xdc are a quote and a backslash with the high bit
+        // set, and 0x9f is a control character with it.
+        let fillers = [
+            "a",
+            " ",
+            "!",
+            "#",
+            "[",
+            "]",
+            "\x7f",
+            "\u{e9}",
+            "\u{a2}",
+            "\u{9f}",
+            "\u{70c}",
+            "\u{20ac}",
+            "\u{1f600}",
+        ];
+        for filler in fillers {
+            for before in 0..(3 * Word::SIZE + 2) {
+                let plain = filler.repeat(before);
+                for behind in ["", "x", "tail of the text"] {
+                    // The string ends at its quote, whatever follows.
+                    let text = format!("[\"{}\",\"{}\"]", plain, behind);
+                    let expected = Value::Array(vec![Value::from(plain.as_str()), Value::from(behind)]);
+                    assert_eq!(three_ways(&text), Ok(expected.to_string()), "{:?}", text);
+                    let mut p = Parser::new(&text);
+                    assert_eq!(p.array(), Ok(true));
+                    assert_eq!(p.element(), Ok(true));
+                    assert!(matches!(p.string(), Ok(Some(Cow::Borrowed(s))) if s == plain));
+                    // An escape, anywhere.
+                    let text = format!("\"{}\\n{}\\\"{}\\\\\"", plain, behind, plain);
+                    let expected = format!("{}\n{}\"{}\\", plain, behind, plain);
+                    assert_eq!(
+                        three_ways(&text),
+                        Ok(Value::from(expected.as_str()).to_string()),
+                        "{:?}",
+                        text
+                    );
+                    // A control character, anywhere.
+                    for control in ["\0", "\x01", "\n", "\x1f"] {
+                        let text = format!("\"{}{}{}\"", plain, control, behind);
+                        let e = ParseError {
+                            offset: 1 + plain.len(),
+                            message: "control character in string",
+                        };
+                        assert_eq!(three_ways(&text), Err(e), "{:?}", text);
+                    }
+                    // No end at all.
+                    let text = format!("\"{}{}", plain, behind);
+                    let e = ParseError {
+                        offset: text.len(),
+                        message: "unterminated string",
+                    };
+                    assert_eq!(three_ways(&text), Err(e), "{:?}", text);
+                }
+            }
+        }
+        // Every byte a word can have in every place of it.
+        for byte in 0..=u8::MAX {
+            for at in 0..Word::SIZE {
+                let mut bytes = [b'a'; Word::SIZE];
+                bytes[at] = byte;
+                let special = byte == QUOTE || byte == ESCAPE || byte < FIRST_PRINTABLE;
+                assert_eq!(
+                    Word::new(bytes).first_special(),
+                    special.then_some(at),
+                    "{:#x} at {}",
+                    byte,
+                    at
+                );
+                // The first of two is the one that is found.
+                for second in [QUOTE, ESCAPE, 0, FIRST_PRINTABLE - 1, FIRST_PRINTABLE, 0x80, u8::MAX] {
+                    for behind in at + 1..Word::SIZE {
+                        let mut bytes = bytes;
+                        bytes[behind] = second;
+                        let first = if special {
+                            Some(at)
+                        } else {
+                            (second == QUOTE || second == ESCAPE || second < FIRST_PRINTABLE).then_some(behind)
+                        };
+                        assert_eq!(Word::new(bytes).first_special(), first);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parser_reads_numbers_of_any_length() {
+        let mut texts: Vec<String> = Vec::new();
+        for digits in 1..=45 {
+            texts.push("9".repeat(digits));
+            texts.push(format!("1{}", "0".repeat(digits - 1)));
+            texts.push(format!("1{}7", "0".repeat(digits - 1)));
+        }
+        for near in [u128::from(u64::MAX), i128::MAX as u128, i128::MAX as u128 + 1] {
+            for value in [near - 1, near, near + 1, near + 2] {
+                texts.push(value.to_string());
+            }
+        }
+        for text in texts {
+            for text in [text.clone(), format!("-{}", text)] {
+                // An integer that fits into 128 bits is exact. A larger one
+                // is the nearest float.
+                let expected = match text.parse::<i128>() {
+                    Ok(i) => Value::Int(i),
+                    Err(_) => Value::Float(text.parse().unwrap()),
+                };
+                assert_eq!(parse(&text), Ok(expected.clone()), "{}", text);
+                assert_eq!(three_ways(&text), Ok(expected.to_string()), "{}", text);
+                let mut p = Parser::new(&text);
+                let number = p.number().unwrap().unwrap();
+                assert_eq!(number.as_u64(), text.parse::<u64>().ok(), "{}", text);
+                assert_eq!(number.as_i64(), text.parse::<i64>().ok(), "{}", text);
+                // With a fraction or an exponent it is a float.
+                for float in [format!("{}.0", text), format!("{}e0", text), format!("{}.5E+1", text)] {
+                    let expected = Value::Float(float.parse().unwrap());
+                    assert_eq!(parse(&float), Ok(expected), "{}", float);
+                    assert!(three_ways(&float).is_ok(), "{}", float);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn writers() {
+        let mut text = String::new();
+        {
+            let mut object = ObjectWriter::new(&mut text);
+            object.key("s").string("a\"b\\c\n\u{1}é");
+            object.key("key \"quoted\"").null();
+            object.key("t").bool(true);
+            object.key("f").bool(false);
+            object.key("zero").unsigned(0);
+            object.key("ten").unsigned(10);
+            object.key("max").unsigned(u64::MAX);
+            object.key("shown").display(format_args!("{}:{:?}", 5, "x\ty"));
+            object.key("empty object").object();
+            object.key("empty array").array();
+            let mut array = object.key("array").array();
+            array.element().unsigned(1);
+            array.element().string("two");
+            array.element().array().element().null();
+            let mut inner = array.element().object();
+            inner.key("k").unsigned(3);
+            drop(inner);
+            drop(array);
+            object.key("last").string("");
+        }
+        assert_eq!(
+            text,
+            concat!(
+                r#"{"s":"a\"b\\c\n\u0001é","key \"quoted\"":null,"t":true,"f":false,"zero":0,"ten":10,"#,
+                r#""max":18446744073709551615,"shown":"5:\"x\\ty\"","empty object":{},"empty array":[],"#,
+                r#""array":[1,"two",[null],{"k":3}],"last":""}"#
+            )
+        );
+        // What the writers write is what the value prints.
+        let value = parse(&text).unwrap();
+        assert_eq!(value.to_string(), text);
+        assert_eq!(value.get("s").unwrap().as_str(), Some("a\"b\\c\n\u{1}é"));
+        assert_eq!(value.get("shown").unwrap().as_str(), Some("5:\"x\\ty\""));
+        assert_eq!(value.get("max").unwrap().as_u64(), Some(u64::MAX));
+        // A writer appends to what the string holds.
+        let mut text = String::from("\u{1e}");
+        ArrayWriter::new(&mut text).element().unsigned(7);
+        text.push('\n');
+        assert_eq!(text, "\u{1e}[7]\n");
     }
 }

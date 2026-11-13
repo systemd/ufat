@@ -71,7 +71,7 @@ RAW=$OUT/compare.tsv
 # valgrind. Inputs depend on FILES and UKI only, and are built once.
 make_inputs() {
     local stamp=$IN/.ready-$FILES-$UKI
-    [ -e "$stamp" ] && return
+    [ -e "$stamp" ] && [ -e "$IN/wide.manifest" ] && return
     say "building inputs under $IN (FILES=$FILES UKI=$UKI)"
     rm -rf "$IN"; mkdir -p "$IN"
     # A subshell that stops at the first failure, so the stamp is only set
@@ -116,6 +116,8 @@ make_inputs() {
     tr '\036' '\n' < "$IN/esp.manifest" | grep '"size":' | sed -E 's/.*"name":"([^"]*)".*/\1/' |
         while IFS= read -r n; do cat "$e/$n"; done > "$IN/esp.blob"
     [ -s "$IN/esp.blob" ] || { say "empty blob"; exit 1; }
+    # The manifest of the wide tree, for a plan that reads nothing else.
+    "$HEAD" manifest "$IN/wide" > "$IN/wide.manifest"
     # An empty file system of 256 MiB, the target of populate, and one
     # holding the wide tree, the input of check. Both are made once, by
     # the head binary, so that both binaries see the same bytes.
@@ -153,6 +155,7 @@ workloads() {
     $r check/wide nothing -- @UFAT@ check "$IN/wide.img"
     $r manifest/esp nothing -- @UFAT@ manifest "$IN/esp"
     $r manifest/wide nothing -- @UFAT@ manifest "$IN/wide"
+    $r plan/wide-manifest nothing -- @UFAT@ assemble --plan --sector-size 512 --manifest "$IN/wide.manifest"
     $r varlink/Populate-wide fresh_image --ufat @UFAT@ --method org.uapi-group.FileSystem.Populate \
         --fd "rw:$IMG/target.img" --fd "$IN/wide" --params "$POPULATE"
     $r varlink/Assemble-esp-stream empty_image --ufat @UFAT@ --method org.uapi-group.FileSystem.Assemble \
