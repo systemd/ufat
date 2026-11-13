@@ -13,6 +13,7 @@ path = "lib.rs"
 
 [dependencies]
 libc.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true
