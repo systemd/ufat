@@ -671,7 +671,7 @@ fn methods_on_an_image_take_the_file_system_type() {
     // An image that holds another file system fails with vfat given as it
     // does without a type.
     let mut bytes = vec![0x55u8; 1 << 20];
-    bytes[11..13].copy_from_slice(&512u16.to_le_bytes());
+    bytes[ufat::boot::field::BYTES_PER_SECTOR].copy_from_slice(&common::SECTOR_SIZE.to_le_bytes());
     let path = scratch.path().join("other");
     std::fs::write(&path, &bytes).unwrap();
     let other = rw(&path);
@@ -1628,7 +1628,7 @@ fn describe_with_and_without_a_manifest() {
     assert_eq!(str_of(&e.parameters, "reason"), "sectorSize");
     assert_eq!(u64_of(&e.parameters, "sectorSize"), 0x5555);
     // A plausible sector size and a FAT16 style FAT size: something else.
-    bytes[11..13].copy_from_slice(&512u16.to_le_bytes());
+    bytes[ufat::boot::field::BYTES_PER_SECTOR].copy_from_slice(&common::SECTOR_SIZE.to_le_bytes());
     let other = file_with(scratch.path(), "other", &bytes);
     let e = error_of(&mut c, "Describe", IMG, &[other.as_fd()]);
     assert_eq!(e.name, format!("{}.NotFileSystem", IFACE));

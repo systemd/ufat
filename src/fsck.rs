@@ -13,9 +13,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::ops::Range;
 
-use crate::boot::{
-    BootSector, FsInfo, BOOT_SECTOR_SIZE, FSINFO_UNKNOWN, FS_TYPE_FAT32, NO_NAME, NT_FLAGS_OFFSET, NT_FLAG_DIRTY,
-};
+use crate::boot::{self, BootSector, FsInfo, BOOT_SECTOR_SIZE, FSINFO_UNKNOWN, FS_TYPE_FAT32, NO_NAME, NT_FLAG_DIRTY};
 use crate::device::Device;
 use crate::dirent::{
     self, short_name_checksum, RawDirEntry, ATTR_LONG_NAME, ATTR_RESERVED, DIR_ENTRY_SIZE, DOTDOT_NAME, DOT_NAME,
@@ -1228,7 +1226,7 @@ impl<'a> Checker<'a> {
                     .expected(u64::from(crate::layout::MIN_CLUSTERS))
             });
         }
-        if self.boot.signature != crate::boot::BOOT_SIGNATURE {
+        if self.boot.signature != boot::BOOT_SIGNATURE {
             self.error(|| Problem::new(ProblemKind::BootSignatureMissing));
         }
         if self.boot.fs_type != FS_TYPE_FAT32 {
@@ -1243,8 +1241,8 @@ impl<'a> Checker<'a> {
             // Linux maintains the dirty flag in sector 0 only, so the two
             // legitimately differ in that bit while the volume is mounted.
             let mut primary = self.boot.to_bytes();
-            primary[NT_FLAGS_OFFSET] &= !NT_FLAG_DIRTY;
-            b[NT_FLAGS_OFFSET] &= !NT_FLAG_DIRTY;
+            primary[boot::field::NT_FLAGS] &= !NT_FLAG_DIRTY;
+            b[boot::field::NT_FLAGS] &= !NT_FLAG_DIRTY;
             if b != primary {
                 self.warning(|| Problem::new(ProblemKind::BackupBootSectorDiffers).copy(backup as u32));
             }
@@ -2072,7 +2070,7 @@ mod tests {
         let (img, v) = populated();
         v.close().unwrap();
         let dev = img.device();
-        dev.write_at(510, &[0, 0]).unwrap();
+        dev.write_at(boot::field::SIGNATURE.start as u64, &[0, 0]).unwrap();
         let r = check(&dev).unwrap();
         assert!(has(&r, ProblemKind::BootSignatureMissing), "{:?}", r.problems);
         drop(dev);
@@ -2191,8 +2189,9 @@ mod tests {
                 .unwrap();
         }
         // A wrong type string and a label only in the boot sector.
-        dev.write_at(0x52, b"FAT32XX ").unwrap();
-        dev.write_at(0x47, b"OTHER      ").unwrap();
+        dev.write_at(boot::field::FS_TYPE.start as u64, b"FAT32XX ").unwrap();
+        dev.write_at(boot::field::VOLUME_LABEL.start as u64, b"OTHER      ")
+            .unwrap();
         // The root's "empty" entry gets a seconds field of 31 and its "EFI"
         // entry a reserved attribute bit; the first long name entry of
         // /EFI/Linux gets a non-zero first cluster field.

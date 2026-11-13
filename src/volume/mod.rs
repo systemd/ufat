@@ -21,9 +21,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
-use crate::boot::{
-    BootSector, FsInfo, BOOT_SECTOR_SIZE, FSINFO_SIZE, FSINFO_UNKNOWN, NO_NAME, NT_FLAGS_OFFSET, NT_FLAG_DIRTY,
-};
+use crate::boot::{self, BootSector, FsInfo, BOOT_SECTOR_SIZE, FSINFO_SIZE, FSINFO_UNKNOWN, NO_NAME, NT_FLAG_DIRTY};
 use crate::device::Device;
 use crate::dir::{DirEntry, Directory, MAX_SLOTS};
 use crate::dirent::{
@@ -332,7 +330,7 @@ impl Volume {
         fat.set_entry1(&store, dirty)?;
         self.flush()?;
         let mut sector = self.boot_raw;
-        sector[NT_FLAGS_OFFSET] |= NT_FLAG_DIRTY;
+        sector[boot::field::NT_FLAGS] |= NT_FLAG_DIRTY;
         self.device.write_at(0, &sector)
     }
 

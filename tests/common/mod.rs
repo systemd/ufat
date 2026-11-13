@@ -7,6 +7,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
+/// The sector size the tests write into boot sectors, the smallest one.
+pub const SECTOR_SIZE: u16 = ufat::layout::MIN_SECTOR_SIZE as u16;
+
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 static SERIAL: Mutex<()> = Mutex::new(());
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! The FAT32 boot sector (BPB) and the FSInfo sector.
 
-use crate::bytes::{le16, le32};
+use crate::bytes::{bytes_at, le16_at, le32_at, size};
 use crate::errno::*;
 use crate::layout::Layout;
 use crate::Result;
@@ -27,12 +27,16 @@ pub const FSINFO_SIZE: usize = 512;
 pub const BOOT_SIGNATURE: u16 = 0xAA55;
 /// The extended boot signature announcing the volume id/label/type fields.
 pub const EXT_BOOT_SIGNATURE: u8 = 0x29;
+/// The size of a volume label, [`field::VOLUME_LABEL`].
+pub const LABEL_SIZE: usize = size(field::VOLUME_LABEL);
+/// The size of an OEM name, [`field::OEM_NAME`].
+pub const OEM_NAME_SIZE: usize = size(field::OEM_NAME);
 /// The file system type string for FAT32.
-pub const FS_TYPE_FAT32: [u8; 8] = *b"FAT32   ";
+pub const FS_TYPE_FAT32: [u8; size(field::FS_TYPE)] = *b"FAT32   ";
 /// The label stored when the volume has none.
-pub const NO_NAME: [u8; 11] = *b"NO NAME    ";
+pub const NO_NAME: [u8; LABEL_SIZE] = *b"NO NAME    ";
 /// The OEM name the FAT specification recommends for maximum compatibility.
-pub const OEM_NAME_DEFAULT: [u8; 8] = *b"MSWIN4.1";
+pub const OEM_NAME_DEFAULT: [u8; OEM_NAME_SIZE] = *b"MSWIN4.1";
 /// The media descriptor for fixed media.
 pub const MEDIA_FIXED: u8 = 0xF8;
 /// The media descriptor for removable media.
@@ -42,23 +46,21 @@ pub const MEDIA_REMOVABLE: u8 = 0xF0;
 pub fn valid_media(media: u8) -> bool {
     media == MEDIA_REMOVABLE || media >= MEDIA_FIXED
 }
-/// Bit in the NT flags byte (offset 0x41) marking a volume that was not
-/// cleanly unmounted. Linux sets it when it mounts a clean volume read-write
-/// and clears it on unmount, in sector 0 only (fs/fat/inode.c,
+/// Bit in the NT flags byte ([`field::NT_FLAGS`]) marking a volume that was
+/// not cleanly unmounted. Linux sets it when it mounts a clean volume
+/// read-write and clears it on unmount, in sector 0 only (fs/fat/inode.c,
 /// fat_set_state()); a volume it finds dirty it mounts anyway, warns about,
 /// and leaves dirty for good.
 pub const NT_FLAG_DIRTY: u8 = 0x01;
-/// Offset of the NT flags byte in the boot sector.
-pub const NT_FLAGS_OFFSET: usize = 0x41;
 /// Bit in the extended flags that turns FAT mirroring off: then only one
 /// FAT is active.
 pub const EXT_FLAGS_NO_MIRRORING: u16 = 0x80;
 /// The BIOS drive number of the first fixed disk.
 pub const DRIVE_NUMBER_FIXED: u8 = 0x80;
 /// The jump over the BPB to the boot code that mkfs.fat writes.
-pub const BOOT_JUMP: [u8; 3] = [0xEB, 0x58, 0x90];
+pub const BOOT_JUMP: [u8; size(field::JUMP)] = [0xEB, 0x58, 0x90];
 /// Size of the boot code area in a FAT32 boot sector.
-pub const BOOT_CODE_SIZE: usize = 420;
+pub const BOOT_CODE_SIZE: usize = size(field::BOOT_CODE);
 /// Lead signature of the FSInfo sector ("RRaA").
 pub const FSINFO_LEAD_SIGNATURE: u32 = 0x4161_5252;
 /// Structure signature of the FSInfo sector ("rrAa").
@@ -67,6 +69,93 @@ pub const FSINFO_STRUCT_SIGNATURE: u32 = 0x6141_7272;
 pub const FSINFO_TRAIL_SIGNATURE: u32 = 0xAA55_0000;
 /// Marker for an unknown free cluster count or next free hint.
 pub const FSINFO_UNKNOWN: u32 = 0xFFFF_FFFF;
+
+/// Where the fields of a FAT32 boot sector are, as the FAT specification
+/// lays them out: the offset of a field of one byte, the bytes of a longer
+/// one. Each comment gives the specification's name of the field.
+pub mod field {
+    use std::ops::Range;
+
+    /// BS_jmpBoot, the jump to the boot code.
+    pub const JUMP: Range<usize> = 0..3;
+    /// BS_OEMName.
+    pub const OEM_NAME: Range<usize> = 3..11;
+    /// BPB_BytsPerSec.
+    pub const BYTES_PER_SECTOR: Range<usize> = 11..13;
+    /// BPB_SecPerClus.
+    pub const SECTORS_PER_CLUSTER: usize = 13;
+    /// BPB_RsvdSecCnt.
+    pub const RESERVED_SECTORS: Range<usize> = 14..16;
+    /// BPB_NumFATs.
+    pub const FATS: usize = 16;
+    /// BPB_RootEntCnt.
+    pub const ROOT_ENTRIES: Range<usize> = 17..19;
+    /// BPB_TotSec16.
+    pub const TOTAL_SECTORS_16: Range<usize> = 19..21;
+    /// BPB_Media.
+    pub const MEDIA: usize = 21;
+    /// BPB_FATSz16.
+    pub const FAT_SECTORS_16: Range<usize> = 22..24;
+    /// BPB_SecPerTrk.
+    pub const SECTORS_PER_TRACK: Range<usize> = 24..26;
+    /// BPB_NumHeads.
+    pub const HEADS: Range<usize> = 26..28;
+    /// BPB_HiddSec.
+    pub const HIDDEN_SECTORS: Range<usize> = 28..32;
+    /// BPB_TotSec32.
+    pub const TOTAL_SECTORS_32: Range<usize> = 32..36;
+    /// BPB_FATSz32.
+    pub const FAT_SECTORS_32: Range<usize> = 36..40;
+    /// BPB_ExtFlags.
+    pub const EXT_FLAGS: Range<usize> = 40..42;
+    /// BPB_FSVer.
+    pub const FS_VERSION: Range<usize> = 42..44;
+    /// BPB_RootClus.
+    pub const ROOT_CLUSTER: Range<usize> = 44..48;
+    /// BPB_FSInfo.
+    pub const FSINFO_SECTOR: Range<usize> = 48..50;
+    /// BPB_BkBootSec.
+    pub const BACKUP_BOOT_SECTOR: Range<usize> = 50..52;
+    /// BPB_Reserved.
+    pub const RESERVED: Range<usize> = 52..64;
+    /// BS_DrvNum.
+    pub const DRIVE_NUMBER: usize = 64;
+    /// BS_Reserved1, where Windows NT keeps its flags.
+    pub const NT_FLAGS: usize = 65;
+    /// BS_BootSig.
+    pub const EXT_BOOT_SIGNATURE: usize = 66;
+    /// BS_VolID.
+    pub const VOLUME_ID: Range<usize> = 67..71;
+    /// BS_VolLab.
+    pub const VOLUME_LABEL: Range<usize> = 71..82;
+    /// BS_FilSysType.
+    pub const FS_TYPE: Range<usize> = 82..90;
+    /// The boot code.
+    pub const BOOT_CODE: Range<usize> = 90..510;
+    /// Signature_word.
+    pub const SIGNATURE: Range<usize> = 510..512;
+}
+
+/// Where the fields of the FSInfo structure are, as the FAT specification
+/// lays them out. Each comment gives the specification's name of the field.
+pub mod fsinfo_field {
+    use std::ops::Range;
+
+    /// FSI_LeadSig.
+    pub const LEAD_SIGNATURE: Range<usize> = 0..4;
+    /// FSI_Reserved1.
+    pub const RESERVED1: Range<usize> = 4..484;
+    /// FSI_StrucSig.
+    pub const STRUCT_SIGNATURE: Range<usize> = 484..488;
+    /// FSI_Free_Count.
+    pub const FREE_CLUSTERS: Range<usize> = 488..492;
+    /// FSI_Nxt_Free.
+    pub const NEXT_FREE: Range<usize> = 492..496;
+    /// FSI_Reserved2.
+    pub const RESERVED2: Range<usize> = 496..508;
+    /// FSI_TrailSig.
+    pub const TRAIL_SIGNATURE: Range<usize> = 508..512;
+}
 
 /// The machine code part of the dummy boot code mkfs.fat installs: it prints
 /// the message that follows it and waits for a key press. The 16-bit offset
@@ -90,9 +179,9 @@ pub fn default_boot_code() -> [u8; BOOT_CODE_SIZE] {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootSector {
     /// Jump instruction, normally EB 58 90.
-    pub jump: [u8; 3],
+    pub jump: [u8; size(field::JUMP)],
     /// OEM name.
-    pub oem_name: [u8; 8],
+    pub oem_name: [u8; OEM_NAME_SIZE],
     /// Bytes per logical sector.
     pub bytes_per_sector: u16,
     /// Sectors per cluster, a power of two up to 128.
@@ -131,7 +220,7 @@ pub struct BootSector {
     /// Sector holding the backup boot sector, 0 if none.
     pub backup_boot_sector: u16,
     /// Reserved, zero.
-    pub reserved: [u8; 12],
+    pub reserved: [u8; size(field::RESERVED)],
     /// BIOS drive number, 0x80 for fixed media.
     pub drive_number: u8,
     /// Windows NT flags, bit 0 is the dirty flag.
@@ -141,9 +230,9 @@ pub struct BootSector {
     /// Volume serial number.
     pub volume_id: u32,
     /// Volume label as stored in the boot sector.
-    pub volume_label: [u8; 11],
+    pub volume_label: [u8; LABEL_SIZE],
     /// File system type string, "FAT32   ".
-    pub fs_type: [u8; 8],
+    pub fs_type: [u8; size(field::FS_TYPE)],
     /// Boot code.
     pub boot_code: [u8; BOOT_CODE_SIZE],
     /// Boot sector signature, 0xAA55.
@@ -167,77 +256,71 @@ impl BootSector {
                 "no file system found, the boot sector is blank"
             );
         }
-        let mut bs = BootSector {
-            jump: [b[0], b[1], b[2]],
-            oem_name: [0; 8],
-            bytes_per_sector: le16(b, 11),
-            sectors_per_cluster: b[13],
-            reserved_sectors: le16(b, 14),
-            fats: b[16],
-            root_entries: le16(b, 17),
-            total_sectors_16: le16(b, 19),
-            media: b[21],
-            fat_sectors_16: le16(b, 22),
-            sectors_per_track: le16(b, 24),
-            heads: le16(b, 26),
-            hidden_sectors: le32(b, 28),
-            total_sectors_32: le32(b, 32),
-            fat_sectors_32: le32(b, 36),
-            ext_flags: le16(b, 40),
-            fs_version: le16(b, 42),
-            root_cluster: le32(b, 44),
-            fsinfo_sector: le16(b, 48),
-            backup_boot_sector: le16(b, 50),
-            reserved: [0; 12],
-            drive_number: b[64],
-            nt_flags: b[65],
-            ext_boot_signature: b[66],
-            volume_id: le32(b, 67),
-            volume_label: [0; 11],
-            fs_type: [0; 8],
-            boot_code: [0; BOOT_CODE_SIZE],
-            signature: le16(b, 510),
-        };
-        bs.oem_name.copy_from_slice(&b[3..11]);
-        bs.reserved.copy_from_slice(&b[52..64]);
-        bs.volume_label.copy_from_slice(&b[71..82]);
-        bs.fs_type.copy_from_slice(&b[82..90]);
-        bs.boot_code.copy_from_slice(&b[90..510]);
-        Ok(bs)
+        Ok(BootSector {
+            jump: bytes_at(b, field::JUMP),
+            oem_name: bytes_at(b, field::OEM_NAME),
+            bytes_per_sector: le16_at(b, field::BYTES_PER_SECTOR),
+            sectors_per_cluster: b[field::SECTORS_PER_CLUSTER],
+            reserved_sectors: le16_at(b, field::RESERVED_SECTORS),
+            fats: b[field::FATS],
+            root_entries: le16_at(b, field::ROOT_ENTRIES),
+            total_sectors_16: le16_at(b, field::TOTAL_SECTORS_16),
+            media: b[field::MEDIA],
+            fat_sectors_16: le16_at(b, field::FAT_SECTORS_16),
+            sectors_per_track: le16_at(b, field::SECTORS_PER_TRACK),
+            heads: le16_at(b, field::HEADS),
+            hidden_sectors: le32_at(b, field::HIDDEN_SECTORS),
+            total_sectors_32: le32_at(b, field::TOTAL_SECTORS_32),
+            fat_sectors_32: le32_at(b, field::FAT_SECTORS_32),
+            ext_flags: le16_at(b, field::EXT_FLAGS),
+            fs_version: le16_at(b, field::FS_VERSION),
+            root_cluster: le32_at(b, field::ROOT_CLUSTER),
+            fsinfo_sector: le16_at(b, field::FSINFO_SECTOR),
+            backup_boot_sector: le16_at(b, field::BACKUP_BOOT_SECTOR),
+            reserved: bytes_at(b, field::RESERVED),
+            drive_number: b[field::DRIVE_NUMBER],
+            nt_flags: b[field::NT_FLAGS],
+            ext_boot_signature: b[field::EXT_BOOT_SIGNATURE],
+            volume_id: le32_at(b, field::VOLUME_ID),
+            volume_label: bytes_at(b, field::VOLUME_LABEL),
+            fs_type: bytes_at(b, field::FS_TYPE),
+            boot_code: bytes_at(b, field::BOOT_CODE),
+            signature: le16_at(b, field::SIGNATURE),
+        })
     }
 
     /// Encodes the boot sector into its 512-byte on-disk form.
     pub fn to_bytes(&self) -> [u8; BOOT_SECTOR_SIZE] {
         let mut b = [0u8; BOOT_SECTOR_SIZE];
-        b[0..3].copy_from_slice(&self.jump);
-        b[3..11].copy_from_slice(&self.oem_name);
-        b[11..13].copy_from_slice(&self.bytes_per_sector.to_le_bytes());
-        b[13] = self.sectors_per_cluster;
-        b[14..16].copy_from_slice(&self.reserved_sectors.to_le_bytes());
-        b[16] = self.fats;
-        b[17..19].copy_from_slice(&self.root_entries.to_le_bytes());
-        b[19..21].copy_from_slice(&self.total_sectors_16.to_le_bytes());
-        b[21] = self.media;
-        b[22..24].copy_from_slice(&self.fat_sectors_16.to_le_bytes());
-        b[24..26].copy_from_slice(&self.sectors_per_track.to_le_bytes());
-        b[26..28].copy_from_slice(&self.heads.to_le_bytes());
-        b[28..32].copy_from_slice(&self.hidden_sectors.to_le_bytes());
-        b[32..36].copy_from_slice(&self.total_sectors_32.to_le_bytes());
-        b[36..40].copy_from_slice(&self.fat_sectors_32.to_le_bytes());
-        b[40..42].copy_from_slice(&self.ext_flags.to_le_bytes());
-        b[42..44].copy_from_slice(&self.fs_version.to_le_bytes());
-        b[44..48].copy_from_slice(&self.root_cluster.to_le_bytes());
-        b[48..50].copy_from_slice(&self.fsinfo_sector.to_le_bytes());
-        b[50..52].copy_from_slice(&self.backup_boot_sector.to_le_bytes());
-        b[52..64].copy_from_slice(&self.reserved);
-        b[64] = self.drive_number;
-        b[65] = self.nt_flags;
-        b[66] = self.ext_boot_signature;
-        b[67..71].copy_from_slice(&self.volume_id.to_le_bytes());
-        b[71..82].copy_from_slice(&self.volume_label);
-        b[82..90].copy_from_slice(&self.fs_type);
-        b[90..510].copy_from_slice(&self.boot_code);
-        b[510..512].copy_from_slice(&self.signature.to_le_bytes());
+        b[field::JUMP].copy_from_slice(&self.jump);
+        b[field::OEM_NAME].copy_from_slice(&self.oem_name);
+        b[field::BYTES_PER_SECTOR].copy_from_slice(&self.bytes_per_sector.to_le_bytes());
+        b[field::SECTORS_PER_CLUSTER] = self.sectors_per_cluster;
+        b[field::RESERVED_SECTORS].copy_from_slice(&self.reserved_sectors.to_le_bytes());
+        b[field::FATS] = self.fats;
+        b[field::ROOT_ENTRIES].copy_from_slice(&self.root_entries.to_le_bytes());
+        b[field::TOTAL_SECTORS_16].copy_from_slice(&self.total_sectors_16.to_le_bytes());
+        b[field::MEDIA] = self.media;
+        b[field::FAT_SECTORS_16].copy_from_slice(&self.fat_sectors_16.to_le_bytes());
+        b[field::SECTORS_PER_TRACK].copy_from_slice(&self.sectors_per_track.to_le_bytes());
+        b[field::HEADS].copy_from_slice(&self.heads.to_le_bytes());
+        b[field::HIDDEN_SECTORS].copy_from_slice(&self.hidden_sectors.to_le_bytes());
+        b[field::TOTAL_SECTORS_32].copy_from_slice(&self.total_sectors_32.to_le_bytes());
+        b[field::FAT_SECTORS_32].copy_from_slice(&self.fat_sectors_32.to_le_bytes());
+        b[field::EXT_FLAGS].copy_from_slice(&self.ext_flags.to_le_bytes());
+        b[field::FS_VERSION].copy_from_slice(&self.fs_version.to_le_bytes());
+        b[field::ROOT_CLUSTER].copy_from_slice(&self.root_cluster.to_le_bytes());
+        b[field::FSINFO_SECTOR].copy_from_slice(&self.fsinfo_sector.to_le_bytes());
+        b[field::BACKUP_BOOT_SECTOR].copy_from_slice(&self.backup_boot_sector.to_le_bytes());
+        b[field::RESERVED].copy_from_slice(&self.reserved);
+        b[field::DRIVE_NUMBER] = self.drive_number;
+        b[field::NT_FLAGS] = self.nt_flags;
+        b[field::EXT_BOOT_SIGNATURE] = self.ext_boot_signature;
+        b[field::VOLUME_ID].copy_from_slice(&self.volume_id.to_le_bytes());
+        b[field::VOLUME_LABEL].copy_from_slice(&self.volume_label);
+        b[field::FS_TYPE].copy_from_slice(&self.fs_type);
+        b[field::BOOT_CODE].copy_from_slice(&self.boot_code);
+        b[field::SIGNATURE].copy_from_slice(&self.signature.to_le_bytes());
         b
     }
 
@@ -438,37 +521,39 @@ impl FsInfo {
         if b.len() < FSINFO_SIZE {
             return None;
         }
-        if le32(b, 0) != FSINFO_LEAD_SIGNATURE || le32(b, 484) != FSINFO_STRUCT_SIGNATURE {
+        if le32_at(b, fsinfo_field::LEAD_SIGNATURE) != FSINFO_LEAD_SIGNATURE
+            || le32_at(b, fsinfo_field::STRUCT_SIGNATURE) != FSINFO_STRUCT_SIGNATURE
+        {
             return None;
         }
         Some(FsInfo {
-            free_clusters: le32(b, 488),
-            next_free: le32(b, 492),
+            free_clusters: le32_at(b, fsinfo_field::FREE_CLUSTERS),
+            next_free: le32_at(b, fsinfo_field::NEXT_FREE),
         })
     }
 
-    /// Whether the trailing signature at offset 508 is present. Linux does
-    /// not check it, EDK2 does.
+    /// Whether the trailing signature is present. Linux does not check it,
+    /// EDK2 does.
     pub fn has_trail_signature(b: &[u8]) -> bool {
-        b.len() >= FSINFO_SIZE && le32(b, 508) == FSINFO_TRAIL_SIGNATURE
+        b.len() >= FSINFO_SIZE && le32_at(b, fsinfo_field::TRAIL_SIGNATURE) == FSINFO_TRAIL_SIGNATURE
     }
 
     /// Writes the two counters and the trailing signature into an FSInfo
     /// sector read from disk, leaving the reserved bytes as they are.
     pub fn patch(&self, sector: &mut [u8; FSINFO_SIZE]) {
-        sector[488..492].copy_from_slice(&self.free_clusters.to_le_bytes());
-        sector[492..496].copy_from_slice(&self.next_free.to_le_bytes());
-        sector[508..512].copy_from_slice(&FSINFO_TRAIL_SIGNATURE.to_le_bytes());
+        sector[fsinfo_field::FREE_CLUSTERS].copy_from_slice(&self.free_clusters.to_le_bytes());
+        sector[fsinfo_field::NEXT_FREE].copy_from_slice(&self.next_free.to_le_bytes());
+        sector[fsinfo_field::TRAIL_SIGNATURE].copy_from_slice(&FSINFO_TRAIL_SIGNATURE.to_le_bytes());
     }
 
     /// Encodes the FSInfo sector into its 512-byte on-disk form.
     pub fn to_bytes(&self) -> [u8; FSINFO_SIZE] {
         let mut b = [0u8; FSINFO_SIZE];
-        b[0..4].copy_from_slice(&FSINFO_LEAD_SIGNATURE.to_le_bytes());
-        b[484..488].copy_from_slice(&FSINFO_STRUCT_SIGNATURE.to_le_bytes());
-        b[488..492].copy_from_slice(&self.free_clusters.to_le_bytes());
-        b[492..496].copy_from_slice(&self.next_free.to_le_bytes());
-        b[508..512].copy_from_slice(&FSINFO_TRAIL_SIGNATURE.to_le_bytes());
+        b[fsinfo_field::LEAD_SIGNATURE].copy_from_slice(&FSINFO_LEAD_SIGNATURE.to_le_bytes());
+        b[fsinfo_field::STRUCT_SIGNATURE].copy_from_slice(&FSINFO_STRUCT_SIGNATURE.to_le_bytes());
+        b[fsinfo_field::FREE_CLUSTERS].copy_from_slice(&self.free_clusters.to_le_bytes());
+        b[fsinfo_field::NEXT_FREE].copy_from_slice(&self.next_free.to_le_bytes());
+        b[fsinfo_field::TRAIL_SIGNATURE].copy_from_slice(&FSINFO_TRAIL_SIGNATURE.to_le_bytes());
         b
     }
 }
@@ -481,9 +566,10 @@ mod tests {
     fn boot_code_matches_mkfs_fat() {
         let code = default_boot_code();
         assert_eq!(&code[..5], &[0x0e, 0x1f, 0xbe, 0x77, 0x7c]);
-        assert_eq!(&code[29..33], b"This");
-        assert_eq!(code[29 + BOOT_MESSAGE.len() - 1], b'\n');
-        assert!(code[29 + BOOT_MESSAGE.len()..].iter().all(|&b| b == 0));
+        let message = &code[BOOT_CODE_HEAD.len()..];
+        assert_eq!(&message[..4], b"This");
+        assert_eq!(message[BOOT_MESSAGE.len() - 1], b'\n');
+        assert!(message[BOOT_MESSAGE.len()..].iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -495,12 +581,11 @@ mod tests {
         let b = fi.to_bytes();
         assert_eq!(FsInfo::parse(&b), Some(fi));
         assert!(FsInfo::has_trail_signature(&b));
-        assert_eq!(&b[0..4], b"RRaA");
-        assert_eq!(&b[484..488], b"rrAa");
-        assert_eq!(b[510], 0x55);
-        assert_eq!(b[511], 0xAA);
+        assert_eq!(&b[fsinfo_field::LEAD_SIGNATURE], b"RRaA");
+        assert_eq!(&b[fsinfo_field::STRUCT_SIGNATURE], b"rrAa");
+        assert_eq!(b[fsinfo_field::TRAIL_SIGNATURE], FSINFO_TRAIL_SIGNATURE.to_le_bytes());
         let mut bad = b;
-        bad[1] = 0;
+        bad[fsinfo_field::LEAD_SIGNATURE.start + 1] = 0;
         assert_eq!(FsInfo::parse(&bad), None);
     }
 }
