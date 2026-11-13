@@ -927,7 +927,7 @@ fn assemble_without_content() {
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"options":{"blockSize":3000},"force":true}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"blockSize":3000,"force":true}}"#,
         &[img.as_fd()],
     );
     assert_eq!(e.name, "org.varlink.service.InvalidParameter");
@@ -935,21 +935,21 @@ fn assemble_without_content() {
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"options":{"sectorSize":256},"force":true}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"sectorSize":256,"force":true}}"#,
         &[img.as_fd()],
     );
     assert_eq!(str_of(&e.parameters, "parameter"), "sectorSize");
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"options":{"vfat":{"fats":9}},"force":true}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"force":true,"vfat":{"fats":9}}}"#,
         &[img.as_fd()],
     );
     assert_eq!(str_of(&e.parameters, "parameter"), "fats");
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"options":{"vfat":{"oemName":"nine chars"}},"force":true}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"force":true,"vfat":{"oemName":"nine chars"}}}"#,
         &[img.as_fd()],
     );
     assert_eq!(str_of(&e.parameters, "parameter"), "oemName");
@@ -988,7 +988,7 @@ fn assemble_refuses_what_is_there_without_force() {
     for params in [
         first.as_str(),
         IMG,
-        r#"{"image":{"fileDescriptor":0},"force":false}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"force":false}}"#,
         r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1}}"#,
     ] {
         let source = ro(tree.path());
@@ -1010,7 +1010,7 @@ fn assemble_refuses_what_is_there_without_force() {
     let r = reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1},"force":true}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"force":true},"content":{"sourceFileDescriptor":1}}"#,
         &[img.as_fd(), source.as_fd()],
     ));
     assert_eq!(u64_of(&r, "files"), 2);
@@ -1027,7 +1027,7 @@ fn assemble_refuses_what_is_there_without_force() {
     reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"force":true}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"force":true}}"#,
         &[ext4_img.as_fd()],
     ));
     let e = error_of(&mut c, "Assemble", IMG, &[ext4_img.as_fd()]);
@@ -1395,7 +1395,7 @@ fn a_failed_assemble_leaves_the_file_system_unfinished() {
     reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2},"force":true}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"force":true},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
         &[img.as_fd(), manifest_file.as_fd(), source.as_fd()],
     ));
     assert!(warnings(&mut c, image.path()).is_empty());

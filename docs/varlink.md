@@ -157,7 +157,6 @@ What the fields mean for vfat:
 | `options` | `FormatOptions`, see below. |
 | `content` | What to copy into the new file system, see "Content". |
 | `imageHash` | `sha256` or `sha512`. Hashes the image after formatting. |
-| `force` | Formats the image whatever it holds. Off by default. |
 
 Mode `assemble` creates the file system and copies the content into it,
 in one call. Mode `plan` computes the geometry and the size the content
@@ -170,8 +169,8 @@ RAID or LVM member, or anything else that libblkid recognizes. It
 formats an image that is blank or holds data that libblkid does not
 recognize, as mkfs.xfs does. Without libblkid it formats only a blank
 image. Blank means that the first 256 KiB are zeros. An empty image file
-and the part of a file that it grows are blank. `force` formats any
-image.
+and the part of a file that it grows are blank. The option `force`
+formats any image.
 
 How the image is sized:
 
@@ -233,6 +232,7 @@ see "Passing file descriptors".
 | `sectorSize` | 512, 1024, 2048 or 4096. The logical block size of a block device by default, 512 for an image file. It must not be smaller than the device's logical block size. |
 | `blockSize` | The cluster size: a power of two from the sector size up to 32768, at most 128 sectors. Chosen from the volume size by default, like mkfs.fat does. |
 | `zero` | Overwrites the whole data area with zeros. Off by default. |
+| `force` | Formats the image whatever it holds. Off by default. |
 | `reproducible` | Makes the image depend on the inputs only. Requires `identifier` and `timestampUSec`, and fails with `NotReproducible` without them. Set `times` to `fixed` or `clamp` to make the file times reproducible too. |
 | `discard` | `false` is accepted. `true` fails with `OperationNotSupported`. |
 | `enableFeatures`, `disableFeatures` | FAT has none. Setting them fails with `OperationNotSupported`. |
