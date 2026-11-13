@@ -3,7 +3,9 @@
 //! contents of the files come from, and the walk over the manifest that
 //! creates directories and files and verifies sizes and hashes.
 
+use std::fmt;
 use std::io::Write;
+use std::ops::{BitOr, BitOrAssign};
 use std::os::fd::{AsFd, OwnedFd};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -88,17 +90,85 @@ impl Directory for SourceDirectory {
 /// half-made left behind.
 pub type DirectorySource = uapi16::DirectorySource<SourceDirectory>;
 
+/// What an assembly does where it could also fail.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AssembleFlags(u8);
+
+impl AssembleFlags {
+    /// Replace files that exist in the volume instead of failing.
+    pub const REPLACE: AssembleFlags = AssembleFlags(1 << 0);
+    /// Skip entries this crate cannot store (see [`Storable`]) instead of
+    /// failing.
+    pub const SKIP_UNSUPPORTED: AssembleFlags = AssembleFlags(1 << 1);
+    /// No flag: an assembly fails in both cases.
+    pub const NONE: AssembleFlags = AssembleFlags(0);
+
+    /// Every single flag with its name.
+    const NAMES: [(AssembleFlags, &'static str); 2] = [
+        (AssembleFlags::REPLACE, "REPLACE"),
+        (AssembleFlags::SKIP_UNSUPPORTED, "SKIP_UNSUPPORTED"),
+    ];
+
+    /// Whether every flag of `flags` is among these.
+    pub const fn contains(self, flags: AssembleFlags) -> bool {
+        self.0 & flags.0 == flags.0
+    }
+
+    /// These flags with `flags` among them if `on` says so, and without
+    /// them if not.
+    #[must_use]
+    pub const fn with(self, flags: AssembleFlags, on: bool) -> AssembleFlags {
+        if on {
+            AssembleFlags(self.0 | flags.0)
+        } else {
+            AssembleFlags(self.0 & !flags.0)
+        }
+    }
+}
+
+impl Default for AssembleFlags {
+    /// [`AssembleFlags::REPLACE`].
+    fn default() -> AssembleFlags {
+        AssembleFlags::REPLACE
+    }
+}
+
+impl BitOr for AssembleFlags {
+    type Output = AssembleFlags;
+
+    fn bitor(self, other: AssembleFlags) -> AssembleFlags {
+        AssembleFlags(self.0 | other.0)
+    }
+}
+
+impl BitOrAssign for AssembleFlags {
+    fn bitor_assign(&mut self, other: AssembleFlags) {
+        self.0 |= other.0;
+    }
+}
+
+impl fmt::Debug for AssembleFlags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names = AssembleFlags::NAMES.iter().filter(|(flag, _)| self.contains(*flag));
+        f.write_str("AssembleFlags(")?;
+        for (i, (_, name)) in names.enumerate() {
+            if i > 0 {
+                f.write_str(" | ")?;
+            }
+            f.write_str(name)?;
+        }
+        f.write_str(")")
+    }
+}
+
 /// Options for [`Volume::assemble`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssembleOptions {
     /// Time stamped on entries without `mTimeNSec` and on directories
     /// created implicitly.
     pub default_time: SystemTime,
-    /// Replace files that exist in the volume instead of failing.
-    pub replace: bool,
-    /// Skip entries this crate cannot store (see [`Storable`]) instead of
-    /// failing.
-    pub skip_unsupported: bool,
+    /// What to do where an assembly could also fail.
+    pub flags: AssembleFlags,
     /// The current time for validity checks, or None to skip them.
     pub now_usec: Option<u64>,
 }
@@ -107,8 +177,7 @@ impl Default for AssembleOptions {
     fn default() -> Self {
         AssembleOptions {
             default_time: UNIX_EPOCH,
-            replace: true,
-            skip_unsupported: false,
+            flags: AssembleFlags::default(),
             now_usec: None,
         }
     }
@@ -206,7 +275,7 @@ impl Volume {
             }
             let storable = match Storable::try_from(entry) {
                 Ok(storable) => storable,
-                Err(e) if e.errno() == EOPNOTSUPP && options.skip_unsupported => {
+                Err(e) if e.errno() == EOPNOTSUPP && options.flags.contains(AssembleFlags::SKIP_UNSUPPORTED) => {
                     report.skipped.push(name.to_string());
                     continue;
                 }
@@ -235,7 +304,8 @@ impl Volume {
                 Storable::File => {
                     // The writer aborts the file when it is dropped on an
                     // error.
-                    let mut writer = self.create_file(&path, time, options.replace)?;
+                    let replace = options.flags.contains(AssembleFlags::REPLACE);
+                    let mut writer = self.create_file(&path, time, replace)?;
                     writer.set_read_only(entry.is_read_only());
                     let mut reporting = Reporting {
                         inner: &mut writer,
@@ -261,8 +331,8 @@ impl Volume {
 impl crate::plan::Plan {
     /// Adds the files and directories of a manifest. Returns the entries
     /// that cannot be stored (see [`Storable`]), which the assembler skips
-    /// or refuses, so a plan and an assembly with `skip_unsupported` cover
-    /// the same entries.
+    /// or refuses, so a plan and an assembly that skips them cover the same
+    /// entries.
     pub fn add_manifest(&mut self, manifest: &Manifest) -> Result<Vec<String>> {
         let mut skipped = Vec::new();
         for entry in &manifest.entries {

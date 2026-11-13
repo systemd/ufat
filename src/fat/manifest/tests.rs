@@ -446,7 +446,7 @@ fn unsupported_entries() {
             &m,
             &mut StreamSource::new(&mut empty),
             &AssembleOptions {
-                skip_unsupported: true,
+                flags: AssembleFlags::REPLACE | AssembleFlags::SKIP_UNSUPPORTED,
                 ..Default::default()
             },
         )
@@ -875,4 +875,32 @@ fn long_operations_report_progress() {
         },
     );
     assert_eq!((removed.files, removed.directories), (2, 2));
+}
+
+#[test]
+fn assemble_flags() {
+    let both = AssembleFlags::REPLACE | AssembleFlags::SKIP_UNSUPPORTED;
+    assert_eq!(AssembleFlags::default(), AssembleFlags::REPLACE);
+    assert_eq!(AssembleOptions::default().flags, AssembleFlags::REPLACE);
+    assert!(both.contains(AssembleFlags::REPLACE) && both.contains(AssembleFlags::SKIP_UNSUPPORTED));
+    assert!(both.contains(both) && both.contains(AssembleFlags::NONE));
+    assert!(!AssembleFlags::REPLACE.contains(AssembleFlags::SKIP_UNSUPPORTED));
+    assert!(!AssembleFlags::NONE.contains(AssembleFlags::REPLACE));
+    for (replace, skip) in [(false, false), (false, true), (true, false), (true, true)] {
+        let flags = AssembleFlags::NONE
+            .with(AssembleFlags::REPLACE, replace)
+            .with(AssembleFlags::SKIP_UNSUPPORTED, skip);
+        assert_eq!(flags.contains(AssembleFlags::REPLACE), replace);
+        assert_eq!(flags.contains(AssembleFlags::SKIP_UNSUPPORTED), skip);
+        assert_eq!(
+            both.with(AssembleFlags::REPLACE, replace)
+                .with(AssembleFlags::SKIP_UNSUPPORTED, skip),
+            flags
+        );
+    }
+    let mut flags = AssembleFlags::NONE;
+    flags |= AssembleFlags::SKIP_UNSUPPORTED;
+    assert_eq!(format!("{:?}", flags), "AssembleFlags(SKIP_UNSUPPORTED)");
+    assert_eq!(format!("{:?}", both), "AssembleFlags(REPLACE | SKIP_UNSUPPORTED)");
+    assert_eq!(format!("{:?}", AssembleFlags::NONE), "AssembleFlags()");
 }

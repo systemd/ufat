@@ -36,7 +36,7 @@ mod generate;
 mod tests;
 mod volume;
 
-pub use assemble::{AssembleOptions, AssembleReport, DirectorySource, SourceDirectory};
+pub use assemble::{AssembleFlags, AssembleOptions, AssembleReport, DirectorySource, SourceDirectory};
 pub use generate::HostTree;
 pub use uapi16::{ContentSource, Contents, Fields, FileObject, InodeType, Location, Name, Sha256, StreamSource};
 pub use volume::WriteReport;
@@ -205,8 +205,9 @@ impl Manifest {
     }
 
     /// Fails with EOPNOTSUPP for the first entry this crate cannot store,
-    /// see [`Storable`]. Assembling without `skip_unsupported` would fail
-    /// at that entry; checking first avoids formatting for nothing.
+    /// see [`Storable`]. Assembling without
+    /// [`AssembleFlags::SKIP_UNSUPPORTED`] would fail at that entry;
+    /// checking first avoids formatting for nothing.
     pub fn check_supported(&self) -> Result<()> {
         self.entries
             .iter()

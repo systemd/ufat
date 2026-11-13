@@ -17,7 +17,8 @@ use fat::errno::{EINVAL, EOPNOTSUPP};
 use fat::format::{self, FormatOptions};
 use fat::host;
 use fat::manifest::{
-    AssembleOptions, DirectorySource, Fields, HostTree, InodeType, Manifest, SourceDirectory, StreamSource,
+    AssembleFlags, AssembleOptions, DirectorySource, Fields, HostTree, InodeType, Manifest, SourceDirectory,
+    StreamSource,
 };
 use fat::plan::{Plan, PlanOptions};
 use fat::volume::Volume;
@@ -274,7 +275,7 @@ fn special_skips_what_fat_cannot_hold() {
     assert_eq!(e.errno(), EOPNOTSUPP);
     assert!(e.message().contains("link"), "{}", e);
     let options = AssembleOptions {
-        skip_unsupported: true,
+        flags: AssembleFlags::REPLACE | AssembleFlags::SKIP_UNSUPPORTED,
         ..AssembleOptions::default()
     };
     let report = v.assemble(&m, &mut source("special"), &options).unwrap();

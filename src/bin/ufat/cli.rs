@@ -14,7 +14,9 @@ use fat::format::{self, FormatOptions, VolumeId};
 use fat::fsck;
 use fat::host;
 use fat::layout::MIN_SECTOR_SIZE;
-use fat::manifest::{self, AssembleOptions, DirectorySource, Fields, HostTree, SourceDirectory, StreamSource};
+use fat::manifest::{
+    self, AssembleFlags, AssembleOptions, DirectorySource, Fields, HostTree, SourceDirectory, StreamSource,
+};
 use fat::plan::{Plan, PlanOptions};
 use fat::populate::{CopyOptions, TimePolicy};
 use fat::probe::Prober;
@@ -558,8 +560,9 @@ fn assemble_options(args: &Args) -> Result<AssembleOptions> {
     let (time, _) = stamp_time(args)?;
     Ok(AssembleOptions {
         default_time: time,
-        replace: !args.flag("no-replace"),
-        skip_unsupported: !fail_unsupported(args)?,
+        flags: AssembleFlags::NONE
+            .with(AssembleFlags::REPLACE, !args.flag("no-replace"))
+            .with(AssembleFlags::SKIP_UNSUPPORTED, !fail_unsupported(args)?),
         now_usec: if args.flag("no-check-validity") {
             None
         } else {

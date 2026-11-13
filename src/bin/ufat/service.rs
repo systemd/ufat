@@ -28,7 +28,8 @@ use fat::fsck::{self, Problem};
 use fat::host;
 use fat::layout::{self, LayoutParams, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE, MIN_CLUSTERS, MIN_SECTOR_SIZE};
 use fat::manifest::{
-    AssembleOptions, AssembleReport, DirectorySource, Fields, Manifest, SourceDirectory, StreamSource, WriteReport,
+    AssembleFlags, AssembleOptions, AssembleReport, DirectorySource, Fields, Manifest, SourceDirectory, StreamSource,
+    WriteReport,
 };
 use fat::plan::{Plan, PlanOptions};
 use fat::populate::{CopyOptions, CopyReport, TimePolicy};
@@ -1101,8 +1102,9 @@ impl Content {
         };
         let assembly = AssembleOptions {
             default_time: self.time,
-            replace: self.replace,
-            skip_unsupported: !self.fail_unsupported,
+            flags: AssembleFlags::NONE
+                .with(AssembleFlags::REPLACE, self.replace)
+                .with(AssembleFlags::SKIP_UNSUPPORTED, !self.fail_unsupported),
             now_usec: if self.check_validity {
                 Some(fat::time::to_usec(util::now()))
             } else {
