@@ -141,7 +141,7 @@ jobs:
             curl -sSfL --retry 3 -o "$ucd/$f" "https://www.unicode.org/Public/16.0.0/ucd/$f"
           done
           (cd "$ucd" && sha256sum -c "$GITHUB_WORKSPACE/tools/fold-table.sha256")
-          cargo run --locked -q -p fold-table "$ucd" | diff -u src/name/fold_table.rs -
+          cargo run --locked -q -p fold-table "$ucd" | diff -u src/fat/name/fold_table.rs -
 
   clippy:
     name: clippy (rustc ${{ matrix.rust }})

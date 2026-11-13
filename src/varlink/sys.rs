@@ -76,7 +76,7 @@ const _: () = assert!(SO_PASSRIGHTS == libc::SO_PASSRIGHTS);
     target_arch = "s390x",
     target_arch = "sparc64"
 )))]
-compile_error!("varlink/sys.rs has no SO_PASSRIGHTS for this architecture");
+compile_error!("src/varlink/sys.rs has no SO_PASSRIGHTS for this architecture");
 
 /// SCM_MAX_FD (include/net/scm.h): the kernel passes at most this many
 /// descriptors in one message, and we make room for exactly that.

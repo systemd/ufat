@@ -44,7 +44,7 @@ pub(crate) const O_LARGEFILE: c_int = 0x40000;
     target_arch = "powerpc64",
     target_arch = "sparc64"
 )))]
-compile_error!("src/sys/uapi.rs has no O_LARGEFILE for this architecture");
+compile_error!("src/fat/sys/uapi.rs has no O_LARGEFILE for this architecture");
 
 // On 32-bit targets glibc has the kernel's value.
 #[cfg(target_pointer_width = "32")]

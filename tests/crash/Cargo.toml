@@ -11,7 +11,7 @@ publish.workspace = true
 # The library again, with the write trace of device.rs compiled in, see
 # build.rs. Only the crash consistency harness uses it.
 [lib]
-path = "../../src/lib.rs"
+path = "../../src/fat/lib.rs"
 test = false
 doctest = false
 doc = false

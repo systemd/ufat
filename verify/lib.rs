@@ -10,25 +10,25 @@
 extern crate libc;
 
 #[macro_use]
-#[path = "../src/error.rs"]
+#[path = "../src/fat/error.rs"]
 mod error;
 pub use error::{CorruptPlace, Detail, Error, NameProblem, NoSpaceReason, NotFat32Reason, Result};
 
-#[path = "../src/boot.rs"]
+#[path = "../src/fat/boot.rs"]
 pub mod boot;
-#[path = "../src/bytes.rs"]
+#[path = "../src/fat/bytes.rs"]
 mod bytes;
-#[path = "../src/dir.rs"]
+#[path = "../src/fat/dir.rs"]
 pub mod dir;
-#[path = "../src/dirent.rs"]
+#[path = "../src/fat/dirent.rs"]
 pub mod dirent;
-#[path = "../src/errno.rs"]
+#[path = "../src/fat/errno.rs"]
 pub mod errno;
-#[path = "../src/fat.rs"]
+#[path = "../src/fat/fat.rs"]
 pub mod fat;
-#[path = "../src/layout.rs"]
+#[path = "../src/fat/layout.rs"]
 pub mod layout;
-#[path = "../src/name.rs"]
+#[path = "../src/fat/name.rs"]
 pub mod name;
-#[path = "../src/time.rs"]
+#[path = "../src/fat/time.rs"]
 pub mod time;

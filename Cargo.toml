@@ -1,10 +1,29 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 [workspace]
-members = [".", "blkid", "dlopen", "dlopen-note", "json", "varlink", "tools", "tests/crash", "tests/fuzz", "bench"]
+members = [
+    ".",
+    "src/blkid",
+    "src/dlopen",
+    "src/dlopen-note",
+    "src/json",
+    "src/varlink",
+    "tools",
+    "tests/crash",
+    "tests/fuzz",
+    "bench",
+]
 # A plain `cargo build` or `cargo test` leaves out the case folding table
 # generator, the fuzzing seeds and the benchmarks.
-default-members = [".", "blkid", "dlopen", "dlopen-note", "json", "varlink", "tests/crash"]
+default-members = [
+    ".",
+    "src/blkid",
+    "src/dlopen",
+    "src/dlopen-note",
+    "src/json",
+    "src/varlink",
+    "tests/crash",
+]
 # cargo update picks dependency versions that support rust-version.
 resolver = "3"
 
@@ -17,10 +36,10 @@ license = "LGPL-2.1-or-later"
 publish = false
 
 [workspace.dependencies]
-blkid = { path = "blkid" }
-dlopen = { path = "dlopen" }
-dlopen-note = { path = "dlopen-note" }
-json = { path = "json" }
+blkid = { path = "src/blkid" }
+dlopen = { path = "src/dlopen" }
+dlopen-note = { path = "src/dlopen-note" }
+json = { path = "src/json" }
 lexopt = "0.3.2"
 # The _IO and _IOR helpers came with 0.2.172. Stay on 0.2: 1.0 may drop
 # the LFS64 functions such as openat64 and fstatfs64.
@@ -28,7 +47,7 @@ libc = "0.2.191"
 # 0.11.1 and later need rustc 1.88.
 sha2 = { version = "0.11.0", default-features = false }
 ufat = { path = "." }
-varlink = { path = "varlink" }
+varlink = { path = "src/varlink" }
 
 [workspace.lints.rust]
 unreachable_pub = "warn"
@@ -42,6 +61,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[lib]
+path = "src/fat/lib.rs"
 
 [dependencies]
 blkid.workspace = true
