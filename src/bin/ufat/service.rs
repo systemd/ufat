@@ -27,8 +27,7 @@ use fat::format::{self, FormatOptions, VolumeId};
 use fat::fsck::{self, Problem};
 use fat::host;
 use fat::layout::{self, LayoutParams, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE, MIN_CLUSTERS, MIN_SECTOR_SIZE};
-use fat::manifest::volume::{Fields, WriteReport};
-use fat::manifest::{AssembleOptions, AssembleReport, DirectorySource, Manifest, StreamSource};
+use fat::manifest::{AssembleOptions, AssembleReport, DirectorySource, Fields, Manifest, StreamSource, WriteReport};
 use fat::plan::{Plan, PlanOptions};
 use fat::populate::{CopyOptions, CopyReport, TimePolicy};
 use fat::probe::Prober;
@@ -835,7 +834,7 @@ impl Sink {
         let file = host::passed_sink(fd).map_err(bad("manifestSink"))?;
         let fields = match p.0.get("fields") {
             None | Some(Value::Null) => Fields::default(),
-            Some(_) => Fields::from_names(p.strings("fields")?).ok_or_else(|| invalid("manifestSink"))?,
+            Some(_) => Fields::from_names(p.strings("fields")?).map_err(|_| invalid("manifestSink"))?,
         };
         Ok(Sink { file, fields })
     }
@@ -844,13 +843,7 @@ impl Sink {
     /// what it covered so far.
     fn write(self, volume: &Volume, progress: &mut dyn FnMut(&Progress)) -> Outcome<WriteReport> {
         let mut out = BufWriter::new(self.file);
-        Ok(fat::manifest::volume::write_with_progress(
-            volume,
-            volume.root_time()?,
-            self.fields,
-            &mut out,
-            progress,
-        )?)
+        Ok(volume.write_manifest_with_progress(volume.root_time()?, self.fields, &mut out, progress)?)
     }
 }
 

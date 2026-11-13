@@ -382,7 +382,10 @@ fn esp_tree() -> Temp {
 /// A manifest of the tree and the contents of its streamed files in
 /// manifest order.
 fn manifest_and_blob(tree: &Path) -> (Vec<u8>, Vec<u8>) {
-    let bytes = fat::manifest::generate(fat::host::open_dir(tree).unwrap().as_fd()).unwrap();
+    let mut bytes = Vec::new();
+    fat::manifest::HostTree::new(fat::host::open_dir(tree).unwrap().as_fd())
+        .write_manifest(&mut bytes)
+        .unwrap();
     let m = fat::manifest::parse(&bytes).unwrap();
     let mut blob = Vec::new();
     for e in &m.entries {

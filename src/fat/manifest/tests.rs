@@ -16,7 +16,11 @@ fn dir_source(path: &Path) -> DirectorySource {
 
 /// The manifest the generator writes for the tree at `path`.
 fn generated(path: &Path) -> Vec<u8> {
-    generate(crate::host::open_dir(path).unwrap().as_fd()).unwrap()
+    let mut out = Vec::new();
+    HostTree::new(crate::host::open_dir(path).unwrap().as_fd())
+        .write_manifest(&mut out)
+        .unwrap();
+    out
 }
 
 fn seq(records: &[&str]) -> Vec<u8> {
@@ -872,18 +876,6 @@ fn validity() {
     assert!(v.assemble(&m, &mut StreamSource::new(&mut empty), &opts).is_ok());
 }
 
-/// mTimeNSec holds nanoseconds since the epoch in 64 bits: up to the year
-/// 2554, and nothing before 1970.
-#[test]
-fn times_outside_mtime_nsec_have_none() {
-    use std::time::{Duration, UNIX_EPOCH};
-    let last = UNIX_EPOCH + Duration::from_nanos(u64::MAX);
-    assert_eq!(generate::time_nsec(UNIX_EPOCH), Some(0));
-    assert_eq!(generate::time_nsec(last), Some(u64::MAX));
-    assert_eq!(generate::time_nsec(last + Duration::from_nanos(1)), None);
-    assert_eq!(generate::time_nsec(UNIX_EPOCH - Duration::from_secs(1)), None);
-}
-
 /// Checks the progress a long operation reported: the counts only grow
 /// and end at what its report says.
 fn reported(seen: &[Progress], last: Progress) {
@@ -925,10 +917,9 @@ fn long_operations_report_progress() {
     );
 
     seen.clear();
-    let w = volume::write_with_progress(&v, None, volume::Fields::default(), &mut Vec::new(), &mut |p| {
-        seen.push(*p)
-    })
-    .unwrap();
+    let w = v
+        .write_manifest_with_progress(None, Fields::default(), &mut Vec::new(), &mut |p| seen.push(*p))
+        .unwrap();
     assert!(seen.iter().any(|p| p.files == 0 && p.bytes > 0), "{:?}", seen);
     reported(
         &seen,

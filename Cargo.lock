@@ -82,6 +82,7 @@ dependencies = [
  "json",
  "libc",
  "sha2",
+ "uapi16",
 ]
 
 [[package]]
@@ -92,6 +93,7 @@ dependencies = [
  "json",
  "libc",
  "sha2",
+ "uapi16",
 ]
 
 [[package]]

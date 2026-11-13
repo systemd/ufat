@@ -31,15 +31,18 @@ use crate::volume::MAX_FILE_SIZE;
 use crate::{Detail, ManifestProblem, Result, UnsupportedKind, ValidityProblem};
 
 mod assemble;
+mod error;
 mod fields;
 mod generate;
 #[cfg(test)]
 mod tests;
-pub mod volume;
+mod volume;
 
 pub use assemble::{AssembleOptions, AssembleReport, ContentSource, DirectorySource, StreamSource};
 pub use fields::{base64_decode, valid_name};
-pub use generate::generate;
+pub use generate::HostTree;
+pub use uapi16::Fields;
+pub use volume::WriteReport;
 
 use fields::{
     access_mode, boolean, check_extended_attributes, check_signature, fat_key, hash, string, uint, valid_gpt_label,
@@ -73,6 +76,12 @@ pub(super) fn malformed_field(problem: ManifestProblem, field: &str) -> Detail {
         name: None,
         field: Some(field.to_string()),
     }
+}
+
+/// The path inside a volume of the file object with the name `name`: the
+/// name below the root directory.
+fn volume_path(name: &str) -> String {
+    crate::path::join("/", name)
 }
 
 /// Media type of the leading object.

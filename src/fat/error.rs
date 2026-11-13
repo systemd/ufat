@@ -623,6 +623,19 @@ impl Error {
         self
     }
 
+    /// The errno an I/O error stands for: the one the system gave, or the
+    /// one that fits its kind.
+    pub(crate) fn errno_of(e: &std::io::Error) -> i32 {
+        match e.raw_os_error() {
+            Some(n) => n,
+            None => match e.kind() {
+                std::io::ErrorKind::InvalidInput => EINVAL,
+                std::io::ErrorKind::OutOfMemory => ENOMEM,
+                _ => EIO,
+            },
+        }
+    }
+
     /// The message describing this error.
     pub fn message(&self) -> &str {
         &self.0.message
@@ -652,15 +665,7 @@ impl From<std::io::Error> for Error {
         if let Some(inner) = e.get_ref().and_then(|i| i.downcast_ref::<Error>()) {
             return inner.clone();
         }
-        let errno = match e.raw_os_error() {
-            Some(n) => n,
-            None => match e.kind() {
-                std::io::ErrorKind::InvalidInput => EINVAL,
-                std::io::ErrorKind::OutOfMemory => ENOMEM,
-                _ => EIO,
-            },
-        };
-        Error::new(errno, e.to_string())
+        Error::new(Error::errno_of(&e), e.to_string())
     }
 }
 

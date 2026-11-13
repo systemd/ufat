@@ -16,8 +16,7 @@ use fat::dirent::ATTR_READ_ONLY;
 use fat::errno::{EINVAL, EOPNOTSUPP};
 use fat::format::{self, FormatOptions};
 use fat::host;
-use fat::manifest::volume::Fields;
-use fat::manifest::{self, AssembleOptions, DirectorySource, InodeType, Manifest, StreamSource};
+use fat::manifest::{self, AssembleOptions, DirectorySource, Fields, HostTree, InodeType, Manifest, StreamSource};
 use fat::plan::{Plan, PlanOptions};
 use fat::volume::Volume;
 
@@ -387,7 +386,10 @@ fn generator_agrees_with_systemd_manifest() {
     for (dir, nsec) in dirs {
         std::fs::File::open(&dir).unwrap().set_modified(time(nsec)).unwrap();
     }
-    let ours = manifest::generate(host::open_dir(copy.path()).unwrap().as_fd()).unwrap();
+    let mut ours = Vec::new();
+    HostTree::new(host::open_dir(copy.path()).unwrap().as_fd())
+        .write_manifest(&mut ours)
+        .unwrap();
     let theirs = std::fs::read(fixtures().join("esp/size-hash-mtime.Uapi16Manifest")).unwrap();
     assert_eq!(
         String::from_utf8_lossy(&ours),
@@ -405,14 +407,14 @@ fn volume_manifest_agrees_with_systemd_manifest() {
     let (_img, mut v, _) = planned_volume(&m);
     v.assemble(&m, &mut source("esp"), &AssembleOptions::default()).unwrap();
     for (name, fields) in [
-        ("none.Uapi16Manifest", Fields::none()),
+        ("none.Uapi16Manifest", Fields::NONE),
         (
             "size-hash-mtime.Uapi16Manifest",
             Fields::from_names(["size", "hash", "mtime"]).unwrap(),
         ),
     ] {
         let mut ours = Vec::new();
-        manifest::volume::write(&v, m.root.mtime(), fields, &mut ours).unwrap();
+        v.write_manifest(m.root.mtime(), fields, &mut ours).unwrap();
         let theirs = std::fs::read(fixtures().join("esp").join(name)).unwrap();
         assert_eq!(
             String::from_utf8_lossy(&ours),

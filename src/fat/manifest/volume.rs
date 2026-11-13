@@ -27,120 +27,14 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::time::SystemTime;
 
-use json::Object;
+use uapi16::{Fields, FileObject, InodeType, Name, Sha256, Writer};
 
-use super::generate::{time_nsec, write_record};
-use super::{valid_name, FILENAME, MEDIA_TYPE, TRAILER_MEDIA_TYPE};
 use crate::dirent::ATTR_READ_ONLY;
 use crate::errno::*;
 use crate::progress::Progress;
-use crate::sha256::{self, Sha256, DIGEST_SIZE};
+use crate::sha256;
 use crate::volume::Volume;
 use crate::{CorruptPlace, Detail, Result};
-
-/// The per-file fields a written manifest carries: systemd-manifest's
-/// vocabulary, the names its `--field=` and repart's `--manifest-fields=`
-/// take, as the Varlink interface's `ManifestField` spells them. The inode
-/// type is always given, and `readOnly` is written where the attribute is
-/// set, which no field governs. FAT has no mode, owner, symbolic links,
-/// device nodes, hardlinks, extended attributes or user and group names,
-/// so of these only `size`, `hash` and `mtime` change what the volume
-/// writer puts out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Fields {
-    /// `mode`: the access mode.
-    pub mode: bool,
-    /// `uid`: the owning user.
-    pub uid: bool,
-    /// `gid`: the owning group.
-    pub gid: bool,
-    /// `size`: the size of regular files.
-    pub size: bool,
-    /// `hash`: the SHA-256 of regular files.
-    pub hash: bool,
-    /// `symlink`: the target of symbolic links.
-    pub symlink: bool,
-    /// `device`: the numbers of device nodes.
-    pub device: bool,
-    /// `hardlink`: the hardlink group token.
-    pub hardlink: bool,
-    /// `mtime`: the modification time.
-    pub mtime: bool,
-    /// `userXattr`: the extended attributes of the user namespace.
-    pub user_xattr: bool,
-    /// `userName`: the owning user's name.
-    pub user_name: bool,
-    /// `groupName`: the owning group's name.
-    pub group_name: bool,
-}
-
-impl Default for Fields {
-    /// systemd's default set: everything but `mtime`, `userName` and
-    /// `groupName`.
-    fn default() -> Fields {
-        Fields {
-            mode: true,
-            uid: true,
-            gid: true,
-            size: true,
-            hash: true,
-            symlink: true,
-            device: true,
-            hardlink: true,
-            mtime: false,
-            user_xattr: true,
-            user_name: false,
-            group_name: false,
-        }
-    }
-}
-
-impl Fields {
-    /// No field at all: the manifest carries the names and the inode types,
-    /// and `readOnly` where the attribute is set.
-    pub fn none() -> Fields {
-        Fields {
-            mode: false,
-            uid: false,
-            gid: false,
-            size: false,
-            hash: false,
-            symlink: false,
-            device: false,
-            hardlink: false,
-            mtime: false,
-            user_xattr: false,
-            user_name: false,
-            group_name: false,
-        }
-    }
-
-    /// The fields named with the interface's names: `mode`, `uid`, `gid`,
-    /// `size`, `hash`, `symlink`, `device`, `hardlink`, `mtime`,
-    /// `userXattr`, `userName` and `groupName`. None when a name is not one
-    /// of them.
-    pub fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<Fields> {
-        let mut fields = Fields::none();
-        for name in names {
-            match name {
-                "mode" => fields.mode = true,
-                "uid" => fields.uid = true,
-                "gid" => fields.gid = true,
-                "size" => fields.size = true,
-                "hash" => fields.hash = true,
-                "symlink" => fields.symlink = true,
-                "device" => fields.device = true,
-                "hardlink" => fields.hardlink = true,
-                "mtime" => fields.mtime = true,
-                "userXattr" => fields.user_xattr = true,
-                "userName" => fields.user_name = true,
-                "groupName" => fields.group_name = true,
-                _ => return None,
-            }
-        }
-        Some(fields)
-    }
-}
 
 /// What a written manifest covers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -170,74 +64,74 @@ impl WriteReport {
     }
 }
 
-/// Writes the UAPI.16 manifest of everything the volume holds to `out`:
-/// the root object, one object per entry, the trailer. `root_time` is the
-/// time the root object carries when `fields.mtime` is on: the root
-/// directory of a FAT volume has no entry of its own and so no time, the
-/// caller passes the one it knows, the source directory's or the label
-/// entry's. Each record goes out in one write and `out` is flushed at the
-/// end, so a descriptor wants a `BufWriter` around it.
-///
-/// Names the manifest cannot carry are left out, with everything below
-/// them. The names the specification reserves in the top level for the
-/// manifest itself and its signatures (`Uapi16Manifest`,
-/// `Uapi16Manifest.*`) are left out silently, as `systemd-manifest` leaves
-/// them out; any other, a component of more than 255 bytes of UTF-8 for
-/// instance, which FAT stores in UTF-16 but no manifest reader takes, is
-/// counted in the report's `omitted`.
-pub fn write(
-    volume: &Volume,
-    root_time: Option<SystemTime>,
-    fields: Fields,
-    out: &mut dyn Write,
-) -> Result<WriteReport> {
-    write_with_progress(volume, root_time, fields, out, &mut |_| {})
-}
-
-/// [`write`], telling `progress` what the manifest covers so far after
-/// every entry and every chunk of a file it reads for the hash.
-pub fn write_with_progress(
-    volume: &Volume,
-    root_time: Option<SystemTime>,
-    fields: Fields,
-    out: &mut dyn Write,
-    progress: &mut dyn FnMut(&Progress),
-) -> Result<WriteReport> {
-    let root = volume.metadata("/")?;
-    let mut writer = Writer {
-        volume,
-        fields,
-        out,
-        report: WriteReport::default(),
-        buf: vec![0u8; volume.layout().cluster_size() as usize],
-        seen: HashSet::from([root.first_cluster]),
-        progress,
-    };
-    // The root object is a directory by definition and carries no type.
-    let mut top = Object::new();
-    top.insert("mediaType", MEDIA_TYPE);
-    if fields.mtime {
-        if let Some(nsec) = root_time.and_then(time_nsec) {
-            top.insert("mTimeNSec", nsec);
-        }
+impl Volume {
+    /// Writes the UAPI.16 manifest of everything the volume holds to `out`:
+    /// the root object, one object per entry, the trailer. `root_time` is
+    /// the time the root object carries when `fields` has
+    /// [`Fields::MTIME`]: the root directory of a FAT volume has no entry
+    /// of its own and so no time, the caller passes the one it knows, the
+    /// source directory's or the label entry's. Each record goes out in
+    /// one write and `out` is flushed at the end, so a descriptor wants a
+    /// `BufWriter` around it.
+    ///
+    /// The inode type is always given, and `readOnly` is written where the
+    /// attribute is set, which no field governs. FAT has no mode, owner,
+    /// symbolic links, device nodes, hardlinks, extended attributes or
+    /// user and group names, so of the fields only [`Fields::SIZE`],
+    /// [`Fields::HASH`] and [`Fields::MTIME`] change what is written.
+    ///
+    /// Names the manifest cannot carry are left out, with everything below
+    /// them. The names the specification reserves in the top level for the
+    /// manifest itself and its signatures (`Uapi16Manifest`,
+    /// `Uapi16Manifest.*`) are left out silently, as `systemd-manifest`
+    /// leaves them out; any other, a component of more than 255 bytes of
+    /// UTF-8 for instance, which FAT stores in UTF-16 but no manifest
+    /// reader takes, is counted in the report's `omitted`.
+    pub fn write_manifest(
+        &self,
+        root_time: Option<SystemTime>,
+        fields: Fields,
+        out: &mut dyn Write,
+    ) -> Result<WriteReport> {
+        self.write_manifest_with_progress(root_time, fields, out, &mut |_| {})
     }
-    write_record(writer.out, top)?;
-    writer.directory("/", "")?;
-    write_record(writer.out, json::object! { "mediaType" => TRAILER_MEDIA_TYPE })?;
-    writer.out.flush()?;
-    Ok(writer.report)
+
+    /// [`Volume::write_manifest`], telling `progress` what the manifest
+    /// covers so far after every entry and every chunk of a file it reads
+    /// for the hash.
+    pub fn write_manifest_with_progress(
+        &self,
+        root_time: Option<SystemTime>,
+        fields: Fields,
+        out: &mut dyn Write,
+        progress: &mut dyn FnMut(&Progress),
+    ) -> Result<WriteReport> {
+        let top = self.metadata("/")?;
+        // The root object is a directory by definition and carries no type.
+        let mut root = FileObject::root();
+        if let Some(time) = root_time.filter(|_| fields.contains(Fields::MTIME)) {
+            root.set_mtime(time);
+        }
+        let mut listing = Listing {
+            volume: self,
+            fields,
+            writer: Writer::begin(out, &root)?,
+            report: WriteReport::default(),
+            buf: vec![0u8; self.layout().cluster_size() as usize],
+            seen: HashSet::from([top.first_cluster]),
+            progress,
+        };
+        listing.directory("/", &Name::ROOT)?;
+        listing.writer.finish()?;
+        Ok(listing.report)
+    }
 }
 
-/// Whether `name`, relative to the root, is one the specification reserves
-/// in the top level for the manifest itself and its signatures.
-fn reserved(name: &str) -> bool {
-    name == FILENAME || name.strip_prefix(FILENAME).is_some_and(|rest| rest.starts_with('.'))
-}
-
-struct Writer<'a> {
+/// The manifest of a volume while it is written.
+struct Listing<'a, W: Write> {
     volume: &'a Volume,
     fields: Fields,
-    out: &'a mut dyn Write,
+    writer: Writer<W>,
     report: WriteReport,
     /// One cluster, the most one read of a file returns.
     buf: Vec<u8>,
@@ -248,40 +142,40 @@ struct Writer<'a> {
     progress: &'a mut dyn FnMut(&Progress),
 }
 
-impl Writer<'_> {
+impl<W: Write> Listing<'_, W> {
     /// Writes the entries of the directory at `path` inside the volume,
-    /// whose name in the manifest is `prefix` (empty for the root), sorted
-    /// by the bytes of their names, each directory followed by what is
-    /// below it.
-    fn directory(&mut self, path: &str, prefix: &str) -> Result<()> {
+    /// whose name in the manifest is `prefix` (the root's for the root),
+    /// sorted by the bytes of their names, each directory followed by what
+    /// is below it.
+    fn directory(&mut self, path: &str, prefix: &Name) -> Result<()> {
         let mut entries = self.volume.read_dir(path)?;
         entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
         for md in &entries {
-            let name = if prefix.is_empty() {
+            let name = if prefix.is_root() {
                 md.name.clone()
             } else {
                 format!("{}/{}", prefix, md.name)
             };
-            let path = format!("/{}", name);
-            if !valid_name(&name) || path.len() > crate::path::MAX_PATH {
-                if !reserved(&name) {
-                    self.report.omitted += 1;
-                }
+            let path = crate::path::join(path, &md.name);
+            // A name that is reserved for the manifest is left out and is
+            // no omission.
+            if Name::is_reserved(&name) {
                 continue;
             }
-            let mut o = Object::new();
-            o.insert("name", name.as_str());
-            // A regular file is what an object without a type is.
-            if md.is_dir {
-                o.insert("type", "dir");
-            }
-            if md.attributes & ATTR_READ_ONLY != 0 {
-                o.insert("readOnly", true);
-            }
-            if self.fields.mtime {
-                if let Some(nsec) = time_nsec(md.modified) {
-                    o.insert("mTimeNSec", nsec);
+            let name = match Name::new(name) {
+                Ok(name) if path.len() <= crate::path::MAX_PATH => name,
+                _ => {
+                    self.report.omitted += 1;
+                    continue;
                 }
+            };
+            // A regular file is what an object without a type is.
+            let mut object = FileObject::new(name);
+            if md.attributes & ATTR_READ_ONLY != 0 {
+                object.read_only = Some(true);
+            }
+            if self.fields.contains(Fields::MTIME) {
+                object.set_mtime(md.modified);
             }
             if md.is_dir {
                 if !self.seen.insert(md.first_cluster) {
@@ -297,18 +191,19 @@ impl Writer<'_> {
                         path
                     );
                 }
-                write_record(self.out, o)?;
+                object.inode_type = InodeType::Directory;
+                self.writer.file(&object)?;
                 self.report.directories += 1;
                 (self.progress)(&self.report.progress());
-                self.directory(&path, &name)?;
+                self.directory(&path, &object.name)?;
             } else {
-                if self.fields.size {
-                    o.insert("size", md.size);
+                if self.fields.contains(Fields::SIZE) {
+                    object.size = Some(md.size);
                 }
-                if self.fields.hash {
-                    o.insert("sha256", sha256::to_hex(&self.hash(&path)?));
+                if self.fields.contains(Fields::HASH) {
+                    object.sha256 = Some(self.hash(&path)?);
                 }
-                write_record(self.out, o)?;
+                self.writer.file(&object)?;
                 self.report.files += 1;
                 self.report.bytes += md.size;
                 (self.progress)(&self.report.progress());
@@ -318,14 +213,14 @@ impl Writer<'_> {
     }
 
     /// The SHA-256 of the file at `path`, read from the volume.
-    fn hash(&mut self, path: &str) -> Result<[u8; DIGEST_SIZE]> {
+    fn hash(&mut self, path: &str) -> Result<Sha256> {
         let mut file = self.volume.begin_read(path)?;
-        let mut hasher = Sha256::new();
+        let mut hasher = sha256::Sha256::new();
         let mut done = self.report.progress();
         loop {
             let n = self.volume.read_file_data(&mut file, &mut self.buf)?;
             if n == 0 {
-                return Ok(hasher.finalize());
+                return Ok(Sha256::from(hasher.finalize()));
             }
             hasher.update(&self.buf[..n]);
             done.bytes += n as u64;
@@ -337,9 +232,10 @@ impl Writer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{self, Entry, InodeType, Manifest, RECORD_SEPARATOR};
+    use crate::manifest::{self, Entry, HostTree, InodeType, Manifest, RECORD_SEPARATOR};
     use crate::populate::CopyOptions;
     use crate::test_util::{volume, TempDir, TempImage};
+    use json::Object;
     use std::os::fd::AsFd;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -429,7 +325,7 @@ mod tests {
 
     fn written(v: &Volume, root_time: Option<SystemTime>, fields: Fields) -> (Vec<u8>, WriteReport) {
         let mut out = Vec::new();
-        let report = write(v, root_time, fields, &mut out).unwrap();
+        let report = v.write_manifest(root_time, fields, &mut out).unwrap();
         (out, report)
     }
 
@@ -566,7 +462,7 @@ mod tests {
         let (_img, v) = populated();
         // Nothing but names and the types of directories, and the attribute
         // no field governs.
-        let (bytes, report) = written(&v, Some(t(1_600_000_000)), Fields::none());
+        let (bytes, report) = written(&v, Some(t(1_600_000_000)), Fields::NONE);
         assert_eq!((report.files, report.directories, report.bytes), (5, 4, 5024));
         let recs = records(&bytes);
         assert_eq!(recs[0].0, r#"{"mediaType":"application/vnd.uapi.16.manifest"}"#);
@@ -603,10 +499,7 @@ mod tests {
 
         // Times: the stored ones, which FAT keeps at 2 s, and the root's
         // only when the caller has one.
-        let fields = Fields {
-            mtime: true,
-            ..Fields::none()
-        };
+        let fields = Fields::MTIME;
         let (bytes, _) = written(&v, None, fields);
         let m = manifest::parse(&bytes).unwrap();
         assert_eq!(m.root.mtime_nsec, None);
@@ -634,90 +527,6 @@ mod tests {
     }
 
     #[test]
-    fn fields_from_names() {
-        let all = [
-            "mode",
-            "uid",
-            "gid",
-            "size",
-            "hash",
-            "symlink",
-            "device",
-            "hardlink",
-            "mtime",
-            "userXattr",
-            "userName",
-            "groupName",
-        ];
-        assert_eq!(
-            Fields::from_names(all).unwrap(),
-            Fields {
-                mode: true,
-                uid: true,
-                gid: true,
-                size: true,
-                hash: true,
-                symlink: true,
-                device: true,
-                hardlink: true,
-                mtime: true,
-                user_xattr: true,
-                user_name: true,
-                group_name: true,
-            }
-        );
-        assert_eq!(Fields::from_names(Vec::<&str>::new()).unwrap(), Fields::none());
-        // systemd's default set.
-        assert_eq!(
-            Fields::from_names([
-                "mode",
-                "uid",
-                "gid",
-                "size",
-                "hash",
-                "symlink",
-                "device",
-                "hardlink",
-                "userXattr"
-            ])
-            .unwrap(),
-            Fields::default()
-        );
-        assert_eq!(
-            Fields::from_names(["size", "hash", "mtime", "size"]).unwrap(),
-            Fields {
-                size: true,
-                hash: true,
-                mtime: true,
-                ..Fields::none()
-            }
-        );
-        for bad in [
-            &["sha256"][..],
-            &["size", "user_xattr"],
-            &["Mode"],
-            &[""],
-            &[
-                "mode",
-                "uid",
-                "gid",
-                "size",
-                "hash",
-                "symlink",
-                "device",
-                "hardlink",
-                "mtime",
-                "userXattr",
-                "userName",
-                "groupName",
-                "type",
-            ],
-        ] {
-            assert_eq!(Fields::from_names(bad.iter().copied()), None, "{:?}", bad);
-        }
-    }
-
-    #[test]
     fn agrees_with_the_host_tree_generator() {
         let tree = host_tree();
         let dir = crate::host::open_dir(tree.path()).unwrap();
@@ -727,7 +536,8 @@ mod tests {
         // The generator writes the fields size, hash and mtime. With the
         // tree's own time for the root and times FAT keeps as they are, the
         // two manifests are the same bytes.
-        let host = manifest::generate(dir.as_fd()).unwrap();
+        let mut host = Vec::new();
+        HostTree::new(dir.as_fd()).write_manifest(&mut host).unwrap();
         let root_time = std::fs::metadata(tree.path()).unwrap().modified().unwrap();
         let fields = Fields::from_names(["size", "hash", "mtime"]).unwrap();
         let (bytes, report) = written(&v, Some(root_time), fields);
@@ -819,7 +629,7 @@ mod tests {
         drop(dev);
         let v = Volume::open(img.device()).unwrap();
         let mut out = Vec::new();
-        let e = write(&v, None, Fields::none(), &mut out).unwrap_err();
+        let e = v.write_manifest(None, Fields::NONE, &mut out).unwrap_err();
         assert_eq!(e.errno(), EUCLEAN);
         assert!(
             matches!(

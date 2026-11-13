@@ -14,7 +14,7 @@ use fat::format::{self, FormatOptions, VolumeId};
 use fat::fsck;
 use fat::host;
 use fat::layout::MIN_SECTOR_SIZE;
-use fat::manifest::{self, AssembleOptions, DirectorySource, StreamSource};
+use fat::manifest::{self, AssembleOptions, DirectorySource, Fields, HostTree, StreamSource};
 use fat::plan::{Plan, PlanOptions};
 use fat::populate::{CopyOptions, TimePolicy};
 use fat::probe::Prober;
@@ -631,15 +631,15 @@ fn manifest_to_stdout(args: &Args) -> bool {
 /// Writes the UAPI.16 manifest of everything `v` holds to the file `path`,
 /// or to standard output for "-", for `--write-manifest`.
 fn write_manifest(v: &Volume, path: &Path) -> Result<()> {
-    let fields = manifest::volume::Fields::default();
+    let fields = Fields::default();
     let (report, shown) = if path == Path::new("-") {
         let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-        let report = manifest::volume::write(v, v.root_time()?, fields, &mut out)?;
+        let report = v.write_manifest(v.root_time()?, fields, &mut out)?;
         (report, "the manifest on standard output".to_string())
     } else {
         let file = std::fs::File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
         let mut out = std::io::BufWriter::new(file);
-        let report = manifest::volume::write(v, v.root_time()?, fields, &mut out)?;
+        let report = v.write_manifest(v.root_time()?, fields, &mut out)?;
         (report, path.display().to_string())
     };
     match report.omitted {
@@ -1197,7 +1197,9 @@ fn cmd_manifest(argv: &[OsString]) -> Result<()> {
         bail!(errno::EINVAL, "manifest takes exactly one DIR");
     };
     let dir = host::open_dir(Path::new(dir))?;
-    let bytes = manifest::generate(dir.as_fd())?;
+    // Nothing is printed of a tree that cannot be listed to its end.
+    let mut bytes = Vec::new();
+    HostTree::new(dir.as_fd()).write_manifest(&mut bytes)?;
     std::io::stdout().write_all(&bytes)?;
     Ok(())
 }
