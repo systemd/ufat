@@ -19,8 +19,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, UNIX_EPOCH};
 
 use common::{build_tree, find_program, first_difference, ufat, Temp};
-use ufat::device::{Access, Device};
-use ufat::volume::Volume;
+use fat::device::{Access, Device};
+use fat::volume::Volume;
 use varlink::{Client, Object, Response, Stream, Value};
 
 const INTERFACE: &str = include_str!("../docs/org.uapi-group.FileSystem.varlink");
@@ -382,8 +382,8 @@ fn esp_tree() -> Temp {
 /// A manifest of the tree and the contents of its streamed files in
 /// manifest order.
 fn manifest_and_blob(tree: &Path) -> (Vec<u8>, Vec<u8>) {
-    let bytes = ufat::manifest::generate(ufat::host::open_dir(tree).unwrap().as_fd()).unwrap();
-    let m = ufat::manifest::parse(&bytes).unwrap();
+    let bytes = fat::manifest::generate(fat::host::open_dir(tree).unwrap().as_fd()).unwrap();
+    let m = fat::manifest::parse(&bytes).unwrap();
     let mut blob = Vec::new();
     for e in &m.entries {
         if e.is_streamed() {
@@ -401,11 +401,11 @@ fn file_with(dir: &Path, name: &str, data: &[u8]) -> File {
 }
 
 fn sha256_hex(data: &[u8]) -> String {
-    ufat::sha256::to_hex(&ufat::sha256::digest(data))
+    fat::sha256::to_hex(&fat::sha256::digest(data))
 }
 
 fn sha512_hex(data: &[u8]) -> String {
-    ufat::sha512::to_hex(&ufat::sha512::digest(data))
+    fat::sha512::to_hex(&fat::sha512::digest(data))
 }
 
 /// Names the entries a listing with the more flag returned, one per reply.
@@ -423,8 +423,8 @@ fn volume(image: &Path, access: Access) -> Volume {
 /// directory gets a modification time with hour 31 and a date with month
 /// 0, two findings each for a check. Returns how many entries were hit.
 fn damage_root_entries(image: &Path) -> usize {
-    use ufat::dirent::{self, ATTR_ARCHIVE, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_END};
-    use ufat::time::FatTimestamp;
+    use fat::dirent::{self, ATTR_ARCHIVE, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_END};
+    use fat::time::FatTimestamp;
 
     // Hour 31, the most the field holds, and month 0, which no time and no
     // date have.
@@ -434,7 +434,7 @@ fn damage_root_entries(image: &Path) -> usize {
     let f = rw(image);
     let mut sector = [0u8; 512];
     f.read_exact_at(&mut sector, 0).unwrap();
-    let boot = ufat::boot::BootSector::parse(&sector).unwrap();
+    let boot = fat::boot::BootSector::parse(&sector).unwrap();
     let layout = boot.layout().unwrap();
     let mut cluster = boot.root_cluster;
     let mut buf = vec![0u8; layout.cluster_size() as usize];
@@ -455,10 +455,10 @@ fn damage_root_entries(image: &Path) -> usize {
             }
         }
         f.write_all_at(&buf, offset).unwrap();
-        let mut entry = [0u8; ufat::fat::ENTRY_SIZE];
+        let mut entry = [0u8; fat::fat::ENTRY_SIZE];
         f.read_exact_at(
             &mut entry,
-            layout.fat_offset(0) + (u64::from(cluster) * ufat::fat::ENTRY_SIZE as u64),
+            layout.fat_offset(0) + (u64::from(cluster) * fat::fat::ENTRY_SIZE as u64),
         )
         .unwrap();
         let next = u32::from_le_bytes(entry) & 0x0FFF_FFFF;
@@ -562,11 +562,9 @@ fn capabilities_describe_vfat() {
     assert_eq!(str_of(caps, "sizeToFit"), "exact");
     // The smallest volume: 65525 clusters of one 512 byte sector, two
     // FATs of 512 sectors and 32 reserved sectors.
-    let mut params = ufat::layout::LayoutParams::new(512);
+    let mut params = fat::layout::LayoutParams::new(512);
     params.sectors_per_cluster = Some(1);
-    let minimal = ufat::layout::minimal(&params, ufat::layout::MIN_CLUSTERS)
-        .unwrap()
-        .size();
+    let minimal = fat::layout::minimal(&params, fat::layout::MIN_CLUSTERS).unwrap().size();
     assert_eq!(u64_of(caps, "minimalSizeBytes"), minimal);
     assert_eq!(u64_of(caps, "minimalSizeBytes"), (32 + 2 * 512 + 65525) * 512);
     assert_eq!(u64_of(caps, "maximalSizeBytes"), 0xFFFF_FFFF * 512);
@@ -674,7 +672,7 @@ fn methods_on_an_image_take_the_file_system_type() {
     // An image that holds no FAT32 file system fails with vfat given as it
     // does without a type.
     let mut bytes = vec![0x55u8; 1 << 20];
-    bytes[ufat::boot::field::BYTES_PER_SECTOR].copy_from_slice(&common::SECTOR_SIZE.to_le_bytes());
+    bytes[fat::boot::field::BYTES_PER_SECTOR].copy_from_slice(&common::SECTOR_SIZE.to_le_bytes());
     let path = scratch.path().join("other");
     std::fs::write(&path, &bytes).unwrap();
     let other = rw(&path);
@@ -967,7 +965,7 @@ fn assemble_refuses_what_is_there_without_force() {
     let Some(ufat) = ufat() else {
         return eprintln!("skipping: no ufat binary");
     };
-    let blkid = ufat::probe::Prober::new().has_libblkid();
+    let blkid = fat::probe::Prober::new().has_libblkid();
     let tree = esp_tree();
     let mut c = connect_fd3(&ufat);
     let image = Temp::image(100 << 20);
@@ -1240,18 +1238,18 @@ fn assemble_with_a_manifest_and_a_stream() {
     drop(reader);
     // The content is small, so the image got the FAT32 minimum of 65525
     // clusters, which EDK2 boots from: it is clean and holds the data.
-    let report = ufat::fsck::check(&Device::open(image.path(), Access::ReadOnly).unwrap()).unwrap();
+    let report = fat::fsck::check(&Device::open(image.path(), Access::ReadOnly).unwrap()).unwrap();
     assert_eq!(report.errors(), 0, "{:?}", report.problems);
     assert!(
         !report
             .problems
             .iter()
-            .any(|p| p.kind == ufat::fsck::ProblemKind::BelowMinimumClusters),
+            .any(|p| p.kind == fat::fsck::ProblemKind::BelowMinimumClusters),
         "{:?}",
         report.problems
     );
     let v = volume(image.path(), Access::ReadOnly);
-    assert!(v.layout().clusters >= ufat::layout::MIN_CLUSTERS);
+    assert!(v.layout().clusters >= fat::layout::MIN_CLUSTERS);
     let mut data = Vec::new();
     v.open_file("/EFI/Linux/linux-6.12.efi")
         .unwrap()
@@ -1280,7 +1278,7 @@ fn assemble_with_a_manifest_and_a_stream() {
     assert_eq!(str_of(&e.parameters, "name"), "EFI/BOOT/BOOTX64.EFI");
     // So is a stream that goes on after the last file: that file got more
     // than the manifest says, by how much is not known.
-    let last = ufat::manifest::parse(&manifest)
+    let last = fat::manifest::parse(&manifest)
         .unwrap()
         .entries
         .into_iter()
@@ -1472,7 +1470,7 @@ fn assemble_writes_a_manifest() {
     assert_eq!(u64_of(&r, "files"), 2);
     assert_eq!(u64_of(&r, "omitted"), 0);
     drop(out_file);
-    let m = ufat::manifest::parse(&std::fs::read(&out).unwrap()).unwrap();
+    let m = fat::manifest::parse(&std::fs::read(&out).unwrap()).unwrap();
     let mut listed: Vec<&str> = m.entries.iter().map(|e| e.name.as_deref().unwrap()).collect();
     listed.sort_unstable();
     assert_eq!(
@@ -1487,10 +1485,10 @@ fn assemble_writes_a_manifest() {
     );
     assert_eq!(m.root.mtime_nsec, Some(T0 * 1000));
     for e in &m.entries {
-        if e.inode_type == ufat::manifest::InodeType::Regular {
+        if e.inode_type == fat::manifest::InodeType::Regular {
             let data = std::fs::read(tree.path().join(e.name.as_deref().unwrap())).unwrap();
             assert_eq!(e.size, Some(data.len() as u64));
-            assert_eq!(e.sha256, Some(ufat::sha256::digest(&data)), "{:?}", e.name);
+            assert_eq!(e.sha256, Some(fat::sha256::digest(&data)), "{:?}", e.name);
             assert!(e.mtime_nsec.is_some());
         }
     }
@@ -1689,7 +1687,7 @@ fn describe_with_and_without_a_manifest() {
     assert_eq!(u64_of(last, "bytes"), 5010);
     assert_eq!(u64_of(last, "omitted"), 0);
     drop(out_file);
-    let m = ufat::manifest::parse(&std::fs::read(&out).unwrap()).unwrap();
+    let m = fat::manifest::parse(&std::fs::read(&out).unwrap()).unwrap();
     assert_eq!(m.entries.len(), 5);
     assert!(m.root.mtime_nsec.is_none());
     assert!(m.entries.iter().all(|e| e.mtime_nsec.is_none()));
@@ -1698,7 +1696,7 @@ fn describe_with_and_without_a_manifest() {
         .iter()
         .find(|e| e.name.as_deref() == Some("loader/loader.conf"))
         .unwrap();
-    assert_eq!(conf.sha256, Some(ufat::sha256::digest(b"timeout 5\n")));
+    assert_eq!(conf.sha256, Some(fat::sha256::digest(b"timeout 5\n")));
     // Images that hold no FAT32 volume say why.
     let blank = Temp::image(40 << 20);
     let blank_ro = ro(blank.path());
@@ -1714,14 +1712,14 @@ fn describe_with_and_without_a_manifest() {
     assert_eq!(e.name, format!("{}.NotFileSystem", IFACE));
     assert_eq!(str_of(&e.parameters, "reason"), "unknown");
     assert!(e.parameters.get("sectorSize").is_none());
-    bytes[ufat::boot::field::BYTES_PER_SECTOR].copy_from_slice(&common::SECTOR_SIZE.to_le_bytes());
+    bytes[fat::boot::field::BYTES_PER_SECTOR].copy_from_slice(&common::SECTOR_SIZE.to_le_bytes());
     let other = file_with(scratch.path(), "other", &bytes);
     let e = error_of(&mut c, "Describe", IMG, &[other.as_fd()]);
     assert_eq!(e.name, format!("{}.NotFileSystem", IFACE));
     assert_eq!(str_of(&e.parameters, "reason"), "unknown");
     // An ext2 superblock behind a first sector of zeros is not blank, and
     // libblkid names it.
-    let blkid = ufat::probe::Prober::new().has_libblkid();
+    let blkid = fat::probe::Prober::new().has_libblkid();
     let mut bytes = vec![0u8; 1 << 20];
     bytes[common::EXT2_MAGIC_FIELD].copy_from_slice(&common::EXT2_SUPER_MAGIC.to_le_bytes());
     let ext2 = file_with(scratch.path(), "ext2", &bytes);
@@ -1752,10 +1750,10 @@ fn describe_with_and_without_a_manifest() {
     }
     // A FAT boot sector with a sector size ufat does not support.
     let mut bytes = vec![0u8; 1 << 20];
-    bytes[ufat::boot::field::JUMP].copy_from_slice(&ufat::boot::BOOT_JUMP);
-    bytes[ufat::boot::field::BYTES_PER_SECTOR].copy_from_slice(&common::ODD_SECTOR_SIZE.to_le_bytes());
-    bytes[ufat::boot::field::FATS] = ufat::layout::DEFAULT_FATS as u8;
-    bytes[ufat::boot::field::MEDIA] = ufat::boot::MEDIA_FIXED;
+    bytes[fat::boot::field::JUMP].copy_from_slice(&fat::boot::BOOT_JUMP);
+    bytes[fat::boot::field::BYTES_PER_SECTOR].copy_from_slice(&common::ODD_SECTOR_SIZE.to_le_bytes());
+    bytes[fat::boot::field::FATS] = fat::layout::DEFAULT_FATS as u8;
+    bytes[fat::boot::field::MEDIA] = fat::boot::MEDIA_FIXED;
     let odd = file_with(scratch.path(), "odd", &bytes);
     let e = error_of(&mut c, "Describe", IMG, &[odd.as_fd()]);
     assert_eq!(e.name, format!("{}.NotFileSystem", IFACE));
@@ -1896,7 +1894,7 @@ fn populate_puts_content_into_a_volume() {
     assert_eq!(u64_of(r, "files"), 2);
     assert_eq!(u64_of(r, "omitted"), 0);
     drop(out_file);
-    let m = ufat::manifest::parse(&std::fs::read(&out).unwrap()).unwrap();
+    let m = fat::manifest::parse(&std::fs::read(&out).unwrap()).unwrap();
     assert!(m
         .entries
         .iter()
@@ -2085,7 +2083,7 @@ fn list_streams_entries() {
     ));
     {
         let mut v = volume(image.path(), Access::ReadWrite);
-        v.set_attributes("/loader/loader.conf", ufat::dirent::ATTR_READ_ONLY)
+        v.set_attributes("/loader/loader.conf", fat::dirent::ATTR_READ_ONLY)
             .unwrap();
         v.close().unwrap();
     }
@@ -2274,7 +2272,7 @@ fn passed_descriptors_are_vetted() {
     let m = bad_fd(&mut c, "Assemble", IMG, &[wronly.as_fd()], "image");
     assert_eq!(m, "writeOnly");
     // O_PATH cannot be read or written and is refused everywhere.
-    let pinned = ufat::host::open_dir(tree.path()).unwrap();
+    let pinned = fat::host::open_dir(tree.path()).unwrap();
     let m = bad_fd(&mut c, "Describe", IMG, &[pinned.as_fd()], "image");
     assert_eq!(m, "oPath");
     reply(call(&mut c, "Assemble", IMG, &[img.as_fd()]));

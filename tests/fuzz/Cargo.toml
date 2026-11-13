@@ -15,7 +15,7 @@ name = "fuzz-seeds"
 path = "seeds.rs"
 
 [dependencies]
-ufat.workspace = true
+fat.workspace = true
 
 [lints]
 workspace = true

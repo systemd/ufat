@@ -10,10 +10,10 @@
 //! The generators follow ALICE: every prefix of the trace (model A), every
 //! prefix with its last write torn at a sector boundary (model B), and
 //! within one fsync epoch every pair dropped and every subset (model C).
-//! Runs with `cargo test` against the library of the ufat-trace package,
+//! Runs with `cargo test` against the library of the fat-trace package,
 //! which is built with `--cfg ufat_trace`.
 
-extern crate ufat_trace as ufat;
+extern crate fat_trace as fat;
 
 #[path = "../common/mod.rs"]
 mod common;
@@ -30,17 +30,17 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::Temp;
-use ufat::boot::BootSector;
-use ufat::device::{Access, Device};
-use ufat::dirent::{self, short_name_checksum, RawDirEntry, ATTR_ARCHIVE, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_END};
-use ufat::fat::{Entry, Fat, BAD_CLUSTER, END_OF_CHAIN_MIN, ENTRY_MASK, ENTRY_SIZE, FREE};
-use ufat::format::{self, FormatOptions};
-use ufat::fsck::{self, ProblemKind, Severity};
-use ufat::layout::{Layout, FIRST_CLUSTER};
-use ufat::name::{join_long_name, parse_long_name_entry, short_name_to_string, LongNameEntry};
-use ufat::sha256;
-use ufat::time::FatTimestamp;
-use ufat::volume::Volume;
+use fat::boot::BootSector;
+use fat::device::{Access, Device};
+use fat::dirent::{self, short_name_checksum, RawDirEntry, ATTR_ARCHIVE, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_END};
+use fat::fat::{Entry, Fat, BAD_CLUSTER, END_OF_CHAIN_MIN, ENTRY_MASK, ENTRY_SIZE, FREE};
+use fat::format::{self, FormatOptions};
+use fat::fsck::{self, ProblemKind, Severity};
+use fat::layout::{Layout, FIRST_CLUSTER};
+use fat::name::{join_long_name, parse_long_name_entry, short_name_to_string, LongNameEntry};
+use fat::sha256;
+use fat::time::FatTimestamp;
+use fat::volume::Volume;
 
 /// Subsets enumerated per epoch before the generator samples instead.
 /// UFAT_CRASH_FULL=1 lifts the cap.
@@ -328,7 +328,7 @@ fn read_tree(v: &Volume) -> Result<(Tree, BTreeMap<String, String>), String> {
             } else {
                 let mut data = Vec::new();
                 v.open_file(&path)
-                    .and_then(|mut f| f.read_to_end(&mut data).map_err(ufat::Error::from))
+                    .and_then(|mut f| f.read_to_end(&mut data).map_err(fat::Error::from))
                     .map_err(|e| format!("{}: {}", path, e))?;
                 if data.len() as u64 != md.size {
                     return Err(format!("{}: {} bytes read, {} in the entry", path, data.len(), md.size));
@@ -1382,7 +1382,7 @@ impl<'a> Worker<'a> {
             // Every listed entry stands for an expected path: under its own
             // name, or under its alias when a torn write left a short entry
             // without its long name slots.
-            let mut seen: BTreeMap<String, Vec<&ufat::volume::Metadata>> = BTreeMap::new();
+            let mut seen: BTreeMap<String, Vec<&fat::volume::Metadata>> = BTreeMap::new();
             for md in &listing {
                 let listed = join(dir, &md.name);
                 let path = if expected.contains(&listed) {
@@ -1436,7 +1436,7 @@ impl<'a> Worker<'a> {
                     let mut data = Vec::new();
                     match v
                         .open_file(&join(dir, &md.name))
-                        .and_then(|mut f| f.read_to_end(&mut data).map_err(ufat::Error::from))
+                        .and_then(|mut f| f.read_to_end(&mut data).map_err(fat::Error::from))
                     {
                         Ok(_) => complain(
                             &mut bad,

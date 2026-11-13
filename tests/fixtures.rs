@@ -11,15 +11,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::Temp;
-use ufat::device::{Access, Device};
-use ufat::dirent::ATTR_READ_ONLY;
-use ufat::errno::{EINVAL, EOPNOTSUPP};
-use ufat::format::{self, FormatOptions};
-use ufat::host;
-use ufat::manifest::volume::Fields;
-use ufat::manifest::{self, AssembleOptions, DirectorySource, InodeType, Manifest, StreamSource};
-use ufat::plan::{Plan, PlanOptions};
-use ufat::volume::Volume;
+use fat::device::{Access, Device};
+use fat::dirent::ATTR_READ_ONLY;
+use fat::errno::{EINVAL, EOPNOTSUPP};
+use fat::format::{self, FormatOptions};
+use fat::host;
+use fat::manifest::volume::Fields;
+use fat::manifest::{self, AssembleOptions, DirectorySource, InodeType, Manifest, StreamSource};
+use fat::plan::{Plan, PlanOptions};
+use fat::volume::Volume;
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -106,7 +106,7 @@ fn check_against_tree(m: &Manifest, v: &Volume, tree: &Path) {
 }
 
 fn clean(img: &Temp) {
-    let r = ufat::fsck::check(&Device::open(img.path(), Access::ReadOnly).unwrap()).unwrap();
+    let r = fat::fsck::check(&Device::open(img.path(), Access::ReadOnly).unwrap()).unwrap();
     assert_eq!(r.errors(), 0, "{:?}", r.problems);
     assert_eq!(r.lost_clusters, 0);
 }

@@ -75,6 +75,26 @@ name = "dlopen-note"
 version = "0.1.0"
 
 [[package]]
+name = "fat"
+version = "0.1.0"
+dependencies = [
+ "blkid",
+ "json",
+ "libc",
+ "sha2",
+]
+
+[[package]]
+name = "fat-trace"
+version = "0.1.0"
+dependencies = [
+ "blkid",
+ "json",
+ "libc",
+ "sha2",
+]
+
+[[package]]
 name = "fold-table"
 version = "0.1.0"
 
@@ -82,7 +102,7 @@ version = "0.1.0"
 name = "fuzz-seeds"
 version = "0.1.0"
 dependencies = [
- "ufat",
+ "fat",
 ]
 
 [[package]]
@@ -131,22 +151,11 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 name = "ufat"
 version = "0.1.0"
 dependencies = [
- "blkid",
+ "fat",
  "json",
  "lexopt",
  "libc",
- "sha2",
  "varlink",
-]
-
-[[package]]
-name = "ufat-trace"
-version = "0.1.0"
-dependencies = [
- "blkid",
- "json",
- "libc",
- "sha2",
 ]
 
 [[package]]

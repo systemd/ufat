@@ -20,24 +20,24 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
+use fat::device::{Access, Device};
+use fat::dirent::{ATTR_ARCHIVE, ATTR_HIDDEN, ATTR_READ_ONLY, ATTR_SYSTEM};
+use fat::errno;
+use fat::format::{self, FormatOptions, VolumeId};
+use fat::fsck::{self, Problem};
+use fat::host;
+use fat::layout::{self, LayoutParams, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE, MIN_CLUSTERS, MIN_SECTOR_SIZE};
+use fat::manifest::volume::{Fields, WriteReport};
+use fat::manifest::{AssembleOptions, AssembleReport, DirectorySource, Manifest, StreamSource};
+use fat::plan::{Plan, PlanOptions};
+use fat::populate::{CopyOptions, CopyReport, TimePolicy};
+use fat::probe::Prober;
+use fat::progress::Progress;
+use fat::sha256::Sha256;
+use fat::sha512::Sha512;
+use fat::volume::{Metadata, Volume};
+use fat::{CorruptPlace, Detail, NoSpaceReason, NotFat32Reason, UnsupportedKind};
 use json::{Object, Value};
-use ufat::device::{Access, Device};
-use ufat::dirent::{ATTR_ARCHIVE, ATTR_HIDDEN, ATTR_READ_ONLY, ATTR_SYSTEM};
-use ufat::errno;
-use ufat::format::{self, FormatOptions, VolumeId};
-use ufat::fsck::{self, Problem};
-use ufat::host;
-use ufat::layout::{self, LayoutParams, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE, MIN_CLUSTERS, MIN_SECTOR_SIZE};
-use ufat::manifest::volume::{Fields, WriteReport};
-use ufat::manifest::{AssembleOptions, AssembleReport, DirectorySource, Manifest, StreamSource};
-use ufat::plan::{Plan, PlanOptions};
-use ufat::populate::{CopyOptions, CopyReport, TimePolicy};
-use ufat::probe::Prober;
-use ufat::progress::Progress;
-use ufat::sha256::Sha256;
-use ufat::sha512::Sha512;
-use ufat::volume::{Metadata, Volume};
-use ufat::{CorruptPlace, Detail, NoSpaceReason, NotFat32Reason, UnsupportedKind};
 use varlink::{Activation, Call, Connection, Info, Reply, Server, Service};
 
 use crate::util::{self, ImageFlags};
@@ -80,7 +80,7 @@ enum Failure {
     Invalid(String),
     /// A descriptor passed with the call is not usable as the parameter
     /// names it: `BadFileDescriptor`.
-    BadDescriptor { parameter: String, error: ufat::Error },
+    BadDescriptor { parameter: String, error: fat::Error },
     /// The image cannot hold what the content needs.
     TooSmall { minimal: u64, actual: u64 },
     /// What was asked for is not among the operations vfat offers.
@@ -97,18 +97,18 @@ enum Failure {
     ExpectedMore,
     /// Anything else, mapped by its detail, or by its errno when it has
     /// none.
-    Other(ufat::Error),
+    Other(fat::Error),
 }
 
-impl From<ufat::Error> for Failure {
-    fn from(e: ufat::Error) -> Failure {
+impl From<fat::Error> for Failure {
+    fn from(e: fat::Error) -> Failure {
         Failure::Other(e)
     }
 }
 
 impl From<std::io::Error> for Failure {
     fn from(e: std::io::Error) -> Failure {
-        Failure::Other(ufat::Error::from(e))
+        Failure::Other(fat::Error::from(e))
     }
 }
 
@@ -120,7 +120,7 @@ fn invalid(parameter: &str) -> Failure {
 
 /// Turns the vetting error of a passed descriptor into the interface's
 /// error for it, naming the parameter; anything else passes through.
-fn bad(parameter: &str) -> impl Fn(ufat::Error) -> Failure + '_ {
+fn bad(parameter: &str) -> impl Fn(fat::Error) -> Failure + '_ {
     move |e| {
         if e.errno() == errno::EBADFD {
             Failure::BadDescriptor {
@@ -190,7 +190,7 @@ fn not_file_system_reason(reason: NotFat32Reason) -> &'static str {
 
 /// Maps a library error to the interface's errors by its detail, falling
 /// back to the generic errno error systemd tools use when it has none.
-fn map_error(e: &ufat::Error) -> varlink::Error {
+fn map_error(e: &fat::Error) -> varlink::Error {
     let Some(detail) = e.detail() else {
         return varlink::Error::system(e.errno());
     };
@@ -420,7 +420,7 @@ impl Params<'_> {
     }
 
     fn time(&self, key: &str) -> Outcome<Option<SystemTime>> {
-        Ok(self.u64(key)?.map(ufat::time::from_usec))
+        Ok(self.u64(key)?.map(fat::time::from_usec))
     }
 }
 
@@ -665,7 +665,7 @@ fn stored_label(options: &FormatOptions) -> Outcome<Option<String>> {
         None => None,
         Some(l) => {
             let raw = format::encode_label(l)?;
-            if raw == ufat::boot::NO_NAME {
+            if raw == fat::boot::NO_NAME {
                 None
             } else {
                 Some(format::decode_label(&raw))
@@ -696,8 +696,8 @@ fn entry(m: &Metadata) -> Object {
         "name" => m.name.as_str(),
         "type" => if m.is_dir { "dir" } else { "reg" },
         "sizeBytes" => m.size,
-        "modifiedUSec" => ufat::time::to_usec(m.modified),
-        "createdUSec" => ufat::time::to_usec(m.created),
+        "modifiedUSec" => fat::time::to_usec(m.modified),
+        "createdUSec" => fat::time::to_usec(m.created),
         "alternateName" => m.short_name.as_str(),
     };
     let attributes: Vec<&str> = [
@@ -718,7 +718,7 @@ fn entry(m: &Metadata) -> Object {
 
 /// What this implementation does for vfat; nothing in it depends on a
 /// call.
-pub(crate) fn capabilities() -> ufat::Result<Object> {
+pub(crate) fn capabilities() -> fat::Result<Object> {
     // The smallest volume: MIN_CLUSTERS clusters of one 512 byte sector.
     let mut params = LayoutParams::new(MIN_SECTOR_SIZE);
     params.sectors_per_cluster = Some(1);
@@ -758,8 +758,8 @@ pub(crate) fn capabilities() -> ufat::Result<Object> {
         "preserves" => vec!["dosAttributes"],
         "times" => json::object! {
             "resolutionNSec" => 2_000_000_000u64,
-            "minUSec" => ufat::time::FAT_EPOCH as u64 * 1_000_000,
-            "maxUSec" => ufat::time::FAT_MAX as u64 * 1_000_000,
+            "minUSec" => fat::time::FAT_EPOCH as u64 * 1_000_000,
+            "maxUSec" => fat::time::FAT_MAX as u64 * 1_000_000,
             "created" => true,
             "accessed" => true,
             "changed" => false,
@@ -768,7 +768,7 @@ pub(crate) fn capabilities() -> ufat::Result<Object> {
         "caseSensitive" => false,
         "nameLengthMax" => 255,
         "nameUnit" => "utf16Units",
-        "fileSizeMaxBytes" => ufat::volume::MAX_FILE_SIZE,
+        "fileSizeMaxBytes" => fat::volume::MAX_FILE_SIZE,
     })
 }
 
@@ -790,7 +790,7 @@ impl Hash {
 
     /// Reads all of `device` back and returns the hash in lowercase hex,
     /// telling `progress` how many bytes it read so far after every read.
-    pub(crate) fn of(mut self, device: &Device, progress: &mut dyn FnMut(&Progress)) -> ufat::Result<String> {
+    pub(crate) fn of(mut self, device: &Device, progress: &mut dyn FnMut(&Progress)) -> fat::Result<String> {
         let mut buf = vec![0u8; HASH_STEP];
         let mut offset = 0;
         while offset < device.len() {
@@ -807,8 +807,8 @@ impl Hash {
             });
         }
         Ok(match self {
-            Hash::Sha256(h) => ufat::sha256::to_hex(&h.finalize()),
-            Hash::Sha512(h) => ufat::sha512::to_hex(&h.finalize()),
+            Hash::Sha256(h) => fat::sha256::to_hex(&h.finalize()),
+            Hash::Sha512(h) => fat::sha512::to_hex(&h.finalize()),
         })
     }
 }
@@ -834,7 +834,7 @@ impl Sink {
     /// what it covered so far.
     fn write(self, volume: &Volume, progress: &mut dyn FnMut(&Progress)) -> Outcome<WriteReport> {
         let mut out = BufWriter::new(self.file);
-        Ok(ufat::manifest::volume::write_with_progress(
+        Ok(fat::manifest::volume::write_with_progress(
             volume,
             volume.root_time()?,
             self.fields,
@@ -920,11 +920,11 @@ impl Counts {
 /// Refuses a tree whose copy would leave entries out, under
 /// UnsupportedPolicy fail: the first of them is named, as the inode type
 /// FAT has no notion of.
-fn refuse_skipped(skipped: &[PathBuf]) -> ufat::Result<()> {
+fn refuse_skipped(skipped: &[PathBuf]) -> fat::Result<()> {
     match skipped.first() {
         None => Ok(()),
         Some(path) => Err(
-            ufat::Error::new(errno::EINVAL, format!("{} cannot be stored on FAT", path.display())).with(
+            fat::Error::new(errno::EINVAL, format!("{} cannot be stored on FAT", path.display())).with(
                 Detail::Unsupported {
                     name: Some(path.display().to_string()),
                     what: UnsupportedKind::InodeType,
@@ -1054,7 +1054,7 @@ impl Content {
     /// Puts the content into `plan`, at the root. Under UnsupportedPolicy
     /// fail a tree with entries FAT cannot hold is refused here, before
     /// anything is written.
-    fn plan(&self, plan: &mut Plan) -> ufat::Result<()> {
+    fn plan(&self, plan: &mut Plan) -> fat::Result<()> {
         match &self.fill {
             Some(Fill::Tree(dir)) => {
                 let skipped = plan.add_tree(dir.as_fd(), "/", true)?;
@@ -1067,7 +1067,7 @@ impl Content {
             }
             Some(Fill::File(_)) | None => {
                 return Err(
-                    ufat::Error::new(errno::EINVAL, "the content is not a tree or a manifest")
+                    fat::Error::new(errno::EINVAL, "the content is not a tree or a manifest")
                         .with(Detail::InvalidOption("content")),
                 )
             }
@@ -1099,7 +1099,7 @@ impl Content {
             replace: self.replace,
             skip_unsupported: !self.fail_unsupported,
             now_usec: if self.check_validity {
-                Some(ufat::time::to_usec(util::now()))
+                Some(fat::time::to_usec(util::now()))
             } else {
                 None
             },
@@ -1136,7 +1136,7 @@ fn ensure_dir(v: &mut Volume, path: &str, parents: bool, time: SystemTime) -> Ou
     match v.metadata(path) {
         Ok(md) if md.is_dir => Ok(()),
         Ok(_) => Err(
-            ufat::Error::new(errno::ENOTDIR, format!("'{}' is not a directory", path))
+            fat::Error::new(errno::ENOTDIR, format!("'{}' is not a directory", path))
                 .with(Detail::Path(path.to_string()))
                 .into(),
         ),

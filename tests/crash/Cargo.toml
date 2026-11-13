@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 [package]
-name = "ufat-trace"
+name = "fat-trace"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

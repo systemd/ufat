@@ -158,7 +158,7 @@ local build.
 ## Crash consistency
 
 tests/crash/crash.rs records the writes of a test scenario. It uses a
-copy of the library built with `--cfg ufat_trace`, the ufat-trace
+copy of the library built with `--cfg ufat_trace`, the fat-trace
 package. It then builds every state a crash could leave on the device
 and checks each one with fsck and against the expected files. Three
 models of the device are checked:
@@ -170,8 +170,8 @@ models of the device are checked:
 The harness runs as part of `cargo test`. For its full output, run it
 on its own:
 
-    cargo test --locked -p ufat-trace -- --nocapture
-    UFAT_CRASH_FULL=1 cargo test --locked -p ufat-trace -- --nocapture
+    cargo test --locked -p fat-trace -- --nocapture
+    UFAT_CRASH_FULL=1 cargo test --locked -p fat-trace -- --nocapture
 
 `UFAT_CRASH_FULL=1` checks every subset of the writes between two
 flushes instead of a sample.

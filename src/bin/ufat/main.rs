@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! The ufat tool: a command line interface and a Varlink service over the
-//! ufat library.
+//! FAT library.
 //!
 //! Started with a socket passed through `LISTEN_FDS` (as `varlinkctl call
 //! exec:/path/to/ufat ...` and systemd socket units do) it serves the
@@ -17,7 +17,7 @@ mod util;
 fn main() -> ExitCode {
     // A tree walk holds one descriptor per level; the soft limit of 1024
     // is select()'s, and nothing here uses select().
-    let _ = ufat::host::raise_descriptor_limit();
+    let _ = fat::host::raise_descriptor_limit();
     match varlink::activation() {
         Ok(Some(activation)) => match service::run(activation) {
             Ok(()) => ExitCode::SUCCESS,
