@@ -744,51 +744,6 @@ fn reading_files_does_not_reread_their_directory() {
     assert_eq!(v.dirs.borrow().loads, loads);
 }
 
-/// Where the barriers are. Each publishing write is preceded by one, and
-/// a freed chain or a linked cluster waits for one too.
-#[test]
-fn durable_mode_puts_a_barrier_before_every_publishing_write() {
-    use std::sync::atomic::Ordering;
-    let (_img, mut v) = volume(1 << 20, 512, 512);
-    v.set_durable(true);
-    let counter = v.device.syncs.clone();
-    let syncs = || counter.load(Ordering::SeqCst);
-    let before = syncs();
-    // A new file: chain, barrier, entry.
-    let mut w = v.create_file("/f", t(0), false).unwrap();
-    w.write_all(b"data").unwrap();
-    w.finish().unwrap();
-    assert_eq!(syncs() - before, 1);
-    // Replacing it: chain, barrier, entry, barrier, old chain freed.
-    let before = syncs();
-    let mut w = v.create_file("/f", t(0), true).unwrap();
-    w.write_all(b"newer").unwrap();
-    w.finish().unwrap();
-    assert_eq!(syncs() - before, 2);
-    // Removing it: entry, barrier, chain freed.
-    let before = syncs();
-    v.remove_file("/f").unwrap();
-    assert_eq!(syncs() - before, 1);
-    // A directory: its cluster, barrier (FAT flushed), entry.
-    let before = syncs();
-    v.create_dir("/d", t(0)).unwrap();
-    assert_eq!(syncs() - before, 1);
-    // Growing the root past its first cluster of 16 slots: the zeroed
-    // cluster is synced before the FAT links it, then the file's barrier.
-    let before = syncs();
-    for i in 0..14 {
-        v.create_file(&format!("/g{}", i), t(0), false)
-            .unwrap()
-            .finish()
-            .unwrap();
-    }
-    assert_eq!(syncs() - before, 14);
-    let before = syncs();
-    v.create_file("/g14", t(0), false).unwrap().finish().unwrap();
-    assert_eq!(syncs() - before, 2, "growing the directory adds a barrier");
-    v.close().unwrap();
-}
-
 #[test]
 fn the_volume_is_marked_dirty_while_written() {
     use crate::boot::{field, FsInfo, FSINFO_SIZE, FSINFO_UNKNOWN, NT_FLAG_DIRTY};

@@ -6,69 +6,22 @@ use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+
+mod temp;
+// Not every test binary uses both.
+#[allow(unused_imports)]
+pub use temp::{serial, Temp};
 
 /// The sector size the tests write into boot sectors, the smallest one.
 pub const SECTOR_SIZE: u16 = fat::layout::MIN_SECTOR_SIZE as u16;
 /// A sector size no FAT file system has, as it is not a power of two.
 pub const ODD_SECTOR_SIZE: u16 = 1000;
 
-static COUNTER: AtomicUsize = AtomicUsize::new(0);
-static SERIAL: Mutex<()> = Mutex::new(());
-
 /// Where an ext2, ext3 or ext4 file system keeps its magic number: the
 /// s_magic field of the superblock, which starts 1024 bytes in.
 pub const EXT2_MAGIC_FIELD: Range<usize> = 1080..1082;
 /// The magic number of an ext2, ext3 or ext4 superblock.
 pub const EXT2_SUPER_MAGIC: u16 = 0xEF53;
-
-/// Runs the tests of a binary one at a time. A child process inherits every
-/// descriptor open at the moment it is forked, and with it the lock on an
-/// image some other test holds, until it execs; a test that opens images
-/// while another spawns programs would see a spurious EBUSY. Hold the guard
-/// for the whole test.
-pub fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// A temporary path, removed on drop (file or directory).
-pub struct Temp(pub PathBuf);
-
-impl Temp {
-    pub fn new(suffix: &str) -> Temp {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        Temp(std::env::temp_dir().join(format!("ufat-it-{}-{}{}", std::process::id(), n, suffix)))
-    }
-
-    /// A zero-filled image file of `size` bytes.
-    pub fn image(size: u64) -> Temp {
-        let t = Temp::new(".img");
-        std::fs::File::create(&t.0).unwrap().set_len(size).unwrap();
-        t
-    }
-
-    /// An empty directory.
-    pub fn dir() -> Temp {
-        let t = Temp::new(".d");
-        std::fs::create_dir_all(&t.0).unwrap();
-        t
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Temp {
-    fn drop(&mut self) {
-        if self.0.is_dir() {
-            let _ = std::fs::remove_dir_all(&self.0);
-        } else {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-}
 
 /// The ufat binary under test, which cargo builds for the integration
 /// tests of the ufat package. The crash harness lives in a package without

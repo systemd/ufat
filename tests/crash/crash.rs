@@ -11,7 +11,7 @@
 //! prefix with its last write torn at a sector boundary (model B), and
 //! within one fsync epoch every pair dropped and every subset (model C).
 //! Runs with `cargo test` against the library of the fat-trace package,
-//! which is built with `--cfg ufat_trace`.
+//! which sits on the shared crate built with `--cfg ufat_trace`.
 
 extern crate fat_trace as fat;
 
@@ -117,6 +117,8 @@ fn read_trace(path: &Path) -> Vec<Record> {
                 data: payload(&mut pos),
             },
             b'Z' => Record::Zero { offset, len },
+            // No scenario here grows or cuts the image.
+            b'L' => panic!("the image changed its length to {} bytes", offset),
             b'F' => Record::Barrier,
             b'S' => Record::Sync,
             b'N' => Record::Note(String::from_utf8_lossy(&payload(&mut pos)).into_owned()),
@@ -1658,6 +1660,72 @@ fn run(cfg: Config) {
         failures.len(),
         recipes.len()
     );
+}
+
+/// Where the barriers are. Each publishing write is preceded by one, and
+/// a freed chain or a linked cluster waits for one too.
+#[test]
+fn durable_mode_puts_a_barrier_before_every_publishing_write() {
+    let img = Temp::image(1 << 20);
+    let dev = Device::open(img.path(), Access::ReadWrite).unwrap();
+    // A cluster is a sector here, so the root directory has 16 slots,
+    // and the volume label takes one of them.
+    let options = FormatOptions {
+        sector_size: Some(512),
+        cluster_size: Some(512),
+        allow_small: true,
+        label: Some("ESP".into()),
+        timestamp: Some(fixed_time()),
+        ..FormatOptions::default()
+    };
+    format::format(&dev, &options).unwrap();
+    drop(dev);
+    let trace = Temp::new(".trace");
+    let mut dev = Device::open(img.path(), Access::ReadWrite).unwrap();
+    dev.trace_to(File::create(trace.path()).unwrap());
+    let mut v = Volume::open(dev).unwrap();
+    v.set_durable(true);
+    // The barriers the trace has so far.
+    let barriers = || {
+        read_trace(trace.path())
+            .iter()
+            .filter(|record| matches!(record, Record::Barrier))
+            .count()
+    };
+    let before = barriers();
+    // A new file: chain, barrier, entry.
+    let mut w = v.create_file("/f", fixed_time(), false).unwrap();
+    w.write_all(b"data").unwrap();
+    w.finish().unwrap();
+    assert_eq!(barriers() - before, 1);
+    // Replacing it: chain, barrier, entry, barrier, old chain freed.
+    let before = barriers();
+    let mut w = v.create_file("/f", fixed_time(), true).unwrap();
+    w.write_all(b"newer").unwrap();
+    w.finish().unwrap();
+    assert_eq!(barriers() - before, 2);
+    // Removing it: entry, barrier, chain freed.
+    let before = barriers();
+    v.remove_file("/f").unwrap();
+    assert_eq!(barriers() - before, 1);
+    // A directory: its cluster, barrier (FAT flushed), entry.
+    let before = barriers();
+    v.create_dir("/d", fixed_time()).unwrap();
+    assert_eq!(barriers() - before, 1);
+    // Growing the root past its first cluster of 16 slots: the zeroed
+    // cluster is synced before the FAT links it, then the file's barrier.
+    let before = barriers();
+    for i in 0..14 {
+        v.create_file(&format!("/g{}", i), fixed_time(), false)
+            .unwrap()
+            .finish()
+            .unwrap();
+    }
+    assert_eq!(barriers() - before, 14);
+    let before = barriers();
+    v.create_file("/g14", fixed_time(), false).unwrap().finish().unwrap();
+    assert_eq!(barriers() - before, 2, "growing the directory adds a barrier");
+    v.close().unwrap();
 }
 
 /// 512 byte sectors with two sectors per cluster: directory writes can

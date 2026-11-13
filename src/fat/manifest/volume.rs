@@ -27,6 +27,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::time::SystemTime;
 
+use shared::manifest::WriteReport;
 use uapi16::{Fields, FileObject, InodeType, Name, Sha256, Writer};
 
 use crate::dirent::ATTR_READ_ONLY;
@@ -35,34 +36,6 @@ use crate::progress::Progress;
 use crate::sha256;
 use crate::volume::Volume;
 use crate::{CorruptPlace, Detail, Result};
-
-/// What a written manifest covers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct WriteReport {
-    /// Regular files listed.
-    pub files: u64,
-    /// Directories listed, the root not counted.
-    pub directories: u64,
-    /// Bytes of the regular files listed.
-    pub bytes: u64,
-    /// What the volume holds that the manifest could not record: entries
-    /// whose names a manifest cannot carry, a directory with everything
-    /// below it counting once. A field FAT has no notion of is not an
-    /// omission. A manifest with omissions does not describe the whole
-    /// volume, which is what repart refuses.
-    pub omitted: u64,
-}
-
-impl WriteReport {
-    /// What the manifest covers so far, as a progress callback hears it.
-    fn progress(&self) -> Progress {
-        Progress {
-            files: self.files,
-            directories: self.directories,
-            bytes: self.bytes,
-        }
-    }
-}
 
 impl Volume {
     /// Writes the UAPI.16 manifest of everything the volume holds to `out`:

@@ -1,7 +1,7 @@
 # Hacking on ufat
 
-ufat is built with cargo. It depends on the libc, sha2 and lexopt
-crates. lexopt parses the command line of the tool.
+ufat and ucpio are built with cargo. They depend on the libc, sha2 and
+lexopt crates. lexopt parses the command lines of the tools.
 
 ufat does not link against libblkid. It loads libblkid.so.1 with
 dlopen() when it needs it. The workspace has a crate for each part of
@@ -30,10 +30,10 @@ that:
     cargo build --locked
     cargo build --release --locked
 
-`cargo build` builds the library and the tool `target/debug/ufat`.
-`--release` builds `target/release/ufat`. `cargo install --locked --path .`
-installs the tool into `~/.cargo/bin`. With `--root /usr/local` it goes
-into /usr/local/bin.
+`cargo build` builds the libraries and the tools `target/debug/ufat` and
+`target/debug/ucpio`. `--release` builds them below `target/release`.
+`cargo install --locked --path .` installs the tools into `~/.cargo/bin`.
+With `--root /usr/local` they go into /usr/local/bin.
 
 Cargo.lock is part of the tree. `--locked` makes cargo use the versions
 it lists.
@@ -48,10 +48,10 @@ With rustup, `cargo +1.85.0` selects rustc 1.85:
 
 `cargo test` runs:
 
-- the unit tests of the library and of the json, uapi16, varlink,
-  dlopen, dlopen-note and blkid crates,
+- the unit tests of the two libraries and of the json, shared, uapi16,
+  varlink, dlopen, dlopen-note and blkid crates,
 - the integration tests in tests/,
-- the crash consistency harness.
+- the crash consistency harnesses.
 
 The tests build with the dev profile, which is optimized and keeps the
 overflow checks and debug assertions. `--release` turns those off.
@@ -155,13 +155,35 @@ sha256sum. A test whose tool is not installed is skipped.
 `UFAT_MTOOLS=` points at a directory with mtools binaries, for example a
 local build.
 
+tests/cpio_reference.rs lets GNU cpio, bsdcpio and busybox read archives
+that ucpio wrote. It compares what they unpack with what a kernel
+unpacked, see the next section.
+
+## The cpio fixtures
+
+tests/fixtures/cpio holds archives and, for each of them, what a kernel
+unpacked it to. tests/cpio_kernel.rs compares that with what ucpio says
+the archive unpacks to. tests/cpio_made.rs checks that ucpio still writes
+the archives that were booted. The fixtures are made by booting them in
+qemu:
+
+    tests/fixtures/cpio/make-fixtures.py --kernel /boot/vmlinuz-...
+
+tests/fixtures/cpio/README.md describes the cases, the listings and what
+the script needs. Add a case there for every rule of the kernel that
+ucpio relies on.
+
+tests/cpio_tool.rs and tests/cpio_service.rs run the ucpio command line
+and the ucpio service. They compare what the tool writes with the same
+archives.
+
 ## Crash consistency
 
-tests/crash/crash.rs records the writes of a test scenario. It uses a
-copy of the library built with `--cfg ufat_trace`, the fat-trace
-package. It then builds every state a crash could leave on the device
-and checks each one with fsck and against the expected files. Three
-models of the device are checked:
+tests/crash/crash.rs records the writes of a test scenario. It uses the
+fat-trace package, a copy of the library on a copy of the shared crate
+built with `--cfg ufat_trace`. It then builds every state a crash could
+leave on the device and checks each one with fsck and against the
+expected files. Three models of the device are checked:
 
 - Every sector is written whole, and writes land in order.
 - A write of several sectors can stop at any sector boundary.
@@ -175,6 +197,13 @@ on its own:
 
 `UFAT_CRASH_FULL=1` checks every subset of the writes between two
 flushes instead of a sample.
+
+tests/crash/cpio/crash.rs does the same for cpio archives, with the
+cpio-trace package. While an archive is written, every state has to be
+what the image held, the archive, or an image whose first byte makes the
+kernel fail. While entries are added to an archive, every state has to
+be the archive as it was, the archive with everything that was added, or
+one of the two with a byte in it that makes every reader fail.
 
 ## Fuzzing
 
@@ -282,8 +311,9 @@ every push to main and once a week. It runs:
   adds, carries a `Signed-off-by:` line from its author. Merge commits
   are left out.
 
-The build jobs fail when mkfs.fat, fsck.fat, mtools or a varlinkctl with
-`--push-fd` is missing, instead of skipping the tests that need them.
+The build jobs fail when mkfs.fat, fsck.fat, mtools, GNU cpio, bsdcpio,
+busybox or a varlinkctl with `--push-fd` is missing, instead of skipping
+the tests that need them.
 
 Dependabot proposes updates of the actions and of the crates once a
 month. It keeps libc on 0.2. It updates sha2 and the crates it needs in

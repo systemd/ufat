@@ -1,0 +1,9 @@
+. d mode=1777 uid=0 gid=0 mtime=boot
+l d mode=0755 uid=0 gid=0 mtime=1577934245
+l/after-passed-a c mode=0600 uid=0 gid=0 mtime=1577934245 nlink=2 rdev=1:3
+l/after-passed-b c mode=0600 uid=0 gid=0 mtime=1577934245 nlink=2 link=l/after-passed-a rdev=1:3
+l/after-sym l uid=0 gid=0 mtime=1577934245 nlink=1 target=second
+l/full d mode=0755 uid=0 gid=0 mtime=1577934245
+l/full/child f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000063 head=63
+l/late d mode=0755 uid=0 gid=0 mtime=1577934245
+l/sym l uid=0 gid=0 mtime=1577934245 nlink=1 target=second

@@ -55,7 +55,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends dosfstools mtools
+          sudo apt-get install -y -q --no-install-recommends \
+            dosfstools mtools busybox-static cpio libarchive-tools
 
       - name: Install rustc ${{ matrix.rust }}
         env:
@@ -71,7 +72,8 @@ jobs:
         # The tests skip what they cannot find. Here they must not.
         run: |
           export PATH=$PATH:/usr/sbin:/sbin
-          for tool in mkfs.fat fsck.fat mcopy mdir mmd mtype sha256sum mkfifo varlinkctl; do
+          for tool in mkfs.fat fsck.fat mcopy mdir mmd mtype sha256sum mkfifo varlinkctl \
+                      cpio bsdcpio busybox; do
             command -v "$tool" || { echo "::error::$tool is missing"; exit 1; }
           done
           varlinkctl --help | grep -- --push-fd >/dev/null || { echo "::error::varlinkctl has no --push-fd"; exit 1; }
@@ -103,7 +105,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends dosfstools mtools
+          sudo apt-get install -y -q --no-install-recommends \
+            dosfstools mtools busybox-static cpio libarchive-tools
 
       - name: Install rustc ${{ matrix.rust }}
         env:
@@ -298,7 +301,7 @@ jobs:
           # shellcheck disable=SC2086
           sudo apt-get install -y -q --no-install-recommends \
             "gcc-$GCC" "libc6-dev-$LIBC-cross" "libc6-$LIBC-cross" $RUNTIME \
-            qemu-user qemu-user-binfmt dosfstools mtools
+            qemu-user qemu-user-binfmt dosfstools mtools busybox-static cpio libarchive-tools
 
       - name: Install rustc
         env:
@@ -388,7 +391,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends dosfstools mtools
+          sudo apt-get install -y -q --no-install-recommends \
+            dosfstools mtools busybox-static cpio libarchive-tools
 
       - name: Install rustc
         # llvm-tools matches the LLVM of rustc.

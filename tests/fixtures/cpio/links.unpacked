@@ -1,0 +1,45 @@
+. d mode=1777 uid=0 gid=0 mtime=boot
+l d mode=0755 uid=0 gid=0 mtime=1577934245
+l/attr-a f mode=0644 uid=2 gid=2 mtime=2000 nlink=2 size=4 sum=000001bb head=61747472
+l/attr-b f mode=0644 uid=2 gid=2 mtime=2000 nlink=2 link=l/attr-a size=4 sum=000001bb head=61747472
+l/both-a f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 size=6 sum=0000027c head=7365636f6e64
+l/both-b f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 link=l/both-a size=6 sum=0000027c head=7365636f6e64
+l/chr-a c mode=0600 uid=0 gid=0 mtime=1577934245 nlink=2 rdev=1:5
+l/chr-b c mode=0600 uid=0 gid=0 mtime=1577934245 nlink=2 link=l/chr-a rdev=1:5
+l/chr-other-a c mode=0600 uid=0 gid=0 mtime=1577934245 nlink=2 rdev=1:5
+l/chr-other-b c mode=0600 uid=0 gid=0 mtime=1577934245 nlink=2 link=l/chr-other-a rdev=1:5
+l/count-a f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 size=5 sum=00000229 head=636f756e74
+l/count-b f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 link=l/count-a size=5 sum=00000229 head=636f756e74
+l/dev-a f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 size=5 sum=000001c0 head=6465762061
+l/dev-a-2 f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 link=l/dev-a size=5 sum=000001c0 head=6465762061
+l/dev-b f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=5 sum=000001c1 head=6465762062
+l/dir-a d mode=0755 uid=0 gid=0 mtime=1577934245
+l/dir-b d mode=0755 uid=0 gid=0 mtime=1577934245
+l/fifo-a p mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2
+l/fifo-b p mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 link=l/fifo-a
+l/first-a f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 size=5 sum=00000228 head=6669727374
+l/first-b f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 link=l/first-a size=5 sum=00000228 head=6669727374
+l/first-c f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 link=l/first-a size=5 sum=00000228 head=6669727374
+l/last-a f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 size=4 sum=000001b4 head=6c617374
+l/last-b f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 link=l/last-a size=4 sum=000001b4 head=6c617374
+l/last-c f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 link=l/last-a size=4 sum=000001b4 head=6c617374
+l/mid-a f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 size=3 sum=0000013a head=6d6964
+l/mid-b f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 link=l/mid-a size=3 sum=0000013a head=6d6964
+l/mid-c f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 link=l/mid-a size=3 sum=0000013a head=6d6964
+l/mix-chr c mode=0600 uid=0 gid=0 mtime=1577934245 nlink=1 rdev=1:3
+l/mix-file f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 size=3 sum=0000014e head=6d6978
+l/mix-file-2 f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 link=l/mix-file size=3 sum=0000014e head=6d6978
+l/one-a f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=2 sum=00000092 head=3161
+l/one-b f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=2 sum=00000093 head=3162
+l/single f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=4 sum=000001bd head=736f6c6f
+l/sock-a s mode=0755 uid=0 gid=0 mtime=1577934245 nlink=2
+l/sock-b s mode=0755 uid=0 gid=0 mtime=1577934245 nlink=2 link=l/sock-a
+l/sym-a l uid=0 gid=0 mtime=1577934245 nlink=1 target=single
+l/sym-b l uid=0 gid=0 mtime=1577934245 nlink=1 target=single
+l/turned-1 d mode=0755 uid=0 gid=0 mtime=1577934245
+l/x d mode=0755 uid=0 gid=0 mtime=1577934245
+l/x/a f mode=0644 uid=2 gid=2 mtime=2000 nlink=2 size=6 sum=0000028b head=6163726f7373
+l/y d mode=0755 uid=0 gid=0 mtime=1577934245
+l/y/b f mode=0644 uid=2 gid=2 mtime=2000 nlink=2 link=l/x/a size=6 sum=0000028b head=6163726f7373
+l/zero-a f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 size=4 sum=000001c0 head=7a65726f
+l/zero-b f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 link=l/zero-a size=4 sum=000001c0 head=7a65726f

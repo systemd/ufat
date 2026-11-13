@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+[package]
+name = "cpio-trace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The cpio library again, on top of the shared crate with the write trace
+# of device.rs compiled in, see ../shared/. Only the crash consistency
+# harness uses it.
+[lib]
+path = "../../../src/cpio/lib.rs"
+test = false
+doctest = false
+doc = false
+
+[[test]]
+name = "cpio_crash"
+path = "crash.rs"
+
+[dependencies]
+shared = { package = "shared-trace", path = "../shared" }
+uapi16.workspace = true
+
+[lints]
+workspace = true

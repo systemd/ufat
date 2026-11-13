@@ -1,0 +1,14 @@
+. d mode=0775 uid=1000 gid=1000 mtime=1699999100
+Mixed\x20Case.TXT f mode=0664 uid=1000 gid=1000 mtime=1700000100 nlink=1 size=7 sum=00000286 head=7365636f6e640a
+a.txt f mode=0664 uid=1000 gid=1000 mtime=1700000100 nlink=1 size=6 sum=00000232 head=66697273740a
+empty f mode=0664 uid=1000 gid=1000 mtime=1700000102 nlink=1 size=0 sum=00000000
+empty\x20dir d mode=0775 uid=1000 gid=1000 mtime=1699999100
+link l uid=1000 gid=1000 mtime=1700000102 nlink=1 target=a.txt
+sub d mode=0775 uid=1000 gid=1000 mtime=1699999100
+sub/fifo p mode=0664 uid=1000 gid=1000 mtime=1700000102 nlink=1
+sub/hl_a f mode=0664 uid=1000 gid=1000 mtime=1700000102 nlink=2 size=11 sum=00000420 head=686172646c696e6b65640a
+sub/hl_b f mode=0664 uid=1000 gid=1000 mtime=1700000102 nlink=2 link=sub/hl_a size=11 sum=00000420 head=686172646c696e6b65640a
+sub/nested d mode=0775 uid=1000 gid=1000 mtime=1699999100
+sub/nested/deep.conf f mode=0664 uid=1000 gid=1000 mtime=1700000100 nlink=1 size=6 sum=00000225 head=74686972640a
+sub/readonly.bin f mode=0444 uid=1000 gid=1000 mtime=1700000100 nlink=1 size=10 sum=00000388 head=72656164206f6e6c790a
+sub/\xc3\xbcmlaut\x20\xe2\x88\x9e.txt f mode=0664 uid=1000 gid=1000 mtime=1700000102 nlink=1 size=7 sum=000002a2 head=756d6c6175740a

@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+[package]
+name = "shared-trace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The shared crate again, with the write trace of device.rs compiled in,
+# see build.rs. Only the crash consistency harness uses it.
+[lib]
+path = "../../../src/shared/lib.rs"
+test = false
+doctest = false
+doc = false
+
+[dependencies]
+libc.workspace = true
+sha2.workspace = true
+uapi16.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+! Initramfs unpacking failed: invalid magic at start of compressed archive
+. d mode=0755 uid=0 gid=0 mtime=1577934245
+big f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=9000 sum=00118144 head=0221405f7e9dbcdbfa1938577695b4d3
+bin d mode=0755 uid=0 gid=0 mtime=1577934245
+bin/setuid f mode=4755 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000073 head=73
+bin/tool f mode=0755 uid=0 gid=0 mtime=1577934245 nlink=1 size=17 sum=000004d4 head=23212f62696e2f73680a657869742030
+dangling l uid=0 gid=0 mtime=1577934245 nlink=1 target=nowhere
+empty d mode=0700 uid=0 gid=0 mtime=1577934245
+etc d mode=0755 uid=0 gid=0 mtime=1577934245
+etc/a-link f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 size=5000 sum=0009b9ac head=01203f5e7d9cbbdaf91837567594b3d2
+etc/conf f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=4 sum=00000149 head=6f6c640a
+etc/empty f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=0 sum=00000000
+etc/keep f mode=0600 uid=0 gid=0 mtime=1577934245 nlink=1 size=5 sum=000001af head=6b6565700a
+lib d mode=0755 uid=0 gid=0 mtime=1577934245
+lib/a.so f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 link=etc/a-link size=5000 sum=0009b9ac head=01203f5e7d9cbbdaf91837567594b3d2
+lib/b.so f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 link=etc/a-link size=5000 sum=0009b9ac head=01203f5e7d9cbbdaf91837567594b3d2
+link l uid=0 gid=0 mtime=1577934245 nlink=1 target=etc/conf
+run d mode=0755 uid=0 gid=0 mtime=1577934245
+run/sock s mode=0600 uid=0 gid=0 mtime=1577934245 nlink=1
+sbin l uid=0 gid=0 mtime=1577934245 nlink=1 target=bin
+tmp d mode=1777 uid=0 gid=0 mtime=1577934245

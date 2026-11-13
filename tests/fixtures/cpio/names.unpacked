@@ -1,0 +1,25 @@
+. d mode=1777 uid=0 gid=0 mtime=boot
+TRAILER!!! f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=2 sum=00000061 head=3130
+n d mode=0755 uid=0 gid=0 mtime=1577934245
+n/... f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=2 sum=00000062 head=3230
+n/.hidden f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=2 sum=00000063 head=3231
+n/TRAILER!!! f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000039 head=39
+n/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000038 head=38
+n/absolute f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000032 head=32
+n/back\x5cslash f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=2 sum=0000006a head=3139
+n/bytes-\xff\xfe f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=2 sum=00000068 head=3137
+n/cut f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=2 sum=00000064 head=3232
+n/dot f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000034 head=34
+n/dot-slash f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000031 head=31
+n/double f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000033 head=33
+n/latin-\xe9 f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=2 sum=00000066 head=3135
+n/many f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000035 head=35
+n/new\x0aline f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=2 sum=00000069 head=3138
+n/notdir f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000037 head=37
+n/padded f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=2 sum=00000063 head=3132
+n/padded-more f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=2 sum=00000064 head=3133
+n/space\x20name f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=2 sum=00000065 head=3134
+n/sub d mode=0755 uid=0 gid=0 mtime=1577934245
+n/sub/in-slashed-dir f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000036 head=36
+n/upper f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=2 sum=00000062 head=3131
+n/utf8-\xc3\xa9 f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=2 sum=00000067 head=3136

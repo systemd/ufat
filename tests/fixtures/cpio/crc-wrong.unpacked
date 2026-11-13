@@ -1,0 +1,5 @@
+! Initramfs unpacking failed: bad data checksum
+. d mode=1777 uid=0 gid=0 mtime=boot
+c d mode=0755 uid=0 gid=0 mtime=1577934245
+c/bad f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=12 sum=000004b5 head=62616420636f6e74656e7473
+c/good f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=4 sum=000001a9 head=676f6f64

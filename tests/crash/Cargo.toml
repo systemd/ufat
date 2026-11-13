@@ -8,8 +8,9 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# The library again, with the write trace of device.rs compiled in, see
-# build.rs. Only the crash consistency harness uses it.
+# The library again, on top of the shared crate with the write trace of
+# device.rs compiled in, see shared/. Only the crash consistency harness
+# uses it.
 [lib]
 path = "../../src/fat/lib.rs"
 test = false
@@ -23,8 +24,7 @@ path = "crash.rs"
 [dependencies]
 blkid.workspace = true
 json.workspace = true
-libc.workspace = true
-sha2.workspace = true
+shared = { package = "shared-trace", path = "shared" }
 uapi16.workspace = true
 
 [lints]

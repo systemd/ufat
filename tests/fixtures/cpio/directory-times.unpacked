@@ -1,0 +1,14 @@
+. d mode=1777 uid=0 gid=0 mtime=boot
+t d mode=0755 uid=0 gid=0 mtime=1577934245
+t/again d mode=0755 uid=0 gid=0 mtime=1000
+t/busy d mode=0755 uid=0 gid=0 mtime=1000
+t/busy/child f mode=0644 uid=0 gid=0 mtime=2000 nlink=1 size=1 sum=00000063 head=63
+t/fifo p mode=0644 uid=0 gid=0 mtime=1000 nlink=1
+t/file f mode=0644 uid=0 gid=0 mtime=1000 nlink=1 size=1 sum=00000066 head=66
+t/file-first d mode=0755 uid=0 gid=0 mtime=5000
+t/forms d mode=0755 uid=0 gid=0 mtime=1000
+t/forms-late d mode=0755 uid=0 gid=0 mtime=1000
+t/late d mode=0755 uid=0 gid=0 mtime=2000
+t/late/sub d mode=0755 uid=0 gid=0 mtime=1000
+t/sym l uid=0 gid=0 mtime=1000 nlink=1 target=target
+t/target f mode=0644 uid=0 gid=0 mtime=3000 nlink=1 size=6 sum=00000287 head=746172676574

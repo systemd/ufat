@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::SystemTime;
 
+use ::cli::{format_time, plural, Args};
 use fat::device::{Access, Device};
 use fat::errno;
 use fat::format::{self, FormatOptions, VolumeId};
@@ -20,7 +21,6 @@ use fat::manifest::{
 use fat::plan::{Plan, PlanOptions};
 use fat::populate::{CopyOptions, TimePolicy};
 use fat::probe::Prober;
-use fat::time::civil_from_days;
 use fat::volume::Volume;
 use fat::{bail, err, Context, Detail, Error, Result};
 
@@ -125,159 +125,18 @@ never repairs), 8 when the image could not be checked.
 /// values of all other options are UTF-8.
 const PATH_OPTIONS: &[&str] = &["fit", "manifest", "write-manifest", "write-hash"];
 
-/// Parsed command line: options with optional values plus positional
-/// arguments. Paths on the host are taken as the bytes they are; paths
-/// inside the volume and other text have to be UTF-8.
-struct Args {
-    options: Vec<(String, Option<OsString>)>,
-    positional: Vec<OsString>,
+/// Parses the options of a command.
+fn parse_args(args: &[OsString], with_value: &[&str], flags: &[&str]) -> Result<Args> {
+    Args::parse(args, with_value, flags, PATH_OPTIONS, USAGE)
 }
 
-impl Args {
-    /// Splits `args` with lexopt: `--name=value` or `--name value` for the
-    /// options in `with_value`, `--name` for those in `flags`, and -p, -l,
-    /// -r and -f for `--parents`, `--long`, `--recursive` and `--force`
-    /// where `flags` has them. Short options can be bundled, as in `-lh`.
-    /// `--` ends the options, and `-` is a positional argument. `-h` or
-    /// `--help` anywhere among the options prints the usage and exits,
-    /// whatever else is on the command line. After `--`, or as the value of
-    /// an option, `-h` is an argument like any other.
-    fn parse(args: &[OsString], with_value: &[&str], flags: &[&str]) -> Result<Args> {
-        use lexopt::Arg::{Long, Short, Value};
-
-        let mut options = Vec::new();
-        let mut positional = Vec::new();
-        let mut help = false;
-        let mut problem = None;
-        let mut parser = lexopt::Parser::from_args(args.iter().cloned());
-        loop {
-            let error = match parser.next() {
-                Ok(None) => break,
-                Ok(Some(Short('h') | Long("help"))) => {
-                    help = true;
-                    continue;
-                }
-                Ok(Some(Short(c))) => match short_option(c).filter(|name| flags.contains(name)) {
-                    Some(name) => {
-                        options.push((name.to_string(), None));
-                        continue;
-                    }
-                    None => err!(errno::EINVAL, "unknown option -{}", c),
-                },
-                Ok(Some(Long(name))) if with_value.contains(&name) => {
-                    let name = name.to_string();
-                    match parser.value() {
-                        Err(_) => err!(errno::EINVAL, "option --{} needs a value", name),
-                        Ok(value) if !PATH_OPTIONS.contains(&name.as_str()) && value.to_str().is_none() => {
-                            err!(errno::EINVAL, "the value of --{} is not valid UTF-8", name)
-                        }
-                        Ok(value) => {
-                            options.push((name, Some(value)));
-                            continue;
-                        }
-                    }
-                }
-                Ok(Some(Long(name))) if flags.contains(&name) => {
-                    let name = name.to_string();
-                    if parser.optional_value().is_some() {
-                        err!(errno::EINVAL, "option --{} takes no value", name)
-                    } else {
-                        options.push((name, None));
-                        continue;
-                    }
-                }
-                Ok(Some(Long(name))) => err!(errno::EINVAL, "unknown option --{}", name),
-                Ok(Some(Value(value))) => {
-                    positional.push(value);
-                    continue;
-                }
-                // A value attached to a short option, as in -r=x.
-                Err(lexopt::Error::UnexpectedValue { option, .. }) => {
-                    err!(errno::EINVAL, "option {} takes no value", option)
-                }
-                Err(e) => err!(errno::EINVAL, "{}", e),
-            };
-            problem.get_or_insert(error);
-        }
-        if help {
-            print!("{}", USAGE);
-            let _ = std::io::stdout().flush();
-            std::process::exit(0);
-        }
-        match problem {
-            Some(e) => Err(e),
-            None => Ok(Args { options, positional }),
-        }
-    }
-
-    /// The last value given to the option `name`.
-    fn last(&self, name: &str) -> Option<&OsStr> {
-        self.options
-            .iter()
-            .rev()
-            .find(|(n, _)| n == name)
-            .and_then(|(_, v)| v.as_deref())
-    }
-
-    /// The value of a text option; see [`PATH_OPTIONS`] for the others.
-    fn value(&self, name: &str) -> Option<&str> {
-        self.last(name).and_then(OsStr::to_str)
-    }
-
-    /// The value of a path option.
-    fn path(&self, name: &str) -> Option<&Path> {
-        self.last(name).map(Path::new)
-    }
-
-    /// All values of a path option that can be given more than once.
-    fn paths(&self, name: &str) -> Vec<&Path> {
-        self.options
-            .iter()
-            .filter(|(n, _)| n == name)
-            .filter_map(|(_, v)| v.as_deref().map(Path::new))
-            .collect()
-    }
-
-    fn flag(&self, name: &str) -> bool {
-        self.options.iter().any(|(n, _)| n == name)
-    }
-
+impl From<&Args> for ImageFlags {
     /// What `--create` and `--force` allow to be done to the image.
-    fn image_flags(&self) -> ImageFlags {
+    fn from(args: &Args) -> ImageFlags {
         let mut flags = ImageFlags::default();
-        flags.set(ImageFlags::CREATE, self.flag("create"));
-        flags.set(ImageFlags::FORCE, self.flag("force"));
+        flags.set(ImageFlags::CREATE, args.flag("create"));
+        flags.set(ImageFlags::FORCE, args.flag("force"));
         flags
-    }
-
-    fn u32(&self, name: &str) -> Result<Option<u32>> {
-        let Some(v) = self.value(name) else {
-            return Ok(None);
-        };
-        let n = util::parse_size(v)?;
-        u32::try_from(n)
-            .map(Some)
-            .map_err(|_| err!(errno::ERANGE, "--{} '{}' is too large", name, v))
-    }
-
-    fn size(&self, name: &str) -> Result<Option<u64>> {
-        self.value(name).map(util::parse_size).transpose()
-    }
-
-    /// The positional arguments as paths on the host.
-    fn positional_paths(&self) -> Vec<&Path> {
-        self.positional.iter().map(Path::new).collect()
-    }
-}
-
-/// The long option a short option stands for.
-fn short_option(c: char) -> Option<&'static str> {
-    match c {
-        'p' => Some("parents"),
-        'l' => Some("long"),
-        'r' => Some("recursive"),
-        'f' => Some("force"),
-        _ => None,
     }
 }
 
@@ -291,11 +150,6 @@ fn volume_path(arg: &OsStr) -> Result<&str> {
             arg.to_string_lossy()
         )
     })
-}
-
-/// `n` followed by `one` or `many`, as the count asks for.
-fn plural(n: u64, one: &str, many: &str) -> String {
-    format!("{} {}", n, if n == 1 { one } else { many })
 }
 
 /// What a copy wrote, or what a plan found, for `--verbose`.
@@ -736,7 +590,7 @@ fn assemble_empty(args: &Args, path: &Path) -> Result<Volume> {
         path,
         offset,
         size,
-        flags: args.image_flags(),
+        flags: ImageFlags::from(args),
     };
     if fit.is_empty() && args.path("manifest").is_none() {
         let mut device = util::open_target(&target)?;
@@ -777,7 +631,7 @@ fn assemble_filled(args: &Args, path: &Path, paths: &[&Path]) -> Result<Volume> 
         path,
         offset: args.size("offset")?.unwrap_or(0),
         size: args.size("size")?,
-        flags: args.image_flags(),
+        flags: ImageFlags::from(args),
     };
     let (mut v, estimate) = util::fit_and_format(&target, &mut options, &mut |plan| plan_sources(plan, args, &sources))
         .map_err(|e| e.into_error(path))?;
@@ -822,7 +676,7 @@ fn force_hint(e: Error) -> Error {
 }
 
 fn cmd_assemble(argv: &[OsString]) -> Result<()> {
-    let args = Args::parse(
+    let args = parse_args(
         argv,
         &with(
             FORMAT_VALUES,
@@ -904,7 +758,7 @@ fn ensure_dir(v: &mut Volume, path: &str, parents: bool, time: SystemTime) -> Re
 }
 
 fn cmd_populate(argv: &[OsString]) -> Result<()> {
-    let args = Args::parse(argv, &with(IMAGE_OPTIONS, FILL_VALUES), &with(FILL_FLAGS, &["parents"]))?;
+    let args = parse_args(argv, &with(IMAGE_OPTIONS, FILL_VALUES), &with(FILL_FLAGS, &["parents"]))?;
     let (image, paths) = match args.positional_paths().split_first() {
         Some((&i, s)) => (i, s.to_vec()),
         None => bail!(errno::EINVAL, "populate takes an IMAGE and SOURCE arguments"),
@@ -976,7 +830,7 @@ fn cmd_populate(argv: &[OsString]) -> Result<()> {
 }
 
 fn cmd_remove(argv: &[OsString]) -> Result<()> {
-    let args = Args::parse(argv, IMAGE_OPTIONS, &["recursive", "verbose"])?;
+    let args = parse_args(argv, IMAGE_OPTIONS, &["recursive", "verbose"])?;
     let (image, paths) = match args.positional.split_first() {
         Some((i, p)) if !p.is_empty() => (i, p),
         _ => bail!(errno::EINVAL, "remove takes an IMAGE and at least one PATH"),
@@ -1011,25 +865,8 @@ fn cmd_remove(argv: &[OsString]) -> Result<()> {
     v.close()
 }
 
-fn format_time(t: SystemTime) -> String {
-    let secs = t
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
-    let sod = secs.rem_euclid(86_400);
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        y,
-        m,
-        d,
-        sod / 3600,
-        (sod % 3600) / 60,
-        sod % 60
-    )
-}
-
 fn cmd_list(argv: &[OsString]) -> Result<()> {
-    let args = Args::parse(argv, IMAGE_OPTIONS, &["long"])?;
+    let args = parse_args(argv, IMAGE_OPTIONS, &["long"])?;
     let (image, path) = match args.positional.as_slice() {
         [i] => (i, "/"),
         [i, p] => (i, volume_path(p)?),
@@ -1096,7 +933,7 @@ fn print_description(v: &Volume, out: &mut dyn Write) -> Result<()> {
 }
 
 fn cmd_describe(argv: &[OsString]) -> Result<()> {
-    let args = Args::parse(argv, &with(IMAGE_OPTIONS, &["write-manifest"]), &[])?;
+    let args = parse_args(argv, &with(IMAGE_OPTIONS, &["write-manifest"]), &[])?;
     let image = image_arg(&args, "describe")?;
     let v = open_volume(&args, image, Access::ReadOnly)?;
     if manifest_to_stdout(&args) {
@@ -1111,7 +948,7 @@ fn cmd_describe(argv: &[OsString]) -> Result<()> {
 }
 
 fn cmd_cat(argv: &[OsString]) -> Result<()> {
-    let args = Args::parse(argv, IMAGE_OPTIONS, &[])?;
+    let args = parse_args(argv, IMAGE_OPTIONS, &[])?;
     let [image, path] = args.positional.as_slice() else {
         bail!(errno::EINVAL, "cat takes an IMAGE and a PATH");
     };
@@ -1139,7 +976,7 @@ const FSCK_OPERATIONAL_ERROR: u8 = 8;
 
 /// Checks the volume and returns the fsck(8) exit code.
 fn cmd_check(argv: &[OsString]) -> Result<ExitCode> {
-    let args = Args::parse(argv, IMAGE_OPTIONS, &[])?;
+    let args = parse_args(argv, IMAGE_OPTIONS, &[])?;
     let image = image_arg(&args, "check")?;
     let report = match open_image(&args, image, Access::ReadOnly).and_then(|d| fsck::check(&d)) {
         Ok(r) => r,
@@ -1185,7 +1022,7 @@ fn cmd_check(argv: &[OsString]) -> Result<ExitCode> {
 
 /// Prints what `GetCapabilities` answers, as JSON.
 fn cmd_capabilities(argv: &[OsString]) -> Result<()> {
-    let args = Args::parse(argv, &[], &[])?;
+    let args = parse_args(argv, &[], &[])?;
     if !args.positional.is_empty() {
         bail!(errno::EINVAL, "capabilities takes no arguments");
     }
@@ -1194,7 +1031,7 @@ fn cmd_capabilities(argv: &[OsString]) -> Result<()> {
 }
 
 fn cmd_manifest(argv: &[OsString]) -> Result<()> {
-    let args = Args::parse(argv, &[], &[])?;
+    let args = parse_args(argv, &[], &[])?;
     let [dir] = args.positional.as_slice() else {
         bail!(errno::EINVAL, "manifest takes exactly one DIR");
     };

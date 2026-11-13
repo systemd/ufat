@@ -1,0 +1,46 @@
+. d mode=0755 uid=0 gid=0 mtime=1577934245
+big f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=9000 sum=00118144 head=0221405f7e9dbcdbfa1938577695b4d3
+bin d mode=0755 uid=0 gid=0 mtime=1577934245
+bin/setuid f mode=4755 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000073 head=73
+bin/tool f mode=0755 uid=0 gid=0 mtime=1577934245 nlink=1 size=17 sum=000004d4 head=23212f62696e2f73680a657869742030
+dangling l uid=0 gid=0 mtime=1577934245 nlink=1 target=nowhere
+empty d mode=0700 uid=0 gid=0 mtime=1577934245
+empty/now-filled f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000078 head=78
+etc d mode=0755 uid=0 gid=0 mtime=1577934245
+etc/a-link f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 size=5000 sum=0009b9ac head=01203f5e7d9cbbdaf91837567594b3d2
+etc/added f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=6 sum=000001fc head=61646465640a
+etc/conf f mode=0640 uid=0 gid=0 mtime=1577934245 nlink=1 size=15 sum=0000054e head=6e657720616e64206c6f6e6765720a
+etc/empty f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=0 sum=00000000
+etc/keep f mode=0600 uid=0 gid=0 mtime=1577934245 nlink=1 size=5 sum=000001af head=6b6565700a
+etc/motd f mode=0444 uid=0 gid=0 mtime=1577934245 nlink=1 size=8 sum=00000298 head=72656164206d650a
+lib d mode=0755 uid=0 gid=0 mtime=1577934245
+lib/a.so f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 link=etc/a-link size=5000 sum=0009b9ac head=01203f5e7d9cbbdaf91837567594b3d2
+lib/b.so f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=3 link=etc/a-link size=5000 sum=0009b9ac head=01203f5e7d9cbbdaf91837567594b3d2
+lib/c.so f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 size=4500 sum=0008c07e head=032241607f9ebddcfb1a39587796b5d4
+lib/d.so f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 link=lib/c.so size=4500 sum=0008c07e head=032241607f9ebddcfb1a39587796b5d4
+link f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=24 sum=00000820 head=612066696c652077686572652061206c
+link2 l uid=0 gid=0 mtime=1577934245 nlink=1 target=bin/tool
+opt d mode=0755 uid=0 gid=0 mtime=1577934245
+opt/pkg d mode=0755 uid=0 gid=0 mtime=1577934245
+opt/pkg/empty d mode=0755 uid=0 gid=0 mtime=1577934245
+opt/pkg/empty/now-filled f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=1 sum=00000078 head=78
+opt/pkg/etc d mode=0700 uid=0 gid=0 mtime=1577934245
+opt/pkg/etc/added f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=6 sum=000001fc head=61646465640a
+opt/pkg/etc/conf f mode=0640 uid=0 gid=0 mtime=1577934245 nlink=1 size=15 sum=0000054e head=6e657720616e64206c6f6e6765720a
+opt/pkg/lib d mode=0755 uid=0 gid=0 mtime=1577934245
+opt/pkg/lib/c.so f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 size=4500 sum=0008c07e head=032241607f9ebddcfb1a39587796b5d4
+opt/pkg/lib/d.so f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=2 link=opt/pkg/lib/c.so size=4500 sum=0008c07e head=032241607f9ebddcfb1a39587796b5d4
+opt/pkg/link f mode=0644 uid=0 gid=0 mtime=1577934245 nlink=1 size=24 sum=00000820 head=612066696c652077686572652061206c
+opt/pkg/link2 l uid=0 gid=0 mtime=1577934245 nlink=1 target=bin/tool
+opt/pkg/usr d mode=0755 uid=0 gid=0 mtime=1577934245
+opt/pkg/usr/share d mode=0755 uid=0 gid=0 mtime=1577934245
+opt/pkg/usr/share/doc d mode=0755 uid=0 gid=0 mtime=1577934245
+opt/pkg/usr/share/doc/readme f mode=0444 uid=0 gid=0 mtime=1577934245 nlink=1 size=8 sum=00000298 head=72656164206d650a
+run d mode=0755 uid=0 gid=0 mtime=1577934245
+run/sock s mode=0600 uid=0 gid=0 mtime=1577934245 nlink=1
+sbin l uid=0 gid=0 mtime=1577934245 nlink=1 target=bin
+tmp d mode=1777 uid=0 gid=0 mtime=1577934245
+usr d mode=0755 uid=0 gid=0 mtime=1577934245
+usr/share d mode=0755 uid=0 gid=0 mtime=1577934245
+usr/share/doc d mode=0755 uid=0 gid=0 mtime=1577934245
+usr/share/doc/readme f mode=0444 uid=0 gid=0 mtime=1577934245 nlink=1 size=8 sum=00000298 head=72656164206d650a

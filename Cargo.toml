@@ -4,14 +4,20 @@
 members = [
     ".",
     "src/blkid",
+    "src/cli",
+    "src/cpio",
     "src/dlopen",
     "src/dlopen-note",
     "src/fat",
     "src/json",
+    "src/service",
+    "src/shared",
     "src/uapi16",
     "src/varlink",
     "tools",
     "tests/crash",
+    "tests/crash/cpio",
+    "tests/crash/shared",
     "tests/fuzz",
     "bench",
 ]
@@ -20,13 +26,18 @@ members = [
 default-members = [
     ".",
     "src/blkid",
+    "src/cli",
+    "src/cpio",
     "src/dlopen",
     "src/dlopen-note",
     "src/fat",
     "src/json",
+    "src/service",
+    "src/shared",
     "src/uapi16",
     "src/varlink",
     "tests/crash",
+    "tests/crash/cpio",
 ]
 # cargo update picks dependency versions that support rust-version.
 resolver = "3"
@@ -41,6 +52,8 @@ publish = false
 
 [workspace.dependencies]
 blkid = { path = "src/blkid" }
+cli = { path = "src/cli" }
+cpio = { path = "src/cpio" }
 dlopen = { path = "src/dlopen" }
 dlopen-note = { path = "src/dlopen-note" }
 fat = { path = "src/fat" }
@@ -49,8 +62,10 @@ lexopt = "0.3.2"
 # The _IO and _IOR helpers came with 0.2.172. Stay on 0.2: 1.0 may drop
 # the LFS64 functions such as openat64 and fstatfs64.
 libc = "0.2.191"
+service = { path = "src/service" }
 # 0.11.1 and later need rustc 1.88.
 sha2 = { version = "0.11.0", default-features = false }
+shared = { path = "src/shared" }
 uapi16 = { path = "src/uapi16" }
 varlink = { path = "src/varlink" }
 
@@ -68,10 +83,13 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+cli.workspace = true
+cpio.workspace = true
 fat.workspace = true
 json.workspace = true
-lexopt.workspace = true
 libc.workspace = true
+service.workspace = true
+shared.workspace = true
 varlink.workspace = true
 
 [lints]

@@ -36,6 +36,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
+name = "cli"
+version = "0.1.0"
+dependencies = [
+ "lexopt",
+ "shared",
+]
+
+[[package]]
+name = "cpio"
+version = "0.1.0"
+dependencies = [
+ "shared",
+ "uapi16",
+]
+
+[[package]]
+name = "cpio-trace"
+version = "0.1.0"
+dependencies = [
+ "shared-trace",
+ "uapi16",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -80,8 +104,7 @@ version = "0.1.0"
 dependencies = [
  "blkid",
  "json",
- "libc",
- "sha2",
+ "shared",
  "uapi16",
 ]
 
@@ -91,8 +114,7 @@ version = "0.1.0"
 dependencies = [
  "blkid",
  "json",
- "libc",
- "sha2",
+ "shared-trace",
  "uapi16",
 ]
 
@@ -133,6 +155,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "service"
+version = "0.1.0"
+dependencies = [
+ "json",
+ "shared",
+ "uapi16",
+ "varlink",
+]
+
+[[package]]
 name = "sha2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -141,6 +173,24 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+]
+
+[[package]]
+name = "shared"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2",
+ "uapi16",
+]
+
+[[package]]
+name = "shared-trace"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2",
+ "uapi16",
 ]
 
 [[package]]
@@ -162,10 +212,13 @@ dependencies = [
 name = "ufat"
 version = "0.1.0"
 dependencies = [
+ "cli",
+ "cpio",
  "fat",
  "json",
- "lexopt",
  "libc",
+ "service",
+ "shared",
  "varlink",
 ]
 
