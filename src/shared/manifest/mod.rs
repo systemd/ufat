@@ -4,3 +4,6 @@
 //! of the `uapi16` crate.
 
 mod error;
+mod source;
+
+pub use source::{DirectorySource, SourceDirectory};

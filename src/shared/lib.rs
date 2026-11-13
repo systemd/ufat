@@ -25,7 +25,7 @@ pub mod device;
 pub mod errno;
 mod flags;
 pub mod host;
-mod manifest;
+pub mod manifest;
 pub mod path;
 pub mod progress;
 pub mod sha256;

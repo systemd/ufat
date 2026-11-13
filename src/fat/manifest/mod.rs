@@ -35,8 +35,9 @@ mod generate;
 mod tests;
 mod volume;
 
-pub use assemble::{AssembleFlags, AssembleOptions, AssembleReport, DirectorySource, SourceDirectory};
+pub use assemble::{AssembleFlags, AssembleOptions, AssembleReport};
 pub use generate::HostTree;
+pub use shared::manifest::{DirectorySource, SourceDirectory};
 pub use uapi16::{ContentSource, Contents, Fields, FileObject, InodeType, Location, Name, Sha256, StreamSource};
 pub use volume::WriteReport;
 
