@@ -40,7 +40,7 @@ use ufat::volume::{Metadata, Volume};
 use ufat::{CorruptPlace, Detail, NoSpaceReason, NotFat32Reason, UnsupportedKind};
 use varlink::{Activation, Call, Connection, Info, Reply, Server, Service};
 
-use crate::util::{self, ImageFlags};
+use crate::util;
 
 /// The interface description, served verbatim.
 pub(crate) const INTERFACE: &str = include_str!("../../../docs/org.uapi-group.FileSystem.varlink");
@@ -582,6 +582,8 @@ struct Options {
     format: FormatOptions,
     /// `timestampUSec` as given; None when the current time stands in.
     time: Option<SystemTime>,
+    /// `force`: format the image whatever it holds.
+    force: bool,
 }
 
 fn format_options(p: Option<Params<'_>>) -> Outcome<Options> {
@@ -594,7 +596,11 @@ fn format_options(p: Option<Params<'_>>) -> Outcome<Options> {
     let Some(p) = p else {
         o.volume_id = util::pick_volume_id(util::now(), None, false);
         o.timestamp = Some(util::now());
-        return Ok(Options { format: o, time: None });
+        return Ok(Options {
+            format: o,
+            time: None,
+            force: false,
+        });
     };
     // What FAT has no notion of is refused, not ignored.
     if p.bool("discard", false) {
@@ -642,7 +648,11 @@ fn format_options(p: Option<Params<'_>>) -> Outcome<Options> {
         o.hidden_sectors = v.u32("hiddenSectors")?;
         o.mkfs_fat_compat = v.bool("mkfsFatCompatible", false);
     }
-    Ok(Options { format: o, time })
+    Ok(Options {
+        format: o,
+        time,
+        force: p.bool("force", false),
+    })
 }
 
 /// The block size against the sector size the format will use, checked
@@ -1169,8 +1179,6 @@ impl FileSystemService {
             Some(a) => Some(Hash::new(a).ok_or_else(|| invalid("imageHash"))?),
         };
         let options = format_options(p.object("options"))?;
-        let mut flags = ImageFlags::default();
-        flags.set(ImageFlags::FORCE, p.bool("force", false));
         let content_time = options.format.timestamp.unwrap_or_else(util::now);
         let taker = if plan_only { Taker::Plan } else { Taker::Assemble };
         let content = match p.object("content") {
@@ -1185,7 +1193,7 @@ impl FileSystemService {
         };
         match image {
             None => plan(options, content, c, more),
-            Some(image) => assemble_image(image, options, content, hash, flags, c, more),
+            Some(image) => assemble_image(image, options, content, hash, c, more),
         }
     }
 
@@ -1434,7 +1442,7 @@ fn fill_image(
 /// when there is one, sized to fit when no size is given. Everything that
 /// can be checked before the image is touched has been checked by now:
 /// the descriptors vetted, the manifest parsed and its source verified,
-/// the options validated. Without [`ImageFlags::FORCE`], an image that
+/// the options validated. Without force in the options, an image that
 /// holds a file system, a partition table or other data is ImageNotEmpty.
 /// A call that fails after the format leaves the file system marked as not
 /// cleanly unmounted.
@@ -1443,7 +1451,6 @@ fn assemble_image(
     mut options: Options,
     content: Option<Content>,
     hash: Option<Hash>,
-    flags: ImageFlags,
     c: &mut Connection,
     more: bool,
 ) -> Outcome<Object> {
@@ -1459,7 +1466,7 @@ fn assemble_image(
                 ct.plan(plan)
             })
             .map_err(fit_error)?;
-            if !flags.contains(ImageFlags::FORCE) {
+            if !options.force {
                 Prober::new().ensure_empty(&device, offset, Some(fit))?;
             }
             phase(c, more, "formatting")?;
@@ -1467,7 +1474,7 @@ fn assemble_image(
             (volume, size.is_none())
         }
         None => {
-            if !flags.contains(ImageFlags::FORCE) {
+            if !options.force {
                 Prober::new().ensure_empty(&device, offset, size)?;
             }
             // A regular file is grown to a size given. An image with no

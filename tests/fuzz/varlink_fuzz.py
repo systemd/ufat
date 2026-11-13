@@ -446,14 +446,16 @@ def method_cases(rng, seeds, work, small_tree, img):
                  {"enableFeatures": ["x"]}, {"ext4": {}}, {"squashfs": {"noPadding": True}}, {"vfat": {"fats": 0}}, {"vfat": {"reservedSectors": 1}},
                  {"vfat": {"oemName": "x" * 9}}, {"vfat": {"oemName": "\u00e9"}}, {"vfat": {"hiddenSectors": 2 ** 40}}, {"vfat": {"mkfsFatCompatible": True}},
                  {"bogus": 1}, None, 5, "x", []]:
-        params = {"image": {"fileDescriptor": 0}, "force": True}
-        if opts is not None:
+        params = {"image": {"fileDescriptor": 0}, "options": {"force": True}}
+        if isinstance(opts, dict):
+            params["options"].update(opts)
+        elif opts is not None:
             params["options"] = opts
         cases.append(("Assemble-%s" % json.dumps(opts)[:30], [fdcall(IFACE + "Assemble", params, [(fimg, "rw")])]))
         cases.append(("Plan-%s" % json.dumps(opts)[:30], [fdcall(IFACE + "Assemble", dict(params, mode="plan"), [(fimg, "rw")])]))
     for extra in [{"imageHash": "sha256"}, {"imageHash": "sha512"}, {"imageHash": "md5"}, {"mode": "repair"}, {"fileSystemType": "ext4"}, {"fileSystemType": ""},
                   {"content": {}}, {"content": {"sourceFileDescriptor": 0}}, {"content": {"manifest": {"fileDescriptor": 0}}}, {"content": 5}]:
-        cases.append(("Assemble-%s" % json.dumps(extra)[:30], [fdcall(IFACE + "Assemble", dict({"image": {"fileDescriptor": 0}, "force": True}, **extra), [(fimg, "rw")])]))
+        cases.append(("Assemble-%s" % json.dumps(extra)[:30], [fdcall(IFACE + "Assemble", dict({"image": {"fileDescriptor": 0}, "options": {"force": True}}, **extra), [(fimg, "rw")])]))
     for sz in [0, 1, 511, 512, 4096, 65536, 1 << 20]:
         p = os.path.join(work, "tiny-%d.img" % sz)
         with open(p, "wb") as f:
