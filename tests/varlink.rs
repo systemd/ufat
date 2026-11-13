@@ -455,9 +455,12 @@ fn damage_root_entries(image: &Path) -> usize {
             }
         }
         f.write_all_at(&buf, offset).unwrap();
-        let mut entry = [0u8; 4];
-        f.read_exact_at(&mut entry, layout.fat_offset(0) + u64::from(cluster) * 4)
-            .unwrap();
+        let mut entry = [0u8; ufat::fat::ENTRY_SIZE];
+        f.read_exact_at(
+            &mut entry,
+            layout.fat_offset(0) + (u64::from(cluster) * ufat::fat::ENTRY_SIZE as u64),
+        )
+        .unwrap();
         let next = u32::from_le_bytes(entry) & 0x0FFF_FFFF;
         if next >= 0x0FFF_FFF8 || !layout.valid_cluster(next) {
             break;

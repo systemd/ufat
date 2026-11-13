@@ -21,12 +21,14 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
-use crate::boot::{self, BootSector, FsInfo, BOOT_SECTOR_SIZE, FSINFO_SIZE, FSINFO_UNKNOWN, NO_NAME, NT_FLAG_DIRTY};
+use crate::boot::{
+    self, BootSector, FsInfo, BOOT_SECTOR_SIZE, FSINFO_SIZE, FSINFO_UNKNOWN, LABEL_SIZE, NO_NAME, NT_FLAG_DIRTY,
+};
 use crate::device::Device;
 use crate::dir::{DirEntry, Directory, MAX_SLOTS};
 use crate::dirent::{
     short_name_checksum, RawDirEntry, ATTR_ARCHIVE, ATTR_DIRECTORY, ATTR_HIDDEN, ATTR_READ_ONLY, ATTR_SYSTEM,
-    ATTR_VOLUME_ID, DIR_ENTRY_SIZE, DOTDOT_NAME, DOT_NAME, ENTRY_DELETED, ENTRY_E5_ESCAPE, ENTRY_END,
+    ATTR_VOLUME_ID, DIR_ENTRY_SIZE, DOTDOT_NAME, DOT_NAME, ENTRY_DELETED, ENTRY_E5_ESCAPE, ENTRY_END, SHORT_NAME_SIZE,
 };
 use crate::errno::*;
 use crate::fat::{Entry, Extent, Fat, FatStore, CACHE_BYTES, ENTRY1_CLEAN_SHUTDOWN};
@@ -86,7 +88,7 @@ enum Located {
 #[derive(Debug)]
 struct Placement {
     start: usize,
-    name: [u8; 11],
+    name: [u8; SHORT_NAME_SIZE],
     case_flags: u8,
     long: Vec<[u8; DIR_ENTRY_SIZE]>,
 }
@@ -230,7 +232,7 @@ fn check_attributes(attributes: u8) -> Result<()> {
 
 /// Whether a label field says the volume has no label: `NO NAME`, which
 /// mkfs.fat and Windows put there, or blanks.
-fn is_no_name(label: &[u8; 11]) -> bool {
+fn is_no_name(label: &[u8; LABEL_SIZE]) -> bool {
     *label == NO_NAME || label.iter().all(|&b| b == b' ')
 }
 
@@ -441,7 +443,7 @@ impl Volume {
     /// OEM code page: the root directory's label entry if there is one, else
     /// the boot sector's. None when that says `NO NAME` or is blank, which
     /// is how a volume without a label is written.
-    pub fn label_bytes(&self) -> Result<Option<[u8; 11]>> {
+    pub fn label_bytes(&self) -> Result<Option<[u8; LABEL_SIZE]>> {
         let label = match self.label_entry()? {
             Some(e) => e.short.name,
             None => self.boot.volume_label,
@@ -469,7 +471,7 @@ impl Volume {
     /// `NO NAME` when that field is blank or zeroed. A field starting with
     /// a zero byte can never go into an entry, where it would read as the
     /// end of the directory.
-    fn label_for_entry(&self) -> [u8; 11] {
+    fn label_for_entry(&self) -> [u8; LABEL_SIZE] {
         let mut label = self.boot.volume_label;
         if label[0] == ENTRY_END || label.iter().all(|&b| b == b' ') {
             return NO_NAME;

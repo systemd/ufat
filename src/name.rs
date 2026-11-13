@@ -28,7 +28,7 @@
 use crate::bytes::le16;
 use crate::dirent::{
     self, RawDirEntry, ATTR_LONG_NAME, CASE_LOWER_BASE, CASE_LOWER_EXT, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_E5_ESCAPE,
-    ENTRY_END, NAME_BASE, NAME_EXT,
+    ENTRY_END, NAME_BASE, NAME_EXT, SHORT_NAME_SIZE,
 };
 use crate::errno::*;
 use crate::Result;
@@ -308,7 +308,7 @@ fn convert_part(part: &str, max: usize) -> (Vec<u8>, bool, Case) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Alias {
     /// The alias, 8 base bytes and 3 extension bytes, space padded.
-    pub name: [u8; 11],
+    pub name: [u8; SHORT_NAME_SIZE],
     /// Bytes used by the base part.
     pub base_len: usize,
     /// The alias lost information; it needs a numeric tail.
@@ -346,7 +346,7 @@ impl Alias {
                 case_flags |= CASE_LOWER_EXT;
             }
         }
-        let mut alias = [b' '; 11];
+        let mut alias = [b' '; SHORT_NAME_SIZE];
         alias[..base_bytes.len()].copy_from_slice(&base_bytes);
         alias[NAME_EXT.start..NAME_EXT.start + ext_bytes.len()].copy_from_slice(&ext_bytes);
         Alias {
@@ -364,7 +364,7 @@ impl Alias {
     /// The alias with the numeric tail `~n` appended, keeping as much of the
     /// base as fits, the way mtools and Windows do it. `n` is clamped to
     /// [`Alias::MAX_TAIL`].
-    pub fn with_tail(&self, n: u32) -> [u8; 11] {
+    pub fn with_tail(&self, n: u32) -> [u8; SHORT_NAME_SIZE] {
         // "~" and up to six decimal digits.
         let mut n = n.clamp(1, Alias::MAX_TAIL);
         let mut digits = [0u8; 6];
@@ -380,7 +380,7 @@ impl Alias {
         }
         let tail = &tail[..1 + count];
         let keep = self.base_len.min(NAME_BASE.len() - tail.len());
-        let mut out = [b' '; 11];
+        let mut out = [b' '; SHORT_NAME_SIZE];
         out[..keep].copy_from_slice(&self.name[..keep]);
         out[keep..keep + tail.len()].copy_from_slice(tail);
         out[NAME_EXT].copy_from_slice(&self.name[NAME_EXT]);
@@ -565,7 +565,7 @@ mod tests {
 
     #[test]
     fn lossy_aliases() {
-        let cases: &[(&str, &[u8; 11])] = &[
+        let cases: &[(&str, &[u8; SHORT_NAME_SIZE])] = &[
             ("foo.html", b"FOO~1   HTM"),
             (".bashrc", b"BASHRC~1   "),
             ("a b.txt", b"AB~1    TXT"),

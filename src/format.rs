@@ -20,7 +20,9 @@ use crate::device::Device;
 use crate::dirent::{RawDirEntry, ATTR_VOLUME_ID, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_E5_ESCAPE};
 use crate::errno::*;
 use crate::fat::Fat;
-use crate::layout::{self, default_geometry, Geometry, Layout, LayoutParams, MAX_SECTOR_SIZE, MIN_SECTOR_SIZE};
+use crate::layout::{
+    self, default_geometry, Geometry, Layout, LayoutParams, FIRST_CLUSTER, MAX_SECTOR_SIZE, MIN_SECTOR_SIZE,
+};
 use crate::sys;
 use crate::time::FatTimestamp;
 use crate::{Context, Result};
@@ -362,7 +364,7 @@ pub fn prepare(
         fat_sectors_32: layout.fat_sectors,
         ext_flags: 0,
         fs_version: 0,
-        root_cluster: 2,
+        root_cluster: FIRST_CLUSTER,
         fsinfo_sector: 1,
         backup_boot_sector: backup_boot_sector(layout.reserved_sectors, 1),
         reserved: [0; size(field::RESERVED)],

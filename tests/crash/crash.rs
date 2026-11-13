@@ -33,10 +33,10 @@ use common::Temp;
 use ufat::boot::BootSector;
 use ufat::device::{Access, Device};
 use ufat::dirent::{self, short_name_checksum, RawDirEntry, ATTR_ARCHIVE, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_END};
-use ufat::fat::{Entry, Fat, BAD_CLUSTER, END_OF_CHAIN_MIN, ENTRY_MASK, FREE};
+use ufat::fat::{Entry, Fat, BAD_CLUSTER, END_OF_CHAIN_MIN, ENTRY_MASK, ENTRY_SIZE, FREE};
 use ufat::format::{self, FormatOptions};
 use ufat::fsck::{self, ProblemKind, Severity};
-use ufat::layout::Layout;
+use ufat::layout::{Layout, FIRST_CLUSTER};
 use ufat::name::{join_long_name, parse_long_name_entry, short_name_to_string, LongNameEntry};
 use ufat::sha256;
 use ufat::time::FatTimestamp;
@@ -401,8 +401,8 @@ impl RawImage {
 
     /// The FAT entry of `c`, decoded from the bytes of the first copy.
     fn fat_get(&self, c: u32) -> Entry {
-        let at = c as usize * 4;
-        let raw = u32::from_le_bytes(self.table[at..at + 4].try_into().unwrap()) & ENTRY_MASK;
+        let at = c as usize * ENTRY_SIZE;
+        let raw = u32::from_le_bytes(self.table[at..at + ENTRY_SIZE].try_into().unwrap()) & ENTRY_MASK;
         match raw {
             FREE => Entry::Free,
             BAD_CLUSTER => Entry::Bad,
@@ -491,7 +491,7 @@ impl RawImage {
 
     /// Every cluster the FAT has in use.
     fn allocated(&self) -> HashSet<u32> {
-        (2..=self.layout.max_cluster())
+        (FIRST_CLUSTER..=self.layout.max_cluster())
             .filter(|&c| !matches!(self.fat_get(c), Entry::Free | Entry::Bad))
             .collect()
     }

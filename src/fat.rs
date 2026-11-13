@@ -32,7 +32,7 @@ use std::cell::RefCell;
 
 use crate::bytes::le32;
 use crate::errno::*;
-use crate::layout::Layout;
+use crate::layout::{Layout, FIRST_CLUSTER};
 use crate::Result;
 use crate::{CorruptPlace, Detail, NoSpaceReason};
 
@@ -46,9 +46,13 @@ fn broken_chain(cluster: u32) -> Detail {
     }
 }
 
-/// The bits of a FAT32 entry that carry the cluster number. The top four
-/// bits are reserved and preserved when writing.
+/// The bits of a FAT32 entry that carry the cluster number.
 pub const ENTRY_MASK: u32 = 0x0FFF_FFFF;
+/// The top four bits of a FAT32 entry, which are reserved: they are kept
+/// as they are when an entry is written.
+pub const RESERVED_BITS: u32 = !ENTRY_MASK;
+/// Size of a FAT32 entry in bytes, a little-endian `u32`.
+pub const ENTRY_SIZE: usize = size_of::<u32>();
 /// Entries at or above this value mark the end of a chain.
 pub const END_OF_CHAIN_MIN: u32 = 0x0FFF_FFF8;
 /// The end of chain marker this crate writes.
@@ -143,9 +147,9 @@ impl Cache {
 }
 
 /// FAT entry 0 of a volume with the media descriptor `media`: the
-/// descriptor in the low byte, all other bits set.
+/// descriptor in the low byte, all other bits of [`ENTRY_MASK`] set.
 pub fn media_entry(media: u8) -> u32 {
-    0x0FFF_FF00 | u32::from(media)
+    (ENTRY_MASK & !u32::from(u8::MAX)) | u32::from(media)
 }
 
 /// The FAT, as far as it is in memory: a sector cache, the free count and
@@ -209,7 +213,7 @@ impl Fat {
     /// Number of FAT sectors that hold entries for existing clusters. A FAT
     /// may be larger than that; the rest is never read or written.
     pub fn used_sectors(layout: &Layout) -> usize {
-        let needed = (u64::from(layout.fat_entries()) * 4).div_ceil(u64::from(layout.sector_size));
+        let needed = (u64::from(layout.fat_entries()) * ENTRY_SIZE as u64).div_ceil(u64::from(layout.sector_size));
         needed.min(u64::from(layout.fat_sectors)) as usize
     }
 
@@ -218,7 +222,7 @@ impl Fat {
     pub fn first_sector(layout: &Layout, media: u8) -> Vec<u8> {
         let mut sector = vec![0u8; layout.sector_size as usize];
         for (i, value) in [media_entry(media), END_OF_CHAIN, END_OF_CHAIN_MIN].iter().enumerate() {
-            sector[i * 4..i * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            sector[i * ENTRY_SIZE..(i + 1) * ENTRY_SIZE].copy_from_slice(&value.to_le_bytes());
         }
         sector
     }
@@ -248,7 +252,7 @@ impl Fat {
             .max(1)
             .min(sectors.next_power_of_two())
             .next_power_of_two();
-        let per_sector = ss / 4;
+        let per_sector = ss / ENTRY_SIZE;
         let max = layout.max_cluster() as usize;
         let mut free = 0u32;
         let mut may_have_free = BitSet::new(sectors);
@@ -260,9 +264,9 @@ impl Fat {
             for s in 0..n {
                 let first_cluster = (sector + s) * per_sector;
                 let mut any = false;
-                for (i, e) in buf[s * ss..(s + 1) * ss].chunks_exact(4).enumerate() {
+                for (i, e) in buf[s * ss..(s + 1) * ss].chunks_exact(ENTRY_SIZE).enumerate() {
                     let cluster = first_cluster + i;
-                    if cluster < 2 || cluster > max {
+                    if cluster < FIRST_CLUSTER as usize || cluster > max {
                         continue;
                     }
                     if le32(e, 0) & ENTRY_MASK == FREE {
@@ -318,7 +322,7 @@ impl Fat {
 
     /// FAT sector and byte offset of a cluster's entry.
     fn locate(&self, cluster: u32) -> (usize, usize) {
-        let offset = cluster as usize * 4;
+        let offset = cluster as usize * ENTRY_SIZE;
         let ss = self.layout.sector_size as usize;
         (offset / ss, offset % ss)
     }
@@ -396,9 +400,9 @@ impl Fat {
         let new = if whole {
             value
         } else {
-            (old & !ENTRY_MASK) | (value & ENTRY_MASK)
+            (old & RESERVED_BITS) | (value & ENTRY_MASK)
         };
-        cache.data[at..at + 4].copy_from_slice(&new.to_le_bytes());
+        cache.data[at..at + ENTRY_SIZE].copy_from_slice(&new.to_le_bytes());
         if !cache.dirty[slot] {
             cache.dirty[slot] = true;
             cache.changed.push(sector);
@@ -514,7 +518,7 @@ impl Fat {
     /// The first free cluster in `lo..=hi`, skipping the FAT sectors known
     /// to be full and remembering the ones found full on the way.
     fn find_free(&mut self, store: &dyn FatStore, lo: u32, hi: u32) -> Result<Option<u32>> {
-        let per_sector = self.layout.sector_size as usize / 4;
+        let per_sector = self.layout.sector_size as usize / ENTRY_SIZE;
         let mut c = lo as usize;
         while c <= hi as usize {
             let sector = c / per_sector;
@@ -528,7 +532,7 @@ impl Fat {
             let found = {
                 let cache = self.cache.borrow();
                 let base = cache.range(slot).start;
-                (c..=end).find(|&x| le32(&cache.data, base + (x % per_sector) * 4) & ENTRY_MASK == FREE)
+                (c..=end).find(|&x| le32(&cache.data, base + (x % per_sector) * ENTRY_SIZE) & ENTRY_MASK == FREE)
             };
             if let Some(x) = found {
                 return Ok(Some(x as u32));
@@ -671,15 +675,15 @@ impl VecStore {
         let mut bytes = self.bytes.borrow_mut();
         let copies = bytes.len() / self.copy_bytes;
         for copy in 0..copies {
-            let at = copy * self.copy_bytes + cluster as usize * 4;
-            bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            let at = copy * self.copy_bytes + cluster as usize * ENTRY_SIZE;
+            bytes[at..at + ENTRY_SIZE].copy_from_slice(&value.to_le_bytes());
         }
     }
 
     /// One entry of one copy.
     pub(crate) fn peek(&self, copy: u32, cluster: u32) -> u32 {
         let bytes = self.bytes.borrow();
-        let at = copy as usize * self.copy_bytes + cluster as usize * 4;
+        let at = copy as usize * self.copy_bytes + cluster as usize * ENTRY_SIZE;
         le32(&bytes, at)
     }
 }
@@ -702,6 +706,7 @@ impl FatStore for VecStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::boot::MEDIA_FIXED;
 
     fn layout(fat_sectors: u32, clusters: u32) -> Layout {
         Layout {
@@ -718,7 +723,7 @@ mod tests {
     /// A fresh FAT of 100 clusters in one sector, with its store.
     fn fat() -> (VecStore, Fat) {
         let l = layout(1, 100);
-        let store = VecStore::fresh(&l, 0xF8);
+        let store = VecStore::fresh(&l, MEDIA_FIXED);
         let fat = Fat::open(&l, &store, 0, CACHE_BYTES).unwrap();
         (store, fat)
     }
@@ -735,7 +740,7 @@ mod tests {
     #[test]
     fn fresh_state() {
         let (s, f) = fat();
-        assert_eq!(f.raw(&s, 0).unwrap(), 0x0FFF_FFF8);
+        assert_eq!(f.raw(&s, 0).unwrap(), media_entry(MEDIA_FIXED));
         assert_eq!(f.raw(&s, 1).unwrap(), END_OF_CHAIN);
         assert_eq!(f.get(&s, 2).unwrap(), Entry::End);
         assert_eq!(f.get(&s, 3).unwrap(), Entry::Free);
@@ -743,7 +748,8 @@ mod tests {
         assert_eq!(f.chain_len(&s, 2).unwrap(), 1);
         assert_eq!(f.chain_bounded(&s, 2, 1).unwrap(), Some(vec![2]));
         assert_eq!(f.cursor(), 1);
-        assert_eq!(Fat::first_sector(&layout(1, 100), 0xF8).len(), 512);
+        let l = layout(1, 100);
+        assert_eq!(Fat::first_sector(&l, MEDIA_FIXED).len(), l.sector_size as usize);
     }
 
     #[test]
@@ -784,8 +790,10 @@ mod tests {
         assert_eq!(f.chain_len(&s, 5).unwrap_err().errno(), EUCLEAN);
         f.set(&s, 7, 8).unwrap();
         assert!(f.chain_len(&s, 7).unwrap_err().message().contains("free cluster"));
-        f.set(&s, 9, 0x0FFF_FFF0).unwrap();
-        assert_eq!(f.get(&s, 9).unwrap(), Entry::Invalid(0x0FFF_FFF0));
+        // The first of the values the FAT specification reserves.
+        let reserved_value = 0x0FFF_FFF0;
+        f.set(&s, 9, reserved_value).unwrap();
+        assert_eq!(f.get(&s, 9).unwrap(), Entry::Invalid(reserved_value));
         assert!(f.chain_len(&s, 9).is_err());
         assert!(f.walk(0).is_err());
         assert!(f.walk(102).is_err());
@@ -803,21 +811,25 @@ mod tests {
     #[test]
     fn high_nibble_is_preserved() {
         let l = layout(1, 100);
-        let s = VecStore::fresh(&l, 0xF8);
-        s.poke(20, 0xA000_0000);
+        let s = VecStore::fresh(&l, MEDIA_FIXED);
+        // Two of the reserved bits, so that keeping them is not the same as
+        // setting all of them.
+        let pattern: u32 = (1 << 31) | (1 << 29);
+        assert_eq!(pattern & RESERVED_BITS, pattern);
+        s.poke(20, pattern);
         let mut f = Fat::open(&l, &s, 0, CACHE_BYTES).unwrap();
         f.set(&s, 20, END_OF_CHAIN).unwrap();
-        assert_eq!(f.raw_entry(&s, 20).unwrap(), 0xAFFF_FFFF);
+        assert_eq!(f.raw_entry(&s, 20).unwrap(), pattern | END_OF_CHAIN);
         assert_eq!(f.get(&s, 20).unwrap(), Entry::End);
         flush(&mut f, &s);
-        assert_eq!(s.peek(1, 20), 0xAFFF_FFFF);
+        assert_eq!(s.peek(1, 20), pattern | END_OF_CHAIN);
     }
 
     #[test]
     fn dirty_runs_come_out_sorted_and_once() {
         // Four sectors of 128 entries each.
         let l = layout(4, 500);
-        let s = VecStore::fresh(&l, 0xF8);
+        let s = VecStore::fresh(&l, MEDIA_FIXED);
         let mut f = Fat::open(&l, &s, 0, CACHE_BYTES).unwrap();
         assert!(f.take_dirty_runs().is_empty());
         // Changes out of order, twice in one sector: one run per group of
@@ -831,7 +843,9 @@ mod tests {
             runs.iter().map(|(s, d)| (*s, d.len())).collect::<Vec<_>>(),
             vec![(0, 1024), (3, 512)]
         );
-        assert_eq!(&runs[0].1[5 * 4..6 * 4], &END_OF_CHAIN.to_le_bytes());
+        // The entry of cluster 5, in the first run.
+        let at = 5 * ENTRY_SIZE;
+        assert_eq!(&runs[0].1[at..at + ENTRY_SIZE], &END_OF_CHAIN.to_le_bytes());
         assert!(f.take_dirty_runs().is_empty());
         assert!(!f.cache.borrow().dirty.iter().any(|&d| d));
     }
@@ -840,7 +854,7 @@ mod tests {
     fn long_runs_are_split() {
         // A FAT of 3000 sectors changed throughout comes out in 1 MiB runs.
         let l = layout(3000, 383_000);
-        let s = VecStore::fresh(&l, 0xF8);
+        let s = VecStore::fresh(&l, MEDIA_FIXED);
         let mut f = Fat::open(&l, &s, 0, CACHE_BYTES).unwrap();
         let used = Fat::used_sectors(&l);
         assert_eq!(used, 2993, "the last seven sectors hold no cluster");
@@ -859,7 +873,7 @@ mod tests {
         // Four FAT sectors, a cache of two slots: sectors 0 and 2 share a
         // slot, as do 1 and 3.
         let l = layout(4, 500);
-        let s = VecStore::fresh(&l, 0xF8);
+        let s = VecStore::fresh(&l, MEDIA_FIXED);
         let mut f = Fat::open(&l, &s, 0, 1024).unwrap();
         assert_eq!(f.cache.borrow().tags.len(), 2);
         let (reads, writes) = f.io_counts();
@@ -890,7 +904,7 @@ mod tests {
     fn full_sectors_are_skipped_and_come_back() {
         // Four sectors; fill the first three completely, then allocate.
         let l = layout(4, 500);
-        let s = VecStore::fresh(&l, 0xF8);
+        let s = VecStore::fresh(&l, MEDIA_FIXED);
         for c in 3..384 {
             s.poke(c, END_OF_CHAIN);
         }

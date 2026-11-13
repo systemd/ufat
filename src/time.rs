@@ -34,6 +34,29 @@ pub const FAT_MAX: i64 = 4_354_819_199;
 /// The largest nanosecond value representable in the last second.
 pub const FAT_MAX_NANOS: u32 = 990_000_000;
 
+/// The units of a day.
+const SECONDS_PER_MINUTE: u32 = 60;
+const MINUTES_PER_HOUR: u32 = 60;
+const HOURS_PER_DAY: u32 = 24;
+const SECONDS_PER_HOUR: u32 = SECONDS_PER_MINUTE * MINUTES_PER_HOUR;
+const SECONDS_PER_DAY: u32 = SECONDS_PER_HOUR * HOURS_PER_DAY;
+/// FAT keeps the time of the day in steps of two seconds, and the creation
+/// time the rest in hundredths of a second.
+const SECONDS_PER_STEP: u32 = 2;
+const HUNDREDTHS_PER_SECOND: u32 = 100;
+const NANOS_PER_SECOND: u32 = 1_000_000_000;
+const NANOS_PER_HUNDREDTH: u32 = NANOS_PER_SECOND / HUNDREDTHS_PER_SECOND;
+/// The months of a year, the month after which a leap year has its extra
+/// day, the days of a year that is not a leap year, and the years from one
+/// leap year to the next one, which holds between 1980 and 2099.
+const MONTHS_PER_YEAR: u16 = 12;
+const FEBRUARY: i64 = 2;
+const DAYS_PER_YEAR: i64 = 365;
+const YEARS_PER_LEAP_YEAR: i64 = 4;
+/// The years of a century, whose last year is no leap year unless it is
+/// that of an era.
+const YEARS_PER_CENTURY: i64 = 100;
+
 /// A field of the date or of the time of a [`FatTimestamp`]: `width` bits
 /// from bit `shift` on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,22 +111,22 @@ impl FatTimestamp {
         } else if secs > FAT_MAX || (secs == FAT_MAX && nanos > FAT_MAX_NANOS) {
             (FAT_MAX, FAT_MAX_NANOS)
         } else {
-            (secs, nanos.min(999_999_999))
+            (secs, nanos.min(NANOS_PER_SECOND - 1))
         };
-        let days = secs.div_euclid(86_400);
-        let sod = secs.rem_euclid(86_400) as u32;
+        let days = secs.div_euclid(i64::from(SECONDS_PER_DAY));
+        let sod = secs.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
         let (year, month, day) = civil_from_days(days);
-        let hour = sod / 3600;
-        let minute = (sod % 3600) / 60;
-        let second = sod % 60;
+        let hour = sod / SECONDS_PER_HOUR;
+        let minute = (sod % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE;
+        let second = sod % SECONDS_PER_MINUTE;
         FatTimestamp {
             date: FatTimestamp::YEARS.put((year - FAT_EPOCH_YEAR) as u16)
                 | FatTimestamp::MONTH.put(month as u16)
                 | FatTimestamp::DAY.put(day as u16),
             time: FatTimestamp::HOURS.put(hour as u16)
                 | FatTimestamp::MINUTES.put(minute as u16)
-                | FatTimestamp::TWO_SECONDS.put((second / 2) as u16),
-            tenths: ((second % 2) * 100 + nanos / 10_000_000) as u8,
+                | FatTimestamp::TWO_SECONDS.put((second / SECONDS_PER_STEP) as u16),
+            tenths: ((second % SECONDS_PER_STEP) * HUNDREDTHS_PER_SECOND + nanos / NANOS_PER_HUNDREDTH) as u8,
         }
     }
 
@@ -125,20 +148,24 @@ impl FatTimestamp {
         let year = i64::from(self.years_since_1980());
         let month = i64::from(self.month()).max(1);
         let day = i64::from(self.day()).max(1) - 1;
-        let mut leap_days = (year + 3) / 4;
+        // The leap years since 1980 before this one: 1980 is one.
+        let mut leap_days = (year + YEARS_PER_LEAP_YEAR - 1) / YEARS_PER_LEAP_YEAR;
         if year > YEAR_2100 {
             leap_days -= 1;
         }
-        if year & 3 == 0 && year != YEAR_2100 && month > 2 {
+        if year % YEARS_PER_LEAP_YEAR == 0 && year != YEAR_2100 && month > FEBRUARY {
             leap_days += 1;
         }
-        let days = year * 365 + leap_days + DAYS_BEFORE_MONTH[month as usize] + day + DAYS_DELTA;
-        let secs = days * 86_400
-            + i64::from(self.hours()) * 3600
-            + i64::from(self.minutes()) * 60
-            + i64::from(self.two_seconds()) * 2;
+        let days = year * DAYS_PER_YEAR + leap_days + DAYS_BEFORE_MONTH[month as usize] + day + DAYS_DELTA;
+        let secs = days * i64::from(SECONDS_PER_DAY)
+            + i64::from(self.hours()) * i64::from(SECONDS_PER_HOUR)
+            + i64::from(self.minutes()) * i64::from(SECONDS_PER_MINUTE)
+            + i64::from(self.two_seconds()) * i64::from(SECONDS_PER_STEP);
         let hundredths = u32::from(self.tenths);
-        (secs + i64::from(hundredths / 100), (hundredths % 100) * 10_000_000)
+        (
+            secs + i64::from(hundredths / HUNDREDTHS_PER_SECOND),
+            (hundredths % HUNDREDTHS_PER_SECOND) * NANOS_PER_HUNDREDTH,
+        )
     }
 
     /// Returns just the date part, with the time zeroed. Used for the access
@@ -190,12 +217,14 @@ impl FatTimestamp {
     /// Whether the date names a day of a month. A day beyond the end of its
     /// month still counts, as the readers roll it over.
     pub fn date_is_valid(self) -> bool {
-        (1..=12).contains(&self.month()) && self.day() != 0
+        (1..=MONTHS_PER_YEAR).contains(&self.month()) && self.day() != 0
     }
 
     /// Whether the time names a time of the day.
     pub fn time_is_valid(self) -> bool {
-        self.hours() <= 23 && self.minutes() <= 59 && self.two_seconds() <= 29
+        u32::from(self.hours()) < HOURS_PER_DAY
+            && u32::from(self.minutes()) < MINUTES_PER_HOUR
+            && u32::from(self.two_seconds()) < SECONDS_PER_MINUTE / SECONDS_PER_STEP
     }
 
     /// Converts a system time, clamping to the representable range.
@@ -214,29 +243,42 @@ impl FatTimestamp {
     }
 }
 
+// The proleptic Gregorian calendar repeats every 400 years, an era of
+// 146097 days. The two conversions below are Howard Hinnant's
+// days_from_civil() and civil_from_days()
+// (https://howardhinnant.github.io/date_algorithms.html). They count the
+// years of an era from March 1st, so that a leap day ends its year, and
+// eras from 0000-03-01, 719468 days before 1970-01-01. The other numbers
+// are the algorithms' own: (153 * mp + 2) / 5 is the day of the year of the
+// first day of month mp, counted from March, and 1460, 36524 and 146096
+// take the leap days out to find the year of the era.
+const YEARS_PER_ERA: i64 = 400;
+const DAYS_PER_ERA: i64 = 146_097;
+const DAYS_TO_UNIX_EPOCH: i64 = 719_468;
+
 /// Converts a proleptic Gregorian date into days since 1970-01-01.
 pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400);
+    let y = if i64::from(month) <= FEBRUARY { year - 1 } else { year };
+    let era = y.div_euclid(YEARS_PER_ERA);
+    let yoe = y.rem_euclid(YEARS_PER_ERA);
     let mp = i64::from(if month > 2 { month - 3 } else { month + 9 });
     let doy = (153 * mp + 2) / 5 + i64::from(day) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
+    let doe = yoe * DAYS_PER_YEAR + yoe / YEARS_PER_LEAP_YEAR - yoe / YEARS_PER_CENTURY + doy;
+    era * DAYS_PER_ERA + doe - DAYS_TO_UNIX_EPOCH
 }
 
 /// Converts days since 1970-01-01 into a proleptic Gregorian date.
 pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let z = days + DAYS_TO_UNIX_EPOCH;
+    let era = z.div_euclid(DAYS_PER_ERA);
+    let doe = z.rem_euclid(DAYS_PER_ERA);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / (DAYS_PER_ERA - 1)) / DAYS_PER_YEAR;
+    let doy = doe - (DAYS_PER_YEAR * yoe + yoe / YEARS_PER_LEAP_YEAR - yoe / YEARS_PER_CENTURY);
     let mp = (5 * doy + 2) / 153;
     let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    (year, month, day)
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * YEARS_PER_ERA + i64::from(month <= FEBRUARY);
+    (year, month as u32, day)
 }
 
 /// Converts microseconds since the epoch, as Varlink carries times, to a

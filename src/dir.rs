@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::dirent::{
     self, short_name_checksum, RawDirEntry, ATTR_LONG_NAME, ATTR_VOLUME_ID, DIR_ENTRY_SIZE, DOTDOT_NAME, DOT_NAME,
-    ENTRY_DELETED, ENTRY_END, NAME_BASE, NAME_EXT,
+    ENTRY_DELETED, ENTRY_END, NAME_BASE, NAME_EXT, SHORT_NAME_SIZE,
 };
 use crate::errno::*;
 use crate::name::{
@@ -666,7 +666,7 @@ impl Directory {
     /// be replaced: its names do not count, so its own tail, if it has one
     /// of this shape, is the lowest candidate worth trying below the hint.
     /// None if every tail is taken.
-    pub(crate) fn short_name_for(&mut self, alias: &Alias, except: Option<&DirEntry>) -> Option<[u8; 11]> {
+    pub(crate) fn short_name_for(&mut self, alias: &Alias, except: Option<&DirEntry>) -> Option<[u8; SHORT_NAME_SIZE]> {
         let own_tail = |shape: &TailShape| {
             let e = except?;
             let (own, tail) = TailShape::parse(&fold_str(&short_name_to_string(&e.short)))?;
@@ -1003,8 +1003,8 @@ mod proofs {
     }
 
     /// A legal 8.3 name with symbolic letters.
-    fn any_short_name() -> [u8; 11] {
-        let name: [u8; 11] = kani::any();
+    fn any_short_name() -> [u8; SHORT_NAME_SIZE] {
+        let name: [u8; SHORT_NAME_SIZE] = kani::any();
         kani::assume(
             name.iter()
                 .all(|&b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b' '),
@@ -1068,7 +1068,7 @@ mod tests {
         d.find_name(&fold_str(name))
     }
 
-    fn short(name: &[u8; 11], attr: u8) -> RawDirEntry {
+    fn short(name: &[u8; SHORT_NAME_SIZE], attr: u8) -> RawDirEntry {
         RawDirEntry {
             name: *name,
             attr,
@@ -1077,7 +1077,7 @@ mod tests {
     }
 
     /// Places `name` the way the volume does and returns its short name.
-    fn create(d: &mut Directory, name: &str) -> [u8; 11] {
+    fn create(d: &mut Directory, name: &str) -> [u8; SHORT_NAME_SIZE] {
         let long_name = LongName::new(name).unwrap();
         assert!(!d.name_taken(&long_name.folded(), None), "{} exists", name);
         let alias = Alias::of(&long_name);

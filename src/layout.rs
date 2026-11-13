@@ -9,6 +9,7 @@
 //! number of data clusters.
 
 use crate::errno::*;
+use crate::fat::ENTRY_SIZE;
 use crate::Result;
 use crate::{Detail, NoSpaceReason};
 
@@ -25,6 +26,9 @@ fn too_small_volume() -> Detail {
 /// based firmware refuses FAT32 volumes with fewer clusters, Windows treats
 /// them as FAT16, so for an ESP this is a hard floor.
 pub const MIN_CLUSTERS: u32 = 65525;
+/// The first cluster of the data area. FAT entries 0 and 1 belong to no
+/// cluster: entry 0 holds the media descriptor, entry 1 the volume flags.
+pub const FIRST_CLUSTER: u32 = 2;
 /// The largest cluster count a FAT32 volume can have (cluster numbers run
 /// from 2 to 0x0FFFFFF6).
 pub const MAX_CLUSTERS: u32 = 0x0FFF_FFF5;
@@ -99,15 +103,16 @@ impl Layout {
 
     /// Number of entries one FAT copy can hold.
     pub fn fat_capacity(&self) -> u32 {
-        u32::try_from(self.fat_size() / 4).unwrap_or(u32::MAX)
+        u32::try_from(self.fat_size() / ENTRY_SIZE as u64).unwrap_or(u32::MAX)
     }
 
-    /// Number of FAT entries in use: two reserved ones plus one per cluster.
+    /// Number of FAT entries in use: the reserved ones before
+    /// [`FIRST_CLUSTER`] and one per cluster.
     pub fn fat_entries(&self) -> u32 {
-        self.clusters + 2
+        FIRST_CLUSTER + self.clusters
     }
 
-    /// First sector of the data area, i.e. of cluster 2.
+    /// First sector of the data area, i.e. of [`FIRST_CLUSTER`].
     pub fn data_start_sector(&self) -> u64 {
         self.fat_start_sector(self.fats)
     }
@@ -119,12 +124,12 @@ impl Layout {
 
     /// Highest valid cluster number.
     pub fn max_cluster(&self) -> u32 {
-        self.clusters + 1
+        self.fat_entries() - 1
     }
 
     /// Whether `cluster` is a valid data cluster number.
     pub fn valid_cluster(&self, cluster: u32) -> bool {
-        (2..=self.max_cluster()).contains(&cluster)
+        (FIRST_CLUSTER..=self.max_cluster()).contains(&cluster)
     }
 
     /// Byte offset of a data cluster.
@@ -132,12 +137,13 @@ impl Layout {
         if !self.valid_cluster(cluster) {
             bail!(
                 EUCLEAN,
-                "cluster {} is out of range 2..={}",
+                "cluster {} is out of range {}..={}",
                 cluster,
+                FIRST_CLUSTER,
                 self.max_cluster()
             );
         }
-        Ok(self.data_start() + (u64::from(cluster) - 2) * u64::from(self.cluster_size()))
+        Ok(self.data_start() + u64::from(cluster - FIRST_CLUSTER) * u64::from(self.cluster_size()))
     }
 
     /// Sectors actually covered by the layout; trailing sectors that do not
@@ -355,9 +361,12 @@ pub fn compute(params: &LayoutParams, total_sectors: u64) -> Result<Layout> {
         }
         let fatdata = total - reserved;
         // mkfs.fat's estimate: everything after the reserved area is split
-        // between the FATs and the clusters they describe.
-        let estimate = (fatdata * ss + fats * 8) / (spc * ss + fats * 4);
-        let fat_sectors = align_up(((estimate + 2) * 4).div_ceil(ss), spc, align);
+        // between the FATs and the clusters they describe. Each FAT holds
+        // the entries before the first cluster and one entry per cluster.
+        let entry = ENTRY_SIZE as u64;
+        let reserved_entries = u64::from(FIRST_CLUSTER);
+        let estimate = (fatdata * ss + fats * reserved_entries * entry) / (spc * ss + fats * entry);
+        let fat_sectors = align_up(((estimate + reserved_entries) * entry).div_ceil(ss), spc, align);
         let clusters = if fatdata > fats * fat_sectors {
             (fatdata - fats * fat_sectors) / spc
         } else {
@@ -426,7 +435,8 @@ pub fn minimal(params: &LayoutParams, clusters: u32) -> Result<Layout> {
     let fats = u64::from(params.fats);
     let candidate = |align: bool| {
         let reserved = align_up(u64::from(params.reserved_sectors), spc, align);
-        let fat_sectors = align_up(((u64::from(need) + 2) * 4).div_ceil(ss), spc, align);
+        let entries = u64::from(FIRST_CLUSTER) + u64::from(need);
+        let fat_sectors = align_up((entries * ENTRY_SIZE as u64).div_ceil(ss), spc, align);
         let total = reserved + fats * fat_sectors + u64::from(need) * spc;
         match params.track_sectors {
             Some(track) => total.next_multiple_of(u64::from(track)),
