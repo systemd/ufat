@@ -309,7 +309,7 @@ This recording uses varlinkctl to make an ESP image from a manifest:
 
 ## The library
 
-The crate `ufat` provides the same operations as the tool:
+The crate `fat` provides the same operations as the tool:
 
 - `format` creates a file system on a `device::Device`.
 - `volume::Volume` opens one and reads, writes, creates and removes

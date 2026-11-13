@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 [package]
-name = "ufat-trace"
+name = "fat-trace"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ publish.workspace = true
 # The library again, with the write trace of device.rs compiled in, see
 # build.rs. Only the crash consistency harness uses it.
 [lib]
-path = "../../src/lib.rs"
+path = "../../src/fat/lib.rs"
 test = false
 doctest = false
 doc = false

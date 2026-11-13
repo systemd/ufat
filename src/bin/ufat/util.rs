@@ -5,13 +5,13 @@ use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ufat::device::{Access, Device};
-use ufat::errno;
-use ufat::format::FormatOptions;
-use ufat::plan::{Estimate, Plan, PlanOptions};
-use ufat::probe::Prober;
-use ufat::volume::Volume;
-use ufat::{bail, err, Context, Error, Result};
+use fat::device::{Access, Device};
+use fat::errno;
+use fat::format::FormatOptions;
+use fat::plan::{Estimate, Plan, PlanOptions};
+use fat::probe::Prober;
+use fat::volume::Volume;
+use fat::{bail, err, Context, Error, Result};
 
 /// The current time.
 pub(crate) fn now() -> SystemTime {
@@ -26,9 +26,9 @@ pub(crate) const MAX_MANIFEST_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Reads a UAPI.16 manifest from an open file or pipe to its end, within
 /// [`MAX_MANIFEST_BYTES`], and parses it.
-pub(crate) fn read_manifest(file: std::fs::File) -> Result<ufat::manifest::Manifest> {
+pub(crate) fn read_manifest(file: std::fs::File) -> Result<fat::manifest::Manifest> {
     let text = read_all(file, MAX_MANIFEST_BYTES).with_context(|| "cannot read the manifest")?;
-    ufat::manifest::parse(&text)
+    fat::manifest::parse(&text)
 }
 
 /// Reads an open file to its end, refusing one of more than `limit` bytes
@@ -91,13 +91,13 @@ pub(crate) fn parse_size(s: &str) -> Result<u64> {
 /// the same timestamp must not end up with the same one.
 pub(crate) fn pick_volume_id(time: SystemTime, label: Option<&str>, reproducible: bool) -> u32 {
     if !reproducible {
-        if let Ok(id) = ufat::format::random_volume_id() {
+        if let Ok(id) = fat::format::random_volume_id() {
             return id;
         }
     }
     // FNV-1a over the time and the label.
     let mut h: u32 = 0x811c_9dc5;
-    for b in ufat::time::to_usec(time)
+    for b in fat::time::to_usec(time)
         .to_le_bytes()
         .iter()
         .chain(label.unwrap_or("").as_bytes())

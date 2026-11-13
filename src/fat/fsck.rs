@@ -2384,7 +2384,7 @@ mod tests {
             Interoperability,
             Other,
         ];
-        let idl = include_str!("../docs/org.uapi-group.FileSystem.varlink");
+        let idl = include_str!("../../docs/org.uapi-group.FileSystem.varlink");
         let line = idl
             .lines()
             .find(|l| l.starts_with("type ProblemClass("))

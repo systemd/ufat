@@ -16,8 +16,8 @@
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
-use ufat::device::{Access, Device};
-use ufat::format::{self, FormatOptions};
+use fat::device::{Access, Device};
+use fat::format::{self, FormatOptions};
 
 fn size(s: &str) -> Option<u64> {
     let (digits, factor) = match s.as_bytes().last()? {

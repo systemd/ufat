@@ -12,11 +12,11 @@ use std::time::{Duration, UNIX_EPOCH};
 use common::{
     build_tree, bytes_at, find_mtool, find_program, first_difference, run, tree_dirs, tree_files, ufat, Temp,
 };
-use ufat::device::{Access, Device};
-use ufat::format::{self, FormatOptions};
-use ufat::host;
-use ufat::populate::{CopyOptions, TimePolicy};
-use ufat::volume::Volume;
+use fat::device::{Access, Device};
+use fat::format::{self, FormatOptions};
+use fat::host;
+use fat::populate::{CopyOptions, TimePolicy};
+use fat::volume::Volume;
 
 /// A source tree resolved once, the way the tool resolves its arguments.
 fn source(path: &Path) -> OwnedFd {
@@ -187,7 +187,7 @@ fn fsck_fat_is_happy() {
             assert!(!text.contains(bad), "fsck.fat output mentions '{}':\n{}", bad, text);
         }
         // Our own checker agrees.
-        let report = ufat::fsck::check(&Device::open(image.path(), Access::ReadOnly).unwrap()).unwrap();
+        let report = fat::fsck::check(&Device::open(image.path(), Access::ReadOnly).unwrap()).unwrap();
         assert_eq!(report.errors(), 0, "{:?}", report.problems);
     }
 }
@@ -385,7 +385,7 @@ fn planner_is_exact() {
             allow_small: true,
             ..FormatOptions::default()
         };
-        let mut plan = ufat::plan::Plan::new(ufat::plan::PlanOptions::from_format_options(&options, None).unwrap());
+        let mut plan = fat::plan::Plan::new(fat::plan::PlanOptions::from_format_options(&options, None).unwrap());
         plan.add_tree(source(tree.path()).as_fd(), "/", false).unwrap();
         let estimate = plan.estimate().unwrap();
         estimate.apply(&mut options);
@@ -482,18 +482,18 @@ fn matches_sha256sum() {
     assert_eq!(expected.len(), files.len());
     for (name, data) in &files {
         assert_eq!(
-            ufat::sha256::to_hex(&ufat::sha256::digest(data)),
+            fat::sha256::to_hex(&fat::sha256::digest(data)),
             expected[name],
             "{}",
             name
         );
     }
     let dir = source(tree.path());
-    let manifest = ufat::manifest::parse(&ufat::manifest::generate(dir.as_fd()).unwrap()).unwrap();
+    let manifest = fat::manifest::parse(&fat::manifest::generate(dir.as_fd()).unwrap()).unwrap();
     let mut hashed = 0;
     for entry in &manifest.entries {
         if let (Some(name), Some(hash)) = (&entry.name, &entry.sha256) {
-            assert_eq!(ufat::sha256::to_hex(hash), expected[name], "{}", name);
+            assert_eq!(fat::sha256::to_hex(hash), expected[name], "{}", name);
             hashed += 1;
         }
     }

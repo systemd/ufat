@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 /// The sector size the tests write into boot sectors, the smallest one.
-pub const SECTOR_SIZE: u16 = ufat::layout::MIN_SECTOR_SIZE as u16;
+pub const SECTOR_SIZE: u16 = fat::layout::MIN_SECTOR_SIZE as u16;
 /// A sector size no FAT file system has, as it is not a power of two.
 pub const ODD_SECTOR_SIZE: u16 = 1000;
 

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-//! Generates src/name/fold_table.rs, the case folding table of the `name`
+//! Generates src/fat/name/fold_table.rs, the case folding table of the `name`
 //! module, from UnicodeData.txt and SpecialCasing.txt of the Unicode
 //! Character Database in the directory given:
 //!
@@ -120,7 +120,7 @@ fn main() {
         "//! Unicode {}.{}.{}. Do not edit; HACKING.md says how to check it, and\n",
         major, minor, update
     ));
-    out.push_str("//! src/name.rs explains the rule.\n\n");
+    out.push_str("//! src/fat/name.rs explains the rule.\n\n");
     out.push_str("/// The Unicode version the table was generated from.\n");
     out.push_str(&format!(
         "pub(super) const UNICODE_VERSION: (u8, u8, u8) = ({}, {}, {});\n\n",

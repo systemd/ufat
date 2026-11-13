@@ -8,19 +8,19 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::SystemTime;
 
-use ufat::device::{Access, Device};
-use ufat::errno;
-use ufat::format::{self, FormatOptions, VolumeId};
-use ufat::fsck;
-use ufat::host;
-use ufat::layout::MIN_SECTOR_SIZE;
-use ufat::manifest::{self, AssembleOptions, DirectorySource, StreamSource};
-use ufat::plan::{Plan, PlanOptions};
-use ufat::populate::{CopyOptions, TimePolicy};
-use ufat::probe::Prober;
-use ufat::time::civil_from_days;
-use ufat::volume::Volume;
-use ufat::{bail, err, Context, Detail, Error, Result};
+use fat::device::{Access, Device};
+use fat::errno;
+use fat::format::{self, FormatOptions, VolumeId};
+use fat::fsck;
+use fat::host;
+use fat::layout::MIN_SECTOR_SIZE;
+use fat::manifest::{self, AssembleOptions, DirectorySource, StreamSource};
+use fat::plan::{Plan, PlanOptions};
+use fat::populate::{CopyOptions, TimePolicy};
+use fat::probe::Prober;
+use fat::time::civil_from_days;
+use fat::volume::Volume;
+use fat::{bail, err, Context, Detail, Error, Result};
 
 use crate::service;
 use crate::util::{self, ImageFlags};
@@ -564,7 +564,7 @@ fn assemble_options(args: &Args) -> Result<AssembleOptions> {
         now_usec: if args.flag("no-check-validity") {
             None
         } else {
-            Some(ufat::time::to_usec(util::now()))
+            Some(fat::time::to_usec(util::now()))
         },
     })
 }
@@ -657,7 +657,7 @@ fn write_manifest(v: &Volume, path: &Path) -> Result<()> {
 }
 
 /// Reports the geometry of a freshly made file system.
-fn report_layout(image: &Path, layout: &ufat::layout::Layout, verbose: bool) {
+fn report_layout(image: &Path, layout: &fat::layout::Layout, verbose: bool) {
     if verbose {
         eprintln!(
             "{}: {} sectors of {} bytes, {} clusters of {} bytes, {} reserved sectors, {} of {} sectors",
@@ -795,7 +795,7 @@ fn unfinished(v: Volume, e: Error) -> Error {
     e
 }
 
-fn report_estimate(args: &Args, path: &Path, estimate: &ufat::plan::Estimate) {
+fn report_estimate(args: &Args, path: &Path, estimate: &fat::plan::Estimate) {
     if args.flag("verbose") {
         eprintln!(
             "{}: {} and {} in {} need a {} byte file system with {} byte clusters",
@@ -1087,7 +1087,7 @@ fn print_description(v: &Volume, out: &mut dyn Write) -> Result<()> {
         writeln!(
             out,
             "note:             below the FAT32 minimum of {} clusters",
-            ufat::layout::MIN_CLUSTERS
+            fat::layout::MIN_CLUSTERS
         )?;
     }
     Ok(())

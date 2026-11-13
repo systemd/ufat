@@ -315,7 +315,7 @@ fn describe_and_check_say_what_an_image_holds() {
     let Some(bin) = ufat() else {
         return eprintln!("skipping: no ufat binary");
     };
-    let blkid = ufat::probe::Prober::new().has_libblkid();
+    let blkid = fat::probe::Prober::new().has_libblkid();
     let dir = Temp::dir();
     for (i, maker) in common::MAKERS.iter().enumerate() {
         let image = dir.path().join(format!("{}-{}.img", i, maker.program));
@@ -366,7 +366,7 @@ fn assemble_refuses_to_format_over_what_is_there() {
     let Some(bin) = ufat() else {
         return eprintln!("skipping: no ufat binary");
     };
-    let blkid = ufat::probe::Prober::new().has_libblkid();
+    let blkid = fat::probe::Prober::new().has_libblkid();
     let dir = Temp::dir();
     let root = dir.path();
     tree(&root.join("tree"));
@@ -876,9 +876,9 @@ fn manifests_of_what_was_written() {
     assert_eq!(stdout, fs::read(&written).unwrap());
     // What --hash sha256 prints for an image sized to fit.
     let sha256_line = |image: &str| {
-        let mut h = ufat::sha256::Sha256::new();
+        let mut h = fat::sha256::Sha256::new();
         h.update(&fs::read(image).unwrap());
-        format!("{}\n", ufat::sha256::to_hex(&h.finalize()))
+        format!("{}\n", fat::sha256::to_hex(&h.finalize()))
     };
     assert_eq!(stderr, sha256_line(c));
     // --write-hash writes the hash to a file of its own, or for "-" to
@@ -982,7 +982,7 @@ fn counts_of_one() {
     let image = fs::OpenOptions::new().read(true).write(true).open(&b).unwrap();
     let mut sector = [0u8; 512];
     image.read_exact_at(&mut sector, 0).unwrap();
-    let layout = ufat::boot::BootSector::parse(&sector).unwrap().layout().unwrap();
+    let layout = fat::boot::BootSector::parse(&sector).unwrap().layout().unwrap();
     image.write_all_at(&[0xf0], layout.fat_offset(0)).unwrap();
     drop(image);
     let out = run(&bin, &["check", b.to_str().unwrap()]);
@@ -1007,8 +1007,8 @@ fn counts_of_one() {
         "{}",
         summary
     );
-    let device = ufat::device::Device::open(Path::new(e), ufat::device::Access::ReadWrite).unwrap();
-    let mut v = ufat::volume::Volume::open(device).unwrap();
+    let device = fat::device::Device::open(Path::new(e), fat::device::Access::ReadWrite).unwrap();
+    let mut v = fat::volume::Volume::open(device).unwrap();
     let long: String = std::iter::repeat_n('\u{20ac}', 100).collect();
     v.create_dir(&format!("/{}", long), std::time::SystemTime::now())
         .unwrap();
@@ -1041,9 +1041,9 @@ fn hashes_and_capabilities() {
     let a = root.join("a.img");
     let a = a.to_str().unwrap();
     let hash = ok(&bin, &["assemble", "--create", "--hash", "sha256", a, t]);
-    let mut h = ufat::sha256::Sha256::new();
+    let mut h = fat::sha256::Sha256::new();
     h.update(&fs::read(a).unwrap());
-    assert_eq!(hash, format!("{}\n", ufat::sha256::to_hex(&h.finalize())));
+    assert_eq!(hash, format!("{}\n", fat::sha256::to_hex(&h.finalize())));
     let hash = ok(&bin, &["assemble", "--force", "--hash", "sha512", a, t]);
     assert_eq!(hash.trim().len(), 128);
     fails(&bin, &["assemble", "--hash", "md5", a, t], "sha256 or sha512");

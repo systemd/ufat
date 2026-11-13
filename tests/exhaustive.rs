@@ -5,10 +5,10 @@
 
 use std::thread;
 
-use ufat::dirent::NAME_BASE;
-use ufat::layout::*;
-use ufat::name::{fold_str, join_long_name, long_name_entries, parse_long_name_entry, Alias, LongName};
-use ufat::time::{FatTimestamp, FAT_EPOCH, FAT_MAX, FAT_MAX_NANOS};
+use fat::dirent::NAME_BASE;
+use fat::layout::*;
+use fat::name::{fold_str, join_long_name, long_name_entries, parse_long_name_entry, Alias, LongName};
+use fat::time::{FatTimestamp, FAT_EPOCH, FAT_MAX, FAT_MAX_NANOS};
 
 fn threads() -> u64 {
     thread::available_parallelism().map_or(4, |n| n.get() as u64)
