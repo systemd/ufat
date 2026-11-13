@@ -157,10 +157,21 @@ What the fields mean for vfat:
 | `options` | `FormatOptions`, see below. |
 | `content` | What to copy into the new file system, see "Content". |
 | `imageHash` | `sha256` or `sha512`. Hashes the image after formatting. |
+| `force` | Formats the image whatever it holds. Off by default. |
 
 Mode `assemble` creates the file system and copies the content into it,
 in one call. Mode `plan` computes the geometry and the size the content
 needs. It writes nothing.
+
+Mode `assemble` does not format over what the image holds. It fails with
+`ImageNotEmpty` when the part of the image that it would format holds a
+file system, FAT32 included, a partition table, an encrypted volume, a
+RAID or LVM member, or anything else that libblkid recognizes. It
+formats an image that is blank or holds data that libblkid does not
+recognize, as mkfs.xfs does. Without libblkid it formats only a blank
+image. Blank means that the first 256 KiB are zeros. An empty image file
+and the part of a file that it grows are blank. `force` formats any
+image.
 
 How the image is sized:
 
@@ -208,9 +219,9 @@ marked as not cleanly unmounted, as after a crash. The file system holds
 the files that were complete when the call failed. `Check` reports the
 mark with the warnings `dirtyFlag` and `fatDirtyFlag`. fsck.fat reports
 it too, and Linux warns about it when it mounts the file system
-read-write. Calling `Assemble` again formats the image anew. A call that
-fails before the image is opened leaves it unchanged, see "Passing file
-descriptors".
+read-write. Calling `Assemble` again with `force` formats the image
+anew. A call that fails before the image is opened leaves it unchanged,
+see "Passing file descriptors".
 
 #### FormatOptions
 
@@ -492,6 +503,7 @@ The service returns no text. Every error is a name with typed fields.
 | `OperationNotSupported` | `discard`, features or `repair` were requested. | `operation` |
 | `SizeRequired` | `Assemble` without content into an empty file without a `size`. | none |
 | `NotFileSystem` | The image holds no FAT32 file system. | `reason` (`blank`, `foreignImageType`, `sectorSize`, `tooSmall`, `unknown`), `found`, `sectorSize` |
+| `ImageNotEmpty` | `Assemble` without `force` into an image that holds a file system, a partition table or other data. | `found` |
 | `Corrupt` | The file system is damaged where the operation needs it. | `where` (`superblock`, `allocation`, `chain`, `directory`), `field`, `path`, `block` |
 | `NoSpaceLeft` | The file system is full, or the cluster size leaves fewer than 65525 clusters. | `reason` (`blocks`, `directoryEntries`, `names`, `volume`), `path` |
 | `TooSmall` | The content does not fit the `size` given to `Assemble`. | `minimalSizeBytes`, `sizeBytes` |
@@ -532,6 +544,11 @@ ufat loads libblkid when it needs it. Without libblkid, `foreignImageType`
 does not occur. An image that holds another file system or a partition
 table is then `unknown`, or `Corrupt` when its boot sector reads like a
 damaged FAT32 one, as that of NTFS does.
+
+`ImageNotEmpty` names what the image holds in `found`, the way libblkid
+does, such as `vfat`, `ext4`, `crypto_LUKS` or `gpt`. FAT12 and FAT16
+volumes are `fat12` and `fat16`. Without libblkid, `found` is `vfat` for
+a FAT32 file system and `unknown` for anything else that is not blank.
 
 The interface also declares `ContentRequired` and `ToolFailed`. The vfat
 implementation never returns them.

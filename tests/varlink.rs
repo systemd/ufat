@@ -919,11 +919,12 @@ fn assemble_without_content() {
     let (_fresh2, fresh_img2) = fresh_image();
     let e = error_of(&mut c, "Assemble", IMG, &[fresh_img2.as_fd()]);
     assert_eq!(e.name, format!("{}.SizeRequired", IFACE));
-    // Options the library refuses are named as the interface spells them.
+    // Options the library refuses are named as the interface spells them,
+    // with force set, since the image holds a file system by now.
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"options":{"blockSize":3000}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"blockSize":3000},"force":true}"#,
         &[img.as_fd()],
     );
     assert_eq!(e.name, "org.varlink.service.InvalidParameter");
@@ -931,24 +932,103 @@ fn assemble_without_content() {
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"options":{"sectorSize":256}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"sectorSize":256},"force":true}"#,
         &[img.as_fd()],
     );
     assert_eq!(str_of(&e.parameters, "parameter"), "sectorSize");
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"options":{"vfat":{"fats":9}}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"vfat":{"fats":9}},"force":true}"#,
         &[img.as_fd()],
     );
     assert_eq!(str_of(&e.parameters, "parameter"), "fats");
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"options":{"vfat":{"oemName":"nine chars"}}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"vfat":{"oemName":"nine chars"}},"force":true}"#,
         &[img.as_fd()],
     );
     assert_eq!(str_of(&e.parameters, "parameter"), "oemName");
+}
+
+/// Assemble does not format over what the image holds, unless force is
+/// set, and ImageNotEmpty says what it found: a FAT32 file system it made
+/// itself, another file system, which only libblkid names. A blank part
+/// of the same image is formatted. Looking leaves the offset of the
+/// caller's descriptor alone.
+#[test]
+fn assemble_refuses_what_is_there_without_force() {
+    use std::io::{Seek, SeekFrom};
+    let _serial = common::serial();
+    let Some(ufat) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let blkid = ufat::probe::Prober::new().has_libblkid();
+    let tree = esp_tree();
+    let mut c = connect_fd3(&ufat);
+    let image = Temp::image(100 << 20);
+    let mut img = rw(image.path());
+    // A file system in the first 40 MiB of the image, and 40 MiB of it
+    // 10 MiB behind them.
+    let size = 40 << 20;
+    let first = format!(r#"{{"image":{{"fileDescriptor":0,"size":{}}}}}"#, size);
+    let behind = format!(
+        r#"{{"image":{{"fileDescriptor":0,"offset":{},"size":{}}}}}"#,
+        size + (10 << 20),
+        size
+    );
+    reply(call(&mut c, "Assemble", &first, &[img.as_fd()]));
+    // Where the caller left its descriptor, which looking leaves alone.
+    let position = 12345;
+    img.seek(SeekFrom::Start(position)).unwrap();
+    for params in [
+        first.as_str(),
+        IMG,
+        r#"{"image":{"fileDescriptor":0},"force":false}"#,
+        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1}}"#,
+    ] {
+        let source = ro(tree.path());
+        let e = error_of(&mut c, "Assemble", params, &[img.as_fd(), source.as_fd()]);
+        assert_eq!(e.name, format!("{}.ImageNotEmpty", IFACE), "{}", params);
+        assert_eq!(str_of(&e.parameters, "found"), "vfat");
+    }
+    assert_eq!(img.stream_position().unwrap(), position);
+    // Planning writes nothing and looks at nothing.
+    reply(call(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"mode":"plan"}"#,
+        &[img.as_fd()],
+    ));
+    // The 40 MiB behind the file system are blank.
+    reply(call(&mut c, "Assemble", &behind, &[img.as_fd()]));
+    let source = ro(tree.path());
+    let r = reply(call(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1},"force":true}"#,
+        &[img.as_fd(), source.as_fd()],
+    ));
+    assert_eq!(u64_of(&r, "files"), 2);
+    // Another file system.
+    let ext4 = Temp::new(".img");
+    let mkfs_ext4 = common::Maker::of("ext4");
+    if !mkfs_ext4.make(ext4.path()) {
+        return eprintln!("skipping {}: not found", mkfs_ext4.program);
+    }
+    let ext4_img = rw(ext4.path());
+    let e = error_of(&mut c, "Assemble", IMG, &[ext4_img.as_fd()]);
+    assert_eq!(e.name, format!("{}.ImageNotEmpty", IFACE));
+    assert_eq!(str_of(&e.parameters, "found"), if blkid { "ext4" } else { "unknown" });
+    reply(call(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"force":true}"#,
+        &[ext4_img.as_fd()],
+    ));
+    let e = error_of(&mut c, "Assemble", IMG, &[ext4_img.as_fd()]);
+    assert_eq!(str_of(&e.parameters, "found"), "vfat");
 }
 
 /// Assemble with a manifest beside the directory it describes: links are
@@ -1305,13 +1385,14 @@ fn a_failed_assemble_leaves_the_file_system_unfinished() {
     );
     assert_eq!(e.name, format!("{}.EntryNotValid", IFACE));
     assert_eq!(warnings(&mut c, expired.path()), ["dirtyFlag", "fatDirtyFlag"]);
-    // Assembling again starts over with a clean file system.
+    // Assembling again starts over with a clean file system, with force
+    // set, since the image holds a file system by now.
     std::fs::write(tree.join("loader/loader.conf"), b"timeout 5\n").unwrap();
     let manifest_file = ro(&base.path().join("manifest"));
     reply(call(
         &mut c,
         "Assemble",
-        assemble,
+        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2},"force":true}"#,
         &[img.as_fd(), manifest_file.as_fd(), source.as_fd()],
     ));
     assert!(warnings(&mut c, image.path()).is_empty());

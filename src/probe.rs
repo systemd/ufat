@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-//! What an image holds when it holds no FAT32 file system.
+//! What an image holds besides a FAT32 file system.
+//!
+//! This answers two questions. When an image holds no FAT32 file system,
+//! opening and checking it say what it holds instead. And before an image
+//! is formatted, [`Prober::ensure_empty`] refuses one that holds something
+//! that formatting would destroy.
 //!
 //! A caller that is told that an image is blank may well format it, so
 //! blank has to mean that nothing is there. ext2, ext3, ext4, btrfs, swap
@@ -20,7 +25,7 @@ use blkid::{Blkid, Found};
 
 use crate::boot::{BootSector, BOOT_SECTOR_SIZE};
 use crate::device::Device;
-use crate::errno::{EMEDIUMTYPE, EUCLEAN};
+use crate::errno::{EMEDIUMTYPE, ENOTEMPTY, EUCLEAN};
 use crate::sys::{reopen, O_NOCTTY, O_NONBLOCK, O_RDONLY};
 use crate::{Context, CorruptPlace, Detail, Error, NotFat32Reason, Result};
 
@@ -52,6 +57,14 @@ struct ImageType {
 }
 
 impl ImageType {
+    /// A FAT32 file system this crate recognizes itself.
+    fn fat32() -> ImageType {
+        ImageType {
+            name: "vfat".to_string(),
+            kind: Kind::FileSystem,
+        }
+    }
+
     /// What libblkid found: the superblock when there is one, the
     /// partition table otherwise.
     fn from_blkid(found: &Found) -> Option<ImageType> {
@@ -95,10 +108,10 @@ impl ImageType {
     }
 }
 
-/// What an image holds.
+/// What a range of an image holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Contents {
-    /// Its first [`HEAD_SIZE`] bytes are zeros, or all of a smaller image,
+    /// Its first [`HEAD_SIZE`] bytes are zeros, or all of a smaller range,
     /// and libblkid, where it was asked, found nothing.
     Blank,
     /// Something libblkid recognizes.
@@ -206,9 +219,9 @@ impl Prober {
         self.blkid.is_some()
     }
 
-    /// What `device` holds.
-    fn examine(&self, device: &Device) -> Result<Contents> {
-        if device.is_empty() {
+    /// What the `len` bytes at `offset` of `device` hold.
+    fn examine(&self, device: &Device, offset: u64, len: u64) -> Result<Contents> {
+        if len == 0 {
             return Ok(Contents::Blank);
         }
         if let Some(blkid) = self.blkid {
@@ -218,14 +231,14 @@ impl Prober {
             // of the image, and the offset and flags of that one, which a
             // Varlink client shares with the service, stay as they are.
             let found = reopen(device.fd(), O_RDONLY | O_NONBLOCK | O_NOCTTY)
-                .and_then(|own| blkid.probe(own.as_fd(), device.offset(), device.len()))
+                .and_then(|own| blkid.probe(own.as_fd(), device.offset() + offset, len))
                 .with_context(|| "libblkid could not probe the image")?;
             if let Some(image_type) = found.as_ref().and_then(ImageType::from_blkid) {
                 return Ok(Contents::Found(image_type));
             }
         }
-        let mut head = vec![0u8; device.len().min(HEAD_SIZE) as usize];
-        device.read_at(0, &mut head)?;
+        let mut head = vec![0u8; len.min(HEAD_SIZE) as usize];
+        device.read_at(offset, &mut head)?;
         Ok(if head.iter().all(|&b| b == 0) {
             Contents::Blank
         } else {
@@ -253,7 +266,7 @@ impl Prober {
         let Some(failure) = Failure::of(&e) else {
             return e;
         };
-        let contents = match self.examine(device) {
+        let contents = match self.examine(device, 0, device.len()) {
             Ok(contents) => contents,
             Err(read) => return read,
         };
@@ -273,6 +286,61 @@ impl Prober {
             Contents::Unknown { .. } if failure == Failure::SectorSize && fat => e,
             other => other.error(),
         }
+    }
+
+    /// Refuses to format the `size` bytes at `offset` of `device`, or all
+    /// that follows `offset` without a size, when they hold something
+    /// formatting would destroy: a file system, FAT32 included, a
+    /// partition table, an encrypted volume, a RAID or LVM member, or
+    /// anything else libblkid recognizes. The error is ENOTEMPTY with
+    /// [`Detail::NotEmpty`], which names it.
+    ///
+    /// A blank range is formatted, and so is data that libblkid does not
+    /// recognize, as mkfs.xfs and mkfs.btrfs do. Without libblkid only a
+    /// blank range is. Only the bytes `device` has now are looked at: a
+    /// file that is grown for the file system is blank beyond its end, and
+    /// a new one is blank all through.
+    pub fn ensure_empty(&self, device: &Device, offset: u64, size: Option<u64>) -> Result<()> {
+        let start = offset.min(device.len());
+        let end = size.map_or(device.len(), |size| offset.saturating_add(size).min(device.len()));
+        let len = end.saturating_sub(start);
+        let found = match self.examine(device, start, len)? {
+            Contents::Blank => return Ok(()),
+            Contents::Found(image_type) => image_type,
+            Contents::Unknown { probed } => {
+                if Prober::holds_fat32(device, start, len)? {
+                    ImageType::fat32()
+                } else if probed {
+                    return Ok(());
+                } else {
+                    bail!(
+                        ENOTEMPTY,
+                        Detail::NotEmpty {
+                            found: "unknown".to_string(),
+                        },
+                        "the image is not blank and libblkid is not available"
+                    );
+                }
+            }
+        };
+        let what = found.describe();
+        bail!(
+            ENOTEMPTY,
+            Detail::NotEmpty { found: found.name },
+            "the image holds {}",
+            what
+        )
+    }
+
+    /// Whether the `len` bytes at `offset` of `device` start with a FAT32
+    /// file system this crate can open.
+    fn holds_fat32(device: &Device, offset: u64, len: u64) -> Result<bool> {
+        if len < BOOT_SECTOR_SIZE as u64 {
+            return Ok(false);
+        }
+        let mut sector = [0u8; BOOT_SECTOR_SIZE];
+        device.read_at(offset, &mut sector)?;
+        Ok(BootSector::parse(&sector).and_then(|b| b.layout()).is_ok())
     }
 }
 
@@ -595,6 +663,74 @@ mod tests {
         );
         // A superblock wins over a partition table.
         assert_eq!(found(Some("iso9660"), fs, None, Some("dos")).unwrap().0, "iso9660");
+    }
+
+    /// What [`Prober::ensure_empty`] refuses to format over in the range,
+    /// None when it lets the range be formatted.
+    fn refused(img: &TempImage, offset: u64, size: Option<u64>, prober: Prober) -> Option<String> {
+        let device = Device::open(img.path(), Access::ReadOnly).unwrap();
+        let e = prober.ensure_empty(&device, offset, size).err()?;
+        assert_eq!(e.errno(), ENOTEMPTY);
+        match e.detail() {
+            Some(Detail::NotEmpty { found }) => Some(found.clone()),
+            _ => panic!("{:?}", e),
+        }
+    }
+
+    /// An empty image, zeros, and what lies behind the first 256 KiB or
+    /// behind the end of the file are formatted, with libblkid and without.
+    #[test]
+    fn blank_images_are_formatted() {
+        for prober in probers() {
+            assert_eq!(refused(&image(0, &[]), 0, None, prober), None);
+            assert_eq!(refused(&image(1 << 20, &[]), 0, None, prober), None);
+            assert_eq!(refused(&image(1 << 20, &[(HEAD_SIZE, b"x")]), 0, None, prober), None);
+            let small = image(SMALL_IMAGE, &[(0, b"x")]);
+            assert_eq!(refused(&small, 2 * SMALL_IMAGE, Some(1 << 20), prober), None);
+            assert_eq!(refused(&small, SMALL_IMAGE, None, prober), None);
+        }
+    }
+
+    /// A FAT32 file system is refused with and without libblkid, other
+    /// data without libblkid only.
+    #[test]
+    fn what_is_there_is_refused() {
+        let (img, volume) = crate::test_util::volume(40 << 20, MIN_SECTOR_SIZE, MIN_SECTOR_SIZE);
+        drop(volume);
+        for prober in probers() {
+            assert_eq!(refused(&img, 0, None, prober).as_deref(), Some("vfat"));
+        }
+        let data = image(1 << 20, &[(0, b"data")]);
+        let ext2 = ext2();
+        let without = Prober::without_libblkid();
+        assert_eq!(refused(&data, 0, None, without).as_deref(), Some("unknown"));
+        assert_eq!(refused(&ext2, 0, None, without).as_deref(), Some("unknown"));
+        let with = Prober::new();
+        if with.has_libblkid() {
+            assert_eq!(refused(&data, 0, None, with), None);
+            assert_eq!(refused(&ext2, 0, None, with).as_deref(), Some("ext2"));
+        }
+    }
+
+    /// Only the part of the image that would be formatted counts: a FAT32
+    /// file system behind it does not, one at its start does.
+    #[test]
+    fn only_the_part_to_format_counts() {
+        // A file system of 40 MiB, 16 MiB into the image.
+        let (offset, size) = (16 << 20, 40 << 20);
+        let img = TempImage::new(64 << 20);
+        let device = Device::open(img.path(), Access::ReadWrite)
+            .unwrap()
+            .window(offset, Some(size))
+            .unwrap();
+        let options = crate::test_util::format_options(MIN_SECTOR_SIZE, MIN_SECTOR_SIZE);
+        crate::format::format(&device, &options).unwrap();
+        drop(device);
+        for prober in probers() {
+            assert_eq!(refused(&img, 0, Some(offset), prober), None);
+            assert_eq!(refused(&img, offset, None, prober).as_deref(), Some("vfat"));
+            assert_eq!(refused(&img, offset, Some(1 << 20), prober).as_deref(), Some("vfat"));
+        }
     }
 
     /// An image too small for a boot sector stays that, and an error that

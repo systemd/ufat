@@ -355,6 +355,69 @@ fn describe_and_check_say_what_an_image_holds() {
     );
 }
 
+/// assemble formats a new, an empty and a blank image, and refuses one
+/// that holds a file system unless --force or -f is given: one that it
+/// made itself, and one of another file system. Without libblkid it
+/// refuses anything that is not blank. Only the part of the image that
+/// --offset and --size select counts.
+#[test]
+fn assemble_refuses_to_format_over_what_is_there() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let blkid = ufat::probe::Prober::new().has_libblkid();
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    let t = root.join("tree");
+    let t = t.to_str().unwrap();
+    let a = root.join("a.img");
+    let a = a.to_str().unwrap();
+    ok(&bin, &["assemble", "--create", a, t]);
+    let refused = "the image holds a FAT file system, use --force to format it anyway";
+    fails(&bin, &["assemble", a, t], refused);
+    fails(&bin, &["assemble", "--create", "--size", "40M", a], refused);
+    fails(&bin, &["assemble", "--fit", t, a], refused);
+    ok(&bin, &["assemble", "--force", "--label", "AGAIN", a, t]);
+    ok(&bin, &["assemble", "-f", "--create", "--size", "40M", a]);
+    assert!(run(&bin, &["check", a]).status.success());
+    assert_eq!(ok(&bin, &["list", a]), "");
+    // Empty and zeros.
+    let empty = root.join("empty.img");
+    fs::File::create(&empty).unwrap();
+    ok(&bin, &["assemble", empty.to_str().unwrap(), t]);
+    let zeros = root.join("zeros.img");
+    fs::File::create(&zeros).unwrap().set_len(40 << 20).unwrap();
+    ok(&bin, &["assemble", zeros.to_str().unwrap()]);
+    // A file system 60 MiB into a disk image: the 40 MiB before it are
+    // blank, the 40 MiB at it are not.
+    let disk = root.join("disk.img");
+    let d = disk.to_str().unwrap();
+    fs::File::create(&disk).unwrap().set_len(100 << 20).unwrap();
+    ok(&bin, &["assemble", "--offset", "60M", "--size", "40M", d]);
+    ok(&bin, &["assemble", "--size", "40M", d]);
+    fails(&bin, &["assemble", "--offset", "60M", d], refused);
+    fails(&bin, &["assemble", "--offset", "60M", "--size", "40M", d, t], refused);
+    // Another file system, which libblkid names.
+    let ext4 = root.join("ext4.img");
+    let mkfs_ext4 = common::Maker::of("ext4");
+    if !mkfs_ext4.make(&ext4) {
+        return eprintln!("skipping {}: not found", mkfs_ext4.program);
+    }
+    let e = ext4.to_str().unwrap();
+    let held = if blkid {
+        "the image holds a file system of type ext4, use --force"
+    } else {
+        "the image is not blank and libblkid is not available, use --force"
+    };
+    fails(&bin, &["assemble", e, t], held);
+    fails(&bin, &["assemble", "--size", "40M", e], held);
+    ok(&bin, &["assemble", "--force", e, t]);
+    assert!(run(&bin, &["check", e]).status.success());
+    assert_eq!(ok(&bin, &["cat", e, "/EFI/Linux/linux.efi"]), "kernel");
+}
+
 #[test]
 fn assemble_and_populate_take_trees_and_manifests() {
     let _serial = common::serial();
@@ -981,7 +1044,7 @@ fn hashes_and_capabilities() {
     let mut h = ufat::sha256::Sha256::new();
     h.update(&fs::read(a).unwrap());
     assert_eq!(hash, format!("{}\n", ufat::sha256::to_hex(&h.finalize())));
-    let hash = ok(&bin, &["assemble", "--hash", "sha512", a, t]);
+    let hash = ok(&bin, &["assemble", "--force", "--hash", "sha512", a, t]);
     assert_eq!(hash.trim().len(), 128);
     fails(&bin, &["assemble", "--hash", "md5", a, t], "sha256 or sha512");
     let caps = ok(&bin, &["capabilities"]);

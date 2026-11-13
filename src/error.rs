@@ -457,6 +457,14 @@ pub enum Detail {
         /// The sector size found, when that is the reason.
         sector_size: Option<u32>,
     },
+    /// The image holds something that formatting would destroy.
+    NotEmpty {
+        /// What it holds, named the way libblkid names it, such as
+        /// `vfat`, `ext4`, `crypto_LUKS` or `gpt`. FAT12 and FAT16 volumes
+        /// are `fat12` and `fat16`. `unknown` when libblkid is not
+        /// available and the image is not blank.
+        found: String,
+    },
     /// The file system is damaged.
     Corrupt {
         /// Which structure.

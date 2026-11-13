@@ -352,8 +352,9 @@ for ss in 512 4096; do
         --manifest "$IN/esp.manifest" "$W" -
     # Into a formatted 1 GiB image, like populate above: the difference to
     # populate is the manifest handling and the SHA-256 verification.
-    bench "assemble/$ss/esp/dir-1G" "fresh_fs $W $ss 1G" -- "$UFAT" assemble --manifest "$IN/esp.manifest" "$W" "$IN/esp"
-    bench "assemble/$ss/esp/stream-1G" "fresh_fs $W $ss 1G" --stdin "$IN/esp.blob" -- "$UFAT" assemble --manifest "$IN/esp.manifest" "$W" -
+    # --force, since the image holds a file system.
+    bench "assemble/$ss/esp/dir-1G" "fresh_fs $W $ss 1G" -- "$UFAT" assemble --force --manifest "$IN/esp.manifest" "$W" "$IN/esp"
+    bench "assemble/$ss/esp/stream-1G" "fresh_fs $W $ss 1G" --stdin "$IN/esp.blob" -- "$UFAT" assemble --force --manifest "$IN/esp.manifest" "$W" -
     rm -f "$W"
 done
 

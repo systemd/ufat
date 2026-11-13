@@ -30,8 +30,9 @@ tool and the service are the same binary.
 - The code uses the Rust standard library and the crates libc, sha2 and
   lexopt.
 - libblkid names what an image holds when it holds no FAT32 file
-  system. ufat loads it at run time when it is installed, and works
-  without it.
+  system, and keeps `assemble` from formatting over a file system or a
+  partition table. ufat loads it at run time when it is installed, and
+  works without it.
 
 ## Building and installing
 
@@ -77,6 +78,19 @@ Make an empty file system of a given size:
 
     ufat assemble --create --size 1G --label ESP empty.img
 
+`assemble` does not format over a file system, a partition table or
+other data that libblkid recognizes. `--force` or `-f` formats the image
+anyway. So running `ufat assemble` again on an image that holds a file
+system already needs `--force`, as mkfs.xfs needs `-f`:
+
+    ufat assemble --force --label ESP esp.img tree/
+
+A new image file, an empty one and one whose first 256 KiB are zeros
+are formatted without `--force`, and so is data that libblkid does not
+recognize. Without libblkid, ufat formats only an image whose first
+256 KiB are zeros, unless `--force` is given. `--offset` and `--size`
+select the part of the image that is looked at.
+
 The commands are:
 
 | Command | What it does |
@@ -119,6 +133,8 @@ The most common ones:
   `assemble` wrote.
 - `--write-hash PATH` writes that hash to PATH instead, or with `-` to
   standard output.
+- `--force` or `-f` lets `assemble` format an image that holds a file
+  system, a partition table or other data.
 
 Sizes take the suffixes K, M, G and T.
 
@@ -264,8 +280,8 @@ When `assemble` fails after it has formatted the file system, ufat
 leaves the file system marked as not cleanly unmounted, as after a
 crash. It holds the files that were complete when the command failed.
 `ufat check` and fsck.fat report the mark, and Linux warns about it when
-it mounts the file system read-write. Running `assemble` again formats
-the file system anew.
+it mounts the file system read-write. Running `assemble --force` again
+formats the file system anew.
 
 A crash can leave a state that readers resolve in different ways. A
 replaced file can briefly exist twice, and a long name can lose its long
