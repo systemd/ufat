@@ -27,7 +27,9 @@ use fat::format::{self, FormatOptions, VolumeId};
 use fat::fsck::{self, Problem};
 use fat::host;
 use fat::layout::{self, LayoutParams, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE, MIN_CLUSTERS, MIN_SECTOR_SIZE};
-use fat::manifest::{AssembleOptions, AssembleReport, DirectorySource, Fields, Manifest, StreamSource, WriteReport};
+use fat::manifest::{
+    AssembleOptions, AssembleReport, DirectorySource, Fields, Manifest, SourceDirectory, StreamSource, WriteReport,
+};
 use fat::plan::{Plan, PlanOptions};
 use fat::populate::{CopyOptions, CopyReport, TimePolicy};
 use fat::probe::Prober;
@@ -1020,8 +1022,8 @@ impl Content {
                 // Symbolic links are followed, resolved below the source
                 // directory and never outside it; the interface has no
                 // switch for that.
-                let source = DirectorySource::new(dir).follow_symlinks(true);
-                source.verify(&m)?;
+                let source = DirectorySource::new(SourceDirectory::new(dir).follow_symlinks(true));
+                source.verify(&m.entries).map_err(fat::Error::from)?;
                 Some(Fill::FromDirectory(m, source))
             }
             (Some(host::PassedSource::Stream(file)), Some(m)) => Some(Fill::FromStream(m, file)),

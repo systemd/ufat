@@ -28,7 +28,7 @@ pub(crate) const MAX_MANIFEST_BYTES: u64 = 256 * 1024 * 1024;
 /// [`MAX_MANIFEST_BYTES`], and parses it.
 pub(crate) fn read_manifest(file: std::fs::File) -> Result<fat::manifest::Manifest> {
     let text = read_all(file, MAX_MANIFEST_BYTES).with_context(|| "cannot read the manifest")?;
-    fat::manifest::parse(&text)
+    fat::manifest::Manifest::parse(&text)
 }
 
 /// Reads an open file to its end, refusing one of more than `limit` bytes

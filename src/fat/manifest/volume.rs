@@ -232,12 +232,13 @@ impl<W: Write> Listing<'_, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{self, Entry, HostTree, InodeType, Manifest, RECORD_SEPARATOR};
+    use crate::manifest::{HostTree, Manifest};
     use crate::populate::CopyOptions;
     use crate::test_util::{volume, TempDir, TempImage};
     use json::Object;
     use std::os::fd::AsFd;
     use std::time::{Duration, UNIX_EPOCH};
+    use uapi16::{Digest, RECORD_SEPARATOR};
 
     fn t(secs: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(secs)
@@ -354,11 +355,11 @@ mod tests {
     }
 
     fn names(m: &Manifest) -> Vec<&str> {
-        m.entries.iter().map(|e| e.name.as_deref().unwrap()).collect()
+        m.entries.iter().map(|e| e.name.as_str()).collect()
     }
 
-    fn entry<'a>(m: &'a Manifest, name: &str) -> &'a Entry {
-        m.entries.iter().find(|e| e.name.as_deref() == Some(name)).unwrap()
+    fn entry<'a>(m: &'a Manifest, name: &str) -> &'a FileObject {
+        m.entries.iter().find(|e| e.name == name).unwrap()
     }
 
     #[test]
@@ -374,7 +375,7 @@ mod tests {
                 omitted: 0,
             }
         );
-        let m = manifest::parse(&bytes).unwrap();
+        let m = Manifest::parse(&bytes).unwrap();
         assert_eq!(names(&m), NAMES);
         use InodeType::{Directory as D, Regular as R};
         let types: Vec<InodeType> = m.entries.iter().map(|e| e.inode_type).collect();
@@ -390,20 +391,16 @@ mod tests {
         ] {
             let e = entry(&m, name);
             assert_eq!(e.size, Some(data.len() as u64), "{}", name);
-            assert_eq!(e.sha256, Some(sha256::digest(data)), "{}", name);
+            assert_eq!(e.sha256, Some(Sha256::of(data)), "{}", name);
         }
-        assert_eq!(entry(&m, "_notes/empty").sha256, Some(sha256::EMPTY));
+        assert_eq!(entry(&m, "_notes/empty").sha256, Some(Sha256::EMPTY));
         for name in ["EFI", "EFI/BOOT", "_notes", "zz"] {
             assert_eq!((entry(&m, name).size, entry(&m, name).sha256), (None, None), "{}", name);
         }
         let boot = entry(&m, "EFI/BOOT/BOOTX64.EFI");
         assert_eq!(boot.read_only, Some(true));
         assert!(boot.is_read_only());
-        for e in m
-            .entries
-            .iter()
-            .filter(|e| e.name.as_deref() != Some("EFI/BOOT/BOOTX64.EFI"))
-        {
+        for e in m.entries.iter().filter(|e| e.name != "EFI/BOOT/BOOTX64.EFI") {
             assert_eq!(e.read_only, None, "{:?}", e.name);
             assert!(!e.is_read_only());
         }
@@ -420,15 +417,12 @@ mod tests {
             recs[4].0,
             format!(
                 r#"{{"name":"EFI/BOOT/BOOTX64.EFI","readOnly":true,"sha256":"{}","size":5000}}"#,
-                sha256::to_hex(&sha256::digest(&boot_data()))
+                Sha256::of(&boot_data())
             )
         );
         assert_eq!(
             recs[7].0,
-            format!(
-                r#"{{"name":"_notes/empty","sha256":"{}","size":0}}"#,
-                sha256::to_hex(&sha256::EMPTY)
-            )
+            format!(r#"{{"name":"_notes/empty","sha256":"{}","size":0}}"#, Sha256::EMPTY)
         );
         assert_eq!(recs[10].0, r#"{"mediaType":"application/vnd.uapi.16.trailer"}"#);
         for ((text, o), e) in recs[1..=NAMES.len()].iter().zip(&m.entries) {
@@ -479,7 +473,7 @@ mod tests {
             };
             assert_eq!(keys, expected, "{}", text);
         }
-        let m = manifest::parse(&bytes).unwrap();
+        let m = Manifest::parse(&bytes).unwrap();
         assert_eq!(names(&m), NAMES);
         assert_eq!(m.root.mtime_nsec, None);
         assert!(m.entries.iter().all(|e| e.size.is_none() && e.sha256.is_none()));
@@ -487,13 +481,13 @@ mod tests {
         // Sizes without hashes, hashes without sizes. The empty file's hash
         // alone still tells the reader its size.
         let (bytes, _) = written(&v, None, Fields::from_names(["size"]).unwrap());
-        let m = manifest::parse(&bytes).unwrap();
+        let m = Manifest::parse(&bytes).unwrap();
         assert_eq!(entry(&m, "a.txt").size, Some(7));
         assert_eq!(entry(&m, "a.txt").sha256, None);
         let (bytes, _) = written(&v, None, Fields::from_names(["hash"]).unwrap());
-        let m = manifest::parse(&bytes).unwrap();
+        let m = Manifest::parse(&bytes).unwrap();
         assert_eq!(entry(&m, "a.txt").size, None);
-        assert_eq!(entry(&m, "a.txt").sha256, Some(sha256::digest(b"lower a")));
+        assert_eq!(entry(&m, "a.txt").sha256, Some(Sha256::of(b"lower a")));
         assert_eq!(entry(&m, "_notes/empty").size, Some(0));
         assert!(!records(&bytes)[7].1.contains_key("size"));
 
@@ -501,11 +495,11 @@ mod tests {
         // only when the caller has one.
         let fields = Fields::MTIME;
         let (bytes, _) = written(&v, None, fields);
-        let m = manifest::parse(&bytes).unwrap();
+        let m = Manifest::parse(&bytes).unwrap();
         assert_eq!(m.root.mtime_nsec, None);
         for e in &m.entries {
-            let stored = v.metadata(&e.path()).unwrap().modified;
-            assert_eq!(e.mtime(), Some(stored), "{}", e.path());
+            let stored = v.metadata(&format!("/{}", e.name)).unwrap().modified;
+            assert_eq!(e.mtime(), Some(stored), "{}", e.name);
         }
         assert_eq!(
             entry(&m, "EFI/BOOT/BOOTX64.EFI").mtime_nsec,
@@ -514,7 +508,7 @@ mod tests {
         assert_eq!(entry(&m, "zz").mtime_nsec, Some(1_700_000_000 * 1_000_000_000));
         let root_time = t(1_600_000_000) + Duration::from_nanos(5);
         let (bytes, _) = written(&v, Some(root_time), fields);
-        let m = manifest::parse(&bytes).unwrap();
+        let m = Manifest::parse(&bytes).unwrap();
         assert_eq!(m.root.mtime_nsec, Some(1_600_000_000_000_000_005));
         assert_eq!(m.root.mtime(), Some(root_time));
         assert_eq!(
@@ -523,7 +517,7 @@ mod tests {
         );
         // Without the field the caller's time is not written either.
         let (bytes, _) = written(&v, Some(root_time), Fields::default());
-        assert_eq!(manifest::parse(&bytes).unwrap().root.mtime_nsec, None);
+        assert_eq!(Manifest::parse(&bytes).unwrap().root.mtime_nsec, None);
     }
 
     #[test]
@@ -542,7 +536,7 @@ mod tests {
         let fields = Fields::from_names(["size", "hash", "mtime"]).unwrap();
         let (bytes, report) = written(&v, Some(root_time), fields);
         assert_eq!(String::from_utf8_lossy(&bytes), String::from_utf8_lossy(&host));
-        assert_eq!(names(&manifest::parse(&bytes).unwrap()), NAMES);
+        assert_eq!(names(&Manifest::parse(&bytes).unwrap()), NAMES);
         assert_eq!((report.files, report.directories, report.bytes), (5, 4, copied.bytes));
     }
 
@@ -558,7 +552,7 @@ mod tests {
         v.create_dir("/sub", t0).unwrap();
         put(&mut v, "/sub/Uapi16Manifest", b"kept", t0, false);
         let (bytes, report) = written(&v, None, Fields::default());
-        let m = manifest::parse(&bytes).unwrap();
+        let m = Manifest::parse(&bytes).unwrap();
         assert_eq!(names(&m), ["Uapi16Manifest2", "sub", "sub/Uapi16Manifest"]);
         assert_eq!(
             report,
@@ -579,7 +573,7 @@ mod tests {
         put(&mut v, &format!("/{}/inside", long), b"x", t0, false);
         put(&mut v, &format!("/sub/{}", long), b"y", t0, false);
         let (bytes, report) = written(&v, None, Fields::default());
-        let m = manifest::parse(&bytes).unwrap();
+        let m = Manifest::parse(&bytes).unwrap();
         assert_eq!(names(&m), ["Uapi16Manifest2", "sub", "sub/Uapi16Manifest"]);
         assert_eq!((report.files, report.directories, report.omitted), (2, 1, 2));
     }

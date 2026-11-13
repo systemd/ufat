@@ -386,11 +386,11 @@ fn manifest_and_blob(tree: &Path) -> (Vec<u8>, Vec<u8>) {
     fat::manifest::HostTree::new(fat::host::open_dir(tree).unwrap().as_fd())
         .write_manifest(&mut bytes)
         .unwrap();
-    let m = fat::manifest::parse(&bytes).unwrap();
+    let m = fat::manifest::Manifest::parse(&bytes).unwrap();
     let mut blob = Vec::new();
     for e in &m.entries {
         if e.is_streamed() {
-            blob.extend(std::fs::read(tree.join(e.name.as_ref().unwrap())).unwrap());
+            blob.extend(std::fs::read(tree.join(e.name.as_str())).unwrap());
         }
     }
     (bytes, blob)
@@ -1281,7 +1281,7 @@ fn assemble_with_a_manifest_and_a_stream() {
     assert_eq!(str_of(&e.parameters, "name"), "EFI/BOOT/BOOTX64.EFI");
     // So is a stream that goes on after the last file: that file got more
     // than the manifest says, by how much is not known.
-    let last = fat::manifest::parse(&manifest)
+    let last = fat::manifest::Manifest::parse(&manifest)
         .unwrap()
         .entries
         .into_iter()
@@ -1303,7 +1303,7 @@ fn assemble_with_a_manifest_and_a_stream() {
         Value::Object(e.parameters.clone())
     );
     assert_eq!(str_of(&e.parameters, "reason"), "size");
-    assert_eq!(Some(str_of(&e.parameters, "name")), last.name.as_deref());
+    assert_eq!(str_of(&e.parameters, "name"), last.name.as_str());
     assert_eq!(u64_of(&e.parameters, "expectedSizeBytes"), last.size.unwrap());
     assert!(e.parameters.get("sizeBytes").is_none());
 }
@@ -1473,8 +1473,8 @@ fn assemble_writes_a_manifest() {
     assert_eq!(u64_of(&r, "files"), 2);
     assert_eq!(u64_of(&r, "omitted"), 0);
     drop(out_file);
-    let m = fat::manifest::parse(&std::fs::read(&out).unwrap()).unwrap();
-    let mut listed: Vec<&str> = m.entries.iter().map(|e| e.name.as_deref().unwrap()).collect();
+    let m = fat::manifest::Manifest::parse(&std::fs::read(&out).unwrap()).unwrap();
+    let mut listed: Vec<&str> = m.entries.iter().map(|e| e.name.as_str()).collect();
     listed.sort_unstable();
     assert_eq!(
         listed,
@@ -1489,9 +1489,9 @@ fn assemble_writes_a_manifest() {
     assert_eq!(m.root.mtime_nsec, Some(T0 * 1000));
     for e in &m.entries {
         if e.inode_type == fat::manifest::InodeType::Regular {
-            let data = std::fs::read(tree.path().join(e.name.as_deref().unwrap())).unwrap();
+            let data = std::fs::read(tree.path().join(e.name.as_str())).unwrap();
             assert_eq!(e.size, Some(data.len() as u64));
-            assert_eq!(e.sha256, Some(fat::sha256::digest(&data)), "{:?}", e.name);
+            assert_eq!(e.sha256, Some(fat::manifest::Sha256::of(&data)), "{:?}", e.name);
             assert!(e.mtime_nsec.is_some());
         }
     }
@@ -1690,16 +1690,12 @@ fn describe_with_and_without_a_manifest() {
     assert_eq!(u64_of(last, "bytes"), 5010);
     assert_eq!(u64_of(last, "omitted"), 0);
     drop(out_file);
-    let m = fat::manifest::parse(&std::fs::read(&out).unwrap()).unwrap();
+    let m = fat::manifest::Manifest::parse(&std::fs::read(&out).unwrap()).unwrap();
     assert_eq!(m.entries.len(), 5);
     assert!(m.root.mtime_nsec.is_none());
     assert!(m.entries.iter().all(|e| e.mtime_nsec.is_none()));
-    let conf = m
-        .entries
-        .iter()
-        .find(|e| e.name.as_deref() == Some("loader/loader.conf"))
-        .unwrap();
-    assert_eq!(conf.sha256, Some(fat::sha256::digest(b"timeout 5\n")));
+    let conf = m.entries.iter().find(|e| e.name == "loader/loader.conf").unwrap();
+    assert_eq!(conf.sha256, Some(fat::manifest::Sha256::of(b"timeout 5\n")));
     // Images that hold no FAT32 volume say why.
     let blank = Temp::image(40 << 20);
     let blank_ro = ro(blank.path());
@@ -1897,12 +1893,9 @@ fn populate_puts_content_into_a_volume() {
     assert_eq!(u64_of(r, "files"), 2);
     assert_eq!(u64_of(r, "omitted"), 0);
     drop(out_file);
-    let m = fat::manifest::parse(&std::fs::read(&out).unwrap()).unwrap();
-    assert!(m
-        .entries
-        .iter()
-        .any(|e| e.name.as_deref() == Some("EFI/BOOT/BOOTX64.EFI")));
-    assert!(m.entries.iter().any(|e| e.name.as_deref() == Some("a/b/c.conf")));
+    let m = fat::manifest::Manifest::parse(&std::fs::read(&out).unwrap()).unwrap();
+    assert!(m.entries.iter().any(|e| e.name == "EFI/BOOT/BOOTX64.EFI"));
+    assert!(m.entries.iter().any(|e| e.name == "a/b/c.conf"));
     assert_eq!(
         names(&call_more(
             &mut c,

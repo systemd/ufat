@@ -14,7 +14,7 @@ use fat::format::{self, FormatOptions, VolumeId};
 use fat::fsck;
 use fat::host;
 use fat::layout::MIN_SECTOR_SIZE;
-use fat::manifest::{self, AssembleOptions, DirectorySource, Fields, HostTree, StreamSource};
+use fat::manifest::{self, AssembleOptions, DirectorySource, Fields, HostTree, SourceDirectory, StreamSource};
 use fat::plan::{Plan, PlanOptions};
 use fat::populate::{CopyOptions, TimePolicy};
 use fat::probe::Prober;
@@ -528,11 +528,10 @@ fn check_sources(args: &Args, sources: &Sources) -> Result<()> {
         m.manifest.check_supported()?;
     }
     if let Some(Data::Directory { path, dir }) = &m.data {
-        DirectorySource::new(dir.try_clone()?)
-            .follow_symlinks(true)
-            .verify(&m.manifest)
+        DirectorySource::new(SourceDirectory::new(dir.try_clone()?).follow_symlinks(true))
+            .verify(&m.manifest.entries)
             .map_err(|e| {
-                e.context(format!(
+                Error::from(e).context(format!(
                     "the files {} describes are not all below {}",
                     m.name,
                     path.display()
@@ -603,7 +602,7 @@ fn fill(v: &mut Volume, args: &Args, sources: &Sources) -> Result<()> {
             }
             Some(Data::Directory { dir, .. }) => v.assemble(
                 &m.manifest,
-                &mut DirectorySource::new(dir.try_clone()?).follow_symlinks(true),
+                &mut DirectorySource::new(SourceDirectory::new(dir.try_clone()?).follow_symlinks(true)),
                 &options,
             )?,
             None => bail!(errno::EINVAL, "a manifest needs a SOURCE to be filled from"),

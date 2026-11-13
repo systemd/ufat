@@ -493,11 +493,12 @@ fn matches_sha256sum() {
     fat::manifest::HostTree::new(dir.as_fd())
         .write_manifest(&mut bytes)
         .unwrap();
-    let manifest = fat::manifest::parse(&bytes).unwrap();
+    let manifest = fat::manifest::Manifest::parse(&bytes).unwrap();
     let mut hashed = 0;
     for entry in &manifest.entries {
-        if let (Some(name), Some(hash)) = (&entry.name, &entry.sha256) {
-            assert_eq!(fat::sha256::to_hex(hash), expected[name], "{}", name);
+        if let Some(hash) = &entry.sha256 {
+            let name = entry.name.as_str();
+            assert_eq!(hash.to_string(), expected[name], "{}", name);
             hashed += 1;
         }
     }

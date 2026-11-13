@@ -608,21 +608,6 @@ impl Error {
         self
     }
 
-    /// Fills in the record index and the object's name of a manifest
-    /// error that lacks them.
-    #[must_use]
-    pub fn in_record(mut self, index: u64, object: Option<&str>) -> Self {
-        if let Some(Detail::Manifest { record, name, .. }) = &mut self.0.detail {
-            if record.is_none() {
-                *record = Some(index);
-            }
-            if name.is_none() {
-                *name = object.map(str::to_string);
-            }
-        }
-        self
-    }
-
     /// The errno an I/O error stands for: the one the system gave, or the
     /// one that fits its kind.
     pub(crate) fn errno_of(e: &std::io::Error) -> i32 {
