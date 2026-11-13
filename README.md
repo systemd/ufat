@@ -111,6 +111,8 @@ below. `cat` and `manifest` have no method.
   what the command prints there otherwise goes to standard error.
 - `--hash sha256` or `--hash sha512` prints the hash of the file system
   `assemble` wrote.
+- `--write-hash PATH` writes that hash to PATH instead, or with `-` to
+  standard output.
 
 Sizes take the suffixes K, M, G and T.
 

@@ -84,6 +84,8 @@ Options for assemble:
                         and leave it empty (no SOURCE; repeatable)
   --hash ALGORITHM      Print the sha256 or sha512 hash of the file system
                         written
+  --write-hash PATH     Write that hash to PATH instead, or to standard output
+                        for -
   --verbose             Report the geometry chosen
 
 Options for assemble and populate:
@@ -111,7 +113,7 @@ never repairs), 8 when the image could not be checked.
 
 /// Options whose value is a path on the host, which can be any bytes. The
 /// values of all other options are UTF-8.
-const PATH_OPTIONS: &[&str] = &["fit", "manifest", "write-manifest"];
+const PATH_OPTIONS: &[&str] = &["fit", "manifest", "write-manifest", "write-hash"];
 
 /// Parsed command line: options with optional values plus positional
 /// arguments. Paths on the host are taken as the bytes they are; paths
@@ -767,7 +769,7 @@ fn cmd_assemble(argv: &[OsString]) -> Result<()> {
         argv,
         &with(
             FORMAT_VALUES,
-            &with(IMAGE_OPTIONS, &with(FILL_VALUES, &["fit", "hash"])),
+            &with(IMAGE_OPTIONS, &with(FILL_VALUES, &["fit", "hash", "write-hash"])),
         ),
         &with(FORMAT_FLAGS, &with(FILL_FLAGS, &["plan"])),
     )?;
@@ -781,6 +783,16 @@ fn cmd_assemble(argv: &[OsString]) -> Result<()> {
                 .ok_or_else(|| err!(errno::EINVAL, "unknown hash algorithm '{}', sha256 or sha512", a))?,
         ),
     };
+    let hash_path = args.path("write-hash");
+    if hash_path.is_some() && hash.is_none() {
+        bail!(errno::EINVAL, "--write-hash needs --hash");
+    }
+    if hash_path == Some(Path::new("-")) && manifest_to_stdout(&args) {
+        bail!(
+            errno::EINVAL,
+            "--write-manifest - and --write-hash - cannot both write to standard output"
+        );
+    }
     let (path, paths) = match args.positional_paths().split_first() {
         Some((&i, s)) => (i, s.to_vec()),
         None => bail!(errno::EINVAL, "assemble takes an IMAGE and SOURCE arguments"),
@@ -800,10 +812,12 @@ fn cmd_assemble(argv: &[OsString]) -> Result<()> {
     report_layout(path, &layout, args.flag("verbose"));
     if let Some(hash) = hash {
         let digest = hash.of(&open_image(&args, path, Access::ReadOnly)?, &mut |_| {})?;
-        if manifest_to_stdout(&args) {
-            eprintln!("{}", digest);
-        } else {
-            println!("{}", digest);
+        match hash_path {
+            Some(p) if p != Path::new("-") => {
+                std::fs::write(p, format!("{}\n", digest)).with_context(|| format!("cannot write {}", p.display()))?
+            }
+            None if manifest_to_stdout(&args) => eprintln!("{}", digest),
+            _ => println!("{}", digest),
         }
     }
     Ok(())

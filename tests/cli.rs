@@ -612,9 +612,58 @@ fn manifests_of_what_was_written() {
         t,
     ]);
     assert_eq!(stdout, fs::read(&written).unwrap());
-    let mut h = ufat::sha256::Sha256::new();
-    h.update(&fs::read(c).unwrap());
-    assert_eq!(stderr, format!("{}\n", ufat::sha256::to_hex(&h.finalize())));
+    // What --hash sha256 prints for an image sized to fit.
+    let sha256_line = |image: &str| {
+        let mut h = ufat::sha256::Sha256::new();
+        h.update(&fs::read(image).unwrap());
+        format!("{}\n", ufat::sha256::to_hex(&h.finalize()))
+    };
+    assert_eq!(stderr, sha256_line(c));
+    // --write-hash writes the hash to a file of its own, or for "-" to
+    // standard output, which the manifest then cannot have as well.
+    let e = root.join("e.img");
+    let e = e.to_str().unwrap();
+    let hash_file = root.join("e.sha256");
+    let (stdout, stderr) = run_here(&[
+        "assemble",
+        "--create",
+        "--hash",
+        "sha256",
+        "--write-hash",
+        hash_file.to_str().unwrap(),
+        "--write-manifest",
+        "-",
+        e,
+        t,
+    ]);
+    assert_eq!(stdout, fs::read(&written).unwrap());
+    assert!(stderr.is_empty(), "{}", stderr);
+    assert_eq!(fs::read_to_string(&hash_file).unwrap(), sha256_line(e));
+    let f = root.join("f.img");
+    let f = f.to_str().unwrap();
+    let (stdout, _) = run_here(&["assemble", "--create", "--hash", "sha256", "--write-hash", "-", f, t]);
+    assert_eq!(String::from_utf8_lossy(&stdout), sha256_line(f));
+    fails(
+        &bin,
+        &["assemble", "--create", "--write-hash", "-", c, t],
+        "--write-hash needs --hash",
+    );
+    fails(
+        &bin,
+        &[
+            "assemble",
+            "--create",
+            "--hash",
+            "sha256",
+            "--write-hash",
+            "-",
+            "--write-manifest",
+            "-",
+            c,
+            t,
+        ],
+        "cannot both write to standard output",
+    );
     let (stdout, _) = run_here(&["populate", "--path", "/more", "--write-manifest", "-", c, t]);
     assert_eq!(stdout, fs::read(&populated).unwrap());
     assert!(!root.join("-").exists());
