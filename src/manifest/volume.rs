@@ -3,7 +3,7 @@
 //! every file and directory in it, in the stored form.
 //!
 //! This is the manifest the Varlink interface's `ManifestSink` receives
-//! from Format, Populate and Describe, see
+//! from Assemble, Populate and Describe, see
 //! docs/org.uapi-group.FileSystem.varlink. It says what the volume stores
 //! as the volume stores it:
 //! times at FAT's 2 s, the read-only attribute as `readOnly`, and no mode,
@@ -16,7 +16,12 @@
 //! directory's entries right after it, sorted by the bytes of their names
 //! and never in on-disk order, the trailer last. Keys inside an object are
 //! sorted and the records carry no whitespace, as `systemd-manifest`
-//! writes them.
+//! writes them. Like `systemd-manifest` and the host tree generator, the
+//! writer leaves out the inode type on the root object and on regular
+//! files, where the specification implies it. So with the same fields, the
+//! manifest of a volume is the one they write for the tree the volume was
+//! filled from, apart from what FAT changes on the way: FAT keeps times at
+//! 2 s, and a read-only file gets `readOnly`.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -36,12 +41,11 @@ use crate::{CorruptPlace, Detail, Result};
 /// The per-file fields a written manifest carries: systemd-manifest's
 /// vocabulary, the names its `--field=` and repart's `--manifest-fields=`
 /// take, as the Varlink interface's `ManifestField` spells them. The inode
-/// type is always written, and so is `readOnly` where the attribute is
+/// type is always given, and `readOnly` is written where the attribute is
 /// set, which no field governs. FAT has no mode, owner, symbolic links,
 /// device nodes, hardlinks, extended attributes or user and group names,
-/// so of these only `size`, `hash`, `mtime` and `user_xattr` change what
-/// the volume writer puts out; `user_xattr` records an empty set on every
-/// entry, systemd's way of telling none from unrecorded.
+/// so of these only `size`, `hash` and `mtime` change what the volume
+/// writer puts out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fields {
     /// `mode`: the access mode.
@@ -209,16 +213,13 @@ pub fn write_with_progress(
         seen: HashSet::from([root.first_cluster]),
         progress,
     };
+    // The root object is a directory by definition and carries no type.
     let mut top = Object::new();
     top.insert("mediaType", MEDIA_TYPE);
-    top.insert("type", "dir");
     if fields.mtime {
         if let Some(nsec) = root_time.and_then(time_nsec) {
             top.insert("mTimeNSec", nsec);
         }
-    }
-    if fields.user_xattr {
-        top.insert("extendedAttributes", Object::new());
     }
     write_record(writer.out, top)?;
     writer.directory("/", "")?;
@@ -270,7 +271,10 @@ impl Writer<'_> {
             }
             let mut o = Object::new();
             o.insert("name", name.as_str());
-            o.insert("type", if md.is_dir { "dir" } else { "reg" });
+            // A regular file is what an object without a type is.
+            if md.is_dir {
+                o.insert("type", "dir");
+            }
             if md.attributes & ATTR_READ_ONLY != 0 {
                 o.insert("readOnly", true);
             }
@@ -278,9 +282,6 @@ impl Writer<'_> {
                 if let Some(nsec) = time_nsec(md.modified) {
                     o.insert("mTimeNSec", nsec);
                 }
-            }
-            if self.fields.user_xattr {
-                o.insert("extendedAttributes", Object::new());
             }
             if md.is_dir {
                 if !self.seen.insert(md.first_cluster) {
@@ -391,18 +392,38 @@ mod tests {
         (img, v)
     }
 
-    /// The same tree on the host.
+    /// The same tree on the host, with times FAT keeps as they are: the
+    /// files two seconds apart, the directories all at one time.
     fn host_tree() -> TempDir {
         let tmp = TempDir::new("manifest-volume");
         let dir = tmp.path();
         std::fs::create_dir_all(dir.join("EFI/BOOT")).unwrap();
         std::fs::create_dir_all(dir.join("_notes")).unwrap();
         std::fs::create_dir_all(dir.join("zz")).unwrap();
-        std::fs::write(dir.join("a.txt"), b"lower a").unwrap();
-        std::fs::write(dir.join("EFI/BOOT/BOOTX64.EFI"), boot_data()).unwrap();
-        std::fs::write(dir.join("EFI/a.txt"), b"first file").unwrap();
-        std::fs::write(dir.join("_notes/empty"), b"").unwrap();
-        std::fs::write(dir.join("B.txt"), b"upper B").unwrap();
+        let files = [
+            ("a.txt", &b"lower a"[..]),
+            ("EFI/BOOT/BOOTX64.EFI", &boot_data()),
+            ("EFI/a.txt", b"first file"),
+            ("_notes/empty", b""),
+            ("B.txt", b"upper B"),
+        ];
+        for (i, (name, data)) in files.iter().enumerate() {
+            std::fs::write(dir.join(name), data).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(dir.join(name))
+                .unwrap()
+                .set_modified(t(1_700_000_000 + 2 * i as u64))
+                .unwrap();
+        }
+        // The directories last, since what goes into them changes their
+        // times.
+        for name in ["EFI/BOOT", "EFI", "_notes", "zz", "."] {
+            std::fs::File::open(dir.join(name))
+                .unwrap()
+                .set_modified(t(1_699_999_000))
+                .unwrap();
+        }
         tmp
     }
 
@@ -492,32 +513,35 @@ mod tests {
         }
         assert!(m.entries.iter().all(|e| e.mtime_nsec.is_none() && e.mode.is_none()));
 
-        // The raw records: the root object, one per entry, the trailer.
+        // The raw records: the root object, one per entry, the trailer. As
+        // systemd-manifest writes them, the root object and the regular
+        // files carry no type, and FAT has no extended attributes to list.
         let recs = records(&bytes);
         assert_eq!(recs.len(), 1 + NAMES.len() + 1);
-        assert_eq!(
-            recs[0].0,
-            r#"{"extendedAttributes":{},"mediaType":"application/vnd.uapi.16.manifest","type":"dir"}"#
-        );
-        assert_eq!(recs[2].0, r#"{"extendedAttributes":{},"name":"EFI","type":"dir"}"#);
+        assert_eq!(recs[0].0, r#"{"mediaType":"application/vnd.uapi.16.manifest"}"#);
+        assert_eq!(recs[2].0, r#"{"name":"EFI","type":"dir"}"#);
         assert_eq!(
             recs[4].0,
             format!(
-                r#"{{"extendedAttributes":{{}},"name":"EFI/BOOT/BOOTX64.EFI","readOnly":true,"sha256":"{}","size":5000,"type":"reg"}}"#,
+                r#"{{"name":"EFI/BOOT/BOOTX64.EFI","readOnly":true,"sha256":"{}","size":5000}}"#,
                 sha256::to_hex(&sha256::digest(&boot_data()))
             )
         );
         assert_eq!(
             recs[7].0,
             format!(
-                r#"{{"extendedAttributes":{{}},"name":"_notes/empty","sha256":"{}","size":0,"type":"reg"}}"#,
+                r#"{{"name":"_notes/empty","sha256":"{}","size":0}}"#,
                 sha256::to_hex(&sha256::EMPTY)
             )
         );
         assert_eq!(recs[10].0, r#"{"mediaType":"application/vnd.uapi.16.trailer"}"#);
-        for (text, o) in &recs[1..=NAMES.len()] {
-            let xattrs = o.get("extendedAttributes").and_then(json::Value::as_object);
-            assert!(xattrs.is_some_and(Object::is_empty), "{}", text);
+        for ((text, o), e) in recs[1..=NAMES.len()].iter().zip(&m.entries) {
+            assert_eq!(
+                o.get("type").and_then(json::Value::as_str),
+                (e.inode_type == D).then_some("dir"),
+                "{}",
+                text
+            );
             for key in [
                 "mediaType",
                 "mode",
@@ -530,6 +554,7 @@ mod tests {
                 "groupName",
                 "mTimeNSec",
                 "contents",
+                "extendedAttributes",
             ] {
                 assert!(!o.contains_key(key), "{} in {}", key, text);
             }
@@ -539,23 +564,24 @@ mod tests {
     #[test]
     fn fields_govern_what_is_written() {
         let (_img, v) = populated();
-        // Nothing but names and types, and the attribute no field governs.
+        // Nothing but names and the types of directories, and the attribute
+        // no field governs.
         let (bytes, report) = written(&v, Some(t(1_600_000_000)), Fields::none());
         assert_eq!((report.files, report.directories, report.bytes), (5, 4, 5024));
         let recs = records(&bytes);
-        assert_eq!(
-            recs[0].0,
-            r#"{"mediaType":"application/vnd.uapi.16.manifest","type":"dir"}"#
-        );
-        assert_eq!(recs[1].0, r#"{"name":"B.txt","type":"reg"}"#);
+        assert_eq!(recs[0].0, r#"{"mediaType":"application/vnd.uapi.16.manifest"}"#);
+        assert_eq!(recs[1].0, r#"{"name":"B.txt"}"#);
         assert_eq!(recs[2].0, r#"{"name":"EFI","type":"dir"}"#);
-        assert_eq!(
-            recs[4].0,
-            r#"{"name":"EFI/BOOT/BOOTX64.EFI","readOnly":true,"type":"reg"}"#
-        );
+        assert_eq!(recs[4].0, r#"{"name":"EFI/BOOT/BOOTX64.EFI","readOnly":true}"#);
         for (text, o) in &recs[1..=NAMES.len()] {
             let keys: Vec<&str> = o.keys().filter(|k| *k != "readOnly").collect();
-            assert_eq!(keys, ["name", "type"], "{}", text);
+            let name = o.get("name").and_then(json::Value::as_str).unwrap();
+            let expected: &[&str] = if ["EFI", "EFI/BOOT", "_notes", "zz"].contains(&name) {
+                &["name", "type"]
+            } else {
+                &["name"]
+            };
+            assert_eq!(keys, expected, "{}", text);
         }
         let m = manifest::parse(&bytes).unwrap();
         assert_eq!(names(&m), NAMES);
@@ -600,7 +626,7 @@ mod tests {
         assert_eq!(m.root.mtime(), Some(root_time));
         assert_eq!(
             records(&bytes)[0].0,
-            r#"{"mTimeNSec":1600000000000000005,"mediaType":"application/vnd.uapi.16.manifest","type":"dir"}"#
+            r#"{"mTimeNSec":1600000000000000005,"mediaType":"application/vnd.uapi.16.manifest"}"#
         );
         // Without the field the caller's time is not written either.
         let (bytes, _) = written(&v, Some(root_time), Fields::default());
@@ -698,19 +724,15 @@ mod tests {
         let (_img, mut v) = volume(8 << 20, 512, 512);
         let copied = v.copy_tree(dir.as_fd(), "/", &CopyOptions::default()).unwrap();
         assert_eq!((copied.files, copied.directories), (5, 4));
-        let host = manifest::parse(&manifest::generate(dir.as_fd()).unwrap()).unwrap();
-        let (bytes, report) = written(&v, None, Fields::default());
-        let vol = manifest::parse(&bytes).unwrap();
-        // Times differ by design (FAT keeps 2 s), and so do the fields only
-        // one of the two writes: the empty attribute sets and readOnly.
-        let view = |m: &Manifest| {
-            m.entries
-                .iter()
-                .map(|e| (e.name.clone(), e.inode_type, e.size, e.sha256))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(view(&vol), view(&host));
-        assert_eq!(names(&vol), NAMES);
+        // The generator writes the fields size, hash and mtime. With the
+        // tree's own time for the root and times FAT keeps as they are, the
+        // two manifests are the same bytes.
+        let host = manifest::generate(dir.as_fd()).unwrap();
+        let root_time = std::fs::metadata(tree.path()).unwrap().modified().unwrap();
+        let fields = Fields::from_names(["size", "hash", "mtime"]).unwrap();
+        let (bytes, report) = written(&v, Some(root_time), fields);
+        assert_eq!(String::from_utf8_lossy(&bytes), String::from_utf8_lossy(&host));
+        assert_eq!(names(&manifest::parse(&bytes).unwrap()), NAMES);
         assert_eq!((report.files, report.directories, report.bytes), (5, 4, copied.bytes));
     }
 

@@ -44,7 +44,8 @@ use crate::util;
 /// The interface description, served verbatim.
 pub(crate) const INTERFACE: &str = include_str!("../../../docs/org.uapi-group.FileSystem.varlink");
 const INTERFACE_NAME: &str = "org.uapi-group.FileSystem";
-const VERSION: &str = "0.1";
+/// The version of the package, which GetInfo and GetCapabilities report.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The one file system type this service makes, as the kernel names it.
 const FILE_SYSTEM_TYPE: &str = "vfat";
 /// Findings per intermediate reply of Check.
@@ -58,7 +59,7 @@ pub(crate) fn run(activation: Activation) -> std::io::Result<()> {
         vendor: "ufat".into(),
         product: "ufat".into(),
         version: VERSION.into(),
-        url: String::new(),
+        url: "https://github.com/systemd/ufat".into(),
     });
     server
         .add_interface(INTERFACE)
@@ -1380,15 +1381,15 @@ fn plan(mut options: Options, content: Option<Content>, c: &mut Connection, more
 
 /// Fills the file system Assemble formatted: the content copied, the root
 /// stamped with its time, the manifest of the result written. Returns the
-/// counts when there was content, the entries the written manifest left
-/// out and the description of the volume.
+/// counts when there was content, the entries the manifest left out when
+/// one was written, and the description of the volume.
 fn fill_image(
     volume: &mut Volume,
     content: Option<Content>,
     time: Option<SystemTime>,
     c: &mut Connection,
     more: bool,
-) -> Outcome<(Option<Counts>, u64, Object)> {
+) -> Outcome<(Option<Counts>, Option<u64>, Object)> {
     let mut counts = None;
     let mut content_time = None;
     let mut sink = None;
@@ -1411,10 +1412,10 @@ fn fill_image(
         volume.set_root_time(t)?;
     }
     let omitted = match sink {
-        None => 0,
+        None => None,
         Some(sink) => {
             let mut r = Reporter::start(c, more, "reading", Shown::PhaseOnly)?;
-            sink.write(volume, &mut |p| r.tick(p))?.omitted
+            Some(sink.write(volume, &mut |p| r.tick(p))?.omitted)
         }
     };
     Ok((counts, omitted, description(volume)?))
@@ -1481,8 +1482,8 @@ fn assemble_image(
     let mut o = json::object! { "description" => description, "exact" => exact };
     if let Some(counts) = counts {
         counts.put(&mut o);
-        o.insert("omitted", omitted);
     }
+    optional(&mut o, "omitted", omitted);
     if let (Some(hash), Some(fd)) = (hash, reader) {
         let mut r = Reporter::start(c, more, "reading", Shown::PhaseOnly)?;
         let device = Device::from_passed(fd, Access::ReadOnly)?.window(offset, Some(window))?;

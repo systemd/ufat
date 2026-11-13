@@ -80,6 +80,19 @@ fn help_and_short_options() {
     };
     let usage = ok(&bin, &["list", "-h"]);
     assert!(usage.starts_with("Usage: ufat COMMAND"), "{}", usage);
+    // assemble's --verbose is described once, with what it reports, and so
+    // is the one of remove.
+    let verbose: Vec<&str> = usage
+        .lines()
+        .filter(|l| l.trim_start().starts_with("--verbose"))
+        .collect();
+    assert_eq!(
+        verbose,
+        [
+            "  --verbose             Report the geometry chosen and what was written",
+            "  --verbose             Report what was removed"
+        ]
+    );
     for args in [
         &["list", "-hl", "x.img"][..],
         &["list", "-lh", "x.img"],
@@ -182,6 +195,18 @@ fn a_closed_pipe_ends_ufat_quietly() {
     }
 }
 
+/// --version, and version like help, print the version of the package.
+#[test]
+fn version() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let version = format!("ufat {}\n", env!("CARGO_PKG_VERSION"));
+    assert_eq!(ok(&bin, &["--version"]), version);
+    assert_eq!(ok(&bin, &["version"]), version);
+}
+
 #[test]
 fn assemble_and_populate_take_trees_and_manifests() {
     let _serial = common::serial();
@@ -232,6 +257,20 @@ fn assemble_and_populate_take_trees_and_manifests() {
     let out = run_in(&bin, &["populate", "--manifest", m, a, "-"], b"kerneltitle x\nmore");
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("goes on after the last file"));
+    // --manifest - reads the manifest from standard input, which then
+    // cannot carry the file contents as well.
+    let manifest_bytes = fs::read(&manifest).unwrap();
+    let out = run_in(&bin, &["assemble", "--plan", "--manifest", "-"], &manifest_bytes);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), tree_size);
+    let out = run_in(&bin, &["populate", "--manifest", "-", a, tree_arg], &manifest_bytes);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = run_in(&bin, &["populate", "--manifest", "-", a, "-"], b"");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot both read standard input"));
+    let out = run_in(&bin, &["assemble", "--plan", "--manifest", "-"], b"not a manifest");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("standard input is not a UAPI.16 manifest"));
     // A SOURCE is a directory, or for populate one file that needs --path;
     // a manifest is named by --manifest.
     fails(&bin, &["populate", a, m], "needs --path");
@@ -518,10 +557,22 @@ fn populate_and_remove_work_on_paths() {
     ok(&bin, &["populate", "--path", "/copy", a, t]);
     assert_eq!(ok(&bin, &["list", a, "/copy/EFI/Linux"]), "linux.efi\n");
     // remove: a file, an empty directory, a tree only with --recursive.
-    ok(&bin, &["remove", a, "/EFI/BOOT/BOOTX64.EFI", "/loader/entries"]);
+    // --verbose says what each PATH took with it, the directory itself
+    // counted.
+    let out = run(
+        &bin,
+        &["remove", "--verbose", a, "/EFI/BOOT/BOOTX64.EFI", "/loader/entries"],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "/EFI/BOOT/BOOTX64.EFI: 1 file, 0 directories\n/loader/entries: 0 files, 1 directory\n"
+    );
     assert_eq!(ok(&bin, &["list", a, "/loader"]), "");
     fails(&bin, &["remove", a, "/copy"], "not empty");
-    ok(&bin, &["remove", "-r", a, "/copy"]);
+    let out = run(&bin, &["remove", "-r", "--verbose", a, "/copy"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "/copy: 2 files, 5 directories\n");
     ok(&bin, &["remove", "--recursive", a, "/EFI"]);
     assert_eq!(ok(&bin, &["list", a, "/"]), "loader/\n");
     fails(&bin, &["remove", "--recursive", a, "/"], "root directory");
@@ -581,6 +632,186 @@ fn manifests_of_what_was_written() {
     let p = populated.to_str().unwrap();
     ok(&bin, &["populate", "--path", "/more", "--write-manifest", p, b, t]);
     assert!(String::from_utf8_lossy(&fs::read(&populated).unwrap()).contains("\"more/EFI/Linux/linux.efi\""));
+
+    // "-" is standard output. What the command prints there otherwise, the
+    // description or the hash, goes to standard error then. Nothing named
+    // "-" is created.
+    let run_here = |args: &[&str]| {
+        let out = Command::new(&bin)
+            .args(args)
+            .current_dir(root)
+            .env("SOURCE_DATE_EPOCH", "1700000000")
+            .output()
+            .expect("ufat runs");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "ufat {:?} failed: {}", args, stderr);
+        (out.stdout, stderr)
+    };
+    let (stdout, stderr) = run_here(&["describe", "--write-manifest", "-", a]);
+    assert_eq!(stdout, fs::read(&written).unwrap());
+    assert!(stderr.contains("volume id:"), "{}", stderr);
+    let c = root.join("c.img");
+    let c = c.to_str().unwrap();
+    let (stdout, stderr) = run_here(&[
+        "assemble",
+        "--create",
+        "--hash",
+        "sha256",
+        "--write-manifest",
+        "-",
+        c,
+        t,
+    ]);
+    assert_eq!(stdout, fs::read(&written).unwrap());
+    // What --hash sha256 prints for an image sized to fit.
+    let sha256_line = |image: &str| {
+        let mut h = ufat::sha256::Sha256::new();
+        h.update(&fs::read(image).unwrap());
+        format!("{}\n", ufat::sha256::to_hex(&h.finalize()))
+    };
+    assert_eq!(stderr, sha256_line(c));
+    // --write-hash writes the hash to a file of its own, or for "-" to
+    // standard output, which the manifest then cannot have as well.
+    let e = root.join("e.img");
+    let e = e.to_str().unwrap();
+    let hash_file = root.join("e.sha256");
+    let (stdout, stderr) = run_here(&[
+        "assemble",
+        "--create",
+        "--hash",
+        "sha256",
+        "--write-hash",
+        hash_file.to_str().unwrap(),
+        "--write-manifest",
+        "-",
+        e,
+        t,
+    ]);
+    assert_eq!(stdout, fs::read(&written).unwrap());
+    assert!(stderr.is_empty(), "{}", stderr);
+    assert_eq!(fs::read_to_string(&hash_file).unwrap(), sha256_line(e));
+    let f = root.join("f.img");
+    let f = f.to_str().unwrap();
+    let (stdout, _) = run_here(&["assemble", "--create", "--hash", "sha256", "--write-hash", "-", f, t]);
+    assert_eq!(String::from_utf8_lossy(&stdout), sha256_line(f));
+    fails(
+        &bin,
+        &["assemble", "--create", "--write-hash", "-", c, t],
+        "--write-hash needs --hash",
+    );
+    fails(
+        &bin,
+        &[
+            "assemble",
+            "--create",
+            "--hash",
+            "sha256",
+            "--write-hash",
+            "-",
+            "--write-manifest",
+            "-",
+            c,
+            t,
+        ],
+        "cannot both write to standard output",
+    );
+    let (stdout, _) = run_here(&["populate", "--path", "/more", "--write-manifest", "-", c, t]);
+    assert_eq!(stdout, fs::read(&populated).unwrap());
+    assert!(!root.join("-").exists());
+}
+
+/// A count of one is said in the singular: in the summary of check, in
+/// what --verbose reports and in the note about entries a manifest leaves
+/// out.
+#[test]
+fn counts_of_one() {
+    use std::os::unix::fs::FileExt;
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    fs::create_dir_all(root.join("tree/d")).unwrap();
+    fs::write(root.join("tree/d/f"), b"x").unwrap();
+    let t = root.join("tree");
+    let t = t.to_str().unwrap();
+    let a = root.join("a.img");
+    let a = a.to_str().unwrap();
+    let out = run(&bin, &["assemble", "--create", "--verbose", "--fats", "1", a, t]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{}", stderr);
+    assert!(
+        stderr.contains(": 1 file and 1 directory in 1 byte need a "),
+        "{}",
+        stderr
+    );
+    assert!(
+        stderr.contains(&format!("{}: 1 file, 1 directory, 1 byte\n", t)),
+        "{}",
+        stderr
+    );
+    assert!(stderr.contains(" reserved sectors, 1 FAT of "), "{}", stderr);
+    // A plan says what it found, the clusters it needs and the sectors.
+    let out = run(&bin, &["assemble", "--plan", "--verbose", t]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "1 file, 1 directory, 1 byte: 3 clusters of 512 bytes, 512 byte sectors\n"
+    );
+    let out = run(&bin, &["assemble", "--plan", "--verbose", "--sector-size", "4096", t]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "1 file, 1 directory, 1 byte: 3 clusters of 4096 bytes, 4096 byte sectors\n"
+    );
+
+    // FAT entry 0 without the media byte in the first of two FATs is one
+    // error, and the one byte the second FAT differs in is one warning.
+    let b = root.join("b.img");
+    ok(&bin, &["assemble", "--create", b.to_str().unwrap(), t]);
+    let image = fs::OpenOptions::new().read(true).write(true).open(&b).unwrap();
+    let mut sector = [0u8; 512];
+    image.read_exact_at(&mut sector, 0).unwrap();
+    let layout = ufat::boot::BootSector::parse(&sector).unwrap().layout().unwrap();
+    image.write_all_at(&[0xf0], layout.fat_offset(0)).unwrap();
+    drop(image);
+    let out = run(&bin, &["check", b.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(4));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let summary = stdout.lines().last().unwrap();
+    assert!(
+        summary.starts_with(&format!("{}: 1 file, 1 directory, 3 clusters used, ", b.display())),
+        "{}",
+        stdout
+    );
+    assert!(summary.ends_with(" free, 0 lost; 1 error, 1 warning"), "{}", stdout);
+
+    // An empty volume uses the one cluster of its root directory. A name
+    // of 100 three-byte characters fits FAT but no manifest.
+    let e = root.join("e.img");
+    let e = e.to_str().unwrap();
+    ok(&bin, &["assemble", "--create", "--size", "40M", e]);
+    let summary = ok(&bin, &["check", e]);
+    assert!(
+        summary.contains(": 0 files, 0 directories, 1 cluster used, "),
+        "{}",
+        summary
+    );
+    let device = ufat::device::Device::open(Path::new(e), ufat::device::Access::ReadWrite).unwrap();
+    let mut v = ufat::volume::Volume::open(device).unwrap();
+    let long: String = std::iter::repeat_n('\u{20ac}', 100).collect();
+    v.create_dir(&format!("/{}", long), std::time::SystemTime::now())
+        .unwrap();
+    v.close().unwrap();
+    let m = root.join("e.manifest");
+    let out = run(&bin, &["describe", "--write-manifest", m.to_str().unwrap(), e]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{}", stderr);
+    assert!(
+        stderr.contains(": its name cannot be written in a manifest"),
+        "{}",
+        stderr
+    );
+    assert!(stderr.starts_with("ufat: 1 entry is not in "), "{}", stderr);
 }
 
 /// assemble prints the hash of the file system it wrote on request, and

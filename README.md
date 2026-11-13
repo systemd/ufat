@@ -90,7 +90,8 @@ The commands are:
 The commands are named after the methods of the Varlink service, see
 below. `cat` and `manifest` have no method.
 
-`ufat --help` lists all options. The most common ones:
+`ufat --version` prints the version. `ufat --help` lists all options.
+The most common ones:
 
 - `--offset BYTES` and `--size BYTES` select a file system inside a larger
   image, for example one partition of a disk image.
@@ -106,9 +107,13 @@ below. `cat` and `manifest` have no method.
   and device nodes. By default they are left out with a message.
 - `--write-manifest PATH` writes a UAPI.16 manifest of what the file
   system holds after `assemble` or `populate`, or of what `describe`
-  finds.
+  finds. It has the size and the SHA-256 hash of every file, and no
+  times. With `-` as PATH the manifest goes to standard output, and
+  what the command prints there otherwise goes to standard error.
 - `--hash sha256` or `--hash sha512` prints the hash of the file system
   `assemble` wrote.
+- `--write-hash PATH` writes that hash to PATH instead, or with `-` to
+  standard output.
 
 Sizes take the suffixes K, M, G and T.
 
@@ -143,6 +148,9 @@ file references point into. `-` reads the file contents from standard
 input instead, back to back in manifest order. Standard input has to end
 after the last file. A manifest names its paths from the root of the
 file system, so `--path` does not apply.
+
+`--manifest -` reads the manifest from standard input. The file
+contents then have to come from a directory.
 
 When the contents come from a directory, ufat first checks that every
 file the manifest names is there with the size the manifest gives. This

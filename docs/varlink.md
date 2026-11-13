@@ -91,7 +91,7 @@ The reply does not depend on the call. It is:
       "capabilities" : {
         "fileSystemType" : "vfat",
         "implementation" : "ufat",
-        "version" : "0.1",
+        "version" : "0.1.0",
         "readOnly" : false,
         "operations" : [ "plan", "assembleWithContent", "populate", "remove",
                          "list", "check", "label", "identifier", "reproducible",
@@ -158,8 +158,8 @@ What the fields mean for vfat:
 | `content` | What to copy into the new file system, see "Content". |
 | `imageHash` | `sha256` or `sha512`. Hashes the image after formatting. |
 
-Mode `format` creates the file system and copies the content into it, in
-one call. Mode `plan` computes the geometry and the size the content
+Mode `assemble` creates the file system and copies the content into it,
+in one call. Mode `plan` computes the geometry and the size the content
 needs. It writes nothing.
 
 How the image is sized:
@@ -174,9 +174,9 @@ How the image is sized:
 
 The reply carries a `description` with the label and the serial number
 as stored, the sector size, the cluster size (`blockSize`), the size and
-the free space. With content, the counts `files`, `directories`, `bytes`,
-`skipped` and `omitted` follow. `exact` is true when the size was
-computed to fit the content.
+the free space. With content, the counts `files`, `directories`, `bytes`
+and `skipped` follow, and with a `manifestSink` also `omitted`. `exact`
+is true when the size was computed to fit the content.
 
 Mode `plan` answers with `minimalSizeBytes` in place of `freeBytes`:
 
@@ -272,8 +272,8 @@ manifest names its paths from the root, so with a manifest `path` has to
 be `/`. Without content, `Populate` creates an empty directory at `path`.
 With `parents`, an existing directory at `path` is accepted.
 
-The reply carries the counts `files`, `directories`, `bytes`, `skipped`
-and `omitted`.
+The reply carries the counts `files`, `directories`, `bytes` and
+`skipped`, and with a `manifestSink` also `omitted`.
 
 ### Remove
 
@@ -345,6 +345,10 @@ A problem carries:
   `slots`, `block` and `blocks` (clusters), `sizeBytes`, `value`,
   `expected`, `name`, `otherName`, `field`, `copy` and `count`.
 
+For `fatCopyDiffers`, `copy` is the FAT copy that differs from the first
+one. The copies are counted from 1. For `backupBootSectorDiffers`, `copy`
+is the sector of the backup boot sector.
+
 The service returns no text. A client turns the kind and its facts into
 a message.
 
@@ -406,10 +410,12 @@ A `ManifestSink` has a `fileDescriptor` open for writing and optional
 `fields`, the per-file fields in the vocabulary of systemd-manifest:
 `mode`, `uid`, `gid`, `size`, `hash`, `symlink`, `device`, `hardlink`,
 `mtime`, `userXattr`, `userName`, `groupName`. Without `fields`, the
-default set of systemd-manifest is used. Fields FAT has no notion of are
-left out. The manifest describes the whole volume, including files that
-were there before the call. Entries whose names a manifest cannot carry
-are left out and counted in `omitted`.
+default set of systemd-manifest is used. FAT has a notion of `size`,
+`hash` and `mtime` only. The other fields are left out. An entry with
+the read-only attribute carries `readOnly`. The manifest describes the
+whole volume, including files that were there before the call. Entries
+whose names a manifest cannot carry are left out and counted in
+`omitted`.
 
 ## The more flag
 

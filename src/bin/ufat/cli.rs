@@ -26,6 +26,8 @@ use crate::util;
 
 const USAGE: &str = "\
 Usage: ufat COMMAND [OPTIONS...] ARGS...
+       ufat --help
+       ufat --version
 
 Commands:
   assemble [OPTIONS] IMAGE [SOURCE...]   Create a FAT32 file system sized to fit
@@ -53,7 +55,8 @@ Without a SOURCE it creates the directory --path.
 A SOURCE is a directory tree, or for populate one file. With --manifest the
 one SOURCE is the tree the manifest describes, where its file contents are
 read, or - for the contents on standard input, back to back in manifest order:
-  --manifest PATH       Build what the UAPI.16 manifest at PATH describes
+  --manifest PATH       Build what the UAPI.16 manifest at PATH, or on standard
+                        input for -, describes
   --no-check-validity   Accept revoked and expired manifest entries
   --unsupported POLICY  What to do with what FAT cannot store: skip (default)
                         or fail
@@ -84,7 +87,8 @@ Options for assemble:
                         and leave it empty (no SOURCE; repeatable)
   --hash ALGORITHM      Print the sha256 or sha512 hash of the file system
                         written
-  --verbose             Report the geometry chosen
+  --write-hash PATH     Write that hash to PATH instead, or to standard output
+                        for -
 
 Options for assemble and populate:
   --timestamp SECONDS   Time to stamp, default $SOURCE_DATE_EPOCH, else now;
@@ -96,12 +100,13 @@ Options for assemble and populate:
                         path of a SOURCE file, or the directory to create
   --parents             Create missing parent directories of --path, and
                         accept a directory that exists (populate)
-  --write-manifest PATH Write the UAPI.16 manifest of the file system to PATH
-                        afterwards (also describe)
-  --verbose             Report what was written
+  --write-manifest PATH Write the UAPI.16 manifest of the file system to PATH,
+                        or to standard output for -, afterwards (also describe)
+  --verbose             Report the geometry chosen and what was written
 
 Options for remove:
   --recursive, -r       Remove directories with everything below them
+  --verbose             Report what was removed
 
 Sizes take K, M, G and T suffixes. Timestamps are seconds since the epoch.
 Exit status: 0 on success, 1 on failure. check uses the fsck(8) codes: 0 for a
@@ -111,7 +116,7 @@ never repairs), 8 when the image could not be checked.
 
 /// Options whose value is a path on the host, which can be any bytes. The
 /// values of all other options are UTF-8.
-const PATH_OPTIONS: &[&str] = &["fit", "manifest", "write-manifest"];
+const PATH_OPTIONS: &[&str] = &["fit", "manifest", "write-manifest", "write-hash"];
 
 /// Parsed command line: options with optional values plus positional
 /// arguments. Paths on the host are taken as the bytes they are; paths
@@ -272,6 +277,21 @@ fn volume_path(arg: &OsStr) -> Result<&str> {
     })
 }
 
+/// `n` followed by `one` or `many`, as the count asks for.
+fn plural(n: u64, one: &str, many: &str) -> String {
+    format!("{} {}", n, if n == 1 { one } else { many })
+}
+
+/// What a copy wrote, or what a plan found, for `--verbose`.
+fn contents(files: u64, directories: u64, bytes: u64) -> String {
+    format!(
+        "{}, {}, {}",
+        plural(files, "file", "files"),
+        plural(directories, "directory", "directories"),
+        plural(bytes, "byte", "bytes")
+    )
+}
+
 const IMAGE_OPTIONS: &[&str] = &["offset", "size"];
 const FORMAT_VALUES: &[&str] = &[
     "sector-size",
@@ -380,7 +400,8 @@ enum Data {
 
 /// The manifest `--manifest` named, read once, and where its data is.
 struct ManifestSource {
-    path: PathBuf,
+    /// How messages name the manifest: its path, or standard input.
+    name: String,
     manifest: manifest::Manifest,
     /// None for the commands that only size.
     data: Option<Data>,
@@ -394,16 +415,24 @@ struct Sources {
     manifest: Option<ManifestSource>,
 }
 
-/// Reads and parses the manifest `path` names.
-fn read_manifest(path: &Path) -> Result<manifest::Manifest> {
-    let file = host::open_file(path)?;
-    util::read_manifest(file).map_err(|e| {
+/// Reads and parses the manifest `path` names, or the one on standard input
+/// for "-". Returns it with the name messages give it.
+fn read_manifest(path: &Path) -> Result<(manifest::Manifest, String)> {
+    let (file, name) = if path == Path::new("-") {
+        // A descriptor of our own, since the reader closes it.
+        let fd = std::io::stdin().as_fd().try_clone_to_owned()?;
+        (std::fs::File::from(fd), "standard input".to_string())
+    } else {
+        (host::open_file(path)?, path.display().to_string())
+    };
+    let manifest = util::read_manifest(file).map_err(|e| {
         if e.is_manifest() {
-            e.context(format_args!("{} is not a UAPI.16 manifest", path.display()))
+            e.context(format_args!("{} is not a UAPI.16 manifest", name))
         } else {
-            e.context(format_args!("cannot read {} as a manifest", path.display()))
+            e.context(format_args!("cannot read {} as a manifest", name))
         }
-    })
+    })?;
+    Ok((manifest, name))
 }
 
 /// Resolves the SOURCE arguments (the `--fit` directories for an empty
@@ -426,7 +455,13 @@ fn sources(args: &Args, paths: &[&Path], sizing: bool) -> Result<Sources> {
         }
         return Ok(Sources { trees, manifest: None });
     };
-    let manifest = read_manifest(m)?;
+    if m == Path::new("-") && !sizing && matches!(paths, [p] if *p == Path::new("-")) {
+        bail!(
+            errno::EINVAL,
+            "--manifest - and a SOURCE of - cannot both read standard input"
+        );
+    }
+    let (manifest, name) = read_manifest(m)?;
     if dest(args) != "/" {
         bail!(
             errno::EINVAL,
@@ -451,11 +486,7 @@ fn sources(args: &Args, paths: &[&Path], sizing: bool) -> Result<Sources> {
     };
     Ok(Sources {
         trees: Vec::new(),
-        manifest: Some(ManifestSource {
-            path: m.to_path_buf(),
-            manifest,
-            data,
-        }),
+        manifest: Some(ManifestSource { name, manifest, data }),
     })
 }
 
@@ -489,7 +520,7 @@ fn check_sources(args: &Args, sources: &Sources) -> Result<()> {
             .map_err(|e| {
                 e.context(format!(
                     "the files {} describes are not all below {}",
-                    m.path.display(),
+                    m.name,
                     path.display()
                 ))
             })?;
@@ -536,11 +567,9 @@ fn fill(v: &mut Volume, args: &Args, sources: &Sources) -> Result<()> {
         let report = v.copy_tree(dir.as_fd(), dest(args), &copy)?;
         if args.flag("verbose") {
             eprintln!(
-                "{}: {} files, {} directories, {} bytes",
+                "{}: {}",
                 path.display(),
-                report.files,
-                report.directories,
-                report.bytes
+                contents(report.files, report.directories, report.bytes)
             );
         }
         for skipped in report.skipped {
@@ -567,11 +596,9 @@ fn fill(v: &mut Volume, args: &Args, sources: &Sources) -> Result<()> {
         };
         if args.flag("verbose") {
             eprintln!(
-                "{}: {} files, {} directories, {} bytes",
-                m.path.display(),
-                report.files,
-                report.directories,
-                report.bytes
+                "{}: {}",
+                m.name,
+                contents(report.files, report.directories, report.bytes)
             );
         }
         for skipped in report.skipped {
@@ -581,18 +608,36 @@ fn fill(v: &mut Volume, args: &Args, sources: &Sources) -> Result<()> {
     Ok(())
 }
 
+/// Whether `--write-manifest -` puts the manifest on standard output. What
+/// the command prints there otherwise goes to standard error then.
+fn manifest_to_stdout(args: &Args) -> bool {
+    args.path("write-manifest") == Some(Path::new("-"))
+}
+
 /// Writes the UAPI.16 manifest of everything `v` holds to the file `path`,
-/// for `--write-manifest`.
+/// or to standard output for "-", for `--write-manifest`.
 fn write_manifest(v: &Volume, path: &Path) -> Result<()> {
-    let file = std::fs::File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
-    let mut out = std::io::BufWriter::new(file);
-    let report = manifest::volume::write(v, v.root_time()?, manifest::volume::Fields::default(), &mut out)?;
-    if report.omitted > 0 {
-        eprintln!(
+    let fields = manifest::volume::Fields::default();
+    let (report, shown) = if path == Path::new("-") {
+        let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+        let report = manifest::volume::write(v, v.root_time()?, fields, &mut out)?;
+        (report, "the manifest on standard output".to_string())
+    } else {
+        let file = std::fs::File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
+        let mut out = std::io::BufWriter::new(file);
+        let report = manifest::volume::write(v, v.root_time()?, fields, &mut out)?;
+        (report, path.display().to_string())
+    };
+    match report.omitted {
+        0 => {}
+        1 => eprintln!(
+            "ufat: 1 entry is not in {}: its name cannot be written in a manifest",
+            shown
+        ),
+        n => eprintln!(
             "ufat: {} entries are not in {}: their names cannot be written in a manifest",
-            report.omitted,
-            path.display()
-        );
+            n, shown
+        ),
     }
     Ok(())
 }
@@ -601,14 +646,14 @@ fn write_manifest(v: &Volume, path: &Path) -> Result<()> {
 fn report_layout(image: &Path, layout: &ufat::layout::Layout, verbose: bool) {
     if verbose {
         eprintln!(
-            "{}: {} sectors of {} bytes, {} clusters of {} bytes, {} reserved sectors, {} FATs of {} sectors",
+            "{}: {} sectors of {} bytes, {} clusters of {} bytes, {} reserved sectors, {} of {} sectors",
             image.display(),
             layout.total_sectors,
             layout.sector_size,
             layout.clusters,
             layout.cluster_size(),
             layout.reserved_sectors,
-            layout.fats,
+            plural(u64::from(layout.fats), "FAT", "FATs"),
             layout.fat_sectors
         );
     }
@@ -653,11 +698,9 @@ fn plan(args: &Args) -> Result<()> {
     println!("{}", e.size());
     if args.flag("verbose") {
         eprintln!(
-            "{} files, {} directories, {} bytes: {} clusters of {} bytes, {} sector size",
-            e.files,
-            e.directories,
-            e.bytes,
-            e.data_clusters,
+            "{}: {} of {} bytes, {} byte sectors",
+            contents(e.files, e.directories, e.bytes),
+            plural(u64::from(e.data_clusters), "cluster", "clusters"),
             e.layout.cluster_size(),
             e.layout.sector_size
         );
@@ -738,11 +781,11 @@ fn unfinished(v: Volume, e: ufat::Error) -> ufat::Error {
 fn report_estimate(args: &Args, path: &Path, estimate: &ufat::plan::Estimate) {
     if args.flag("verbose") {
         eprintln!(
-            "{}: {} files and {} directories in {} bytes need a {} byte file system with {} byte clusters",
+            "{}: {} and {} in {} need a {} byte file system with {} byte clusters",
             path.display(),
-            estimate.files,
-            estimate.directories,
-            estimate.bytes,
+            plural(estimate.files, "file", "files"),
+            plural(estimate.directories, "directory", "directories"),
+            plural(estimate.bytes, "byte", "bytes"),
             estimate.size(),
             estimate.layout.cluster_size()
         );
@@ -754,7 +797,7 @@ fn cmd_assemble(argv: &[OsString]) -> Result<()> {
         argv,
         &with(
             FORMAT_VALUES,
-            &with(IMAGE_OPTIONS, &with(FILL_VALUES, &["fit", "hash"])),
+            &with(IMAGE_OPTIONS, &with(FILL_VALUES, &["fit", "hash", "write-hash"])),
         ),
         &with(FORMAT_FLAGS, &with(FILL_FLAGS, &["plan"])),
     )?;
@@ -768,6 +811,16 @@ fn cmd_assemble(argv: &[OsString]) -> Result<()> {
                 .ok_or_else(|| err!(errno::EINVAL, "unknown hash algorithm '{}', sha256 or sha512", a))?,
         ),
     };
+    let hash_path = args.path("write-hash");
+    if hash_path.is_some() && hash.is_none() {
+        bail!(errno::EINVAL, "--write-hash needs --hash");
+    }
+    if hash_path == Some(Path::new("-")) && manifest_to_stdout(&args) {
+        bail!(
+            errno::EINVAL,
+            "--write-manifest - and --write-hash - cannot both write to standard output"
+        );
+    }
     let (path, paths) = match args.positional_paths().split_first() {
         Some((&i, s)) => (i, s.to_vec()),
         None => bail!(errno::EINVAL, "assemble takes an IMAGE and SOURCE arguments"),
@@ -786,7 +839,14 @@ fn cmd_assemble(argv: &[OsString]) -> Result<()> {
     v.close()?;
     report_layout(path, &layout, args.flag("verbose"));
     if let Some(hash) = hash {
-        println!("{}", hash.of(&open_image(&args, path, Access::ReadOnly)?, &mut |_| {})?);
+        let digest = hash.of(&open_image(&args, path, Access::ReadOnly)?, &mut |_| {})?;
+        match hash_path {
+            Some(p) if p != Path::new("-") => {
+                std::fs::write(p, format!("{}\n", digest)).with_context(|| format!("cannot write {}", p.display()))?
+            }
+            None if manifest_to_stdout(&args) => eprintln!("{}", digest),
+            _ => println!("{}", digest),
+        }
     }
     Ok(())
 }
@@ -886,7 +946,7 @@ fn cmd_populate(argv: &[OsString]) -> Result<()> {
 }
 
 fn cmd_remove(argv: &[OsString]) -> Result<()> {
-    let args = Args::parse(argv, IMAGE_OPTIONS, &["recursive"])?;
+    let args = Args::parse(argv, IMAGE_OPTIONS, &["recursive", "verbose"])?;
     let (image, paths) = match args.positional.split_first() {
         Some((i, p)) if !p.is_empty() => (i, p),
         _ => bail!(errno::EINVAL, "remove takes an IMAGE and at least one PATH"),
@@ -899,12 +959,23 @@ fn cmd_remove(argv: &[OsString]) -> Result<()> {
         if md.name.is_empty() {
             bail!(errno::EBUSY, "the root directory cannot be removed");
         }
-        if !md.is_dir {
+        let (files, directories) = if !md.is_dir {
             v.remove_file(path)?;
+            (1, 0)
         } else if args.flag("recursive") {
-            v.remove_tree(path)?;
+            let report = v.remove_tree(path)?;
+            (report.files, report.directories)
         } else {
             v.remove_dir(path)?;
+            (0, 1)
+        };
+        if args.flag("verbose") {
+            eprintln!(
+                "{}: {}, {}",
+                path,
+                plural(files, "file", "files"),
+                plural(directories, "directory", "directories")
+            );
         }
     }
     v.close()
@@ -960,32 +1031,48 @@ fn cmd_list(argv: &[OsString]) -> Result<()> {
     Ok(())
 }
 
+/// Prints the geometry, the serial number and the label of `v` to `out`.
+fn print_description(v: &Volume, out: &mut dyn Write) -> Result<()> {
+    let l = v.layout();
+    let bs = v.boot_sector();
+    writeln!(out, "sector size:      {}", l.sector_size)?;
+    writeln!(
+        out,
+        "usable on:        devices with a logical block size up to {} bytes",
+        l.sector_size
+    )?;
+    writeln!(out, "cluster size:     {}", l.cluster_size())?;
+    writeln!(out, "total sectors:    {}", l.total_sectors)?;
+    writeln!(out, "size:             {}", l.size())?;
+    writeln!(out, "reserved sectors: {}", l.reserved_sectors)?;
+    writeln!(out, "FATs:             {} x {} sectors", l.fats, l.fat_sectors)?;
+    writeln!(out, "clusters:         {} ({} free)", l.clusters, v.free_clusters())?;
+    writeln!(out, "root cluster:     {}", bs.root_cluster)?;
+    writeln!(out, "volume id:        {}", VolumeId(bs.volume_id))?;
+    writeln!(out, "volume label:     {}", v.label()?.unwrap_or_default())?;
+    writeln!(
+        out,
+        "OEM name:         {}",
+        String::from_utf8_lossy(&bs.oem_name).trim_end()
+    )?;
+    if l.below_spec_minimum() {
+        writeln!(
+            out,
+            "note:             below the FAT32 minimum of {} clusters",
+            ufat::layout::MIN_CLUSTERS
+        )?;
+    }
+    Ok(())
+}
+
 fn cmd_describe(argv: &[OsString]) -> Result<()> {
     let args = Args::parse(argv, &with(IMAGE_OPTIONS, &["write-manifest"]), &[])?;
     let image = image_arg(&args, "describe")?;
     let v = open_volume(&args, image, Access::ReadOnly)?;
-    let l = v.layout();
-    let bs = v.boot_sector();
-    println!("sector size:      {}", l.sector_size);
-    println!(
-        "usable on:        devices with a logical block size up to {} bytes",
-        l.sector_size
-    );
-    println!("cluster size:     {}", l.cluster_size());
-    println!("total sectors:    {}", l.total_sectors);
-    println!("size:             {}", l.size());
-    println!("reserved sectors: {}", l.reserved_sectors);
-    println!("FATs:             {} x {} sectors", l.fats, l.fat_sectors);
-    println!("clusters:         {} ({} free)", l.clusters, v.free_clusters());
-    println!("root cluster:     {}", bs.root_cluster);
-    println!("volume id:        {}", VolumeId(bs.volume_id));
-    println!("volume label:     {}", v.label()?.unwrap_or_default());
-    println!("OEM name:         {}", String::from_utf8_lossy(&bs.oem_name).trim_end());
-    if l.below_spec_minimum() {
-        println!(
-            "note:             below the FAT32 minimum of {} clusters",
-            ufat::layout::MIN_CLUSTERS
-        );
+    if manifest_to_stdout(&args) {
+        print_description(&v, &mut std::io::stderr().lock())?;
+    } else {
+        print_description(&v, &mut std::io::stdout().lock())?;
     }
     if let Some(m) = args.path("write-manifest") {
         write_manifest(&v, m)?;
@@ -1043,18 +1130,21 @@ fn cmd_check(argv: &[OsString]) -> Result<ExitCode> {
         );
     }
     if report.dropped > 0 {
-        println!("... and {} more problems not shown", report.dropped);
+        println!(
+            "... and {} not shown",
+            plural(report.dropped as u64, "more problem", "more problems")
+        );
     }
     println!(
-        "{}: {} files, {} directories, {} clusters used, {} free, {} lost; {} errors, {} warnings",
+        "{}: {}, {}, {} used, {} free, {} lost; {}, {}",
         image.display(),
-        report.files,
-        report.directories,
-        report.used_clusters,
+        plural(report.files, "file", "files"),
+        plural(report.directories, "directory", "directories"),
+        plural(u64::from(report.used_clusters), "cluster", "clusters"),
         report.free_clusters,
         report.lost_clusters,
-        report.errors(),
-        report.warnings()
+        plural(report.errors() as u64, "error", "errors"),
+        plural(report.warnings() as u64, "warning", "warnings")
     );
     Ok(if report.errors() > 0 {
         ExitCode::from(FSCK_ERRORS_LEFT_UNCORRECTED)
@@ -1096,6 +1186,10 @@ fn run(argv: &[OsString]) -> Result<ExitCode> {
     // knows where the options end.
     if matches!(command, "help" | "--help" | "-h") {
         print!("{}", USAGE);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if matches!(command, "version" | "--version") {
+        println!("ufat {}", env!("CARGO_PKG_VERSION"));
         return Ok(ExitCode::SUCCESS);
     }
     let rest = &argv[1..];

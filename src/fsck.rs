@@ -143,8 +143,8 @@ pub enum ProblemKind {
     FatHardwareErrorFlag,
     /// FAT entry 1 is not an end of chain marker: `value`.
     FatEntry1,
-    /// A FAT copy differs from the first: `copy`, `count` the differing
-    /// bytes.
+    /// A FAT copy differs from the first: `copy` the copy, counting from 1,
+    /// `count` the differing bytes.
     FatCopyDiffers,
     /// A chain points at an invalid cluster: `path`, `cluster`.
     ChainInvalidCluster,
@@ -436,7 +436,7 @@ pub struct Problem {
     pub other_name: Option<String>,
     /// A boot sector field or a timestamp field.
     pub field: Option<&'static str>,
-    /// A FAT copy or a sector number.
+    /// A FAT copy, counting from 1, or a sector number.
     pub copy: Option<u32>,
     /// A count of things.
     pub count: Option<u64>,
@@ -572,8 +572,9 @@ impl fmt::Display for Problem {
             ),
             BelowMinimumClusters => write!(
                 f,
-                "{} clusters is below the FAT32 minimum of {}: EDK2 firmware refuses the volume, Linux and the Windows driver still mount it as FAT32",
-                clusters, expected
+                "{} is below the FAT32 minimum of {}: EDK2 firmware refuses the volume, Linux and the Windows driver still mount it as FAT32",
+                plural(clusters, "cluster", "clusters"),
+                expected
             ),
             BootSignatureMissing => f.write_str("boot sector signature is missing"),
             FileSystemTypeString => write!(
@@ -588,6 +589,9 @@ impl fmt::Display for Problem {
             FsinfoSignatures => f.write_str("the FSInfo sector has invalid signatures"),
             FsinfoTrailingSignature => {
                 f.write_str("the FSInfo sector lacks its trailing signature, EDK2 ignores its contents")
+            }
+            FsinfoFreeCount if expected == 1 => {
+                write!(f, "the FSInfo free cluster count is {} but 1 cluster is free", value)
             }
             FsinfoFreeCount => write!(
                 f,
@@ -613,8 +617,9 @@ impl fmt::Display for Problem {
             FatEntry1 => write!(f, "FAT entry 1 is 0x{:08x}, expected an end of chain marker", value),
             FatCopyDiffers => write!(
                 f,
-                "FAT copy {} differs from the first FAT in {} bytes; Linux and EDK2 read the first copy, fsck.fat copies it over the others",
-                copy, count
+                "FAT copy {} differs from FAT copy 1 in {}; Linux and EDK2 read copy 1, fsck.fat copies it over the others",
+                copy,
+                plural(count, "byte", "bytes")
             ),
             ChainInvalidCluster => write!(f, "{}: chain points at invalid cluster {}", path, cluster),
             ChainLoop => write!(f, "{}: cluster chain loops at cluster {}", path, cluster),
@@ -641,6 +646,7 @@ impl fmt::Display for Problem {
                     path, cluster
                 ),
             },
+            CrossLinkedMore if count == 1 => f.write_str("1 more cross-linked cluster is not listed"),
             CrossLinkedMore => write!(f, "{} more cross-linked clusters are not listed", count),
             DirectoryTooLong => write!(
                 f,
@@ -674,6 +680,11 @@ impl fmt::Display for Problem {
                 f,
                 "{}: long name entry in slot {} has the invalid sequence byte {:#04x}; Linux skips it",
                 path, slot, value
+            ),
+            LongNameMismatch if slots == 1 => write!(
+                f,
+                "{}: long name entry in slot {} does not belong to '{}' (checksum or sequence mismatch)",
+                path, slot, name
             ),
             LongNameMismatch => write!(
                 f,
@@ -762,8 +773,9 @@ impl fmt::Display for Problem {
             ),
             SizeWithoutClusters => write!(
                 f,
-                "{}: has {} bytes but no clusters; Linux reads it as zeros",
-                path, size
+                "{}: has {} but no clusters; Linux reads it as zeros",
+                path,
+                plural(size, "byte", "bytes")
             ),
             TooFewClusters => write!(
                 f,
@@ -772,16 +784,22 @@ impl fmt::Display for Problem {
             ),
             TooManyClusters => write!(
                 f,
-                "{}: has {} bytes but {} clusters, {} too many; Linux refuses to append to it (\"clusters badly computed\") and so does EDK2",
+                "{}: has {} but {}, {} too many; Linux refuses to append to it (\"clusters badly computed\") and so does EDK2",
                 path,
-                size,
-                clusters,
+                plural(size, "byte", "bytes"),
+                plural(clusters, "cluster", "clusters"),
                 clusters.saturating_sub(needed)
             ),
+            LostClusters if count == 1 => {
+                f.write_str("1 cluster is allocated but not referenced by any file or directory")
+            }
             LostClusters => write!(
                 f,
                 "{} clusters are allocated but not referenced by any file or directory",
                 count
+            ),
+            ReservedBitsSet if count == 1 => f.write_str(
+                "1 FAT entry has bits set in its reserved high nibble; GRUB does not mask them and cuts chains short",
             ),
             ReservedBitsSet => write!(
                 f,
@@ -790,6 +808,11 @@ impl fmt::Display for Problem {
             ),
         }
     }
+}
+
+/// `n` followed by `one` or `many`, as the count asks for.
+fn plural(n: u64, one: &str, many: &str) -> String {
+    format!("{} {}", n, if n == 1 { one } else { many })
 }
 
 /// Problems a report keeps, at most. A damaged directory can yield one per
@@ -1302,9 +1325,10 @@ impl<'a> Checker<'a> {
                     // Linux and EDK2 read the first copy and never the
                     // others; fsck.fat offers to copy the first over them.
                     // A crash between the two writes leaves this behind.
+                    // The finding counts copies from 1, as people do.
                     self.warning(|| {
                         Problem::new(ProblemKind::FatCopyDiffers)
-                            .copy(i)
+                            .copy(i + 1)
                             .count(differing as u64)
                     });
                 }
@@ -2000,7 +2024,7 @@ mod tests {
         assert!(r
             .problems
             .iter()
-            .any(|p| p.kind == ProblemKind::FatCopyDiffers && p.copy == Some(1)));
+            .any(|p| p.kind == ProblemKind::FatCopyDiffers && p.copy == Some(2)));
         assert!(r.problems.iter().any(|p| {
             p.kind == ProblemKind::TooFewClusters && p.clusters == Some(1) && p.clusters_needed == Some(5)
         }));
@@ -2068,6 +2092,65 @@ mod tests {
         assert_eq!(r.dropped, 7);
         assert_eq!(r.errors() + r.warnings(), MAX_PROBLEMS + 7);
         assert!(!r.is_clean());
+    }
+
+    /// A finding that counts one thing says so in the singular.
+    #[test]
+    fn counts_of_one() {
+        use ProblemKind::*;
+        let file = |kind: ProblemKind| Problem::new(kind).path("/a".to_string());
+        for (p, text) in [
+            (
+                Problem::new(BelowMinimumClusters).clusters(1).expected(65525),
+                "1 cluster is below the FAT32 minimum of 65525: EDK2 firmware refuses the volume, Linux and the Windows driver still mount it as FAT32",
+            ),
+            (
+                Problem::new(FsinfoFreeCount).value(2).expected(1),
+                "the FSInfo free cluster count is 2 but 1 cluster is free",
+            ),
+            (
+                Problem::new(FsinfoFreeCount).value(1).expected(2),
+                "the FSInfo free cluster count is 1 but 2 clusters are free",
+            ),
+            (
+                Problem::new(FatCopyDiffers).copy(2).count(1),
+                "FAT copy 2 differs from FAT copy 1 in 1 byte; Linux and EDK2 read copy 1, fsck.fat copies it over the others",
+            ),
+            (
+                Problem::new(CrossLinkedMore).count(1),
+                "1 more cross-linked cluster is not listed",
+            ),
+            (
+                file(LongNameMismatch).slot(3).slots(1).name("A.TXT"),
+                "/a: long name entry in slot 3 does not belong to 'A.TXT' (checksum or sequence mismatch)",
+            ),
+            (
+                file(LongNameMismatch).slot(3).slots(2).name("A.TXT"),
+                "/a: long name entries in slots 3..5 do not belong to 'A.TXT' (checksum or sequence mismatch)",
+            ),
+            (
+                file(SizeWithoutClusters).size_bytes(1),
+                "/a: has 1 byte but no clusters; Linux reads it as zeros",
+            ),
+            (
+                file(TooManyClusters).size_bytes(0).clusters(1).clusters_needed(0),
+                "/a: has 0 bytes but 1 cluster, 1 too many; Linux refuses to append to it (\"clusters badly computed\") and so does EDK2",
+            ),
+            (
+                Problem::new(LostClusters).count(1),
+                "1 cluster is allocated but not referenced by any file or directory",
+            ),
+            (
+                Problem::new(LostClusters).count(2),
+                "2 clusters are allocated but not referenced by any file or directory",
+            ),
+            (
+                Problem::new(ReservedBitsSet).count(1),
+                "1 FAT entry has bits set in its reserved high nibble; GRUB does not mask them and cuts chains short",
+            ),
+        ] {
+            assert_eq!(p.to_string(), text);
+        }
     }
 
     #[test]

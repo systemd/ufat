@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "bench"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "json",
  "libc",
@@ -56,11 +56,11 @@ dependencies = [
 
 [[package]]
 name = "fold-table"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "fuzz-seeds"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ufat",
 ]
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "json"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lexopt"
@@ -109,7 +109,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "ufat"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "json",
  "lexopt",
@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "ufat-trace"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "json",
  "libc",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "varlink"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "json",
  "libc",

@@ -9,6 +9,7 @@ default-members = [".", "json", "varlink", "tests/crash"]
 resolver = "3"
 
 [workspace.package]
+version = "0.1.0"
 edition = "2021"
 # ufat has to keep building with this rustc.
 rust-version = "1.85"
@@ -33,6 +34,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(ufat_trace)"]
 
 [package]
 name = "ufat"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -469,6 +469,12 @@ fn info_and_description_over_fd3() {
         vec!["io.systemd", IFACE, "org.varlink.service"]
     );
     assert_eq!(info.get("product").unwrap().as_str(), Some("ufat"));
+    // The version is the package's.
+    assert_eq!(info.get("version").unwrap().as_str(), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        info.get("url").unwrap().as_str(),
+        Some("https://github.com/systemd/ufat")
+    );
     let d = reply(
         c.call(
             "org.varlink.service.GetInterfaceDescription",
@@ -521,7 +527,7 @@ fn capabilities_describe_vfat() {
     let caps = object_of(&r, "capabilities");
     assert_eq!(str_of(caps, "fileSystemType"), "vfat");
     assert_eq!(str_of(caps, "implementation"), "ufat");
-    assert!(!str_of(caps, "version").is_empty());
+    assert_eq!(str_of(caps, "version"), env!("CARGO_PKG_VERSION"));
     assert!(!bool_of(caps, "readOnly"));
     assert_eq!(
         strings_of(caps, "operations"),
@@ -785,7 +791,7 @@ fn assemble_with_a_tree() {
     assert_eq!(u64_of(&r, "directories"), 3);
     assert_eq!(u64_of(&r, "bytes"), 5010);
     assert_eq!(u64_of(&r, "skipped"), 0);
-    assert_eq!(u64_of(&r, "omitted"), 0);
+    assert!(r.get("omitted").is_none());
     assert!(r.get("imageHash").is_none());
     let d = object_of(&r, "description");
     assert_eq!(str_of(d, "fileSystemType"), "vfat");
