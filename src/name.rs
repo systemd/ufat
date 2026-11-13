@@ -415,7 +415,7 @@ pub fn parse_long_name_entry(raw: &[u8; DIR_ENTRY_SIZE]) -> Option<LongNameEntry
         return None;
     }
     let sequence = raw[0] & !LFN_LAST_ENTRY;
-    if sequence == 0 || sequence as usize > LFN_MAX_ENTRIES || raw[0] & 0x80 != 0 {
+    if sequence == 0 || sequence as usize > LFN_MAX_ENTRIES {
         return None;
     }
     let units = LFN_UNIT_OFFSETS.map(|off| le16(raw, off));
