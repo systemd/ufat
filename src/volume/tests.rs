@@ -501,17 +501,24 @@ fn reproducible() {
 
 #[test]
 fn fsinfo_reserved_bytes_survive() {
-    use crate::boot::FsInfo;
+    use crate::boot::{fsinfo_field, FsInfo};
+    use crate::bytes::size;
     let (img, v) = volume(1 << 20, 512, 512);
-    let off = u64::from(v.boot_sector().fsinfo_sector) * 512;
+    let off = u64::from(v.boot_sector().fsinfo_sector) * u64::from(v.layout().sector_size);
     v.close().unwrap();
     // Something else keeps data in the reserved bytes, as lDOS does with its
     // FSIBOOT block, and the trailing signature is missing, as some
     // formatters leave it.
     let dev = img.device();
-    dev.write_at(off + 4, b"FSIBOOT").unwrap();
-    dev.write_at(off + 500, b"xyz").unwrap();
-    dev.write_at(off + 508, &[0u8; 4]).unwrap();
+    dev.write_at(off + fsinfo_field::RESERVED1.start as u64, b"FSIBOOT")
+        .unwrap();
+    dev.write_at(off + fsinfo_field::RESERVED2.start as u64, b"xyz")
+        .unwrap();
+    dev.write_at(
+        off + fsinfo_field::TRAIL_SIGNATURE.start as u64,
+        &[0u8; size(fsinfo_field::TRAIL_SIGNATURE)],
+    )
+    .unwrap();
     drop(dev);
     let mut v = Volume::open(img.device()).unwrap();
     v.create_dir("/d", t(0)).unwrap();
@@ -519,8 +526,8 @@ fn fsinfo_reserved_bytes_survive() {
     v.close().unwrap();
     let mut sector = [0u8; 512];
     img.device().read_at(off, &mut sector).unwrap();
-    assert_eq!(&sector[4..11], b"FSIBOOT");
-    assert_eq!(&sector[500..503], b"xyz");
+    assert_eq!(&sector[fsinfo_field::RESERVED1][..7], b"FSIBOOT");
+    assert_eq!(&sector[fsinfo_field::RESERVED2][..3], b"xyz");
     let info = FsInfo::parse(&sector).unwrap();
     assert_eq!(info.free_clusters, free);
     assert!(FsInfo::has_trail_signature(&sector));
@@ -779,17 +786,17 @@ fn durable_mode_puts_a_barrier_before_every_publishing_write() {
 
 #[test]
 fn the_volume_is_marked_dirty_while_written() {
-    use crate::boot::{FsInfo, FSINFO_UNKNOWN, NT_FLAG_DIRTY};
+    use crate::boot::{field, FsInfo, FSINFO_SIZE, FSINFO_UNKNOWN, NT_FLAG_DIRTY};
     let (img, mut v) = volume(1 << 20, 512, 512);
     let layout = *v.layout();
-    let fsinfo = v.boot_sector().fsinfo_sector as usize * 512;
+    let fsinfo = usize::from(v.boot_sector().fsinfo_sector) * layout.sector_size as usize;
     let entry1 = |bytes: &[u8], copy: u32| {
         let off = layout.fat_offset(copy) as usize + 4;
         u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap())
     };
     // Nothing is marked before the first write.
     let bytes = std::fs::read(img.path()).unwrap();
-    assert_eq!(bytes[0x41] & NT_FLAG_DIRTY, 0);
+    assert_eq!(bytes[field::NT_FLAGS] & NT_FLAG_DIRTY, 0);
     assert_eq!(entry1(&bytes, 0), 0x0FFF_FFFF);
     v.read_dir("/").unwrap();
     assert_eq!(std::fs::read(img.path()).unwrap(), bytes, "reading marks nothing");
@@ -798,19 +805,19 @@ fn the_volume_is_marked_dirty_while_written() {
     let mut w = v.create_file("/f", t(0), false).unwrap();
     w.write_all(b"data").unwrap();
     let bytes = std::fs::read(img.path()).unwrap();
-    assert_ne!(bytes[0x41] & NT_FLAG_DIRTY, 0);
+    assert_ne!(bytes[field::NT_FLAGS] & NT_FLAG_DIRTY, 0);
     assert_eq!(entry1(&bytes, 0) & (1 << 27), 0);
     assert_eq!(entry1(&bytes, 1) & (1 << 27), 0);
-    let info = FsInfo::parse(&bytes[fsinfo..fsinfo + 512]).unwrap();
+    let info = FsInfo::parse(&bytes[fsinfo..fsinfo + FSINFO_SIZE]).unwrap();
     assert_eq!((info.free_clusters, info.next_free), (FSINFO_UNKNOWN, FSINFO_UNKNOWN));
     w.finish().unwrap();
     // Closed, everything is back and the counts are real.
     v.close().unwrap();
     let bytes = std::fs::read(img.path()).unwrap();
-    assert_eq!(bytes[0x41] & NT_FLAG_DIRTY, 0);
+    assert_eq!(bytes[field::NT_FLAGS] & NT_FLAG_DIRTY, 0);
     assert_eq!(entry1(&bytes, 0), 0x0FFF_FFFF);
     assert_eq!(entry1(&bytes, 1), 0x0FFF_FFFF);
-    let info = FsInfo::parse(&bytes[fsinfo..fsinfo + 512]).unwrap();
+    let info = FsInfo::parse(&bytes[fsinfo..fsinfo + FSINFO_SIZE]).unwrap();
     let r = fsck::check(&img.device()).unwrap();
     assert_eq!(info.free_clusters, r.free_clusters);
     assert_eq!(r.errors(), 0, "{:?}", r.problems);
@@ -828,11 +835,11 @@ fn the_volume_is_marked_dirty_while_written() {
 /// that nothing was written to since it was opened gets the marks too.
 #[test]
 fn a_volume_closed_unfinished_stays_marked() {
-    use crate::boot::{FsInfo, FSINFO_UNKNOWN, NT_FLAG_DIRTY};
+    use crate::boot::{field, FsInfo, FSINFO_SIZE, FSINFO_UNKNOWN, NT_FLAG_DIRTY};
     for written in [true, false] {
         let (img, mut v) = volume(1 << 20, 512, 512);
         let layout = *v.layout();
-        let fsinfo = v.boot_sector().fsinfo_sector as usize * 512;
+        let fsinfo = usize::from(v.boot_sector().fsinfo_sector) * layout.sector_size as usize;
         if written {
             let mut w = v.create_file("/f", t(0), false).unwrap();
             w.write_all(b"data").unwrap();
@@ -840,13 +847,13 @@ fn a_volume_closed_unfinished_stays_marked() {
         }
         v.close_unfinished().unwrap();
         let bytes = std::fs::read(img.path()).unwrap();
-        assert_ne!(bytes[0x41] & NT_FLAG_DIRTY, 0);
+        assert_ne!(bytes[field::NT_FLAGS] & NT_FLAG_DIRTY, 0);
         for copy in 0..layout.fats {
             let off = layout.fat_offset(copy) as usize + 4;
             let entry1 = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
             assert_eq!(entry1 & (1 << 27), 0, "FAT {}", copy);
         }
-        let info = FsInfo::parse(&bytes[fsinfo..fsinfo + 512]).unwrap();
+        let info = FsInfo::parse(&bytes[fsinfo..fsinfo + FSINFO_SIZE]).unwrap();
         assert_eq!((info.free_clusters, info.next_free), (FSINFO_UNKNOWN, FSINFO_UNKNOWN));
         let r = fsck::check(&img.device()).unwrap();
         assert_eq!(r.errors(), 0, "{:?}", r.problems);

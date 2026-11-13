@@ -12,9 +12,10 @@ use std::str::FromStr;
 use std::time::SystemTime;
 
 use crate::boot::{
-    default_boot_code, valid_media, BootSector, FsInfo, BOOT_JUMP, BOOT_SIGNATURE, DRIVE_NUMBER_FIXED,
-    EXT_BOOT_SIGNATURE, FS_TYPE_FAT32, MEDIA_FIXED, NO_NAME, OEM_NAME_DEFAULT,
+    default_boot_code, field, valid_media, BootSector, FsInfo, BOOT_JUMP, BOOT_SIGNATURE, DRIVE_NUMBER_FIXED,
+    EXT_BOOT_SIGNATURE, FS_TYPE_FAT32, LABEL_SIZE, MEDIA_FIXED, NO_NAME, OEM_NAME_DEFAULT, OEM_NAME_SIZE,
 };
+use crate::bytes::size;
 use crate::device::Device;
 use crate::dirent::{RawDirEntry, ATTR_VOLUME_ID, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_E5_ESCAPE};
 use crate::errno::*;
@@ -44,7 +45,7 @@ pub struct FormatOptions {
     /// Volume label, up to 11 ASCII characters.
     pub label: Option<String>,
     /// OEM name field.
-    pub oem_name: [u8; 8],
+    pub oem_name: [u8; OEM_NAME_SIZE],
     /// The time stamped on the volume label entry. None uses 1980-01-01.
     pub timestamp: Option<SystemTime>,
     /// Hidden sectors field. None uses the start of the partition the
@@ -93,19 +94,25 @@ impl Default for FormatOptions {
 /// Characters mkfs.fat refuses in a label.
 const LABEL_INVALID: &[u8] = b"*?.,;:/\\|+=<>[]\"";
 
+/// Whether `c` is printable ASCII: a space or a graphic character.
+fn is_printable(c: u8) -> bool {
+    c == b' ' || c.is_ascii_graphic()
+}
+
 /// Validates a volume label and returns its space padded on-disk form.
-pub fn encode_label(label: &str) -> Result<[u8; 11]> {
+pub fn encode_label(label: &str) -> Result<[u8; LABEL_SIZE]> {
     let invalid = |problem: LabelProblem| Detail::Label {
         label: label.to_string(),
         problem,
     };
     let bytes = label.as_bytes();
-    if bytes.len() > 11 {
+    if bytes.len() > LABEL_SIZE {
         bail!(
             EINVAL,
             invalid(LabelProblem::TooLong),
-            "label '{}' is longer than 11 characters",
-            label
+            "label '{}' is longer than {} characters",
+            label,
+            LABEL_SIZE
         );
     }
     if bytes.iter().all(|&c| c == b' ') {
@@ -119,7 +126,7 @@ pub fn encode_label(label: &str) -> Result<[u8; 11]> {
         );
     }
     for &c in bytes {
-        if !(0x20..0x7f).contains(&c) {
+        if !is_printable(c) {
             bail!(
                 EINVAL,
                 invalid(LabelProblem::InvalidCharacter),
@@ -137,31 +144,32 @@ pub fn encode_label(label: &str) -> Result<[u8; 11]> {
             );
         }
     }
-    let mut out = [b' '; 11];
+    let mut out = [b' '; LABEL_SIZE];
     out[..bytes.len()].copy_from_slice(bytes);
     Ok(out)
 }
 
 /// The label `raw` as text, without its padding. The code page is
 /// unknown, so bytes outside ASCII are taken as Latin-1.
-pub fn decode_label(raw: &[u8; 11]) -> String {
+pub fn decode_label(raw: &[u8; LABEL_SIZE]) -> String {
     let label: String = raw.iter().map(|&b| char::from(b)).collect();
     label.trim_end().to_string()
 }
 
 /// Validates an OEM name and returns its space padded on-disk form: up to
 /// eight printable ASCII characters.
-pub fn encode_oem_name(name: &str) -> Result<[u8; 8]> {
+pub fn encode_oem_name(name: &str) -> Result<[u8; OEM_NAME_SIZE]> {
     let bytes = name.as_bytes();
-    if bytes.len() > 8 || !bytes.iter().all(|b| (0x20..0x7f).contains(b)) {
+    if bytes.len() > OEM_NAME_SIZE || !bytes.iter().all(|&c| is_printable(c)) {
         bail!(
             EINVAL,
             Detail::InvalidOption("oemName"),
-            "OEM name '{}' is not up to 8 printable ASCII characters",
-            name
+            "OEM name '{}' is not up to {} printable ASCII characters",
+            name,
+            OEM_NAME_SIZE
         );
     }
-    let mut out = [b' '; 8];
+    let mut out = [b' '; OEM_NAME_SIZE];
     out[..bytes.len()].copy_from_slice(bytes);
     Ok(out)
 }
@@ -357,7 +365,7 @@ pub fn prepare(
         root_cluster: 2,
         fsinfo_sector: 1,
         backup_boot_sector: backup_boot_sector(layout.reserved_sectors, 1),
-        reserved: [0; 12],
+        reserved: [0; size(field::RESERVED)],
         drive_number: options.drive_number.unwrap_or(if options.media == MEDIA_FIXED {
             DRIVE_NUMBER_FIXED
         } else {
@@ -510,7 +518,7 @@ mod tests {
     fn oem_names() {
         assert_eq!(encode_oem_name("mkfs.fat").unwrap(), *b"mkfs.fat");
         assert_eq!(encode_oem_name("MSWIN").unwrap(), *b"MSWIN   ");
-        assert_eq!(encode_oem_name("").unwrap(), [b' '; 8]);
+        assert_eq!(encode_oem_name("").unwrap(), [b' '; OEM_NAME_SIZE]);
         for bad in ["TOOLONGNAME", "\u{c4}", "A\tB"] {
             let e = encode_oem_name(bad).unwrap_err();
             assert_eq!(e.detail(), Some(&Detail::InvalidOption("oemName")), "{:?}", bad);

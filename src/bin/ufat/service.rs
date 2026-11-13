@@ -32,6 +32,7 @@ use ufat::manifest::volume::{Fields, WriteReport};
 use ufat::manifest::{AssembleOptions, AssembleReport, DirectorySource, Manifest, StreamSource};
 use ufat::plan::{Plan, PlanOptions};
 use ufat::populate::{CopyOptions, CopyReport, TimePolicy};
+use ufat::probe::Prober;
 use ufat::progress::Progress;
 use ufat::sha256::Sha256;
 use ufat::sha512::Sha512;
@@ -39,7 +40,7 @@ use ufat::volume::{Metadata, Volume};
 use ufat::{CorruptPlace, Detail, NoSpaceReason, NotFat32Reason, UnsupportedKind};
 use varlink::{Activation, Call, Connection, Info, Reply, Server, Service};
 
-use crate::util;
+use crate::util::{self, ImageFlags};
 
 /// The interface description, served verbatim.
 pub(crate) const INTERFACE: &str = include_str!("../../../docs/org.uapi-group.FileSystem.varlink");
@@ -174,16 +175,16 @@ fn no_space_reason(reason: NoSpaceReason) -> &'static str {
 }
 
 /// Why the image holds no FAT32 volume, as the interface's
-/// `NotFileSystemReason`. A boot sector that is not blank and not FAT32
-/// belongs to something else, a FAT12 or FAT16 volume or another file
-/// system altogether, which is `otherFileSystem`; the library does not
-/// say what it found, so `found` stays unset.
+/// `NotFileSystemReason`. Another file system, a partition table or
+/// anything else libblkid recognizes, a FAT12 or FAT16 volume included, is
+/// `foreignImageType`, and `found` names it.
 fn not_file_system_reason(reason: NotFat32Reason) -> &'static str {
     match reason {
         NotFat32Reason::Blank => "blank",
-        NotFat32Reason::NotFat32 => "otherFileSystem",
+        NotFat32Reason::NotFat32 => "foreignImageType",
         NotFat32Reason::SectorSize => "sectorSize",
         NotFat32Reason::TooSmall => "tooSmall",
+        NotFat32Reason::Unknown => "unknown",
     }
 }
 
@@ -227,11 +228,17 @@ fn map_error(e: &ufat::Error) -> varlink::Error {
             optional(&mut o, "path", path.as_deref());
             interface_error("NoSpaceLeft", o)
         }
-        Detail::NotFat32 { reason, sector_size } => {
+        Detail::NotFat32 {
+            reason,
+            found,
+            sector_size,
+        } => {
             let mut o = json::object! { "reason" => not_file_system_reason(*reason) };
+            optional(&mut o, "found", found.as_deref());
             optional(&mut o, "sectorSize", *sector_size);
             interface_error("NotFileSystem", o)
         }
+        Detail::NotEmpty { found } => interface_error("ImageNotEmpty", json::object! { "found" => found.as_str() }),
         Detail::Corrupt {
             place,
             field,
@@ -765,7 +772,8 @@ pub(crate) fn capabilities() -> ufat::Result<Object> {
     })
 }
 
-/// The hash of an image window, as `imageHash` asks for it.
+/// The hash of a file system as it is in its image, as `imageHash` asks
+/// for it.
 pub(crate) enum Hash {
     Sha256(Sha256),
     Sha512(Sha512),
@@ -780,9 +788,8 @@ impl Hash {
         }
     }
 
-    /// Reads the whole window of `device` back and returns the hash in
-    /// lowercase hex, telling `progress` how many bytes it read so far after
-    /// every read.
+    /// Reads all of `device` back and returns the hash in lowercase hex,
+    /// telling `progress` how many bytes it read so far after every read.
     pub(crate) fn of(mut self, device: &Device, progress: &mut dyn FnMut(&Progress)) -> ufat::Result<String> {
         let mut buf = vec![0u8; HASH_STEP];
         let mut offset = 0;
@@ -1162,6 +1169,8 @@ impl FileSystemService {
             Some(a) => Some(Hash::new(a).ok_or_else(|| invalid("imageHash"))?),
         };
         let options = format_options(p.object("options"))?;
+        let mut flags = ImageFlags::default();
+        flags.set(ImageFlags::FORCE, p.bool("force", false));
         let content_time = options.format.timestamp.unwrap_or_else(util::now);
         let taker = if plan_only { Taker::Plan } else { Taker::Assemble };
         let content = match p.object("content") {
@@ -1176,7 +1185,7 @@ impl FileSystemService {
         };
         match image {
             None => plan(options, content, c, more),
-            Some(image) => assemble_image(image, options, content, hash, c, more),
+            Some(image) => assemble_image(image, options, content, hash, flags, c, more),
         }
     }
 
@@ -1425,13 +1434,16 @@ fn fill_image(
 /// when there is one, sized to fit when no size is given. Everything that
 /// can be checked before the image is touched has been checked by now:
 /// the descriptors vetted, the manifest parsed and its source verified,
-/// the options validated. A call that fails after the format leaves the
-/// file system marked as not cleanly unmounted.
+/// the options validated. Without [`ImageFlags::FORCE`], an image that
+/// holds a file system, a partition table or other data is ImageNotEmpty.
+/// A call that fails after the format leaves the file system marked as not
+/// cleanly unmounted.
 fn assemble_image(
     image: Image,
     mut options: Options,
     content: Option<Content>,
     hash: Option<Hash>,
+    flags: ImageFlags,
     c: &mut Connection,
     more: bool,
 ) -> Outcome<Object> {
@@ -1447,12 +1459,18 @@ fn assemble_image(
                 ct.plan(plan)
             })
             .map_err(fit_error)?;
+            if !flags.contains(ImageFlags::FORCE) {
+                Prober::new().ensure_empty(&device, offset, Some(fit))?;
+            }
             phase(c, more, "formatting")?;
             let (volume, _) = util::format_fit(device, offset, fit, estimate, &options.format).map_err(fit_error)?;
             (volume, size.is_none())
         }
         None => {
-            // A regular file is grown to a size given; a window with no
+            if !flags.contains(ImageFlags::FORCE) {
+                Prober::new().ensure_empty(&device, offset, size)?;
+            }
+            // A regular file is grown to a size given. An image with no
             // bytes in it has no size at all.
             if let Some(s) = size {
                 util::size_image(&mut device, offset, s)?;

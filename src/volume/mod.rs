@@ -21,9 +21,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
-use crate::boot::{
-    BootSector, FsInfo, BOOT_SECTOR_SIZE, FSINFO_SIZE, FSINFO_UNKNOWN, NO_NAME, NT_FLAGS_OFFSET, NT_FLAG_DIRTY,
-};
+use crate::boot::{self, BootSector, FsInfo, BOOT_SECTOR_SIZE, FSINFO_SIZE, FSINFO_UNKNOWN, NO_NAME, NT_FLAG_DIRTY};
 use crate::device::Device;
 use crate::dir::{DirEntry, Directory, MAX_SLOTS};
 use crate::dirent::{
@@ -35,6 +33,7 @@ use crate::fat::{Entry, Extent, Fat, FatStore, CACHE_BYTES, ENTRY1_CLEAN_SHUTDOW
 use crate::layout::Layout;
 use crate::name::{fold_str, long_name_entries, short_name_to_string, Alias, LongName};
 use crate::path::components;
+use crate::probe::Prober;
 use crate::time::FatTimestamp;
 use crate::Result;
 use crate::{Detail, NoSpaceReason, NotFat32Reason};
@@ -249,6 +248,7 @@ impl Volume {
                 EMEDIUMTYPE,
                 Detail::NotFat32 {
                     reason: NotFat32Reason::TooSmall,
+                    found: None,
                     sector_size: None,
                 },
                 "{} bytes are too few to hold a file system",
@@ -257,8 +257,8 @@ impl Volume {
         }
         let mut sector = [0u8; BOOT_SECTOR_SIZE];
         device.read_at(0, &mut sector)?;
-        let boot = BootSector::parse(&sector)?;
-        let layout = boot.layout()?;
+        let boot = BootSector::parse(&sector).map_err(|e| Prober::new().refine(e, &device, &sector))?;
+        let layout = boot.layout().map_err(|e| Prober::new().refine(e, &device, &sector))?;
         if layout.size() > device.len() {
             bail!(
                 EUCLEAN,
@@ -332,7 +332,7 @@ impl Volume {
         fat.set_entry1(&store, dirty)?;
         self.flush()?;
         let mut sector = self.boot_raw;
-        sector[NT_FLAGS_OFFSET] |= NT_FLAG_DIRTY;
+        sector[boot::field::NT_FLAGS] |= NT_FLAG_DIRTY;
         self.device.write_at(0, &sector)
     }
 

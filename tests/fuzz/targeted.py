@@ -80,12 +80,12 @@ class Probes:
             self.run("list --offset %r" % s, [self.ufat, "list", "--offset", s, img, "/"])
             self.run("list --size %r" % s, [self.ufat, "list", "--size", s, img, "/"])
         for s in ["4294967296", "4294967295", "0", "1", "3", "1024", "2048", "8192", "65536", "262144", "18446744073709551615"]:
-            self.run("assemble --sector-size %s" % s, [self.ufat, "assemble", "--create", "--size", "300M", "--sector-size", s, os.path.join(self.work, "ss.img")])
-            self.run("assemble --cluster-size %s" % s, [self.ufat, "assemble", "--create", "--size", "300M", "--cluster-size", s, os.path.join(self.work, "cs.img")])
-            self.run("assemble --reserved-sectors %s" % s, [self.ufat, "assemble", "--create", "--size", "300M", "--reserved-sectors", s, os.path.join(self.work, "rs.img")])
-            self.run("assemble --fats %s" % s, [self.ufat, "assemble", "--create", "--size", "300M", "--fats", s, os.path.join(self.work, "fats.img")])
+            self.run("assemble --sector-size %s" % s, [self.ufat, "assemble", "--create", "--force", "--size", "300M", "--sector-size", s, os.path.join(self.work, "ss.img")])
+            self.run("assemble --cluster-size %s" % s, [self.ufat, "assemble", "--create", "--force", "--size", "300M", "--cluster-size", s, os.path.join(self.work, "cs.img")])
+            self.run("assemble --reserved-sectors %s" % s, [self.ufat, "assemble", "--create", "--force", "--size", "300M", "--reserved-sectors", s, os.path.join(self.work, "rs.img")])
+            self.run("assemble --fats %s" % s, [self.ufat, "assemble", "--create", "--force", "--size", "300M", "--fats", s, os.path.join(self.work, "fats.img")])
         for s in ["0", "1", "511", "512", "1023", "1024", "32K", "1M", "32M", "40M"]:
-            self.run("assemble --size %s" % s, [self.ufat, "assemble", "--create", "--size", s, os.path.join(self.work, "small.img")])
+            self.run("assemble --size %s" % s, [self.ufat, "assemble", "--create", "--force", "--size", s, os.path.join(self.work, "small.img")])
         self.run("assemble --label 12 chars", [self.ufat, "assemble", "--create", "--size", "40M", "--label", "123456789012", os.path.join(self.work, "l.img")])
         self.run("assemble --label unicode", [self.ufat, "assemble", "--create", "--size", "40M", "--label", "日本語", os.path.join(self.work, "l.img")])
         self.run("assemble --label 0xE5", [self.ufat, "assemble", "--create", "--size", "40M", "--label", "å", os.path.join(self.work, "l.img")])

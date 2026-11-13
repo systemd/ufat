@@ -9,6 +9,7 @@ use ufat::device::{Access, Device};
 use ufat::errno;
 use ufat::format::FormatOptions;
 use ufat::plan::{Estimate, Plan, PlanOptions};
+use ufat::probe::Prober;
 use ufat::volume::Volume;
 use ufat::{bail, err, Context, Error, Result};
 
@@ -116,7 +117,7 @@ pub(crate) fn open_image(path: &Path, offset: u64, size: Option<u64>, access: Ac
 /// This is the one lookup of the image path; sizing, growing, formatting
 /// and populating all go through the descriptor.
 pub(crate) fn open_target(target: &Target<'_>) -> Result<Device> {
-    if target.create {
+    if target.flags.contains(ImageFlags::CREATE) {
         Device::create(target.path)
     } else {
         Device::open(target.path, Access::ReadWrite)
@@ -134,13 +135,38 @@ pub(crate) fn size_image(device: &mut Device, offset: u64, size: u64) -> Result<
     device.grow(total)
 }
 
-/// Where a file system goes: an image path, the window inside it, and
-/// whether a missing regular file may be created.
+/// What may be done to the image a file system goes to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ImageFlags(u8);
+
+impl ImageFlags {
+    /// Create the image file when it does not exist.
+    pub(crate) const CREATE: ImageFlags = ImageFlags(1 << 0);
+    /// Format the image whatever it holds.
+    pub(crate) const FORCE: ImageFlags = ImageFlags(1 << 1);
+
+    /// Whether all of `flags` are set.
+    pub(crate) fn contains(self, flags: ImageFlags) -> bool {
+        self.0 & flags.0 == flags.0
+    }
+
+    /// Sets `flags` when `on` is true, and clears them otherwise.
+    pub(crate) fn set(&mut self, flags: ImageFlags, on: bool) {
+        if on {
+            self.0 |= flags.0;
+        } else {
+            self.0 &= !flags.0;
+        }
+    }
+}
+
+/// Where a file system goes: an image path, the part of the image it
+/// takes up, and what may be done to the image.
 pub(crate) struct Target<'a> {
     pub path: &'a Path,
     pub offset: u64,
     pub size: Option<u64>,
-    pub create: bool,
+    pub flags: ImageFlags,
 }
 
 /// Why [`fit_and_format`] could not fit the content.
@@ -180,12 +206,14 @@ impl FitError {
 /// the Varlink Assemble method does in two steps with [`plan_fit`] and
 /// [`format_fit`]. The image is opened once; a block device
 /// is planned for its logical block size, a regular image file is grown,
-/// never shrunk, to the size given or to the fit, and created first when
-/// `create` is set. Everything that can go wrong before the first write,
-/// a source that cannot be read, content that does not fit the size
-/// given, is found out while the image is untouched, and a file created
+/// never shrunk, to the size given or to the fit, and created first with
+/// [`ImageFlags::CREATE`]. Everything that can go wrong before the first
+/// write, a source that cannot be read, content that does not fit the
+/// size given, is found out while the image is untouched, and a file created
 /// for the file system is removed again then, so a failed command leaves
-/// nothing behind.
+/// nothing behind. Without [`ImageFlags::FORCE`], an image that holds a
+/// file system, a partition table or other data is not formatted over
+/// ([`Prober::ensure_empty`]).
 pub(crate) fn fit_and_format(
     target: &Target<'_>,
     options: &mut FormatOptions,
@@ -201,6 +229,9 @@ pub(crate) fn fit_and_format(
             return Err(e);
         }
     };
+    if !target.flags.contains(ImageFlags::FORCE) {
+        Prober::new().ensure_empty(&device, target.offset, Some(size))?;
+    }
     format_fit(device, target.offset, size, estimate, options)
 }
 

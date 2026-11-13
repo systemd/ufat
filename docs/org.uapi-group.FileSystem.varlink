@@ -464,8 +464,11 @@ method GetCapabilities(
 # nothing is written: the geometry, the size the content needs and whether
 # that size is exact are computed, from the content and the options, and
 # from the image's size when one is given. A regular image file without a
-# size is grown to the fit when content is given. The reply carries what was
-# written: the label and identifier as stored, never as asked.
+# size is grown to the fit when content is given. With mode assemble, an
+# image that holds a filesystem, a partition table or other data that
+# formatting would destroy is refused with ImageNotEmpty, unless force is
+# set. With offset and size, only that part of the image counts. The reply
+# contains the label and identifier as stored.
 # [Supports 'more' flag]: intermediate replies carry the phase and the
 # counts so far.
 method Assemble(
@@ -475,10 +478,13 @@ method Assemble(
 	mode: ?AssembleMode,
 	options: ?FormatOptions,
 	content: ?Content,
-	# Hash the whole image window as it is after the call: the written bytes
-	# and the rest, which the implementation knows to be zero when the call
-	# sized or zeroed the image, and reads back otherwise
-	imageHash: ?HashAlgorithm
+	# Hash the filesystem as it is in the image after the call, all size bytes
+	# from offset: the written bytes and the rest, which the implementation
+	# knows to be zero when the call sized or zeroed the image, and reads back
+	# otherwise
+	imageHash: ?HashAlgorithm,
+	# Format the image whatever it holds, false by default
+	force: ?bool
 ) -> (
 	# The step in progress, in intermediate replies only
 	phase: ?Phase,
@@ -619,9 +625,19 @@ error ContentRequired()
 # The filesystem cannot be sized to fit and no size was given.
 error SizeRequired()
 
-# The image holds no filesystem of this type.
-type NotFileSystemReason(blank, otherFileSystem, sectorSize, tooSmall, unknown)
+# The image holds no filesystem of this type: nothing (blank), another
+# filesystem, a partition table or anything else blkid recognizes, which
+# found names the way blkid names it (foreignImageType), a sector size the
+# implementation does not support (sectorSize), too few bytes (tooSmall),
+# or data the implementation does not recognize (unknown).
+type NotFileSystemReason(blank, foreignImageType, sectorSize, tooSmall, unknown)
 error NotFileSystem(reason: NotFileSystemReason, found: ?string, sectorSize: ?int)
+
+# Assemble would write over what the image holds, and force is not set: a
+# filesystem, a partition table, an encrypted volume, a RAID or LVM member,
+# named the way blkid names it (vfat, ext4, crypto_LUKS, gpt, ...), or
+# unknown when the implementation cannot tell what it is.
+error ImageNotEmpty(found: string)
 
 # The filesystem is damaged where the operation needed it sound.
 type CorruptPlace(superblock, allocation, chain, directory, journal, checksum)

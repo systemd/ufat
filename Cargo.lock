@@ -12,6 +12,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blkid"
+version = "0.1.0"
+dependencies = [
+ "dlopen",
+ "dlopen-note",
+ "libc",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -53,6 +62,17 @@ dependencies = [
  "block-buffer",
  "crypto-common",
 ]
+
+[[package]]
+name = "dlopen"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "dlopen-note"
+version = "0.1.0"
 
 [[package]]
 name = "fold-table"
@@ -111,6 +131,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 name = "ufat"
 version = "0.1.0"
 dependencies = [
+ "blkid",
  "json",
  "lexopt",
  "libc",
@@ -122,6 +143,7 @@ dependencies = [
 name = "ufat-trace"
 version = "0.1.0"
 dependencies = [
+ "blkid",
  "json",
  "libc",
  "sha2",

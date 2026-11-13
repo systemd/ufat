@@ -17,12 +17,13 @@ use ufat::layout::MIN_SECTOR_SIZE;
 use ufat::manifest::{self, AssembleOptions, DirectorySource, StreamSource};
 use ufat::plan::{Plan, PlanOptions};
 use ufat::populate::{CopyOptions, TimePolicy};
+use ufat::probe::Prober;
 use ufat::time::civil_from_days;
 use ufat::volume::Volume;
-use ufat::{bail, err, Context, Result};
+use ufat::{bail, err, Context, Detail, Error, Result};
 
 use crate::service;
-use crate::util;
+use crate::util::{self, ImageFlags};
 
 const USAGE: &str = "\
 Usage: ufat COMMAND [OPTIONS...] ARGS...
@@ -49,6 +50,9 @@ interface that ufat serves; cat and manifest have no method.
 
 assemble without a SOURCE creates an empty file system of the size of IMAGE or
 --size, or sized to hold the --fit directories or what --manifest describes.
+assemble refuses an IMAGE that holds a file system, a partition table or other
+data libblkid recognizes, or without libblkid anything that is not blank.
+--force formats it anyway.
 populate puts a SOURCE directory below --path and a SOURCE file at --path.
 Without a SOURCE it creates the directory --path.
 
@@ -83,6 +87,7 @@ Options for assemble:
   --zero                Zero the whole data area
   --create              Create IMAGE if it does not exist (without a SOURCE it
                         needs --size, --fit or --manifest for that)
+  --force, -f           Format IMAGE whatever it holds
   --fit DIR             Size IMAGE to the smallest file system holding DIR
                         and leave it empty (no SOURCE; repeatable)
   --hash ALGORITHM      Print the sha256 or sha512 hash of the file system
@@ -128,13 +133,13 @@ struct Args {
 
 impl Args {
     /// Splits `args` with lexopt: `--name=value` or `--name value` for the
-    /// options in `with_value`, `--name` for those in `flags`, and -p, -l
-    /// and -r for `--parents`, `--long` and `--recursive` where `flags` has
-    /// them. Short options can be bundled, as in `-lh`. `--` ends the
-    /// options, and `-` is a positional argument. `-h` or `--help` anywhere
-    /// among the options prints the usage and exits, whatever else is on
-    /// the command line. After `--`, or as the value of an option, `-h` is
-    /// an argument like any other.
+    /// options in `with_value`, `--name` for those in `flags`, and -p, -l,
+    /// -r and -f for `--parents`, `--long`, `--recursive` and `--force`
+    /// where `flags` has them. Short options can be bundled, as in `-lh`.
+    /// `--` ends the options, and `-` is a positional argument. `-h` or
+    /// `--help` anywhere among the options prints the usage and exits,
+    /// whatever else is on the command line. After `--`, or as the value of
+    /// an option, `-h` is an argument like any other.
     fn parse(args: &[OsString], with_value: &[&str], flags: &[&str]) -> Result<Args> {
         use lexopt::Arg::{Long, Short, Value};
 
@@ -235,6 +240,14 @@ impl Args {
         self.options.iter().any(|(n, _)| n == name)
     }
 
+    /// What `--create` and `--force` allow to be done to the image.
+    fn image_flags(&self) -> ImageFlags {
+        let mut flags = ImageFlags::default();
+        flags.set(ImageFlags::CREATE, self.flag("create"));
+        flags.set(ImageFlags::FORCE, self.flag("force"));
+        flags
+    }
+
     fn u32(&self, name: &str) -> Result<Option<u32>> {
         let Some(v) = self.value(name) else {
             return Ok(None);
@@ -261,6 +274,7 @@ fn short_option(c: char) -> Option<&'static str> {
         'p' => Some("parents"),
         'l' => Some("long"),
         'r' => Some("recursive"),
+        'f' => Some("force"),
         _ => None,
     }
 }
@@ -314,7 +328,7 @@ const FILL_VALUES: &[&str] = &[
     "write-manifest",
 ];
 const FILL_FLAGS: &[&str] = &["no-replace", "no-check-validity", "verbose"];
-const FORMAT_FLAGS: &[&str] = &["no-align", "mkfs-fat-compat", "zero", "create", "verbose"];
+const FORMAT_FLAGS: &[&str] = &["no-align", "mkfs-fat-compat", "zero", "create", "force", "verbose"];
 
 fn with(a: &[&'static str], b: &[&'static str]) -> Vec<&'static str> {
     a.iter().chain(b).copied().collect()
@@ -720,11 +734,14 @@ fn assemble_empty(args: &Args, path: &Path) -> Result<Volume> {
         path,
         offset,
         size,
-        create: args.flag("create"),
+        flags: args.image_flags(),
     };
     if fit.is_empty() && args.path("manifest").is_none() {
         let mut device = util::open_target(&target)?;
-        if target.create {
+        if !target.flags.contains(ImageFlags::FORCE) {
+            Prober::new().ensure_empty(&device, offset, size)?;
+        }
+        if target.flags.contains(ImageFlags::CREATE) {
             let size = size.ok_or_else(|| err!(errno::EINVAL, "--create needs --size, --fit or --manifest"))?;
             util::size_image(&mut device, offset, size)?;
         }
@@ -758,7 +775,7 @@ fn assemble_filled(args: &Args, path: &Path, paths: &[&Path]) -> Result<Volume> 
         path,
         offset: args.size("offset")?.unwrap_or(0),
         size: args.size("size")?,
-        create: args.flag("create"),
+        flags: args.image_flags(),
     };
     let (mut v, estimate) = util::fit_and_format(&target, &mut options, &mut |plan| plan_sources(plan, args, &sources))
         .map_err(|e| e.into_error(path))?;
@@ -773,7 +790,7 @@ fn assemble_filled(args: &Args, path: &Path, paths: &[&Path]) -> Result<Volume> 
 /// not cleanly unmounted as after a crash, so that nobody takes it for a
 /// finished one. Returns `e`: an error of the close is not the one the
 /// user needs to hear about.
-fn unfinished(v: Volume, e: ufat::Error) -> ufat::Error {
+fn unfinished(v: Volume, e: Error) -> Error {
     let _ = v.close_unfinished();
     e
 }
@@ -789,6 +806,16 @@ fn report_estimate(args: &Args, path: &Path, estimate: &ufat::plan::Estimate) {
             estimate.size(),
             estimate.layout.cluster_size()
         );
+    }
+}
+
+/// Says how to format an image that holds something anyway.
+fn force_hint(e: Error) -> Error {
+    match e.detail() {
+        Some(detail @ Detail::NotEmpty { .. }) => {
+            Error::new(e.errno(), format!("{}, use --force to format it anyway", e.message())).with(detail.clone())
+        }
+        _ => e,
     }
 }
 
@@ -826,10 +853,11 @@ fn cmd_assemble(argv: &[OsString]) -> Result<()> {
         None => bail!(errno::EINVAL, "assemble takes an IMAGE and SOURCE arguments"),
     };
     let v = if paths.is_empty() {
-        assemble_empty(&args, path)?
+        assemble_empty(&args, path)
     } else {
-        assemble_filled(&args, path, &paths)?
-    };
+        assemble_filled(&args, path, &paths)
+    }
+    .map_err(force_hint)?;
     if let Some(m) = args.path("write-manifest") {
         if let Err(e) = write_manifest(&v, m) {
             return Err(unfinished(v, e));
