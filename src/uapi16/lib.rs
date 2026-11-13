@@ -9,9 +9,10 @@
 //! objects can come after the file objects, and a trailer object ends the
 //! manifest.
 //!
-//! - [`Name`] is the name a file has in a manifest, and [`Sha256`] the hash
-//!   of its contents. [`Sha256Hasher`] computes the hash of a file while it
-//!   is read.
+//! - [`FileObject`], [`Contents`] and [`Signature`] are the objects, and
+//!   [`Name`], [`InodeType`], [`Mode`], [`Sha256`] and [`Uuid`] what their
+//!   fields hold.
+//! - [`Sha256Hasher`] computes the hash of a file while it is read.
 //!
 //! [UAPI.16 file manifest]: https://uapi-group.org/specifications/specs/file_manifest/
 
@@ -19,11 +20,17 @@
 #![warn(missing_docs)]
 
 mod digest;
+mod error;
 mod hex;
 mod name;
+mod object;
 
 pub use digest::{Digest, InvalidDigest, Sha256, Sha256Hasher};
+pub use error::{ContentProblem, Error, ErrorKind, Field, Invalid, Problem, SourceProblem, Unsupported};
 pub use name::{InvalidName, Name};
+pub use object::{
+    Contents, FileObject, Gpt, InodeType, InvalidUuid, Location, Mode, Signature, UnknownInodeType, Uuid, Validity,
+};
 
 /// The name of a manifest that is stored in the tree it describes.
 pub const FILENAME: &str = "Uapi16Manifest";
