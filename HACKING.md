@@ -238,10 +238,11 @@ every push to main and once a week. It runs:
 
 - the build and the tests with rustc 1.85 and with the current stable
   rustc, on x86_64 and aarch64, with warnings turned into errors,
+- the same with musl on x86_64,
 - the case folding table check, which generates the table from the
   Unicode 16.0.0 files,
 - clippy with rustc 1.85 and with the current stable rustc, for every
-  supported architecture,
+  supported architecture and for musl on x86_64,
 - rustfmt,
 - the build and the tests for the other architectures, under qemu
   except for i686,
