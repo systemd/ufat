@@ -3,7 +3,7 @@
 
 use std::ops::Range;
 
-use crate::bytes::{le16_at, le32_at};
+use crate::bytes::{bytes_at, le16_at, le32_at, size};
 use crate::time::FatTimestamp;
 
 /// Size of a directory entry.
@@ -34,10 +34,12 @@ pub const ENTRY_E5_ESCAPE: u8 = 0x05;
 pub const CASE_LOWER_BASE: u8 = 0x08;
 /// Flag in the NT reserved byte: the extension is lower case.
 pub const CASE_LOWER_EXT: u8 = 0x10;
+/// The size of an 8.3 name, [`field::NAME`].
+pub const SHORT_NAME_SIZE: usize = size(field::NAME);
 /// The 8.3 name of the "." entry of a subdirectory.
-pub const DOT_NAME: [u8; 11] = *b".          ";
+pub const DOT_NAME: [u8; SHORT_NAME_SIZE] = *b".          ";
 /// The 8.3 name of the ".." entry of a subdirectory.
-pub const DOTDOT_NAME: [u8; 11] = *b"..         ";
+pub const DOTDOT_NAME: [u8; SHORT_NAME_SIZE] = *b"..         ";
 /// The base of an 8.3 name, space padded.
 pub const NAME_BASE: Range<usize> = 0..8;
 /// The extension of an 8.3 name, space padded.
@@ -106,7 +108,7 @@ pub mod lfn_field {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RawDirEntry {
     /// 8.3 name, space padded, as stored on disk (0x05 escaping included).
-    pub name: [u8; 11],
+    pub name: [u8; SHORT_NAME_SIZE],
     /// Attribute bits.
     pub attr: u8,
     /// Windows NT case flags.
@@ -133,10 +135,8 @@ pub struct RawDirEntry {
 impl RawDirEntry {
     /// Decodes an entry from 32 bytes.
     pub fn from_bytes(b: &[u8; DIR_ENTRY_SIZE]) -> RawDirEntry {
-        let mut name = [0u8; 11];
-        name.copy_from_slice(&b[field::NAME]);
         RawDirEntry {
-            name,
+            name: bytes_at(b, field::NAME),
             attr: b[field::ATTR],
             nt_flags: b[field::NT_FLAGS],
             create_tenths: b[field::CREATE_TENTHS],
@@ -226,7 +226,7 @@ impl RawDirEntry {
 }
 
 /// Computes the checksum of an 8.3 name that long name entries carry.
-pub fn short_name_checksum(name: &[u8; 11]) -> u8 {
+pub fn short_name_checksum(name: &[u8; SHORT_NAME_SIZE]) -> u8 {
     name.iter().fold(0u8, |sum, &c| sum.rotate_right(1).wrapping_add(c))
 }
 

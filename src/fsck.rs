@@ -13,7 +13,9 @@ use std::collections::HashSet;
 use std::fmt;
 use std::ops::Range;
 
-use crate::boot::{self, BootSector, FsInfo, BOOT_SECTOR_SIZE, FSINFO_UNKNOWN, FS_TYPE_FAT32, NO_NAME, NT_FLAG_DIRTY};
+use crate::boot::{
+    self, BootSector, FsInfo, BOOT_SECTOR_SIZE, FSINFO_UNKNOWN, FS_TYPE_FAT32, LABEL_SIZE, NO_NAME, NT_FLAG_DIRTY,
+};
 use crate::device::Device;
 use crate::dirent::{
     self, short_name_checksum, RawDirEntry, ATTR_LONG_NAME, ATTR_RESERVED, DIR_ENTRY_SIZE, DOTDOT_NAME, DOT_NAME,
@@ -957,7 +959,7 @@ struct Checker<'a> {
     current_dir: Cell<u32>,
     dir_path: RefCell<Option<(u32, String)>>,
     /// The label entry of the root directory, if there is one.
-    root_label: Option<[u8; 11]>,
+    root_label: Option<[u8; LABEL_SIZE]>,
     report: RefCell<Report>,
     progress: RefCell<&'a mut dyn FnMut(&Progress)>,
 }
