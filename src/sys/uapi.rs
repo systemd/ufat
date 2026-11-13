@@ -4,7 +4,7 @@
 //! Linux. Each architecture ufat supports is listed; the build fails on
 //! any other.
 
-use std::ffi::{c_int, c_ulong};
+use std::ffi::c_int;
 
 /// Linux 7.2: `openat(fd, "", flags | O_EMPTYPATH)` opens what `fd` refers
 /// to, which is how an O_PATH descriptor becomes a real one without procfs.
@@ -75,8 +75,8 @@ const _: () = {
 
 /// BLKGETSIZE64, `_IOR(0x12, 114, size_t)`: the size of a block device in
 /// bytes. include/uapi/linux/fs.h.
-pub(super) const BLKGETSIZE64: c_ulong = libc::_IOR::<libc::size_t>(0x12, 114);
+pub(super) const BLKGETSIZE64: libc::Ioctl = libc::_IOR::<libc::size_t>(0x12, 114);
 /// BLKZEROOUT, `_IO(0x12, 127)`: zero a range of a block device, with a
 /// write zeroes command where the device has one (block/ioctl.c).
 /// include/uapi/linux/fs.h.
-pub(super) const BLKZEROOUT: c_ulong = libc::_IO(0x12, 127);
+pub(super) const BLKZEROOUT: libc::Ioctl = libc::_IO(0x12, 127);

@@ -144,6 +144,14 @@ pub(crate) fn peek(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
     })
 }
 
+/// A length as a message header and a control message header have it, in
+/// bytes. It is a size_t with glibc and a socklen_t with musl, which is
+/// why it is also stored with `as _`.
+fn bytes(len: impl TryInto<usize>) -> usize {
+    // Neither is wider than a usize. A length of nothing ends the walk.
+    len.try_into().unwrap_or(0)
+}
+
 /// Reads up to `buf.len()` bytes and takes the descriptors that were sent
 /// along with them (SCM_RIGHTS), FD_CLOEXEC set on arrival so that none of
 /// them leaks into a child. The caller decides what they belong to.
@@ -155,7 +163,7 @@ pub(crate) fn recv_with_fds(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<Re
     };
     let mut msg = message(&mut iov);
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = size_of_val(&control);
+    msg.msg_controllen = size_of_val(&control) as _;
     let n = retry(|| {
         // SAFETY: the header points at one iovec over the caller's buffer
         // and at a control buffer of the stated size, all alive for the
@@ -167,7 +175,7 @@ pub(crate) fn recv_with_fds(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<Re
     let mut fds = Vec::new();
     // SAFETY: CMSG_LEN() computes a size and touches no memory.
     let header = unsafe { libc::CMSG_LEN(0) } as usize;
-    let end = msg.msg_control.addr() + msg.msg_controllen;
+    let end = msg.msg_control.addr() + bytes(msg.msg_controllen);
     // SAFETY: the header describes the control buffer, which the kernel
     // filled in up to msg_controllen.
     let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
@@ -177,13 +185,14 @@ pub(crate) fn recv_with_fds(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<Re
         // kernel aligned for it in a buffer aligned for it.
         let hdr = unsafe { &*cmsg };
         // They do not check that the data fits as well.
-        if hdr.cmsg_len < header || hdr.cmsg_len > end - cmsg.addr() {
+        let len = bytes(hdr.cmsg_len);
+        if len < header || len > end - cmsg.addr() {
             break;
         }
         if hdr.cmsg_level == libc::SOL_SOCKET && hdr.cmsg_type == libc::SCM_RIGHTS {
             // SAFETY: the data follows the header.
             let data = unsafe { libc::CMSG_DATA(cmsg) };
-            for i in 0..(hdr.cmsg_len - header) / size_of::<c_int>() {
+            for i in 0..(len - header) / size_of::<c_int>() {
                 // SAFETY: the data of an SCM_RIGHTS message is ints within
                 // the cmsg_len bytes checked above, read unaligned.
                 let raw = unsafe { data.add(i * size_of::<c_int>()).cast::<c_int>().read_unaligned() };
@@ -224,14 +233,14 @@ pub(crate) fn send_with_fds(fd: BorrowedFd<'_>, data: &[u8], fds: &[BorrowedFd<'
         let size = fds_size(fds.len());
         msg.msg_control = control.as_mut_ptr().cast();
         // SAFETY: CMSG_SPACE() computes a size and touches no memory.
-        msg.msg_controllen = unsafe { libc::CMSG_SPACE(size) } as usize;
+        msg.msg_controllen = unsafe { libc::CMSG_SPACE(size) } as _;
         // SAFETY: the control buffer is aligned for the header and has
         // room for it and for MAX_FDS ints, and msg_controllen covers
         // them, so CMSG_FIRSTHDR() returns its start. The ints are
         // written unaligned.
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&msg);
-            (*cmsg).cmsg_len = libc::CMSG_LEN(size) as usize;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(size) as _;
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
             let data = libc::CMSG_DATA(cmsg);

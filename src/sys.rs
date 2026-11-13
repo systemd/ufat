@@ -534,11 +534,14 @@ pub(crate) fn fs_kind(fd: BorrowedFd<'_>) -> io::Result<FsKind> {
     }
     // SAFETY: fstatfs64 succeeded, so it filled in the struct.
     let st = unsafe { st.assume_init() };
-    // f_type and the magic numbers have the same type, a long or, on
-    // s390x, an unsigned int.
-    Ok(if st.f_type == libc::PROC_SUPER_MAGIC {
+    // f_type and the magic numbers are a long with glibc and an unsigned
+    // int on s390x. With musl f_type is an unsigned long and the magic
+    // numbers are a long. All of them widen, and the two magic numbers
+    // asked for here are positive as a long of 32 bits too.
+    let fs_type = i128::from(st.f_type);
+    Ok(if fs_type == i128::from(libc::PROC_SUPER_MAGIC) {
         FsKind::Proc
-    } else if st.f_type == libc::SYSFS_MAGIC {
+    } else if fs_type == i128::from(libc::SYSFS_MAGIC) {
         FsKind::Sysfs
     } else {
         FsKind::Other

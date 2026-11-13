@@ -7,9 +7,10 @@ crates. lexopt parses the command line of the tool.
 
 - rustc and cargo 1.85 or newer. ufat has to keep building with rustc
   1.85.
-- Linux with glibc, on x86_64, i686, aarch64, armv7, loongarch64,
-  powerpc, powerpc64, powerpc64le, riscv64, s390x or sparc64. The build
-  fails on other targets, musl included.
+- Linux with glibc or musl, on x86_64, i686, aarch64, armv7,
+  loongarch64, powerpc, powerpc64, powerpc64le, riscv64, s390x or
+  sparc64. The build fails on other architectures. musl is tested on
+  x86_64 only.
 - rustfmt, for the formatting check, and clippy, for the lints.
 
 ## Building
