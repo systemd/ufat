@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::dirent::{
-    short_name_checksum, RawDirEntry, ATTR_LONG_NAME, ATTR_VOLUME_ID, DIR_ENTRY_SIZE, DOTDOT_NAME, DOT_NAME,
+    self, short_name_checksum, RawDirEntry, ATTR_LONG_NAME, ATTR_VOLUME_ID, DIR_ENTRY_SIZE, DOTDOT_NAME, DOT_NAME,
     ENTRY_DELETED, ENTRY_END,
 };
 use crate::errno::*;
@@ -358,7 +358,10 @@ impl Directory {
         if chain.is_empty() || data.len() != chain.len() * cluster_size {
             bail!(EINVAL, "directory data does not match its chain");
         }
-        let damaged = match data.chunks_exact(DIR_ENTRY_SIZE).position(|s| s[0] == ENTRY_END) {
+        let damaged = match data
+            .chunks_exact(DIR_ENTRY_SIZE)
+            .position(|s| s[dirent::field::MARKER] == ENTRY_END)
+        {
             Some(end) => data[(end + 1) * DIR_ENTRY_SIZE..].iter().any(|&b| b != 0),
             None => false,
         };
@@ -414,7 +417,7 @@ impl Directory {
 
     /// Whether the first byte of slot `i` marks it as in use.
     fn in_use(&self, i: usize) -> bool {
-        let b = self.slot(i)[0];
+        let b = self.slot(i)[dirent::field::MARKER];
         b != ENTRY_END && b != ENTRY_DELETED
     }
 
@@ -438,12 +441,12 @@ impl Directory {
     /// that keeps its name, as when a file gets its size or its times, is
     /// taken into the index; any other change rebuilds it.
     pub(crate) fn set_slot(&mut self, i: usize, bytes: &[u8; DIR_ENTRY_SIZE]) {
-        let off = i * DIR_ENTRY_SIZE;
-        if &self.data[off..off + DIR_ENTRY_SIZE] == bytes {
+        let old = self.slot(i);
+        if old == bytes {
             return;
         }
-        let same_name = self.data[off..off + 11] == bytes[..11]
-            && (self.data[off + 11] ^ bytes[11]) & ATTR_VOLUME_ID == 0
+        let same_name = old[dirent::field::NAME] == bytes[dirent::field::NAME]
+            && (old[dirent::field::ATTR] ^ bytes[dirent::field::ATTR]) & ATTR_VOLUME_ID == 0
             && self.index.entries.contains_key(&i);
         self.set_slot_raw(i, bytes);
         if same_name {
@@ -498,10 +501,10 @@ impl Directory {
         let mut i = 0;
         while i < n {
             let raw = self.slot(i);
-            if raw[0] == ENTRY_END {
+            if raw[dirent::field::MARKER] == ENTRY_END {
                 break;
             }
-            if raw[0] == ENTRY_DELETED {
+            if raw[dirent::field::MARKER] == ENTRY_DELETED {
                 orphan(&mut pending, &mut free);
                 free[i] = true;
                 i += 1;
@@ -526,7 +529,7 @@ impl Directory {
                 i += 1;
                 continue;
             }
-            if raw[11] == ATTR_LONG_NAME {
+            if raw[dirent::field::ATTR] == ATTR_LONG_NAME {
                 // A long name slot whose sequence byte is out of range. The
                 // kernel skips it (fat_parse_long() returns PARSE_INVALID);
                 // it is never read as a short entry.
@@ -718,9 +721,9 @@ impl Directory {
         // directory would hide it: a run reserved for an entry not written
         // yet. Mark them deleted; the entry they wait for overwrites them.
         for i in self.index.raw_end..start {
-            if self.slot(i)[0] == ENTRY_END {
+            if self.slot(i)[dirent::field::MARKER] == ENTRY_END {
                 let mut raw = *self.slot(i);
-                raw[0] = ENTRY_DELETED;
+                raw[dirent::field::MARKER] = ENTRY_DELETED;
                 self.set_slot_raw(i, &raw);
             }
         }
@@ -754,7 +757,7 @@ impl Directory {
     pub(crate) fn delete(&mut self, entry: &DirEntry) {
         for i in entry.first_slot()..=entry.slot {
             let mut raw = *self.slot(i);
-            raw[0] = ENTRY_DELETED;
+            raw[dirent::field::MARKER] = ENTRY_DELETED;
             self.set_slot_raw(i, &raw);
         }
         match self.index.remove(entry.slot) {
@@ -764,7 +767,7 @@ impl Directory {
             _ => self.rebuild_index(),
         }
         for i in self.index.raw_end..self.slots() {
-            if self.slot(i)[0] == ENTRY_END {
+            if self.slot(i)[dirent::field::MARKER] == ENTRY_END {
                 break;
             }
             self.set_slot_raw(i, &[0u8; DIR_ENTRY_SIZE]);
@@ -980,14 +983,18 @@ mod proofs {
     fn shaped_directory() -> Directory {
         let mut data = vec![0u8; SLOTS * DIR_ENTRY_SIZE];
         let lfn: [u8; DIR_ENTRY_SIZE] = kani::any();
-        kani::assume(lfn[0] != ENTRY_END && lfn[0] != ENTRY_DELETED);
+        kani::assume(lfn[dirent::field::MARKER] != ENTRY_END && lfn[dirent::field::MARKER] != ENTRY_DELETED);
         data[..DIR_ENTRY_SIZE].copy_from_slice(&lfn);
         data[11] = ATTR_LONG_NAME;
         let short: [u8; DIR_ENTRY_SIZE] = kani::any();
-        kani::assume(short[0] != ENTRY_END && short[0] != ENTRY_DELETED && short[11] != ATTR_LONG_NAME);
+        kani::assume(
+            short[dirent::field::MARKER] != ENTRY_END
+                && short[dirent::field::MARKER] != ENTRY_DELETED
+                && short[dirent::field::ATTR] != ATTR_LONG_NAME,
+        );
         data[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE].copy_from_slice(&short);
         let third: [u8; DIR_ENTRY_SIZE] = kani::any();
-        kani::assume(third[0] != ENTRY_END && third[11] != ATTR_LONG_NAME);
+        kani::assume(third[dirent::field::MARKER] != ENTRY_END && third[dirent::field::ATTR] != ATTR_LONG_NAME);
         data[2 * DIR_ENTRY_SIZE..3 * DIR_ENTRY_SIZE].copy_from_slice(&third);
         Directory::new(vec![2], data, SLOTS * DIR_ENTRY_SIZE).unwrap()
     }
@@ -1123,7 +1130,7 @@ mod tests {
 
         // Deleting the first entry leaves 0xE5 slots that are reused first.
         d.delete(&e[0]);
-        assert_eq!(d.slot(0)[0], ENTRY_DELETED);
+        assert_eq!(d.slot(0)[dirent::field::MARKER], ENTRY_DELETED);
         assert!(find(&d, "readme.txt").is_none());
         assert_eq!(d.find_free_run(2), Some(0));
         assert_eq!(d.find_free_run(3), Some(3));
@@ -1136,7 +1143,7 @@ mod tests {
     #[test]
     fn garbage_after_end_marker_is_remembered() {
         let mut data = vec![0u8; 1024];
-        data[0..32].copy_from_slice(&short(b"A          ", ATTR_ARCHIVE).to_bytes());
+        data[..DIR_ENTRY_SIZE].copy_from_slice(&short(b"A          ", ATTR_ARCHIVE).to_bytes());
         data[700] = 1;
         let d = Directory::new(vec![2, 3], data.clone(), 512).unwrap();
         assert!(d.is_damaged());
@@ -1181,7 +1188,7 @@ mod tests {
         // well, and so is a deleted slot between it and the short entry.
         d.set_slot(0, &lfn[1]);
         let mut deleted = lfn[0];
-        deleted[0] = ENTRY_DELETED;
+        deleted[dirent::field::MARKER] = ENTRY_DELETED;
         d.set_slot(1, &deleted);
         let e = d.entries();
         assert_eq!(e.len(), 1);

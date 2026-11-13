@@ -358,9 +358,13 @@ fn a_damaged_directory_is_read_but_not_written() {
     let d = v.metadata("/d").unwrap();
     let layout = *v.layout();
     v.close().unwrap();
-    // Garbage behind the end marker, as a foreign writer might leave it.
+    // Garbage behind the end marker, as a foreign writer might leave it,
+    // in slot 5 of /d.
     img.device()
-        .write_at(layout.cluster_offset(d.first_cluster).unwrap() + 5 * 32, b"X")
+        .write_at(
+            layout.cluster_offset(d.first_cluster).unwrap() + 5 * DIR_ENTRY_SIZE as u64,
+            b"X",
+        )
         .unwrap();
     let mut v = Volume::open(img.device()).unwrap();
     // Reading stops at the marker, like Linux.

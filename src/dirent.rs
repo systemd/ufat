@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! The 32-byte on-disk directory entry.
 
-use crate::bytes::{le16, le32};
+use crate::bytes::{le16_at, le32_at};
 use crate::time::FatTimestamp;
 
 /// Size of a directory entry.
@@ -37,6 +37,40 @@ pub const DOT_NAME: [u8; 11] = *b".          ";
 /// The 8.3 name of the ".." entry of a subdirectory.
 pub const DOTDOT_NAME: [u8; 11] = *b"..         ";
 
+/// Byte offsets of the fields of a short entry. The names in the comments
+/// are the ones the FAT specification uses.
+pub mod field {
+    use std::ops::Range;
+
+    /// 8.3 name, DIR_Name.
+    pub const NAME: Range<usize> = 0..11;
+    /// First byte of the name, which also marks a deleted or an unused
+    /// entry: `DIR_Name[0]`.
+    pub const MARKER: usize = 0;
+    /// Attribute bits, DIR_Attr.
+    pub const ATTR: usize = 11;
+    /// Windows NT case flags, DIR_NTRes.
+    pub const NT_FLAGS: usize = 12;
+    /// Hundredths of a second of the creation time, DIR_CrtTimeTenth.
+    pub const CREATE_TENTHS: usize = 13;
+    /// Creation time, DIR_CrtTime.
+    pub const CREATE_TIME: Range<usize> = 14..16;
+    /// Creation date, DIR_CrtDate.
+    pub const CREATE_DATE: Range<usize> = 16..18;
+    /// Last access date, DIR_LstAccDate.
+    pub const ACCESS_DATE: Range<usize> = 18..20;
+    /// High half of the first cluster, DIR_FstClusHI.
+    pub const FIRST_CLUSTER_HI: Range<usize> = 20..22;
+    /// Last modification time, DIR_WrtTime.
+    pub const WRITE_TIME: Range<usize> = 22..24;
+    /// Last modification date, DIR_WrtDate.
+    pub const WRITE_DATE: Range<usize> = 24..26;
+    /// Low half of the first cluster, DIR_FstClusLO.
+    pub const FIRST_CLUSTER_LO: Range<usize> = 26..28;
+    /// File size in bytes, DIR_FileSize.
+    pub const SIZE: Range<usize> = 28..32;
+}
+
 /// A decoded short directory entry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RawDirEntry {
@@ -69,37 +103,38 @@ impl RawDirEntry {
     /// Decodes an entry from 32 bytes.
     pub fn from_bytes(b: &[u8; DIR_ENTRY_SIZE]) -> RawDirEntry {
         let mut name = [0u8; 11];
-        name.copy_from_slice(&b[0..11]);
+        name.copy_from_slice(&b[field::NAME]);
         RawDirEntry {
             name,
-            attr: b[11],
-            nt_flags: b[12],
-            create_tenths: b[13],
-            create_time: le16(b, 14),
-            create_date: le16(b, 16),
-            access_date: le16(b, 18),
-            first_cluster: (u32::from(le16(b, 20)) << 16) | u32::from(le16(b, 26)),
-            write_time: le16(b, 22),
-            write_date: le16(b, 24),
-            size: le32(b, 28),
+            attr: b[field::ATTR],
+            nt_flags: b[field::NT_FLAGS],
+            create_tenths: b[field::CREATE_TENTHS],
+            create_time: le16_at(b, field::CREATE_TIME),
+            create_date: le16_at(b, field::CREATE_DATE),
+            access_date: le16_at(b, field::ACCESS_DATE),
+            first_cluster: (u32::from(le16_at(b, field::FIRST_CLUSTER_HI)) << u16::BITS)
+                | u32::from(le16_at(b, field::FIRST_CLUSTER_LO)),
+            write_time: le16_at(b, field::WRITE_TIME),
+            write_date: le16_at(b, field::WRITE_DATE),
+            size: le32_at(b, field::SIZE),
         }
     }
 
     /// Encodes the entry into its on-disk form.
     pub fn to_bytes(&self) -> [u8; DIR_ENTRY_SIZE] {
         let mut b = [0u8; DIR_ENTRY_SIZE];
-        b[0..11].copy_from_slice(&self.name);
-        b[11] = self.attr;
-        b[12] = self.nt_flags;
-        b[13] = self.create_tenths;
-        b[14..16].copy_from_slice(&self.create_time.to_le_bytes());
-        b[16..18].copy_from_slice(&self.create_date.to_le_bytes());
-        b[18..20].copy_from_slice(&self.access_date.to_le_bytes());
-        b[20..22].copy_from_slice(&((self.first_cluster >> 16) as u16).to_le_bytes());
-        b[22..24].copy_from_slice(&self.write_time.to_le_bytes());
-        b[24..26].copy_from_slice(&self.write_date.to_le_bytes());
-        b[26..28].copy_from_slice(&(self.first_cluster as u16).to_le_bytes());
-        b[28..32].copy_from_slice(&self.size.to_le_bytes());
+        b[field::NAME].copy_from_slice(&self.name);
+        b[field::ATTR] = self.attr;
+        b[field::NT_FLAGS] = self.nt_flags;
+        b[field::CREATE_TENTHS] = self.create_tenths;
+        b[field::CREATE_TIME].copy_from_slice(&self.create_time.to_le_bytes());
+        b[field::CREATE_DATE].copy_from_slice(&self.create_date.to_le_bytes());
+        b[field::ACCESS_DATE].copy_from_slice(&self.access_date.to_le_bytes());
+        b[field::FIRST_CLUSTER_HI].copy_from_slice(&((self.first_cluster >> u16::BITS) as u16).to_le_bytes());
+        b[field::WRITE_TIME].copy_from_slice(&self.write_time.to_le_bytes());
+        b[field::WRITE_DATE].copy_from_slice(&self.write_date.to_le_bytes());
+        b[field::FIRST_CLUSTER_LO].copy_from_slice(&(self.first_cluster as u16).to_le_bytes());
+        b[field::SIZE].copy_from_slice(&self.size.to_le_bytes());
         b
     }
 
@@ -179,8 +214,10 @@ mod tests {
         };
         e.set_times(FatTimestamp::from_unix(1_426_325_213, 450_000_000));
         let b = e.to_bytes();
-        assert_eq!(b[20..22], [0x01, 0x00]);
-        assert_eq!(b[26..28], [0x45, 0x23]);
+        // Cluster 0x0001_2345 is stored as its high half, 0x0001, and its
+        // low half, 0x2345, each in little-endian order.
+        assert_eq!(b[field::FIRST_CLUSTER_HI], [0x01, 0x00]);
+        assert_eq!(b[field::FIRST_CLUSTER_LO], [0x45, 0x23]);
         assert_eq!(RawDirEntry::from_bytes(&b), e);
     }
 

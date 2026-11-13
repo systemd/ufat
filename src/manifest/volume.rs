@@ -776,6 +776,9 @@ mod tests {
 
     #[test]
     fn a_cross_linked_directory_tree_is_refused() {
+        use crate::bytes::le16_at;
+        use crate::dirent::{self, ATTR_DIRECTORY, DIR_ENTRY_SIZE};
+
         let (img, mut v) = volume(8 << 20, 512, 512);
         let t0 = t(1_700_000_000);
         v.create_dir_all("/a/b", t0).unwrap();
@@ -786,23 +789,33 @@ mod tests {
         let mut cluster = vec![0u8; v.layout().cluster_size() as usize];
         v.close().unwrap();
         // Point the entry of "b" inside "a" back at "a". The first cluster
-        // of a 32-byte entry is split over bytes 20 (high half) and 26 (low
-        // half); the entry is the directory one, not a dot entry, that
-        // refers to b's cluster.
+        // of an entry is split over a high and a low half; the entry is the
+        // directory one, not a dot entry, that refers to b's cluster.
         let dev = img.device();
         dev.read_at(offset, &mut cluster).unwrap();
-        let slot = (0..cluster.len() / 32)
+        let slot = (0..cluster.len() / DIR_ENTRY_SIZE)
             .find(|&i| {
-                let e = &cluster[i * 32..(i + 1) * 32];
-                let first = (u32::from(u16::from_le_bytes([e[20], e[21]])) << 16)
-                    | u32::from(u16::from_le_bytes([e[26], e[27]]));
-                e[0] != b'.' && e[11] & crate::dirent::ATTR_DIRECTORY != 0 && first == b.first_cluster
+                let e = &cluster[i * DIR_ENTRY_SIZE..(i + 1) * DIR_ENTRY_SIZE];
+                let first = (u32::from(le16_at(e, dirent::field::FIRST_CLUSTER_HI)) << u16::BITS)
+                    | u32::from(le16_at(e, dirent::field::FIRST_CLUSTER_LO));
+                !e[dirent::field::NAME].starts_with(b".")
+                    && e[dirent::field::ATTR] & ATTR_DIRECTORY != 0
+                    && first == b.first_cluster
             })
             .unwrap();
-        let at = offset + (slot * 32) as u64;
-        dev.write_at(at + 20, &((a.first_cluster >> 16) as u16).to_le_bytes())
-            .unwrap();
-        dev.write_at(at + 26, &(a.first_cluster as u16).to_le_bytes()).unwrap();
+        // Where that entry is in the image: slot `slot` of the cluster at
+        // `offset`.
+        let at = offset + (slot * DIR_ENTRY_SIZE) as u64;
+        dev.write_at(
+            at + dirent::field::FIRST_CLUSTER_HI.start as u64,
+            &((a.first_cluster >> u16::BITS) as u16).to_le_bytes(),
+        )
+        .unwrap();
+        dev.write_at(
+            at + dirent::field::FIRST_CLUSTER_LO.start as u64,
+            &(a.first_cluster as u16).to_le_bytes(),
+        )
+        .unwrap();
         drop(dev);
         let v = Volume::open(img.device()).unwrap();
         let mut out = Vec::new();
