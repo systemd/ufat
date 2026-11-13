@@ -183,6 +183,8 @@ pub struct Volume {
     /// Something has been written since open() or the last sync(): the
     /// volume carries its dirty marks, see [`Volume::begin_write`].
     writing: bool,
+    /// Closed with [`Volume::close_unfinished`]: the marks stay.
+    unfinished: bool,
     layout: Layout,
     fat: Fat,
     /// The FSInfo structure as it is on disk, the start of its sector: the
@@ -284,6 +286,7 @@ impl Volume {
             boot_raw: sector,
             entry1_at_open,
             writing: false,
+            unfinished: false,
             layout,
             fat,
             fsinfo_raw,
@@ -1073,13 +1076,26 @@ impl Volume {
     pub fn close(mut self) -> Result<()> {
         self.sync()
     }
+
+    /// Closes a volume whose contents are not complete, such as one an
+    /// assembly failed to fill. Everything written reaches stable storage,
+    /// but the volume keeps the marks it carries while it is written, even
+    /// when nothing was written since open(). Linux, EDK2 and fsck then
+    /// see a volume that was not cleanly unmounted, as after a crash.
+    pub fn close_unfinished(mut self) -> Result<()> {
+        self.unfinished = true;
+        self.begin_write()?;
+        self.flush()?;
+        self.device.sync()
+    }
 }
 
 impl Drop for Volume {
     fn drop(&mut self) {
         // While unwinding from a panic the in-memory state is not to be
         // trusted; the dirty marks stay so that fsck looks at the volume.
-        if std::thread::panicking() {
+        // A volume closed unfinished keeps them as well.
+        if std::thread::panicking() || self.unfinished {
             return;
         }
         // Best effort: callers that care about errors use close().

@@ -476,7 +476,7 @@ pub enum Detail {
     /// A file the manifest names is not below the source directory as the
     /// manifest describes it, found before anything is written.
     Source {
-        /// The entry's path as the manifest names it.
+        /// The entry's name, exactly as its record in the manifest has it.
         name: String,
         /// What is wrong.
         problem: SourceProblem,
@@ -487,7 +487,7 @@ pub enum Detail {
     },
     /// File contents do not match the manifest.
     Content {
-        /// The entry's path as the manifest names it.
+        /// The entry's name, exactly as its record in the manifest has it.
         name: String,
         /// What is wrong.
         problem: ContentProblem,

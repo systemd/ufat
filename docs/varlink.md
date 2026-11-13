@@ -200,6 +200,15 @@ With `imageHash`, the service reads the whole file system back after
 writing it and returns the digest in lower case hex. For an image file
 sized to fit, this is the hash of the file.
 
+A call that fails after the image was formatted leaves the file system
+marked as not cleanly unmounted, as after a crash. The file system holds
+the files that were complete when the call failed. `Check` reports the
+mark with the warnings `dirtyFlag` and `fatDirtyFlag`. fsck.fat reports
+it too, and Linux warns about it when it mounts the file system
+read-write. Calling `Assemble` again formats the image anew. A call that
+fails before the image is opened leaves it unchanged, see "Passing file
+descriptors".
+
 #### FormatOptions
 
 | Option | Meaning |
@@ -381,6 +390,14 @@ refer to a sub-manifest, or that have an inode type FAT does not have.
 
 The sizes and SHA-256 hashes in a manifest are verified while the
 contents are copied. A mismatch fails with `ContentMismatch`.
+
+A stream has to end after the last file. A stream that ends early fails
+with `ContentMismatch` and reason `streamEnded`, for the file it ended
+in. A stream with more data after the last file fails with
+`ContentMismatch` and reason `size`, for the last file.
+
+The `name` of `SourceMismatch` and `ContentMismatch` is the name of the
+file's record in the manifest, such as `loader/loader.conf`.
 
 A `ManifestSink` has a `fileDescriptor` open for writing and optional
 `fields`, the per-file fields in the vocabulary of systemd-manifest:

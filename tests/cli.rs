@@ -229,6 +229,9 @@ fn assemble_and_populate_take_trees_and_manifests() {
     let out = run_in(&bin, &["populate", "--manifest", m, a, "-"], b"kern");
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("ended"));
+    let out = run_in(&bin, &["populate", "--manifest", m, a, "-"], b"kerneltitle x\nmore");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("goes on after the last file"));
     // A SOURCE is a directory, or for populate one file that needs --path;
     // a manifest is named by --manifest.
     fails(&bin, &["populate", a, m], "needs --path");
@@ -300,6 +303,40 @@ fn assemble_and_populate_take_trees_and_manifests() {
         "nowhere",
     );
     assert!(!Path::new(d).exists());
+    // A file that grew since the manifest was written is caught the same
+    // way.
+    fs::write(root.join("tree/EFI/Linux/linux.efi"), b"kernel and more").unwrap();
+    fails(
+        &bin,
+        &["assemble", "--create", "--manifest", m, d, tree_arg],
+        ": EFI/Linux/linux.efi: EFI/Linux/linux.efi is 15 bytes, the manifest says 6",
+    );
+    assert!(!Path::new(d).exists());
+    // One whose contents changed fails while it is copied. The messages
+    // name the file the way the manifest does.
+    fs::write(root.join("tree/EFI/Linux/linux.efi"), b"kernal").unwrap();
+    fails(
+        &bin,
+        &["assemble", "--create", "--manifest", m, d, tree_arg],
+        "ufat: 'EFI/Linux/linux.efi' does not match the hash in the manifest",
+    );
+    fs::write(root.join("tree/EFI/Linux/linux.efi"), b"kernel").unwrap();
+    // What a failed assemble wrote is left the way a crash would leave it:
+    // the files that were complete, in a file system marked as not cleanly
+    // unmounted. check reports the mark.
+    fs::write(root.join("tree/loader/entries/x.conf"), b"title y\n").unwrap();
+    let e = root.join("e.img");
+    let e = e.to_str().unwrap();
+    fails(
+        &bin,
+        &["assemble", "--create", "--manifest", m, e, tree_arg],
+        "'loader/entries/x.conf' does not match the hash",
+    );
+    assert_eq!(ok(&bin, &["cat", e, "/EFI/Linux/linux.efi"]), "kernel");
+    let report = ok(&bin, &["check", e]);
+    assert!(report.contains("marked dirty"), "{}", report);
+    assert!(report.contains("0 errors, 2 warnings"), "{}", report);
+    fs::write(root.join("tree/loader/entries/x.conf"), b"title x\n").unwrap();
     // Without a SOURCE assemble makes an empty file system, sized for a
     // manifest as well, and takes no --fit with it.
     let c = root.join("c.img");

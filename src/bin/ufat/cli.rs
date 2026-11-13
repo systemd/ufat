@@ -720,8 +720,19 @@ fn assemble_filled(args: &Args, path: &Path, paths: &[&Path]) -> Result<Volume> 
     let (mut v, estimate) = util::fit_and_format(&target, &mut options, &mut |plan| plan_sources(plan, args, &sources))
         .map_err(|e| e.into_error(path))?;
     report_estimate(args, path, &estimate);
-    fill(&mut v, args, &sources)?;
-    Ok(v)
+    match fill(&mut v, args, &sources) {
+        Ok(()) => Ok(v),
+        Err(e) => Err(unfinished(v, e)),
+    }
+}
+
+/// Closes the file system `assemble` failed to finish with `e`, marked as
+/// not cleanly unmounted as after a crash, so that nobody takes it for a
+/// finished one. Returns `e`: an error of the close is not the one the
+/// user needs to hear about.
+fn unfinished(v: Volume, e: ufat::Error) -> ufat::Error {
+    let _ = v.close_unfinished();
+    e
 }
 
 fn report_estimate(args: &Args, path: &Path, estimate: &ufat::plan::Estimate) {
@@ -767,7 +778,9 @@ fn cmd_assemble(argv: &[OsString]) -> Result<()> {
         assemble_filled(&args, path, &paths)?
     };
     if let Some(m) = args.path("write-manifest") {
-        write_manifest(&v, m)?;
+        if let Err(e) = write_manifest(&v, m) {
+            return Err(unfinished(v, e));
+        }
     }
     let layout = *v.layout();
     v.close()?;

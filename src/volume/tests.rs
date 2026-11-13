@@ -819,6 +819,41 @@ fn the_volume_is_marked_dirty_while_written() {
     );
 }
 
+/// A volume closed unfinished keeps the marks of a writing session, as a
+/// crash would leave them, and what was written before is on disk. One
+/// that nothing was written to since it was opened gets the marks too.
+#[test]
+fn a_volume_closed_unfinished_stays_marked() {
+    use crate::boot::{FsInfo, FSINFO_UNKNOWN, NT_FLAG_DIRTY};
+    for written in [true, false] {
+        let (img, mut v) = volume(1 << 20, 512, 512);
+        let layout = *v.layout();
+        let fsinfo = v.boot_sector().fsinfo_sector as usize * 512;
+        if written {
+            let mut w = v.create_file("/f", t(0), false).unwrap();
+            w.write_all(b"data").unwrap();
+            w.finish().unwrap();
+        }
+        v.close_unfinished().unwrap();
+        let bytes = std::fs::read(img.path()).unwrap();
+        assert_ne!(bytes[0x41] & NT_FLAG_DIRTY, 0);
+        for copy in 0..layout.fats {
+            let off = layout.fat_offset(copy) as usize + 4;
+            let entry1 = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            assert_eq!(entry1 & (1 << 27), 0, "FAT {}", copy);
+        }
+        let info = FsInfo::parse(&bytes[fsinfo..fsinfo + 512]).unwrap();
+        assert_eq!((info.free_clusters, info.next_free), (FSINFO_UNKNOWN, FSINFO_UNKNOWN));
+        let r = fsck::check(&img.device()).unwrap();
+        assert_eq!(r.errors(), 0, "{:?}", r.problems);
+        for kind in [fsck::ProblemKind::DirtyFlag, fsck::ProblemKind::FatDirtyFlag] {
+            assert!(r.problems.iter().any(|p| p.kind == kind), "{:?}", r.problems);
+        }
+        let v = Volume::open(img.device()).unwrap();
+        assert_eq!(v.metadata("/f").ok().map(|m| m.size), written.then_some(4));
+    }
+}
+
 #[test]
 fn remove_tree() {
     let (img, mut v) = volume(1 << 20, 512, 512);

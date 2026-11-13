@@ -1373,11 +1373,54 @@ fn plan(mut options: Options, content: Option<Content>, c: &mut Connection, more
     })
 }
 
+/// Fills the file system Assemble formatted: the content copied, the root
+/// stamped with its time, the manifest of the result written. Returns the
+/// counts when there was content, the entries the written manifest left
+/// out and the description of the volume.
+fn fill_image(
+    volume: &mut Volume,
+    content: Option<Content>,
+    time: Option<SystemTime>,
+    c: &mut Connection,
+    more: bool,
+) -> Outcome<(Option<Counts>, u64, Object)> {
+    let mut counts = None;
+    let mut content_time = None;
+    let mut sink = None;
+    if let Some(mut ct) = content {
+        let mut r = Reporter::start(c, more, "populating", Shown::EntriesAndBytes)?;
+        counts = Some(ct.write_into(volume, "/", &mut |p| r.tick(p))?);
+        content_time = Some(ct.root_time());
+        sink = ct.sink.take();
+    }
+    // The root directory's time, on the volume label entry: the timestamp
+    // given, else what the content says about its root, else now. Without
+    // content and without a timestamp the format left the entry, if any,
+    // stamped with the current time already.
+    let root_time = match (time, content_time) {
+        (Some(t), _) => Some(t),
+        (None, Some(from_content)) => Some(from_content.unwrap_or_else(util::now)),
+        (None, None) => None,
+    };
+    if let Some(t) = root_time {
+        volume.set_root_time(t)?;
+    }
+    let omitted = match sink {
+        None => 0,
+        Some(sink) => {
+            let mut r = Reporter::start(c, more, "reading", Shown::PhaseOnly)?;
+            sink.write(volume, &mut |p| r.tick(p))?.omitted
+        }
+    };
+    Ok((counts, omitted, description(volume)?))
+}
+
 /// Assemble with mode assemble: the image written, filled with the content
 /// when there is one, sized to fit when no size is given. Everything that
 /// can be checked before the image is touched has been checked by now:
 /// the descriptors vetted, the manifest parsed and its source verified,
-/// the options validated.
+/// the options validated. A call that fails after the format leaves the
+/// file system marked as not cleanly unmounted.
 fn assemble_image(
     image: Image,
     mut options: Options,
@@ -1417,35 +1460,17 @@ fn assemble_image(
             (Volume::create(device, &options.format)?, false)
         }
     };
-    let mut counts = None;
-    let mut content_time = None;
-    let mut sink = None;
-    if let Some(mut ct) = content {
-        let mut r = Reporter::start(c, more, "populating", Shown::EntriesAndBytes)?;
-        counts = Some(ct.write_into(&mut volume, "/", &mut |p| r.tick(p))?);
-        content_time = Some(ct.root_time());
-        sink = ct.sink.take();
-    }
-    // The root directory's time, on the volume label entry: the timestamp
-    // given, else what the content says about its root, else now. Without
-    // content and without a timestamp the format left the entry, if any,
-    // stamped with the current time already.
-    let root_time = match (options.time, content_time) {
-        (Some(t), _) => Some(t),
-        (None, Some(from_content)) => Some(from_content.unwrap_or_else(util::now)),
-        (None, None) => None,
-    };
-    if let Some(t) = root_time {
-        volume.set_root_time(t)?;
-    }
-    let omitted = match sink {
-        None => 0,
-        Some(sink) => {
-            let mut r = Reporter::start(c, more, "reading", Shown::PhaseOnly)?;
-            sink.write(&volume, &mut |p| r.tick(p))?.omitted
+    let (counts, omitted, description) = match fill_image(&mut volume, content, options.time, c, more) {
+        Ok(filled) => filled,
+        Err(e) => {
+            // The file system is left marked as not cleanly unmounted, as
+            // after a crash, so that nobody takes it for a finished one.
+            // An error of the close is not the one the caller needs to
+            // hear about.
+            let _ = volume.close_unfinished();
+            return Err(e);
         }
     };
-    let description = description(&volume)?;
     let window = volume.device().len();
     volume.close()?;
     let mut o = json::object! { "description" => description, "exact" => exact };

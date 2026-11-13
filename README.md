@@ -140,8 +140,9 @@ manifest instead of a tree:
 
 With `--manifest`, the one SOURCE is the directory that the manifest's
 file references point into. `-` reads the file contents from standard
-input instead, back to back in manifest order. A manifest names its
-paths from the root of the file system, so `--path` does not apply.
+input instead, back to back in manifest order. Standard input has to end
+after the last file. A manifest names its paths from the root of the
+file system, so `--path` does not apply.
 
 When the contents come from a directory, ufat first checks that every
 file the manifest names is there with the size the manifest gives. This
@@ -239,6 +240,13 @@ While ufat writes to a volume, it marks the volume as not cleanly
 unmounted, the way Linux, Windows and EDK2 expect. ufat removes the mark
 when it closes the volume. After a crash, the mark tells readers and
 `ufat check` to look at the volume.
+
+When `assemble` fails after it has formatted the file system, ufat
+leaves the file system marked as not cleanly unmounted, as after a
+crash. It holds the files that were complete when the command failed.
+`ufat check` and fsck.fat report the mark, and Linux warns about it when
+it mounts the file system read-write. Running `assemble` again formats
+the file system anew.
 
 A crash can leave a state that readers resolve in different ways. A
 replaced file can briefly exist twice, and a long name can lose its long

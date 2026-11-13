@@ -935,7 +935,31 @@ fn assemble_with_a_manifest_and_a_directory() {
         Value::Object(e.parameters.clone())
     );
     assert_eq!(str_of(&e.parameters, "reason"), "missing");
+    // The file as the manifest names it, not as a path in the volume.
+    assert_eq!(str_of(&e.parameters, "name"), "EFI/BOOT/BOOTX64.EFI");
     assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
+    // So does a file that grew since the manifest was written. The manifest
+    // takes it whole, so it has to have the manifest's size.
+    std::fs::write(tree.join("loader/loader.conf"), b"timeout 5\nconsole-mode max\n").unwrap();
+    let manifest_file = ro(&base.path().join("manifest"));
+    let e = error_of(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        &[fresh_img.as_fd(), manifest_file.as_fd(), source.as_fd()],
+    );
+    assert_eq!(
+        e.name,
+        format!("{}.SourceMismatch", IFACE),
+        "{}",
+        Value::Object(e.parameters.clone())
+    );
+    assert_eq!(str_of(&e.parameters, "reason"), "size");
+    assert_eq!(str_of(&e.parameters, "name"), "loader/loader.conf");
+    assert_eq!(u64_of(&e.parameters, "sizeBytes"), 27);
+    assert_eq!(u64_of(&e.parameters, "expectedSizeBytes"), 10);
+    assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
+    std::fs::write(tree.join("loader/loader.conf"), b"timeout 5\n").unwrap();
     // A broken manifest is InvalidManifest, with nothing written either.
     let garbage = file_with(base.path(), "garbage", b"garbage");
     let e = error_of(
@@ -1078,6 +1102,127 @@ fn assemble_with_a_manifest_and_a_stream() {
         Value::Object(e.parameters.clone())
     );
     assert_eq!(str_of(&e.parameters, "reason"), "streamEnded");
+    assert_eq!(str_of(&e.parameters, "name"), "EFI/BOOT/BOOTX64.EFI");
+    // So is a stream that goes on after the last file: that file got more
+    // than the manifest says, by how much is not known.
+    let last = ufat::manifest::parse(&manifest)
+        .unwrap()
+        .entries
+        .into_iter()
+        .rfind(|e| e.is_streamed())
+        .unwrap();
+    let (_image3, img3) = fresh_image();
+    let long = file_with(scratch.path(), "long", &[&blob[..], b"more"].concat());
+    let manifest_file = ro(&scratch.path().join("manifest"));
+    let e = error_of(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        &[img3.as_fd(), manifest_file.as_fd(), long.as_fd()],
+    );
+    assert_eq!(
+        e.name,
+        format!("{}.ContentMismatch", IFACE),
+        "{}",
+        Value::Object(e.parameters.clone())
+    );
+    assert_eq!(str_of(&e.parameters, "reason"), "size");
+    assert_eq!(Some(str_of(&e.parameters, "name")), last.name.as_deref());
+    assert_eq!(u64_of(&e.parameters, "expectedSizeBytes"), last.size.unwrap());
+    assert!(e.parameters.get("sizeBytes").is_none());
+}
+
+/// The kinds of the problems Check finds in `image`, which has no errors.
+fn warnings(c: &mut Client, image: &Path) -> Vec<String> {
+    let img = ro(image);
+    let ck = reply(call(c, "Check", IMG, &[img.as_fd()]));
+    assert_eq!(u64_of(&ck, "errors"), 0, "{}", Value::Object(ck.clone()));
+    let mut kinds: Vec<String> = ck
+        .get("problems")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| str_of(p.as_object().unwrap(), "kind").to_string())
+        .collect();
+    kinds.sort();
+    kinds
+}
+
+/// An Assemble that fails after the format leaves the file system as after
+/// a crash: with the files that were complete, and marked as not cleanly
+/// unmounted, which Check reports. It is marked when it fails before the
+/// first file as well. Assembling again makes a clean file system.
+#[test]
+fn a_failed_assemble_leaves_the_file_system_unfinished() {
+    let _serial = common::serial();
+    let Some(ufat) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let base = Temp::dir();
+    let tree = base.path().join("tree");
+    build_tree(
+        &tree,
+        &[
+            ("EFI/BOOT/BOOTX64.EFI", &[1u8; 5000]),
+            ("loader/loader.conf", b"timeout 5\n"),
+        ],
+    );
+    let (manifest, _) = manifest_and_blob(&tree);
+    let manifest_file = file_with(base.path(), "manifest", &manifest);
+    // loader.conf keeps its size and changes its contents after the
+    // manifest was written: it passes the check of the source before the
+    // format and fails while it is copied, after BOOTX64.EFI.
+    std::fs::write(tree.join("loader/loader.conf"), b"timeout 9\n").unwrap();
+    let mut c = connect_fd3(&ufat);
+    let source = ro(&tree);
+    let (image, img) = fresh_image();
+    let assemble =
+        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#;
+    let e = error_of(
+        &mut c,
+        "Assemble",
+        assemble,
+        &[img.as_fd(), manifest_file.as_fd(), source.as_fd()],
+    );
+    assert_eq!(
+        e.name,
+        format!("{}.ContentMismatch", IFACE),
+        "{}",
+        Value::Object(e.parameters.clone())
+    );
+    assert_eq!(str_of(&e.parameters, "reason"), "hash");
+    assert_eq!(warnings(&mut c, image.path()), ["dirtyFlag", "fatDirtyFlag"]);
+    let v = volume(image.path(), Access::ReadOnly);
+    assert_eq!(v.metadata("/EFI/BOOT/BOOTX64.EFI").unwrap().size, 5000);
+    assert!(v.metadata("/loader/loader.conf").is_err());
+    drop(v);
+    // A manifest that expired fails before anything is copied.
+    let (expired, expired_img) = fresh_image();
+    let old = file_with(
+        base.path(),
+        "expired",
+        b"\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"validUntilUSec\":1}\n\x1e{\"name\":\"x\",\"size\":0}\n\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
+    );
+    let empty = file_with(base.path(), "empty", b"");
+    let e = error_of(
+        &mut c,
+        "Assemble",
+        assemble,
+        &[expired_img.as_fd(), old.as_fd(), empty.as_fd()],
+    );
+    assert_eq!(e.name, format!("{}.EntryNotValid", IFACE));
+    assert_eq!(warnings(&mut c, expired.path()), ["dirtyFlag", "fatDirtyFlag"]);
+    // Assembling again starts over with a clean file system.
+    std::fs::write(tree.join("loader/loader.conf"), b"timeout 5\n").unwrap();
+    let manifest_file = ro(&base.path().join("manifest"));
+    reply(call(
+        &mut c,
+        "Assemble",
+        assemble,
+        &[img.as_fd(), manifest_file.as_fd(), source.as_fd()],
+    ));
+    assert!(warnings(&mut c, image.path()).is_empty());
 }
 
 /// imageHash: the hash of the whole image window as the call leaves it,
