@@ -5,5 +5,7 @@
 
 mod error;
 mod source;
+mod written;
 
 pub use source::{DirectorySource, SourceDirectory};
+pub use written::WriteReport;

@@ -37,9 +37,8 @@ mod volume;
 
 pub use assemble::{AssembleFlags, AssembleOptions, AssembleReport};
 pub use generate::HostTree;
-pub use shared::manifest::{DirectorySource, SourceDirectory};
+pub use shared::manifest::{DirectorySource, SourceDirectory, WriteReport};
 pub use uapi16::{ContentSource, Contents, Fields, FileObject, InodeType, Location, Name, Sha256, StreamSource};
-pub use volume::WriteReport;
 
 /// The path inside a volume of the file object with the name `name`: the
 /// name below the root directory.
