@@ -28,7 +28,7 @@
 use crate::bytes::le16;
 use crate::dirent::{
     self, RawDirEntry, ATTR_LONG_NAME, CASE_LOWER_BASE, CASE_LOWER_EXT, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_E5_ESCAPE,
-    ENTRY_END,
+    ENTRY_END, NAME_BASE, NAME_EXT,
 };
 use crate::errno::*;
 use crate::Result;
@@ -329,8 +329,8 @@ impl Alias {
             Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
             None => (trimmed, ""),
         };
-        let (base_bytes, base_lossy, base_case) = convert_part(base, 8);
-        let (ext_bytes, ext_lossy, ext_case) = convert_part(ext, 3);
+        let (base_bytes, base_lossy, base_case) = convert_part(base, NAME_BASE.len());
+        let (ext_bytes, ext_lossy, ext_case) = convert_part(ext, NAME_EXT.len());
         lossy |= base_lossy || ext_lossy;
         if base_bytes.is_empty() || RESERVED_NAMES.contains(&base_bytes.as_slice()) {
             lossy = true;
@@ -348,7 +348,7 @@ impl Alias {
         }
         let mut alias = [b' '; 11];
         alias[..base_bytes.len()].copy_from_slice(&base_bytes);
-        alias[8..8 + ext_bytes.len()].copy_from_slice(&ext_bytes);
+        alias[NAME_EXT.start..NAME_EXT.start + ext_bytes.len()].copy_from_slice(&ext_bytes);
         Alias {
             name: alias,
             base_len: base_bytes.len(),
@@ -379,11 +379,11 @@ impl Alias {
             tail[1 + i] = digits[count - 1 - i];
         }
         let tail = &tail[..1 + count];
-        let keep = self.base_len.min(8 - tail.len());
+        let keep = self.base_len.min(NAME_BASE.len() - tail.len());
         let mut out = [b' '; 11];
         out[..keep].copy_from_slice(&self.name[..keep]);
         out[keep..keep + tail.len()].copy_from_slice(tail);
-        out[8..].copy_from_slice(&self.name[8..]);
+        out[NAME_EXT].copy_from_slice(&self.name[NAME_EXT]);
         out
     }
 }
@@ -485,8 +485,8 @@ pub fn short_name_to_string(entry: &RawDirEntry) -> String {
             })
             .collect()
     };
-    let base = part(&name[..8], entry.nt_flags & CASE_LOWER_BASE != 0);
-    let ext = part(&name[8..], entry.nt_flags & CASE_LOWER_EXT != 0);
+    let base = part(&name[NAME_BASE], entry.nt_flags & CASE_LOWER_BASE != 0);
+    let ext = part(&name[NAME_EXT], entry.nt_flags & CASE_LOWER_EXT != 0);
     if ext.is_empty() {
         base
     } else {
@@ -806,7 +806,7 @@ mod proofs {
     #[kani::proof]
     #[kani::unwind(16)]
     fn with_tail_is_total() {
-        let base_len: usize = kani::any_where(|l: &usize| *l <= 8);
+        let base_len: usize = kani::any_where(|l: &usize| *l <= NAME_BASE.len());
         let alias = Alias {
             name: *b"ABCDEFGHEXT",
             base_len,
@@ -816,13 +816,13 @@ mod proofs {
         };
         let n: u32 = kani::any();
         let tailed = alias.with_tail(n);
-        assert!(&tailed[8..] == &alias.name[8..]);
+        assert!(&tailed[NAME_EXT] == &alias.name[NAME_EXT]);
         assert!(tailed.iter().all(|&b| legal_short_byte(b)));
-        let tilde = tailed[..8].iter().position(|&b| b == b'~').unwrap();
+        let tilde = tailed[NAME_BASE].iter().position(|&b| b == b'~').unwrap();
         assert!(tilde <= base_len);
         let mut value: u32 = 0;
         let mut digits = 0;
-        for &b in &tailed[tilde + 1..8] {
+        for &b in &tailed[tilde + 1..NAME_BASE.end] {
             if b == b' ' {
                 break;
             }

@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::dirent::{
     self, short_name_checksum, RawDirEntry, ATTR_LONG_NAME, ATTR_VOLUME_ID, DIR_ENTRY_SIZE, DOTDOT_NAME, DOT_NAME,
-    ENTRY_DELETED, ENTRY_END,
+    ENTRY_DELETED, ENTRY_END, NAME_BASE, NAME_EXT,
 };
 use crate::errno::*;
 use crate::name::{
@@ -119,12 +119,15 @@ impl TailShape {
     /// The shape `alias` takes with a tail of `digits` digits, as
     /// [`Alias::with_tail`] builds it.
     fn of(alias: &Alias, digits: u8) -> TailShape {
-        let keep = alias.base_len.min(8 - 1 - digits as usize);
-        let ext_end = alias.name[8..].iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1);
+        let keep = alias.base_len.min(NAME_BASE.len() - 1 - digits as usize);
+        let ext_end = alias.name[NAME_EXT]
+            .iter()
+            .rposition(|&b| b != b' ')
+            .map_or(0, |p| p + 1);
         TailShape {
             prefix: alias.name[..keep].to_vec(),
             digits,
-            ext: alias.name[8..8 + ext_end].to_vec(),
+            ext: alias.name[NAME_EXT.start..NAME_EXT.start + ext_end].to_vec(),
         }
     }
 
@@ -165,7 +168,7 @@ impl TailShape {
             Some(i) => (&bytes[..i], &bytes[i + 1..]),
             None => (&bytes[..], &bytes[bytes.len()..]),
         };
-        if base.len() > 8 || ext.len() > 3 {
+        if base.len() > NAME_BASE.len() || ext.len() > NAME_EXT.len() {
             return None;
         }
         let tilde = base.iter().rposition(|&b| b == b'~')?;
@@ -1312,14 +1315,14 @@ mod tests {
         let fourth = find(&d, "linux-6.12.4-200.fc41.x86_64.efi").unwrap();
         d.delete(&fourth);
         let s = create(&mut d, "linux-6.13.0-100.fc42.x86_64.efi");
-        assert_eq!(&s[..8], b"LINUX-~4");
+        assert_eq!(&s[NAME_BASE], b"LINUX-~4");
         // A plain name that looks like a candidate takes that tail.
         create(&mut d, "linux~13.efi");
         let s = create(&mut d, "linux-6.14.0-100.fc42.x86_64.efi");
-        assert_eq!(&s[..8], b"LINUX~14");
+        assert_eq!(&s[NAME_BASE], b"LINUX~14");
         // A name of another shape is not affected.
         let s = create(&mut d, "linux-6.14.0-100.fc42.x86_64.conf");
-        assert_eq!(&s[..8], b"LINUX-~1");
+        assert_eq!(&s[NAME_BASE], b"LINUX-~1");
         d.check_index();
     }
 
@@ -1330,10 +1333,10 @@ mod tests {
         create(&mut d, "Some Long Name 2.txt");
         let first = find(&d, "some long name.txt").unwrap();
         let alias = Alias::of(&LongName::new("Some Long Name.txt").unwrap());
-        assert_eq!(&d.short_name_for(&alias, Some(&first)).unwrap()[..8], b"SOMELO~1");
-        assert_eq!(&d.short_name_for(&alias, None).unwrap()[..8], b"SOMELO~3");
+        assert_eq!(&d.short_name_for(&alias, Some(&first)).unwrap()[NAME_BASE], b"SOMELO~1");
+        assert_eq!(&d.short_name_for(&alias, None).unwrap()[NAME_BASE], b"SOMELO~3");
         // The pick is not written, so the next pick is the same.
-        assert_eq!(&d.short_name_for(&alias, None).unwrap()[..8], b"SOMELO~3");
+        assert_eq!(&d.short_name_for(&alias, None).unwrap()[NAME_BASE], b"SOMELO~3");
         d.check_index();
         // With many tails taken the hint says where to start, also for a
         // replacement: the smallest tail nobody else has, not always its own.
@@ -1341,11 +1344,17 @@ mod tests {
             create(&mut d, &format!("Some Long Name {}.txt", i));
         }
         let fortieth = find(&d, "some long name 40.txt").unwrap();
-        assert_eq!(&fortieth.short.name[..8], b"SOMEL~40");
-        assert_eq!(&d.short_name_for(&alias, Some(&fortieth)).unwrap()[..8], b"SOMEL~40");
+        assert_eq!(&fortieth.short.name[NAME_BASE], b"SOMEL~40");
+        assert_eq!(
+            &d.short_name_for(&alias, Some(&fortieth)).unwrap()[NAME_BASE],
+            b"SOMEL~40"
+        );
         d.delete(&find(&d, "some long name 7.txt").unwrap());
-        assert_eq!(&d.short_name_for(&alias, Some(&fortieth)).unwrap()[..8], b"SOMELO~7");
-        assert_eq!(&d.short_name_for(&alias, None).unwrap()[..8], b"SOMELO~7");
+        assert_eq!(
+            &d.short_name_for(&alias, Some(&fortieth)).unwrap()[NAME_BASE],
+            b"SOMELO~7"
+        );
+        assert_eq!(&d.short_name_for(&alias, None).unwrap()[NAME_BASE], b"SOMELO~7");
         d.check_index();
     }
 

@@ -5,6 +5,7 @@
 
 use std::thread;
 
+use ufat::dirent::NAME_BASE;
 use ufat::layout::*;
 use ufat::name::{fold_str, join_long_name, long_name_entries, parse_long_name_entry, Alias, LongName};
 use ufat::time::{FatTimestamp, FAT_EPOCH, FAT_MAX, FAT_MAX_NANOS};
@@ -322,14 +323,14 @@ fn every_short_ascii_name_has_a_legal_alias() {
         let alias = Alias::of(&name);
         assert!(alias.name.iter().all(|&b| legal(b)), "{:?} -> {:?}", s, alias.name);
         assert!(
-            alias.base_len <= 8 && alias.name[alias.base_len..8].iter().all(|&b| b == b' '),
+            alias.base_len <= NAME_BASE.len() && alias.name[alias.base_len..NAME_BASE.end].iter().all(|&b| b == b' '),
             "{:?}",
             s
         );
         assert!(!alias.needs_long_name || alias.case_flags == 0, "{:?}", s);
         let tailed = alias.with_tail(1);
         assert!(
-            tailed.iter().all(|&b| legal(b)) && tailed[..8].contains(&b'~'),
+            tailed.iter().all(|&b| legal(b)) && tailed[NAME_BASE].contains(&b'~'),
             "{:?}",
             s
         );

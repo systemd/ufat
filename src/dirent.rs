@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! The 32-byte on-disk directory entry.
 
+use std::ops::Range;
+
 use crate::bytes::{le16_at, le32_at};
 use crate::time::FatTimestamp;
 
@@ -36,6 +38,10 @@ pub const CASE_LOWER_EXT: u8 = 0x10;
 pub const DOT_NAME: [u8; 11] = *b".          ";
 /// The 8.3 name of the ".." entry of a subdirectory.
 pub const DOTDOT_NAME: [u8; 11] = *b"..         ";
+/// The base of an 8.3 name, space padded.
+pub const NAME_BASE: Range<usize> = 0..8;
+/// The extension of an 8.3 name, space padded.
+pub const NAME_EXT: Range<usize> = 8..11;
 
 /// Byte offsets of the fields of a short entry. The names in the comments
 /// are the ones the FAT specification uses.
