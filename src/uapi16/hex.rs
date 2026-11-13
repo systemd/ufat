@@ -45,8 +45,6 @@ impl Hex<'_> {
     }
 
     /// Decodes the bytes `text` spells, however many there are.
-    // The reader of signature objects is what calls this.
-    #[allow(dead_code)]
     pub(crate) fn decode(text: &str) -> Option<Vec<u8>> {
         let mut out = Vec::with_capacity(text.len() / DIGITS_PER_BYTE);
         let mut values = Hex::values(text);
