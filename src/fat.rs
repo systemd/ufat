@@ -147,9 +147,9 @@ impl Cache {
 }
 
 /// FAT entry 0 of a volume with the media descriptor `media`: the
-/// descriptor in the low byte, all other bits set.
+/// descriptor in the low byte, all other bits of [`ENTRY_MASK`] set.
 pub fn media_entry(media: u8) -> u32 {
-    0x0FFF_FF00 | u32::from(media)
+    (ENTRY_MASK & !u32::from(u8::MAX)) | u32::from(media)
 }
 
 /// The FAT, as far as it is in memory: a sector cache, the free count and
