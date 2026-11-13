@@ -62,6 +62,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "dlopen-note"
+version = "0.1.0"
+
+[[package]]
 name = "fold-table"
 version = "0.1.0"
 
