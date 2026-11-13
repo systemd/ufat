@@ -18,6 +18,11 @@
 //! - [`Writer`] writes a manifest record by record. [`Fields`] names what a
 //!   writer can be asked to record, and [`Sha256Hasher`] computes the hash
 //!   of a file while it is read.
+//! - [`ContentSource`] is where the contents of the files come from when a
+//!   manifest is applied: [`DirectorySource`] for the files next to the
+//!   manifest and [`StreamSource`] for one stream with all of them.
+//!   [`FileObject::copy_contents`] copies the contents of a file and checks
+//!   them against the manifest.
 //!
 //! A manifest is input from outside. Reading one takes time in proportion
 //! to its size and keeps one record in memory, which is at most
@@ -25,7 +30,8 @@
 //!
 //! Signature objects are read and not verified: that takes an OpenPGP or
 //! an X.509 implementation. [`Reader::signed_len`] says how much of the
-//! manifest they sign.
+//! manifest they sign. Contents that are stored in an encoding or that
+//! have to be fetched from a URL are not taken.
 //!
 //! The reader takes the fields systemd's reader takes. A field it does
 //! not know is passed over, whatever its value is. That goes for the
@@ -40,6 +46,7 @@
 #![warn(missing_docs)]
 
 mod base64;
+mod content;
 mod decode;
 mod digest;
 mod error;
@@ -50,6 +57,7 @@ mod object;
 mod reader;
 mod writer;
 
+pub use content::{ContentSource, Data, Directory, DirectorySource, OpenError, Reference, StreamSource};
 pub use digest::{Digest, InvalidDigest, Sha256, Sha256Hasher};
 pub use error::{ContentProblem, Error, ErrorKind, Field, Invalid, Problem, SourceProblem, Unsupported};
 pub use manifest::Manifest;

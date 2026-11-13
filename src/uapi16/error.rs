@@ -303,8 +303,6 @@ struct Inner {
     cause: Option<Cause>,
 }
 
-// The reader and the sources of file contents are what build most errors.
-#[allow(dead_code)]
 impl Error {
     pub(crate) fn new(kind: ErrorKind, message: String) -> Error {
         Error(Box::new(Inner {
