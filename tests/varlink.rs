@@ -423,6 +423,14 @@ fn volume(image: &Path, access: Access) -> Volume {
 /// directory gets a modification time with hour 31 and a date with month
 /// 0, two findings each for a check. Returns how many entries were hit.
 fn damage_root_entries(image: &Path) -> usize {
+    use ufat::dirent::{self, ATTR_ARCHIVE, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_END};
+    use ufat::time::FatTimestamp;
+
+    // Hour 31, the most the field holds, and month 0, which no time and no
+    // date have.
+    let time = FatTimestamp::HOURS.put(FatTimestamp::HOURS.max());
+    let date = FatTimestamp::MONTH.put(0);
+
     let f = rw(image);
     let mut sector = [0u8; 512];
     f.read_exact_at(&mut sector, 0).unwrap();
@@ -434,12 +442,15 @@ fn damage_root_entries(image: &Path) -> usize {
     loop {
         let offset = layout.cluster_offset(cluster).unwrap();
         f.read_exact_at(&mut buf, offset).unwrap();
-        for slot in buf.chunks_mut(32) {
+        for slot in buf.chunks_mut(DIR_ENTRY_SIZE) {
             // An entry in use with the plain file attribute, no long name
             // part, no label, no directory.
-            if slot[0] != 0xE5 && slot[0] != 0x00 && slot[11] == 0x20 {
-                slot[22..24].copy_from_slice(&0xFFFFu16.to_le_bytes());
-                slot[24..26].copy_from_slice(&0u16.to_le_bytes());
+            if slot[dirent::field::MARKER] != ENTRY_DELETED
+                && slot[dirent::field::MARKER] != ENTRY_END
+                && slot[dirent::field::ATTR] == ATTR_ARCHIVE
+            {
+                slot[dirent::field::WRITE_TIME].copy_from_slice(&time.to_le_bytes());
+                slot[dirent::field::WRITE_DATE].copy_from_slice(&date.to_le_bytes());
                 damaged += 1;
             }
         }

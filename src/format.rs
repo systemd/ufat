@@ -630,7 +630,12 @@ mod tests {
         let e = p.root_entry.unwrap();
         assert_eq!(e.attr, ATTR_VOLUME_ID);
         assert_eq!(e.create_tenths, 0);
-        assert_eq!(e.write_date, ((2015 - 1980) << 9) | (3 << 5) | 14);
+        assert_eq!(
+            e.write_date,
+            FatTimestamp::YEARS.put((2015 - crate::time::FAT_EPOCH_YEAR) as u16)
+                | FatTimestamp::MONTH.put(3)
+                | FatTimestamp::DAY.put(14)
+        );
         let bs = BootSector::parse(&p.boot_sector.to_bytes()).unwrap();
         assert_eq!(bs, p.boot_sector);
         assert_eq!(bs.layout().unwrap(), p.layout);

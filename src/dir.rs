@@ -27,8 +27,8 @@ use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::dirent::{
-    short_name_checksum, RawDirEntry, ATTR_LONG_NAME, ATTR_VOLUME_ID, DIR_ENTRY_SIZE, DOTDOT_NAME, DOT_NAME,
-    ENTRY_DELETED, ENTRY_END,
+    self, short_name_checksum, RawDirEntry, ATTR_LONG_NAME, ATTR_VOLUME_ID, DIR_ENTRY_SIZE, DOTDOT_NAME, DOT_NAME,
+    ENTRY_DELETED, ENTRY_END, NAME_BASE, NAME_EXT,
 };
 use crate::errno::*;
 use crate::name::{
@@ -119,12 +119,15 @@ impl TailShape {
     /// The shape `alias` takes with a tail of `digits` digits, as
     /// [`Alias::with_tail`] builds it.
     fn of(alias: &Alias, digits: u8) -> TailShape {
-        let keep = alias.base_len.min(8 - 1 - digits as usize);
-        let ext_end = alias.name[8..].iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1);
+        let keep = alias.base_len.min(NAME_BASE.len() - 1 - digits as usize);
+        let ext_end = alias.name[NAME_EXT]
+            .iter()
+            .rposition(|&b| b != b' ')
+            .map_or(0, |p| p + 1);
         TailShape {
             prefix: alias.name[..keep].to_vec(),
             digits,
-            ext: alias.name[8..8 + ext_end].to_vec(),
+            ext: alias.name[NAME_EXT.start..NAME_EXT.start + ext_end].to_vec(),
         }
     }
 
@@ -165,7 +168,7 @@ impl TailShape {
             Some(i) => (&bytes[..i], &bytes[i + 1..]),
             None => (&bytes[..], &bytes[bytes.len()..]),
         };
-        if base.len() > 8 || ext.len() > 3 {
+        if base.len() > NAME_BASE.len() || ext.len() > NAME_EXT.len() {
             return None;
         }
         let tilde = base.iter().rposition(|&b| b == b'~')?;
@@ -358,7 +361,10 @@ impl Directory {
         if chain.is_empty() || data.len() != chain.len() * cluster_size {
             bail!(EINVAL, "directory data does not match its chain");
         }
-        let damaged = match data.chunks_exact(DIR_ENTRY_SIZE).position(|s| s[0] == ENTRY_END) {
+        let damaged = match data
+            .chunks_exact(DIR_ENTRY_SIZE)
+            .position(|s| s[dirent::field::MARKER] == ENTRY_END)
+        {
             Some(end) => data[(end + 1) * DIR_ENTRY_SIZE..].iter().any(|&b| b != 0),
             None => false,
         };
@@ -414,7 +420,7 @@ impl Directory {
 
     /// Whether the first byte of slot `i` marks it as in use.
     fn in_use(&self, i: usize) -> bool {
-        let b = self.slot(i)[0];
+        let b = self.slot(i)[dirent::field::MARKER];
         b != ENTRY_END && b != ENTRY_DELETED
     }
 
@@ -438,12 +444,12 @@ impl Directory {
     /// that keeps its name, as when a file gets its size or its times, is
     /// taken into the index; any other change rebuilds it.
     pub(crate) fn set_slot(&mut self, i: usize, bytes: &[u8; DIR_ENTRY_SIZE]) {
-        let off = i * DIR_ENTRY_SIZE;
-        if &self.data[off..off + DIR_ENTRY_SIZE] == bytes {
+        let old = self.slot(i);
+        if old == bytes {
             return;
         }
-        let same_name = self.data[off..off + 11] == bytes[..11]
-            && (self.data[off + 11] ^ bytes[11]) & ATTR_VOLUME_ID == 0
+        let same_name = old[dirent::field::NAME] == bytes[dirent::field::NAME]
+            && (old[dirent::field::ATTR] ^ bytes[dirent::field::ATTR]) & ATTR_VOLUME_ID == 0
             && self.index.entries.contains_key(&i);
         self.set_slot_raw(i, bytes);
         if same_name {
@@ -498,10 +504,10 @@ impl Directory {
         let mut i = 0;
         while i < n {
             let raw = self.slot(i);
-            if raw[0] == ENTRY_END {
+            if raw[dirent::field::MARKER] == ENTRY_END {
                 break;
             }
-            if raw[0] == ENTRY_DELETED {
+            if raw[dirent::field::MARKER] == ENTRY_DELETED {
                 orphan(&mut pending, &mut free);
                 free[i] = true;
                 i += 1;
@@ -526,7 +532,7 @@ impl Directory {
                 i += 1;
                 continue;
             }
-            if raw[11] == ATTR_LONG_NAME {
+            if raw[dirent::field::ATTR] == ATTR_LONG_NAME {
                 // A long name slot whose sequence byte is out of range. The
                 // kernel skips it (fat_parse_long() returns PARSE_INVALID);
                 // it is never read as a short entry.
@@ -718,9 +724,9 @@ impl Directory {
         // directory would hide it: a run reserved for an entry not written
         // yet. Mark them deleted; the entry they wait for overwrites them.
         for i in self.index.raw_end..start {
-            if self.slot(i)[0] == ENTRY_END {
+            if self.slot(i)[dirent::field::MARKER] == ENTRY_END {
                 let mut raw = *self.slot(i);
-                raw[0] = ENTRY_DELETED;
+                raw[dirent::field::MARKER] = ENTRY_DELETED;
                 self.set_slot_raw(i, &raw);
             }
         }
@@ -754,7 +760,7 @@ impl Directory {
     pub(crate) fn delete(&mut self, entry: &DirEntry) {
         for i in entry.first_slot()..=entry.slot {
             let mut raw = *self.slot(i);
-            raw[0] = ENTRY_DELETED;
+            raw[dirent::field::MARKER] = ENTRY_DELETED;
             self.set_slot_raw(i, &raw);
         }
         match self.index.remove(entry.slot) {
@@ -764,7 +770,7 @@ impl Directory {
             _ => self.rebuild_index(),
         }
         for i in self.index.raw_end..self.slots() {
-            if self.slot(i)[0] == ENTRY_END {
+            if self.slot(i)[dirent::field::MARKER] == ENTRY_END {
                 break;
             }
             self.set_slot_raw(i, &[0u8; DIR_ENTRY_SIZE]);
@@ -980,14 +986,18 @@ mod proofs {
     fn shaped_directory() -> Directory {
         let mut data = vec![0u8; SLOTS * DIR_ENTRY_SIZE];
         let lfn: [u8; DIR_ENTRY_SIZE] = kani::any();
-        kani::assume(lfn[0] != ENTRY_END && lfn[0] != ENTRY_DELETED);
+        kani::assume(lfn[dirent::field::MARKER] != ENTRY_END && lfn[dirent::field::MARKER] != ENTRY_DELETED);
         data[..DIR_ENTRY_SIZE].copy_from_slice(&lfn);
-        data[11] = ATTR_LONG_NAME;
+        data[dirent::lfn_field::ATTR] = ATTR_LONG_NAME;
         let short: [u8; DIR_ENTRY_SIZE] = kani::any();
-        kani::assume(short[0] != ENTRY_END && short[0] != ENTRY_DELETED && short[11] != ATTR_LONG_NAME);
+        kani::assume(
+            short[dirent::field::MARKER] != ENTRY_END
+                && short[dirent::field::MARKER] != ENTRY_DELETED
+                && short[dirent::field::ATTR] != ATTR_LONG_NAME,
+        );
         data[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE].copy_from_slice(&short);
         let third: [u8; DIR_ENTRY_SIZE] = kani::any();
-        kani::assume(third[0] != ENTRY_END && third[11] != ATTR_LONG_NAME);
+        kani::assume(third[dirent::field::MARKER] != ENTRY_END && third[dirent::field::ATTR] != ATTR_LONG_NAME);
         data[2 * DIR_ENTRY_SIZE..3 * DIR_ENTRY_SIZE].copy_from_slice(&third);
         Directory::new(vec![2], data, SLOTS * DIR_ENTRY_SIZE).unwrap()
     }
@@ -1048,7 +1058,7 @@ mod proofs {
 mod tests {
     use super::*;
     use crate::dirent::{ATTR_ARCHIVE, ATTR_DIRECTORY};
-    use crate::name::{long_name_entries, LongName};
+    use crate::name::{long_name_entries, LongName, LFN_LAST_ENTRY, LFN_MAX_ENTRIES};
 
     fn dir() -> Directory {
         Directory::new(vec![2], vec![0u8; 512], 512).unwrap()
@@ -1123,7 +1133,7 @@ mod tests {
 
         // Deleting the first entry leaves 0xE5 slots that are reused first.
         d.delete(&e[0]);
-        assert_eq!(d.slot(0)[0], ENTRY_DELETED);
+        assert_eq!(d.slot(0)[dirent::field::MARKER], ENTRY_DELETED);
         assert!(find(&d, "readme.txt").is_none());
         assert_eq!(d.find_free_run(2), Some(0));
         assert_eq!(d.find_free_run(3), Some(3));
@@ -1136,7 +1146,7 @@ mod tests {
     #[test]
     fn garbage_after_end_marker_is_remembered() {
         let mut data = vec![0u8; 1024];
-        data[0..32].copy_from_slice(&short(b"A          ", ATTR_ARCHIVE).to_bytes());
+        data[..DIR_ENTRY_SIZE].copy_from_slice(&short(b"A          ", ATTR_ARCHIVE).to_bytes());
         data[700] = 1;
         let d = Directory::new(vec![2, 3], data.clone(), 512).unwrap();
         assert!(d.is_damaged());
@@ -1181,7 +1191,7 @@ mod tests {
         // well, and so is a deleted slot between it and the short entry.
         d.set_slot(0, &lfn[1]);
         let mut deleted = lfn[0];
-        deleted[0] = ENTRY_DELETED;
+        deleted[dirent::field::MARKER] = ENTRY_DELETED;
         d.set_slot(1, &deleted);
         let e = d.entries();
         assert_eq!(e.len(), 1);
@@ -1198,11 +1208,14 @@ mod tests {
         let lfn = long_name_entries(&name, short_name_checksum(&s.name));
         d.write_entry(0, &lfn, &s);
         d.write_entry(3, &[], &short(b"OTHER   TXT", ATTR_ARCHIVE));
-        // Sequence 31 with the last bit, a set 0x80 bit and sequence 0:
-        // none of them is a long name entry, none of them a short one.
-        for bad in [0x40 | 31, 0x81, 0x40] {
+        // A sequence above the most a long name has, sequence 1 with bit 7
+        // set, and sequence 0: none of them is a long name entry, none of
+        // them a short one.
+        const ORDER_BIT_7: u8 = 1 << 7;
+        let above = LFN_MAX_ENTRIES as u8 + 1;
+        for bad in [LFN_LAST_ENTRY | above, ORDER_BIT_7 | 1, LFN_LAST_ENTRY] {
             let mut slot = lfn[0];
-            slot[0] = bad;
+            slot[dirent::lfn_field::ORDER] = bad;
             d.set_slot(0, &slot);
             let e = d.entries();
             assert_eq!(e.len(), 2, "{:#x}: {:?}", bad, e);
@@ -1216,7 +1229,7 @@ mod tests {
         // The same byte in the slot right before the short entry.
         d.set_slot(0, &lfn[0]);
         let mut slot = lfn[1];
-        slot[0] = 0x81;
+        slot[dirent::lfn_field::ORDER] = ORDER_BIT_7 | 1;
         d.set_slot(1, &slot);
         let e = d.entries();
         assert_eq!(e.len(), 2);
@@ -1302,14 +1315,14 @@ mod tests {
         let fourth = find(&d, "linux-6.12.4-200.fc41.x86_64.efi").unwrap();
         d.delete(&fourth);
         let s = create(&mut d, "linux-6.13.0-100.fc42.x86_64.efi");
-        assert_eq!(&s[..8], b"LINUX-~4");
+        assert_eq!(&s[NAME_BASE], b"LINUX-~4");
         // A plain name that looks like a candidate takes that tail.
         create(&mut d, "linux~13.efi");
         let s = create(&mut d, "linux-6.14.0-100.fc42.x86_64.efi");
-        assert_eq!(&s[..8], b"LINUX~14");
+        assert_eq!(&s[NAME_BASE], b"LINUX~14");
         // A name of another shape is not affected.
         let s = create(&mut d, "linux-6.14.0-100.fc42.x86_64.conf");
-        assert_eq!(&s[..8], b"LINUX-~1");
+        assert_eq!(&s[NAME_BASE], b"LINUX-~1");
         d.check_index();
     }
 
@@ -1320,10 +1333,10 @@ mod tests {
         create(&mut d, "Some Long Name 2.txt");
         let first = find(&d, "some long name.txt").unwrap();
         let alias = Alias::of(&LongName::new("Some Long Name.txt").unwrap());
-        assert_eq!(&d.short_name_for(&alias, Some(&first)).unwrap()[..8], b"SOMELO~1");
-        assert_eq!(&d.short_name_for(&alias, None).unwrap()[..8], b"SOMELO~3");
+        assert_eq!(&d.short_name_for(&alias, Some(&first)).unwrap()[NAME_BASE], b"SOMELO~1");
+        assert_eq!(&d.short_name_for(&alias, None).unwrap()[NAME_BASE], b"SOMELO~3");
         // The pick is not written, so the next pick is the same.
-        assert_eq!(&d.short_name_for(&alias, None).unwrap()[..8], b"SOMELO~3");
+        assert_eq!(&d.short_name_for(&alias, None).unwrap()[NAME_BASE], b"SOMELO~3");
         d.check_index();
         // With many tails taken the hint says where to start, also for a
         // replacement: the smallest tail nobody else has, not always its own.
@@ -1331,11 +1344,17 @@ mod tests {
             create(&mut d, &format!("Some Long Name {}.txt", i));
         }
         let fortieth = find(&d, "some long name 40.txt").unwrap();
-        assert_eq!(&fortieth.short.name[..8], b"SOMEL~40");
-        assert_eq!(&d.short_name_for(&alias, Some(&fortieth)).unwrap()[..8], b"SOMEL~40");
+        assert_eq!(&fortieth.short.name[NAME_BASE], b"SOMEL~40");
+        assert_eq!(
+            &d.short_name_for(&alias, Some(&fortieth)).unwrap()[NAME_BASE],
+            b"SOMEL~40"
+        );
         d.delete(&find(&d, "some long name 7.txt").unwrap());
-        assert_eq!(&d.short_name_for(&alias, Some(&fortieth)).unwrap()[..8], b"SOMELO~7");
-        assert_eq!(&d.short_name_for(&alias, None).unwrap()[..8], b"SOMELO~7");
+        assert_eq!(
+            &d.short_name_for(&alias, Some(&fortieth)).unwrap()[NAME_BASE],
+            b"SOMELO~7"
+        );
+        assert_eq!(&d.short_name_for(&alias, None).unwrap()[NAME_BASE], b"SOMELO~7");
         d.check_index();
     }
 

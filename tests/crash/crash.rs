@@ -32,7 +32,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use common::Temp;
 use ufat::boot::BootSector;
 use ufat::device::{Access, Device};
-use ufat::dirent::{short_name_checksum, RawDirEntry, ATTR_ARCHIVE, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_END};
+use ufat::dirent::{self, short_name_checksum, RawDirEntry, ATTR_ARCHIVE, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_END};
 use ufat::fat::{Entry, Fat, BAD_CLUSTER, END_OF_CHAIN_MIN, ENTRY_MASK, FREE};
 use ufat::format::{self, FormatOptions};
 use ufat::fsck::{self, ProblemKind, Severity};
@@ -442,10 +442,10 @@ impl RawImage {
             let data = self.cluster(dev, c)?;
             for raw in data.chunks_exact(DIR_ENTRY_SIZE) {
                 let raw: &[u8; DIR_ENTRY_SIZE] = raw.try_into().unwrap();
-                if raw[0] == ENTRY_END {
+                if raw[dirent::field::MARKER] == ENTRY_END {
                     break 'clusters;
                 }
-                if raw[0] == ENTRY_DELETED {
+                if raw[dirent::field::MARKER] == ENTRY_DELETED {
                     pending.clear();
                     continue;
                 }

@@ -27,7 +27,8 @@
 
 use crate::bytes::le16;
 use crate::dirent::{
-    RawDirEntry, ATTR_LONG_NAME, CASE_LOWER_BASE, CASE_LOWER_EXT, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_E5_ESCAPE,
+    self, RawDirEntry, ATTR_LONG_NAME, CASE_LOWER_BASE, CASE_LOWER_EXT, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_E5_ESCAPE,
+    ENTRY_END, NAME_BASE, NAME_EXT,
 };
 use crate::errno::*;
 use crate::Result;
@@ -47,6 +48,10 @@ pub const LFN_UNITS_PER_ENTRY: usize = 13;
 pub const LFN_LAST_ENTRY: u8 = 0x40;
 /// Largest sequence number of a long name entry.
 pub const LFN_MAX_ENTRIES: usize = 20;
+/// The unit that ends a long name that does not fill its last entry.
+pub const LFN_TERMINATOR: u16 = 0x0000;
+/// The unit that fills the last entry of a long name after its terminator.
+pub const LFN_PADDING: u16 = 0xFFFF;
 
 /// Characters that may not appear in a long name, besides control characters.
 pub(crate) const LONG_NAME_INVALID: &[char] = &['"', '*', '/', ':', '<', '>', '?', '\\', '|'];
@@ -58,8 +63,29 @@ const RESERVED_NAMES: &[&[u8]] = &[
     b"LPT1", b"LPT2", b"LPT3", b"LPT4", b"LPT5", b"LPT6", b"LPT7", b"LPT8", b"LPT9",
 ];
 
-/// Byte offsets of the 13 UTF-16 units inside a long name entry.
-const LFN_UNIT_OFFSETS: [usize; LFN_UNITS_PER_ENTRY] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+/// Byte offsets of the 13 UTF-16 units inside a long name entry: the units
+/// of its three name fields, in order.
+const LFN_UNIT_OFFSETS: [usize; LFN_UNITS_PER_ENTRY] = {
+    let fields = [
+        dirent::lfn_field::NAME1,
+        dirent::lfn_field::NAME2,
+        dirent::lfn_field::NAME3,
+    ];
+    let mut offsets = [0; LFN_UNITS_PER_ENTRY];
+    let mut n = 0;
+    let mut f = 0;
+    while f < fields.len() {
+        let mut off = fields[f].start;
+        while off < fields[f].end {
+            offsets[n] = off;
+            n += 1;
+            off += size_of::<u16>();
+        }
+        f += 1;
+    }
+    assert!(n == LFN_UNITS_PER_ENTRY);
+    offsets
+};
 
 /// A validated long file name.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -303,8 +329,8 @@ impl Alias {
             Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
             None => (trimmed, ""),
         };
-        let (base_bytes, base_lossy, base_case) = convert_part(base, 8);
-        let (ext_bytes, ext_lossy, ext_case) = convert_part(ext, 3);
+        let (base_bytes, base_lossy, base_case) = convert_part(base, NAME_BASE.len());
+        let (ext_bytes, ext_lossy, ext_case) = convert_part(ext, NAME_EXT.len());
         lossy |= base_lossy || ext_lossy;
         if base_bytes.is_empty() || RESERVED_NAMES.contains(&base_bytes.as_slice()) {
             lossy = true;
@@ -322,7 +348,7 @@ impl Alias {
         }
         let mut alias = [b' '; 11];
         alias[..base_bytes.len()].copy_from_slice(&base_bytes);
-        alias[8..8 + ext_bytes.len()].copy_from_slice(&ext_bytes);
+        alias[NAME_EXT.start..NAME_EXT.start + ext_bytes.len()].copy_from_slice(&ext_bytes);
         Alias {
             name: alias,
             base_len: base_bytes.len(),
@@ -353,11 +379,11 @@ impl Alias {
             tail[1 + i] = digits[count - 1 - i];
         }
         let tail = &tail[..1 + count];
-        let keep = self.base_len.min(8 - tail.len());
+        let keep = self.base_len.min(NAME_BASE.len() - tail.len());
         let mut out = [b' '; 11];
         out[..keep].copy_from_slice(&self.name[..keep]);
         out[keep..keep + tail.len()].copy_from_slice(tail);
-        out[8..].copy_from_slice(&self.name[8..]);
+        out[NAME_EXT].copy_from_slice(&self.name[NAME_EXT]);
         out
     }
 }
@@ -371,20 +397,20 @@ pub fn long_name_entries(name: &LongName, checksum: u8) -> Vec<[u8; DIR_ENTRY_SI
     let mut out = Vec::with_capacity(count);
     for seq in (1..=count).rev() {
         let mut e = [0u8; DIR_ENTRY_SIZE];
-        e[0] = seq as u8 | if seq == count { LFN_LAST_ENTRY } else { 0 };
-        e[11] = ATTR_LONG_NAME;
-        e[13] = checksum;
+        e[dirent::lfn_field::ORDER] = seq as u8 | if seq == count { LFN_LAST_ENTRY } else { 0 };
+        e[dirent::lfn_field::ATTR] = ATTR_LONG_NAME;
+        e[dirent::lfn_field::CHECKSUM] = checksum;
         let start = (seq - 1) * LFN_UNITS_PER_ENTRY;
         for (i, &off) in LFN_UNIT_OFFSETS.iter().enumerate() {
             let pos = start + i;
-            // The name is terminated by one 0x0000 unit and padded with
-            // 0xFFFF; a name that fills its entries has neither.
+            // The name ends with a terminator and is padded after it. A
+            // name that fills its entries has neither.
             let unit = match units.get(pos) {
                 Some(&u) => u,
-                None if pos == units.len() => 0x0000,
-                None => 0xFFFF,
+                None if pos == units.len() => LFN_TERMINATOR,
+                None => LFN_PADDING,
             };
-            e[off..off + 2].copy_from_slice(&unit.to_le_bytes());
+            e[off..off + size_of::<u16>()].copy_from_slice(&unit.to_le_bytes());
         }
         out.push(e);
     }
@@ -407,32 +433,33 @@ pub struct LongNameEntry {
 /// Decodes a long name entry. Returns None if the slot is not a well formed
 /// long name entry.
 pub fn parse_long_name_entry(raw: &[u8; DIR_ENTRY_SIZE]) -> Option<LongNameEntry> {
-    if raw[11] != ATTR_LONG_NAME || raw[0] == ENTRY_DELETED || raw[0] == 0 {
+    let order = raw[dirent::lfn_field::ORDER];
+    if raw[dirent::lfn_field::ATTR] != ATTR_LONG_NAME || order == ENTRY_DELETED || order == ENTRY_END {
         return None;
     }
-    let sequence = raw[0] & !LFN_LAST_ENTRY;
-    if sequence == 0 || sequence as usize > LFN_MAX_ENTRIES || raw[0] & 0x80 != 0 {
+    let sequence = order & !LFN_LAST_ENTRY;
+    if sequence == 0 || sequence as usize > LFN_MAX_ENTRIES {
         return None;
     }
     let units = LFN_UNIT_OFFSETS.map(|off| le16(raw, off));
     Some(LongNameEntry {
         sequence,
-        last: raw[0] & LFN_LAST_ENTRY != 0,
-        checksum: raw[13],
+        last: order & LFN_LAST_ENTRY != 0,
+        checksum: raw[dirent::lfn_field::CHECKSUM],
         units,
     })
 }
 
 /// Joins the units of a complete set of long name entries, given in
 /// sequence order (1 first), into the stored name. Reading stops at the
-/// first 0x0000 unit; 0xFFFF padding without a terminator ends the name as
-/// well, where Linux would decode it as U+FFFF. Nothing this crate writes
-/// has such a name, see [`LongName::new`].
+/// first [`LFN_TERMINATOR`]. [`LFN_PADDING`] without a terminator ends the
+/// name as well, where Linux would decode it as U+FFFF. Nothing this crate
+/// writes has such a name, see [`LongName::new`].
 pub fn join_long_name(entries: &[LongNameEntry]) -> Vec<u16> {
     entries
         .iter()
         .flat_map(|e| e.units)
-        .take_while(|&u| u != 0x0000 && u != 0xFFFF)
+        .take_while(|&u| u != LFN_TERMINATOR && u != LFN_PADDING)
         .collect()
 }
 
@@ -458,8 +485,8 @@ pub fn short_name_to_string(entry: &RawDirEntry) -> String {
             })
             .collect()
     };
-    let base = part(&name[..8], entry.nt_flags & CASE_LOWER_BASE != 0);
-    let ext = part(&name[8..], entry.nt_flags & CASE_LOWER_EXT != 0);
+    let base = part(&name[NAME_BASE], entry.nt_flags & CASE_LOWER_BASE != 0);
+    let ext = part(&name[NAME_EXT], entry.nt_flags & CASE_LOWER_EXT != 0);
     if ext.is_empty() {
         base
     } else {
@@ -576,19 +603,20 @@ mod tests {
     #[test]
     fn long_name_entry_layout() {
         let n = LongName::new("Readme.txt").unwrap();
-        let e = long_name_entries(&n, 0x42);
+        let checksum = 0x42;
+        let e = long_name_entries(&n, checksum);
         assert_eq!(e.len(), 1);
-        assert_eq!(e[0][0], 0x41);
-        assert_eq!(e[0][11], ATTR_LONG_NAME);
-        assert_eq!(e[0][12], 0);
-        assert_eq!(e[0][13], 0x42);
-        assert_eq!(&e[0][26..28], &[0, 0]);
+        assert_eq!(e[0][dirent::lfn_field::ORDER], LFN_LAST_ENTRY | 1);
+        assert_eq!(e[0][dirent::lfn_field::ATTR], ATTR_LONG_NAME);
+        assert_eq!(e[0][dirent::lfn_field::TYPE], 0);
+        assert_eq!(e[0][dirent::lfn_field::CHECKSUM], checksum);
+        assert_eq!(&e[0][dirent::lfn_field::FIRST_CLUSTER], &[0, 0]);
         let p = parse_long_name_entry(&e[0]).unwrap();
         assert_eq!(p.sequence, 1);
         assert!(p.last);
         let mut expected: Vec<u16> = "Readme.txt".encode_utf16().collect();
-        expected.push(0);
-        expected.extend([0xFFFF, 0xFFFF]);
+        expected.push(LFN_TERMINATOR);
+        expected.extend([LFN_PADDING, LFN_PADDING]);
         assert_eq!(p.units.to_vec(), expected);
         assert_eq!(join_long_name(&[p]), n.units());
 
@@ -603,12 +631,12 @@ mod tests {
         let n = LongName::new("fourteen_chars").unwrap();
         let e = long_name_entries(&n, 0);
         assert_eq!(e.len(), 2);
-        assert_eq!(e[0][0], 0x42);
-        assert_eq!(e[1][0], 0x01);
+        assert_eq!(e[0][dirent::lfn_field::ORDER], LFN_LAST_ENTRY | 2);
+        assert_eq!(e[1][dirent::lfn_field::ORDER], 1);
         let first = parse_long_name_entry(&e[0]).unwrap();
         assert_eq!(first.units[0], 's' as u16);
-        assert_eq!(first.units[1], 0);
-        assert_eq!(first.units[2], 0xFFFF);
+        assert_eq!(first.units[1], LFN_TERMINATOR);
+        assert_eq!(first.units[2], LFN_PADDING);
         let second = parse_long_name_entry(&e[1]).unwrap();
         assert_eq!(join_long_name(&[second, first]), n.units());
     }
@@ -778,7 +806,7 @@ mod proofs {
     #[kani::proof]
     #[kani::unwind(16)]
     fn with_tail_is_total() {
-        let base_len: usize = kani::any_where(|l: &usize| *l <= 8);
+        let base_len: usize = kani::any_where(|l: &usize| *l <= NAME_BASE.len());
         let alias = Alias {
             name: *b"ABCDEFGHEXT",
             base_len,
@@ -788,13 +816,13 @@ mod proofs {
         };
         let n: u32 = kani::any();
         let tailed = alias.with_tail(n);
-        assert!(&tailed[8..] == &alias.name[8..]);
+        assert!(&tailed[NAME_EXT] == &alias.name[NAME_EXT]);
         assert!(tailed.iter().all(|&b| legal_short_byte(b)));
-        let tilde = tailed[..8].iter().position(|&b| b == b'~').unwrap();
+        let tilde = tailed[NAME_BASE].iter().position(|&b| b == b'~').unwrap();
         assert!(tilde <= base_len);
         let mut value: u32 = 0;
         let mut digits = 0;
-        for &b in &tailed[tilde + 1..8] {
+        for &b in &tailed[tilde + 1..NAME_BASE.end] {
             if b == b' ' {
                 break;
             }

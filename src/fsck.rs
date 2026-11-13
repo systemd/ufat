@@ -18,7 +18,7 @@ use crate::boot::{
 };
 use crate::device::Device;
 use crate::dirent::{
-    short_name_checksum, RawDirEntry, ATTR_LONG_NAME, ATTR_RESERVED, DIR_ENTRY_SIZE, DOTDOT_NAME, DOT_NAME,
+    self, short_name_checksum, RawDirEntry, ATTR_LONG_NAME, ATTR_RESERVED, DIR_ENTRY_SIZE, DOTDOT_NAME, DOT_NAME,
     ENTRY_DELETED, ENTRY_E5_ESCAPE, ENTRY_END,
 };
 use crate::errno::*;
@@ -30,7 +30,7 @@ use crate::format::decode_label;
 use crate::layout::Layout;
 use crate::name::{
     fold_str, join_long_name, parse_long_name_entry, short_name_to_string, valid_short_char, LongNameEntry,
-    LFN_MAX_ENTRIES, LONG_NAME_INVALID, MAX_LONG_NAME,
+    LFN_MAX_ENTRIES, LFN_PADDING, LFN_TERMINATOR, LONG_NAME_INVALID, MAX_LONG_NAME,
 };
 use crate::progress::Progress;
 use crate::volume::DeviceStore;
@@ -1538,12 +1538,12 @@ impl<'a> Checker<'a> {
                 }
                 continue;
             }
-            if raw[0] == ENTRY_END {
+            if raw[dirent::field::MARKER] == ENTRY_END {
                 ended_at = Some(slot);
                 self.drop_orphans(dir.chain, &mut pending, pending_start, slot);
                 continue;
             }
-            if raw[0] == ENTRY_DELETED {
+            if raw[dirent::field::MARKER] == ENTRY_DELETED {
                 self.drop_orphans(dir.chain, &mut pending, pending_start, slot);
                 continue;
             }
@@ -1559,7 +1559,7 @@ impl<'a> Checker<'a> {
                             .slot(slot as u32)
                     });
                 }
-                if raw[12] != 0 || raw[26] != 0 || raw[27] != 0 {
+                if raw[dirent::lfn_field::TYPE] != 0 || raw[dirent::lfn_field::FIRST_CLUSTER] != [0, 0] {
                     self.warning(|| {
                         Problem::new(ProblemKind::LongNameReservedBytes)
                             .path(self.chain_path(dir.chain))
@@ -1579,13 +1579,13 @@ impl<'a> Checker<'a> {
                 }
                 continue;
             }
-            if raw[11] == ATTR_LONG_NAME {
+            if raw[dirent::field::ATTR] == ATTR_LONG_NAME {
                 self.drop_orphans(dir.chain, &mut pending, pending_start, slot);
                 self.warning(|| {
                     Problem::new(ProblemKind::LongNameBadSequence)
                         .path(self.chain_path(dir.chain))
                         .slot(slot as u32)
-                        .value(u64::from(raw[0]))
+                        .value(u64::from(raw[dirent::lfn_field::ORDER]))
                 });
                 continue;
             }
@@ -1750,11 +1750,12 @@ impl<'a> Checker<'a> {
                     .expected(MAX_LONG_NAME as u64)
             });
         }
-        // After the name there must be one 0x0000 and then only 0xFFFF.
+        // After the name there must be one terminator and then only
+        // padding.
         let all: Vec<u16> = entries.iter().flat_map(|e| e.units).collect();
         if units.len() < all.len() {
             let tail = &all[units.len()..];
-            if tail[0] != 0 || tail[1..].iter().any(|&u| u != 0xFFFF) {
+            if tail[0] != LFN_TERMINATOR || tail[1..].iter().any(|&u| u != LFN_PADDING) {
                 self.warning(|| Problem::new(ProblemKind::LongNamePadding).path(self.path_of(path)));
             }
         }
@@ -1947,7 +1948,10 @@ impl<'a> Checker<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dirent::{ATTR_DIRECTORY, ATTR_RESERVED};
+    use crate::name::LFN_LAST_ENTRY;
     use crate::test_util::{volume, TempImage};
+    use crate::time::FatTimestamp;
     use std::io::Write;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -2045,12 +2049,21 @@ mod tests {
         v.close().unwrap();
         let dev = img.device();
         let off = layout.cluster_offset(linux.first_cluster).unwrap();
-        dev.write_at(off + 15 * 32, b"X").unwrap();
-        dev.write_at(off + 32 + 26, &[7u8, 0]).unwrap();
+        // Slot 15 of /EFI/Linux lies behind its end marker.
+        dev.write_at(off + 15 * DIR_ENTRY_SIZE as u64, b"X").unwrap();
+        // Slot 1 is "..", which gets a cluster that is not the one of /EFI.
+        let not_the_parent: u16 = 7;
+        dev.write_at(
+            off + (DIR_ENTRY_SIZE + dirent::field::FIRST_CLUSTER_LO.start) as u64,
+            &not_the_parent.to_le_bytes(),
+        )
+        .unwrap();
         let r = check(&dev).unwrap();
         assert!(has(&r, ProblemKind::EntryAfterEnd));
         assert!(r.problems.iter().any(|p| {
-            p.kind == ProblemKind::DotEntryCluster && p.name.as_deref() == Some("..") && p.cluster == Some(7)
+            p.kind == ProblemKind::DotEntryCluster
+                && p.name.as_deref() == Some("..")
+                && p.cluster == Some(u32::from(not_the_parent))
         }));
         assert!(r.errors() >= 2);
 
@@ -2184,19 +2197,38 @@ mod tests {
         // entry a reserved attribute bit; the first long name entry of
         // /EFI/Linux gets a non-zero first cluster field.
         let root_off = layout.cluster_offset(root).unwrap();
-        dev.write_at(root_off + 32 + 22, &[0x1F, 0x00]).unwrap();
-        dev.write_at(root_off + 11, &[0x50]).unwrap();
+        // The write time of "empty", the second slot of the root: 62
+        // seconds, the most the field holds.
+        let seconds = FatTimestamp::TWO_SECONDS.put(FatTimestamp::TWO_SECONDS.max());
+        dev.write_at(
+            root_off + (DIR_ENTRY_SIZE + dirent::field::WRITE_TIME.start) as u64,
+            &seconds.to_le_bytes(),
+        )
+        .unwrap();
+        // The attributes of "EFI", the first slot of the root.
+        dev.write_at(root_off + dirent::field::ATTR as u64, &[ATTR_DIRECTORY | ATTR_RESERVED])
+            .unwrap();
+        // The first cluster field of the third slot of /EFI/Linux, after "."
+        // and "..": the first long name entry of "kernel 0.efi".
         let linux_off = layout.cluster_offset(linux.first_cluster).unwrap();
-        dev.write_at(linux_off + 2 * 32 + 26, &[1, 0]).unwrap();
+        dev.write_at(
+            linux_off + (2 * DIR_ENTRY_SIZE + dirent::lfn_field::FIRST_CLUSTER.start) as u64,
+            &1u16.to_le_bytes(),
+        )
+        .unwrap();
         // The root's last entry is followed by a long name slot with a
         // sequence byte that is out of range.
         let mut root_raw = vec![0u8; layout.cluster_size() as usize];
         dev.read_at(root_off, &mut root_raw).unwrap();
-        let end = root_raw.chunks_exact(32).position(|s| s[0] == ENTRY_END).unwrap();
-        let mut slot = [0u8; 32];
-        slot[0] = 0x40 | 31;
-        slot[11] = ATTR_LONG_NAME;
-        dev.write_at(root_off + end as u64 * 32, &slot).unwrap();
+        let end = root_raw
+            .chunks_exact(DIR_ENTRY_SIZE)
+            .position(|s| s[dirent::field::MARKER] == ENTRY_END)
+            .unwrap();
+        let bad_order = LFN_LAST_ENTRY | (LFN_MAX_ENTRIES as u8 + 1);
+        let mut slot = [0u8; DIR_ENTRY_SIZE];
+        slot[dirent::lfn_field::ORDER] = bad_order;
+        slot[dirent::lfn_field::ATTR] = ATTR_LONG_NAME;
+        dev.write_at(root_off + (end * DIR_ENTRY_SIZE) as u64, &slot).unwrap();
 
         let r = check(&dev).unwrap();
         for kind in [
@@ -2210,12 +2242,12 @@ mod tests {
             assert!(has(&r, kind), "missing {:?} in {:?}", kind, r.problems);
         }
         assert!(r.problems.iter().any(|p| {
-            p.kind == ProblemKind::TimeInvalid && p.field == Some("modification") && p.value == Some(0x1f)
+            p.kind == ProblemKind::TimeInvalid && p.field == Some("modification") && p.value == Some(u64::from(seconds))
         }));
         assert!(r
             .problems
             .iter()
-            .any(|p| p.kind == ProblemKind::LongNameBadSequence && p.value == Some(0x5f)));
+            .any(|p| p.kind == ProblemKind::LongNameBadSequence && p.value == Some(u64::from(bad_order))));
         assert!(!has(&r, ProblemKind::FatHardwareErrorFlag), "{:?}", r.problems);
         // The nibble is an error: GRUB loses the file.
         assert!(r
@@ -2255,7 +2287,9 @@ mod tests {
         v.close().unwrap();
         let dev = img.device();
         let off = layout.cluster_offset(sub).unwrap();
-        dev.write_at(off + 32, &[0xE5]).unwrap();
+        // The first byte of slot 1 of /sub, which holds "..".
+        dev.write_at(off + (DIR_ENTRY_SIZE + dirent::field::MARKER) as u64, &[ENTRY_DELETED])
+            .unwrap();
         let r = check(&dev).unwrap();
         let missing = |r: &Report, which: &str| {
             r.problems
@@ -2273,8 +2307,12 @@ mod tests {
             attr: ATTR_VOLUME_ID,
             ..RawDirEntry::default()
         };
-        dev.write_at(off + 32, b".").unwrap();
-        dev.write_at(off + 3 * 32, &label.to_bytes()).unwrap();
+        // ".." gets its first byte back, and the label goes into slot 3,
+        // after ".", ".." and "F".
+        dev.write_at(off + (DIR_ENTRY_SIZE + dirent::field::MARKER) as u64, b".")
+            .unwrap();
+        dev.write_at(off + 3 * DIR_ENTRY_SIZE as u64, &label.to_bytes())
+            .unwrap();
         let r = check(&dev).unwrap();
         assert_eq!(r.errors(), 0, "{:?}", r.problems);
         assert!(
