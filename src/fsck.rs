@@ -1951,7 +1951,7 @@ impl<'a> Checker<'a> {
 mod tests {
     use super::*;
     use crate::dirent::{ATTR_DIRECTORY, ATTR_RESERVED};
-    use crate::fat::ENTRY_SIZE;
+    use crate::fat::{END_OF_CHAIN, ENTRY_SIZE};
     use crate::name::LFN_LAST_ENTRY;
     use crate::test_util::{volume, TempImage};
     use crate::time::FatTimestamp;
@@ -2181,15 +2181,16 @@ mod tests {
         let fat_entry = |copy: u32, c: u32| layout.fat_offset(copy) + (u64::from(c) * ENTRY_SIZE as u64);
         let has = |r: &Report, kind: ProblemKind| r.problems.iter().any(|p| p.kind == kind);
 
-        // Entry 1 says "not cleanly unmounted" in both FAT copies.
-        for copy in 0..2 {
-            dev.write_at(fat_entry(copy, 1), &0x07FF_FFFFu32.to_le_bytes()).unwrap();
+        // Entry 1 says "not cleanly unmounted" in every FAT copy.
+        let unclean = END_OF_CHAIN & !ENTRY1_CLEAN_SHUTDOWN;
+        for copy in 0..layout.fats {
+            dev.write_at(fat_entry(copy, 1), &unclean.to_le_bytes()).unwrap();
         }
         // The reserved nibble of the kernel's first entry is set.
         let mut raw = [0u8; ENTRY_SIZE];
         dev.read_at(fat_entry(0, kernel.first_cluster), &mut raw).unwrap();
         let value = u32::from_le_bytes(raw) | RESERVED_BITS;
-        for copy in 0..2 {
+        for copy in 0..layout.fats {
             dev.write_at(fat_entry(copy, kernel.first_cluster), &value.to_le_bytes())
                 .unwrap();
         }

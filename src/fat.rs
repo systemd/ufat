@@ -706,6 +706,7 @@ impl FatStore for VecStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::boot::MEDIA_FIXED;
 
     fn layout(fat_sectors: u32, clusters: u32) -> Layout {
         Layout {
@@ -722,7 +723,7 @@ mod tests {
     /// A fresh FAT of 100 clusters in one sector, with its store.
     fn fat() -> (VecStore, Fat) {
         let l = layout(1, 100);
-        let store = VecStore::fresh(&l, 0xF8);
+        let store = VecStore::fresh(&l, MEDIA_FIXED);
         let fat = Fat::open(&l, &store, 0, CACHE_BYTES).unwrap();
         (store, fat)
     }
@@ -739,7 +740,7 @@ mod tests {
     #[test]
     fn fresh_state() {
         let (s, f) = fat();
-        assert_eq!(f.raw(&s, 0).unwrap(), 0x0FFF_FFF8);
+        assert_eq!(f.raw(&s, 0).unwrap(), media_entry(MEDIA_FIXED));
         assert_eq!(f.raw(&s, 1).unwrap(), END_OF_CHAIN);
         assert_eq!(f.get(&s, 2).unwrap(), Entry::End);
         assert_eq!(f.get(&s, 3).unwrap(), Entry::Free);
@@ -747,7 +748,8 @@ mod tests {
         assert_eq!(f.chain_len(&s, 2).unwrap(), 1);
         assert_eq!(f.chain_bounded(&s, 2, 1).unwrap(), Some(vec![2]));
         assert_eq!(f.cursor(), 1);
-        assert_eq!(Fat::first_sector(&layout(1, 100), 0xF8).len(), 512);
+        let l = layout(1, 100);
+        assert_eq!(Fat::first_sector(&l, MEDIA_FIXED).len(), l.sector_size as usize);
     }
 
     #[test]
@@ -788,8 +790,10 @@ mod tests {
         assert_eq!(f.chain_len(&s, 5).unwrap_err().errno(), EUCLEAN);
         f.set(&s, 7, 8).unwrap();
         assert!(f.chain_len(&s, 7).unwrap_err().message().contains("free cluster"));
-        f.set(&s, 9, 0x0FFF_FFF0).unwrap();
-        assert_eq!(f.get(&s, 9).unwrap(), Entry::Invalid(0x0FFF_FFF0));
+        // The first of the values the FAT specification reserves.
+        let reserved_value = 0x0FFF_FFF0;
+        f.set(&s, 9, reserved_value).unwrap();
+        assert_eq!(f.get(&s, 9).unwrap(), Entry::Invalid(reserved_value));
         assert!(f.chain_len(&s, 9).is_err());
         assert!(f.walk(0).is_err());
         assert!(f.walk(102).is_err());
@@ -807,7 +811,7 @@ mod tests {
     #[test]
     fn high_nibble_is_preserved() {
         let l = layout(1, 100);
-        let s = VecStore::fresh(&l, 0xF8);
+        let s = VecStore::fresh(&l, MEDIA_FIXED);
         // Two of the reserved bits, so that keeping them is not the same as
         // setting all of them.
         let pattern: u32 = (1 << 31) | (1 << 29);
@@ -825,7 +829,7 @@ mod tests {
     fn dirty_runs_come_out_sorted_and_once() {
         // Four sectors of 128 entries each.
         let l = layout(4, 500);
-        let s = VecStore::fresh(&l, 0xF8);
+        let s = VecStore::fresh(&l, MEDIA_FIXED);
         let mut f = Fat::open(&l, &s, 0, CACHE_BYTES).unwrap();
         assert!(f.take_dirty_runs().is_empty());
         // Changes out of order, twice in one sector: one run per group of
@@ -850,7 +854,7 @@ mod tests {
     fn long_runs_are_split() {
         // A FAT of 3000 sectors changed throughout comes out in 1 MiB runs.
         let l = layout(3000, 383_000);
-        let s = VecStore::fresh(&l, 0xF8);
+        let s = VecStore::fresh(&l, MEDIA_FIXED);
         let mut f = Fat::open(&l, &s, 0, CACHE_BYTES).unwrap();
         let used = Fat::used_sectors(&l);
         assert_eq!(used, 2993, "the last seven sectors hold no cluster");
@@ -869,7 +873,7 @@ mod tests {
         // Four FAT sectors, a cache of two slots: sectors 0 and 2 share a
         // slot, as do 1 and 3.
         let l = layout(4, 500);
-        let s = VecStore::fresh(&l, 0xF8);
+        let s = VecStore::fresh(&l, MEDIA_FIXED);
         let mut f = Fat::open(&l, &s, 0, 1024).unwrap();
         assert_eq!(f.cache.borrow().tags.len(), 2);
         let (reads, writes) = f.io_counts();
@@ -900,7 +904,7 @@ mod tests {
     fn full_sectors_are_skipped_and_come_back() {
         // Four sectors; fill the first three completely, then allocate.
         let l = layout(4, 500);
-        let s = VecStore::fresh(&l, 0xF8);
+        let s = VecStore::fresh(&l, MEDIA_FIXED);
         for c in 3..384 {
             s.poke(c, END_OF_CHAIN);
         }

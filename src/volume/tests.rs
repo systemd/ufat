@@ -803,7 +803,7 @@ fn the_volume_is_marked_dirty_while_written() {
     // Nothing is marked before the first write.
     let bytes = std::fs::read(img.path()).unwrap();
     assert_eq!(bytes[field::NT_FLAGS] & NT_FLAG_DIRTY, 0);
-    assert_eq!(entry1(&bytes, 0), 0x0FFF_FFFF);
+    assert_eq!(entry1(&bytes, 0), END_OF_CHAIN);
     v.read_dir("/").unwrap();
     assert_eq!(std::fs::read(img.path()).unwrap(), bytes, "reading marks nothing");
     // While a file is being written the marks are on disk: the boot
@@ -821,8 +821,8 @@ fn the_volume_is_marked_dirty_while_written() {
     v.close().unwrap();
     let bytes = std::fs::read(img.path()).unwrap();
     assert_eq!(bytes[field::NT_FLAGS] & NT_FLAG_DIRTY, 0);
-    assert_eq!(entry1(&bytes, 0), 0x0FFF_FFFF);
-    assert_eq!(entry1(&bytes, 1), 0x0FFF_FFFF);
+    assert_eq!(entry1(&bytes, 0), END_OF_CHAIN);
+    assert_eq!(entry1(&bytes, 1), END_OF_CHAIN);
     let info = FsInfo::parse(&bytes[fsinfo..fsinfo + FSINFO_SIZE]).unwrap();
     let r = fsck::check(&img.device()).unwrap();
     assert_eq!(info.free_clusters, r.free_clusters);
