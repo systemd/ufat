@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # The build and the tests with the oldest and the newest rustc on x86_64
-# and aarch64, the case folding table, the lints for every supported
-# architecture, the build and the tests on the other architectures, the
-# exhaustive sweeps, a fuzzing run, the coverage report, a compile check of
-# the Kani proofs, the dependency check, the performance comparison and the
-# sign-offs. See HACKING.md.
+# and aarch64, the same with musl on x86_64, the case folding table, the
+# lints for every supported architecture, the build and the tests on the
+# other architectures, the exhaustive sweeps, a fuzzing run, the coverage
+# report, a compile check of the Kani proofs, the dependency check, the
+# performance comparison and the sign-offs. See HACKING.md.
 #
 # Warnings fail the build through CARGO_TARGET_<TRIPLE>_RUSTFLAGS and
 # clippy's -D warnings.
@@ -85,6 +85,45 @@ jobs:
       - name: Build the release binary
         run: cargo build --release --locked
 
+  musl:
+    name: Build and test (x86_64-unknown-linux-musl, rustc ${{ matrix.rust }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ['1.85.0', stable]
+    env:
+      TARGET: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends dosfstools mtools
+
+      - name: Install rustc ${{ matrix.rust }}
+        env:
+          RUST: ${{ matrix.rust }}
+        run: |
+          rustup toolchain install "$RUST" --profile minimal
+          rustup default "$RUST"
+          rustup target add "$TARGET"
+          rustc --version
+          t=$(echo "$TARGET" | tr 'a-z-' 'A-Z_')
+          echo "CARGO_TARGET_${t}_RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
+
+      # rustc links a musl binary with the C library and the startup
+      # files that come with the target, so no musl toolchain is needed.
+      - name: Build
+        run: cargo build --locked --target "$TARGET" --workspace --all-targets
+
+      - name: Test
+        run: cargo test --locked --target "$TARGET"
+
   fold-table:
     name: Case folding table
     runs-on: ubuntu-26.04
@@ -125,6 +164,7 @@ jobs:
         riscv64gc-unknown-linux-gnu
         s390x-unknown-linux-gnu
         sparc64-unknown-linux-gnu
+        x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

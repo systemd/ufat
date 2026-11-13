@@ -13,10 +13,8 @@
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-// sys.rs calls the LFS64 functions of glibc, such as openat64(), which
-// musl does not have.
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-compile_error!("ufat supports Linux with glibc only");
+#[cfg(not(target_os = "linux"))]
+compile_error!("ufat supports Linux only");
 
 #[macro_use]
 mod error;

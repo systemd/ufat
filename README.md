@@ -32,7 +32,7 @@ tool and the service are the same binary.
 
 ## Building and installing
 
-You need rustc and cargo 1.85 or newer, on Linux with glibc.
+You need rustc and cargo 1.85 or newer, on Linux with glibc or musl.
 
     cargo build --release --locked
     cargo install --locked --path . --root /usr/local
