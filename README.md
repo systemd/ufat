@@ -29,10 +29,15 @@ tool and the service are the same binary.
   damaged.
 - The code uses the Rust standard library and the crates libc, sha2 and
   lexopt.
+- libblkid names what an image holds when it holds no FAT32 file
+  system. ufat loads it at run time when it is installed, and works
+  without it.
 
 ## Building and installing
 
 You need rustc and cargo 1.85 or newer, on Linux with glibc or musl.
+libblkid from util-linux is not needed to build ufat. A statically
+linked ufat, which a musl build is by default, cannot load it.
 
     cargo build --release --locked
     cargo install --locked --path . --root /usr/local
@@ -232,8 +237,10 @@ The exit status follows fsck(8):
 | 8 | The image could not be checked. |
 
 An image that holds no FAT32 file system cannot be checked. The message
-says whether the image is blank. Blank means that its first 256 KiB are
-zeros.
+says what the image holds instead: another file system or a partition
+table by the name libblkid gives it, such as ext4 or gpt, or that the
+image is blank. Blank means that its first 256 KiB are zeros. Without
+libblkid, the message can only say whether the image is blank.
 
 ## Crash safety
 

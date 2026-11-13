@@ -126,7 +126,10 @@ pub enum NotFat32Reason {
     /// when the first 256 KiB of the image are zeros, which is where file
     /// systems and partition tables keep their signatures.
     Blank,
-    /// The boot sector is not that of a FAT32 volume.
+    /// The boot sector is not that of a FAT32 volume. Opening or checking
+    /// a volume says so only when libblkid finds another file system or a
+    /// partition table, a FAT12 or FAT16 volume included, and names it in
+    /// `found`.
     NotFat32,
     /// A FAT boot sector with a sector size this crate does not support.
     SectorSize,
@@ -447,6 +450,10 @@ pub enum Detail {
     NotFat32 {
         /// Why not.
         reason: NotFat32Reason,
+        /// What the image holds instead, named the way libblkid names it,
+        /// such as `ext4`, `crypto_LUKS` or `gpt`. FAT12 and FAT16 volumes
+        /// are `fat12` and `fat16`.
+        found: Option<String>,
         /// The sector size found, when that is the reason.
         sector_size: Option<u32>,
     },

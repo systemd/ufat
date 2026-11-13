@@ -2,9 +2,10 @@
 //! Helpers shared by the integration tests.
 #![allow(dead_code, unreachable_pub)]
 
+use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -88,6 +89,161 @@ pub fn find_program(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// A tool that makes an image hold something other than a FAT32 file
+/// system, and how ufat names that with libblkid.
+pub struct Maker {
+    /// The program, found with [`find_program`].
+    pub program: &'static str,
+    /// Its arguments before the path of the image.
+    pub args: &'static [&'static str],
+    /// The size of the image, enough for the program.
+    pub size: u64,
+    /// What the program reads from standard input.
+    pub stdin: &'static [u8],
+    /// What libblkid calls it, as `found` carries it.
+    pub found: &'static str,
+    /// What ufat's messages call it.
+    pub what: &'static str,
+}
+
+/// File systems, swap space, an encrypted volume and partition tables, as
+/// their own tools make them.
+pub const MAKERS: &[Maker] = &[
+    Maker {
+        program: "mkfs.ext4",
+        args: &["-q", "-F"],
+        size: 64 << 20,
+        stdin: b"",
+        found: "ext4",
+        what: "a file system of type ext4",
+    },
+    Maker {
+        program: "mkfs.xfs",
+        args: &["-q", "-f"],
+        size: 300 << 20,
+        stdin: b"",
+        found: "xfs",
+        what: "a file system of type xfs",
+    },
+    Maker {
+        program: "mkfs.btrfs",
+        args: &["-q", "-f"],
+        size: 300 << 20,
+        stdin: b"",
+        found: "btrfs",
+        what: "a file system of type btrfs",
+    },
+    Maker {
+        program: "mkfs.exfat",
+        args: &[],
+        size: 64 << 20,
+        stdin: b"",
+        found: "exfat",
+        what: "a file system of type exfat",
+    },
+    Maker {
+        program: "mkfs.ntfs",
+        args: &["-q", "-F", "-f"],
+        size: 64 << 20,
+        stdin: b"",
+        found: "ntfs",
+        what: "a file system of type ntfs",
+    },
+    Maker {
+        program: "mkfs.fat",
+        args: &["-F", "12"],
+        size: 4 << 20,
+        stdin: b"",
+        found: "fat12",
+        what: "a FAT12 file system",
+    },
+    Maker {
+        program: "mkfs.fat",
+        args: &["-F", "16"],
+        size: 64 << 20,
+        stdin: b"",
+        found: "fat16",
+        what: "a FAT16 file system",
+    },
+    Maker {
+        program: "mkswap",
+        args: &[],
+        size: 64 << 20,
+        stdin: b"",
+        found: "swap",
+        what: "data of type swap",
+    },
+    Maker {
+        program: "cryptsetup",
+        args: &[
+            "luksFormat",
+            "--batch-mode",
+            "--type",
+            "luks2",
+            "--pbkdf",
+            "pbkdf2",
+            "--pbkdf-force-iterations",
+            "1000",
+            "--key-file",
+            "-",
+        ],
+        size: 32 << 20,
+        stdin: b"ufat",
+        found: "crypto_LUKS",
+        what: "an encrypted volume of type crypto_LUKS",
+    },
+    Maker {
+        program: "sfdisk",
+        args: &["--quiet"],
+        size: 64 << 20,
+        stdin: b"label: gpt\n,\n",
+        found: "gpt",
+        what: "a partition table of type gpt",
+    },
+    Maker {
+        program: "sfdisk",
+        args: &["--quiet"],
+        size: 64 << 20,
+        stdin: b"label: dos\n,\n",
+        found: "dos",
+        what: "a partition table of type dos",
+    },
+];
+
+impl Maker {
+    /// The maker of what libblkid calls `found`.
+    pub fn of(found: &str) -> &'static Maker {
+        MAKERS.iter().find(|m| m.found == found).expect("a maker of MAKERS")
+    }
+
+    /// Makes the image at `path`. False when the program is not installed.
+    pub fn make(&self, path: &Path) -> bool {
+        let Some(program) = find_program(self.program) else {
+            return false;
+        };
+        std::fs::File::create(path).unwrap().set_len(self.size).unwrap();
+        let mut child = Command::new(&program)
+            .args(self.args)
+            .arg(path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to run {}: {}", program.display(), e));
+        // A program that does not read it is judged by its exit status.
+        let _ = child.stdin.take().unwrap().write_all(self.stdin);
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{} {:?} failed: {}",
+            self.program,
+            self.args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        true
+    }
 }
 
 /// Finds an mtools program, honouring `UFAT_MTOOLS` (a directory).

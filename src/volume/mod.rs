@@ -33,6 +33,7 @@ use crate::fat::{Entry, Extent, Fat, FatStore, CACHE_BYTES, ENTRY1_CLEAN_SHUTDOW
 use crate::layout::Layout;
 use crate::name::{fold_str, long_name_entries, short_name_to_string, Alias, LongName};
 use crate::path::components;
+use crate::probe::Prober;
 use crate::time::FatTimestamp;
 use crate::Result;
 use crate::{Detail, NoSpaceReason, NotFat32Reason};
@@ -247,6 +248,7 @@ impl Volume {
                 EMEDIUMTYPE,
                 Detail::NotFat32 {
                     reason: NotFat32Reason::TooSmall,
+                    found: None,
                     sector_size: None,
                 },
                 "{} bytes are too few to hold a file system",
@@ -255,8 +257,8 @@ impl Volume {
         }
         let mut sector = [0u8; BOOT_SECTOR_SIZE];
         device.read_at(0, &mut sector)?;
-        let boot = BootSector::parse(&sector).map_err(|e| crate::probe::refine(e, &device, &sector))?;
-        let layout = boot.layout().map_err(|e| crate::probe::refine(e, &device, &sector))?;
+        let boot = BootSector::parse(&sector).map_err(|e| Prober::new().refine(e, &device, &sector))?;
+        let layout = boot.layout().map_err(|e| Prober::new().refine(e, &device, &sector))?;
         if layout.size() > device.len() {
             bail!(
                 EUCLEAN,

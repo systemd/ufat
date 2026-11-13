@@ -30,6 +30,7 @@ use crate::name::{
     fold_str, join_long_name, parse_long_name_entry, short_name_to_string, valid_short_char, LongNameEntry,
     LFN_MAX_ENTRIES, LFN_PADDING, LFN_TERMINATOR, LONG_NAME_INVALID, MAX_LONG_NAME,
 };
+use crate::probe::Prober;
 use crate::progress::Progress;
 use crate::volume::DeviceStore;
 use crate::{Detail, NotFat32Reason, Result};
@@ -978,6 +979,7 @@ pub fn check_with_progress(device: &Device, progress: &mut dyn FnMut(&Progress))
             EMEDIUMTYPE,
             Detail::NotFat32 {
                 reason: NotFat32Reason::TooSmall,
+                found: None,
                 sector_size: None,
             },
             "{} bytes are too few to hold a file system",
@@ -986,10 +988,10 @@ pub fn check_with_progress(device: &Device, progress: &mut dyn FnMut(&Progress))
     }
     let mut sector = [0u8; BOOT_SECTOR_SIZE];
     device.read_at(0, &mut sector)?;
-    let boot = BootSector::parse(&sector).map_err(|e| crate::probe::refine(e, device, &sector))?;
+    let boot = BootSector::parse(&sector).map_err(|e| Prober::new().refine(e, device, &sector))?;
     if let Err(e) = boot.validate() {
         // Not FAT32 at all, or the device could not be read.
-        let e = crate::probe::refine(e, device, &sector);
+        let e = Prober::new().refine(e, device, &sector);
         if e.errno() != EUCLEAN {
             return Err(e);
         }

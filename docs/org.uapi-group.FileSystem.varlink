@@ -620,8 +620,12 @@ error ContentRequired()
 # The filesystem cannot be sized to fit and no size was given.
 error SizeRequired()
 
-# The image holds no filesystem of this type.
-type NotFileSystemReason(blank, otherFileSystem, sectorSize, tooSmall, unknown)
+# The image holds no filesystem of this type: nothing (blank), another
+# filesystem, a partition table or anything else blkid recognizes, which
+# found names the way blkid names it (foreignImageType), a sector size the
+# implementation does not support (sectorSize), too few bytes (tooSmall),
+# or data the implementation does not recognize (unknown).
+type NotFileSystemReason(blank, foreignImageType, sectorSize, tooSmall, unknown)
 error NotFileSystem(reason: NotFileSystemReason, found: ?string, sectorSize: ?int)
 
 # The filesystem is damaged where the operation needed it sound.

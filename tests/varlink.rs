@@ -1635,13 +1635,37 @@ fn describe_with_and_without_a_manifest() {
     let e = error_of(&mut c, "Describe", IMG, &[other.as_fd()]);
     assert_eq!(e.name, format!("{}.NotFileSystem", IFACE));
     assert_eq!(str_of(&e.parameters, "reason"), "unknown");
-    // An ext2 superblock behind a first sector of zeros is not blank.
+    // An ext2 superblock behind a first sector of zeros is not blank, and
+    // libblkid names it.
+    let blkid = ufat::probe::Prober::new().has_libblkid();
     let mut bytes = vec![0u8; 1 << 20];
     bytes[common::EXT2_MAGIC_FIELD].copy_from_slice(&common::EXT2_SUPER_MAGIC.to_le_bytes());
     let ext2 = file_with(scratch.path(), "ext2", &bytes);
     let e = error_of(&mut c, "Describe", IMG, &[ext2.as_fd()]);
     assert_eq!(e.name, format!("{}.NotFileSystem", IFACE));
-    assert_eq!(str_of(&e.parameters, "reason"), "unknown");
+    if blkid {
+        assert_eq!(str_of(&e.parameters, "reason"), "foreignImageType");
+        assert_eq!(str_of(&e.parameters, "found"), "ext2");
+    } else {
+        assert_eq!(str_of(&e.parameters, "reason"), "unknown");
+        assert!(e.parameters.get("found").is_none());
+    }
+    // So it does a FAT16 file system, after its version.
+    let fat16 = scratch.path().join("fat16");
+    let mkfs_fat16 = common::Maker::of("fat16");
+    if mkfs_fat16.make(&fat16) {
+        let fat16 = ro(&fat16);
+        let e = error_of(&mut c, "Describe", IMG, &[fat16.as_fd()]);
+        assert_eq!(e.name, format!("{}.NotFileSystem", IFACE));
+        if blkid {
+            assert_eq!(str_of(&e.parameters, "reason"), "foreignImageType");
+            assert_eq!(str_of(&e.parameters, "found"), "fat16");
+        } else {
+            assert_eq!(str_of(&e.parameters, "reason"), "unknown");
+        }
+    } else {
+        eprintln!("skipping {}: not found", mkfs_fat16.program);
+    }
     // A FAT boot sector with a sector size ufat does not support.
     let mut bytes = vec![0u8; 1 << 20];
     bytes[ufat::boot::field::JUMP].copy_from_slice(&ufat::boot::BOOT_JUMP);

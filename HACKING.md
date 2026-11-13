@@ -3,6 +3,18 @@
 ufat is built with cargo. It depends on the libc, sha2 and lexopt
 crates. lexopt parses the command line of the tool.
 
+ufat does not link against libblkid. It loads libblkid.so.1 with
+dlopen() when it needs it. The workspace has a crate for each part of
+that:
+
+- dlopen loads a library and looks up its functions.
+- dlopen-note writes the `.note.dlopen` ELF note of the ELF dlopen
+  metadata specification
+  (https://uapi-group.org/specifications/specs/elf_dlopen_metadata/),
+  which tells packaging tools that a program loads a library.
+- blkid has the functions of libblkid that ufat calls, and declares
+  libblkid in such a note.
+
 ## Requirements
 
 - rustc and cargo 1.85 or newer. ufat has to keep building with rustc
@@ -36,7 +48,8 @@ With rustup, `cargo +1.85.0` selects rustc 1.85:
 
 `cargo test` runs:
 
-- the unit tests of the library and of the json and varlink crates,
+- the unit tests of the library and of the json, varlink, dlopen,
+  dlopen-note and blkid crates,
 - the integration tests in tests/,
 - the crash consistency harness.
 
@@ -54,6 +67,13 @@ same time.
 
 tests/varlink.rs also drives the service with `varlinkctl` when it is
 installed.
+
+tests/cli.rs and tests/varlink.rs make images with mkfs.ext4, mkfs.xfs,
+mkfs.btrfs, mkfs.exfat, mkfs.ntfs, mkfs.fat, mkswap, cryptsetup and
+sfdisk, and skip the ones that are not installed. Whether ufat can
+detect them depends on the presence of libblkid. The tests check whether
+libblkid can be loaded and expect what ufat does with it, or without it.
+The tests under qemu in the CI usually run without it.
 
 ## Formatting
 

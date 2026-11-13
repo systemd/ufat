@@ -17,6 +17,7 @@ license = "LGPL-2.1-or-later"
 publish = false
 
 [workspace.dependencies]
+blkid = { path = "blkid" }
 dlopen = { path = "dlopen" }
 dlopen-note = { path = "dlopen-note" }
 json = { path = "json" }
@@ -43,6 +44,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+blkid.workspace = true
 json.workspace = true
 lexopt.workspace = true
 libc.workspace = true

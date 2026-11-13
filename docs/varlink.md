@@ -491,7 +491,7 @@ The service returns no text. Every error is a name with typed fields.
 | `FileSystemTypeNotSupported` | A `fileSystemType` other than `vfat`. | `fileSystemType` |
 | `OperationNotSupported` | `discard`, features or `repair` were requested. | `operation` |
 | `SizeRequired` | `Assemble` without content into an empty file without a `size`. | none |
-| `NotFileSystem` | The image holds no FAT32 file system. | `reason` (`blank`, `sectorSize`, `tooSmall`, `unknown`), `sectorSize` |
+| `NotFileSystem` | The image holds no FAT32 file system. | `reason` (`blank`, `foreignImageType`, `sectorSize`, `tooSmall`, `unknown`), `found`, `sectorSize` |
 | `Corrupt` | The file system is damaged where the operation needs it. | `where` (`superblock`, `allocation`, `chain`, `directory`), `field`, `path`, `block` |
 | `NoSpaceLeft` | The file system is full, or the cluster size leaves fewer than 65525 clusters. | `reason` (`blocks`, `directoryEntries`, `names`, `volume`), `path` |
 | `TooSmall` | The content does not fit the `size` given to `Assemble`. | `minimalSizeBytes`, `sizeBytes` |
@@ -517,11 +517,21 @@ The service returns no text. Every error is a name with typed fields.
 
 - `blank`: the first 256 KiB of the image are zeros. File systems and
   partition tables keep their signatures there.
+- `foreignImageType`: another file system, a partition table, an
+  encrypted volume or anything else libblkid recognizes.
+  `found` names it the way libblkid does, such as `ext4`, `btrfs`,
+  `crypto_LUKS`, `swap`, `gpt` or `dos`. FAT12 and FAT16 volumes are
+  `fat12` and `fat16`.
 - `sectorSize`: a FAT boot sector with a sector size ufat does not
   support. `sectorSize` gives it.
 - `tooSmall`: the image is too small to hold a file system.
 - `unknown`: the image is not blank, and ufat does not recognize what it
   holds.
+
+ufat loads libblkid when it needs it. Without libblkid, `foreignImageType`
+does not occur. An image that holds another file system or a partition
+table is then `unknown`, or `Corrupt` when its boot sector reads like a
+damaged FAT32 one, as that of NTFS does.
 
 The interface also declares `ContentRequired` and `ToolFailed`. The vfat
 implementation never returns them.

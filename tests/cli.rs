@@ -13,6 +13,11 @@ use std::process::{Command, Output};
 
 use common::{ufat, Temp};
 
+/// The exit statuses of check, as fsck has them: errors are left in the
+/// file system, and the check could not be done.
+const FSCK_ERRORS_LEFT_UNCORRECTED: i32 = 4;
+const FSCK_OPERATIONAL_ERROR: i32 = 8;
+
 fn run(bin: &Path, args: &[&str]) -> Output {
     Command::new(bin)
         .args(args)
@@ -205,6 +210,149 @@ fn version() {
     let version = format!("ufat {}\n", env!("CARGO_PKG_VERSION"));
     assert_eq!(ok(&bin, &["--version"]), version);
     assert_eq!(ok(&bin, &["version"]), version);
+}
+
+/// The owner, with its NUL, and the type of a dlopen note, as the ELF
+/// dlopen metadata specification has them.
+const DLOPEN_NOTE_OWNER: &[u8] = b"FDO\0";
+const DLOPEN_NOTE_TYPE: u32 = 0x407c_0c0a;
+
+/// The bytes of a section as `readelf --hex-dump` prints them. A line
+/// holds the address, then up to 16 bytes as hex digits in groups of 4
+/// bytes, which take 36 columns, then the bytes as text.
+fn hex_dump(dump: &str) -> Vec<u8> {
+    const HEX_COLUMNS: usize = 36;
+    let mut bytes = Vec::new();
+    for line in dump.lines() {
+        let Some((_, hex)) = line.trim_start().strip_prefix("0x").and_then(|l| l.split_once(' ')) else {
+            continue;
+        };
+        let digits: Vec<u8> = hex
+            .bytes()
+            .take(HEX_COLUMNS)
+            .filter(|b| !b.is_ascii_whitespace())
+            .collect();
+        for pair in digits.chunks(2) {
+            bytes.push(u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap());
+        }
+    }
+    bytes
+}
+
+/// The notes in the bytes of a note section, in the byte order of the
+/// target: the name with its NUL, the type and the description of each.
+/// A note is the sizes of the name and of the description and the type,
+/// 32 bits each, then the name and the description, each padded to 4
+/// bytes.
+fn elf_notes(mut section: &[u8]) -> Vec<(Vec<u8>, u32, Vec<u8>)> {
+    const WORD: usize = 4;
+    const HEADER_SIZE: usize = 3 * WORD;
+    let mut notes = Vec::new();
+    while section.len() >= HEADER_SIZE {
+        let word = |at: usize| u32::from_ne_bytes(section[at..at + WORD].try_into().unwrap());
+        let namesz = word(0) as usize;
+        let descsz = word(WORD) as usize;
+        let kind = word(2 * WORD);
+        let desc = HEADER_SIZE + namesz.next_multiple_of(WORD);
+        notes.push((
+            section[HEADER_SIZE..HEADER_SIZE + namesz].to_vec(),
+            kind,
+            section[desc..desc + descsz].to_vec(),
+        ));
+        section = &section[(desc + descsz).next_multiple_of(WORD).min(section.len())..];
+    }
+    notes
+}
+
+/// The binary carries the `.note.dlopen` ELF note that names libblkid,
+/// which ufat loads with dlopen(): owner FDO, type 0x407c0c0a and the JSON
+/// of the ELF dlopen metadata specification.
+#[test]
+fn the_binary_names_libblkid_in_a_dlopen_note() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let Some(readelf) = common::find_program("readelf") else {
+        return eprintln!("skipping readelf: not found");
+    };
+    let readelf = |args: &[&str]| {
+        let out = Command::new(&readelf)
+            .args(args)
+            .arg(&bin)
+            .output()
+            .expect("readelf runs");
+        assert!(
+            out.status.success(),
+            "readelf {:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    // Only a note section is listed with --notes.
+    assert!(readelf(&["--wide", "--notes"]).contains("Displaying notes found in: .note.dlopen"));
+    let json = concat!(
+        r#"[{"feature":"blkid","#,
+        r#""description":"Identification of file systems and partition tables in images","#,
+        r#""priority":"recommended","#,
+        r#""soname":["libblkid.so.1"]}]"#,
+        "\0"
+    );
+    let notes = elf_notes(&hex_dump(&readelf(&["--hex-dump=.note.dlopen"])));
+    let note = (DLOPEN_NOTE_OWNER.to_vec(), DLOPEN_NOTE_TYPE, json.as_bytes().to_vec());
+    assert_eq!(notes, [note]);
+}
+
+/// describe and check say what an image holds when it holds no FAT32 file
+/// system, for the images the tools of other file systems make. With
+/// libblkid they name it. Without it they say that the image is not
+/// blank, except for NTFS, whose boot sector reads like a damaged FAT32
+/// one. Only an image of zeros is blank.
+#[test]
+fn describe_and_check_say_what_an_image_holds() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let blkid = ufat::probe::Prober::new().has_libblkid();
+    let dir = Temp::dir();
+    for (i, maker) in common::MAKERS.iter().enumerate() {
+        let image = dir.path().join(format!("{}-{}.img", i, maker.program));
+        if !maker.make(&image) {
+            eprintln!("skipping {}: not found", maker.program);
+            continue;
+        }
+        let image = image.to_str().unwrap();
+        if !blkid && maker.found == "ntfs" {
+            fails(&bin, &["describe", image], "invalid reserved sector count 0");
+            let out = run(&bin, &["check", image]);
+            assert_eq!(out.status.code(), Some(FSCK_ERRORS_LEFT_UNCORRECTED), "{}", maker.found);
+            assert!(String::from_utf8_lossy(&out.stdout).contains("the reservedSectors field is invalid"));
+            continue;
+        }
+        let expected = if blkid {
+            format!("no FAT32 file system found, the image holds {}", maker.what)
+        } else {
+            "no FAT32 file system found, the image is not blank and libblkid is not available".to_string()
+        };
+        fails(&bin, &["describe", image], &expected);
+        let out = run(&bin, &["check", image]);
+        assert_eq!(out.status.code(), Some(FSCK_OPERATIONAL_ERROR), "{}", maker.found);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(&expected),
+            "{}: {}",
+            maker.found,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let blank = dir.path().join("blank.img");
+    fs::File::create(&blank).unwrap().set_len(64 << 20).unwrap();
+    fails(
+        &bin,
+        &["describe", blank.to_str().unwrap()],
+        "no file system found, the image is blank",
+    );
 }
 
 #[test]
@@ -775,7 +923,7 @@ fn counts_of_one() {
     image.write_all_at(&[0xf0], layout.fat_offset(0)).unwrap();
     drop(image);
     let out = run(&bin, &["check", b.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(4));
+    assert_eq!(out.status.code(), Some(FSCK_ERRORS_LEFT_UNCORRECTED));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let summary = stdout.lines().last().unwrap();
     assert!(

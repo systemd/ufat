@@ -324,6 +324,12 @@ impl Device {
         self.block_device
     }
 
+    /// The descriptor of the underlying file, for libblkid to probe the
+    /// image through.
+    pub(crate) fn fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+
     /// Where a partition starts on its disk, in bytes: 0 for regular files
     /// and whole disks.
     pub fn partition_start(&self) -> Result<u64> {
