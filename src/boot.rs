@@ -5,7 +5,8 @@ use std::ops::RangeInclusive;
 
 use crate::bytes::{bytes_at, le16_at, le32_at, size};
 use crate::errno::*;
-use crate::layout::Layout;
+use crate::fat::ENTRY_SIZE;
+use crate::layout::{Layout, FIRST_CLUSTER};
 use crate::Result;
 use crate::{CorruptPlace, Detail, NotFat32Reason};
 
@@ -502,14 +503,16 @@ impl BootSector {
         }
         let mut clusters = ((total - data_start) / u64::from(spc)) as u32;
         // Entries the FAT has room for; compared in 64 bits since a 4096
-        // byte sector FAT of 2^22 sectors overflows a u32.
-        let capacity =
-            (u64::from(self.fat_sectors_32) * u64::from(self.bytes_per_sector) / 4).min(u64::from(u32::MAX) + 2);
-        if capacity < 3 {
+        // byte sector FAT of 2^22 sectors overflows a u32. The entries
+        // before the first cluster hold no cluster.
+        let reserved_entries = u64::from(FIRST_CLUSTER);
+        let capacity = (u64::from(self.fat_sectors_32) * u64::from(self.bytes_per_sector) / ENTRY_SIZE as u64)
+            .min(u64::from(u32::MAX) + reserved_entries);
+        if capacity <= reserved_entries {
             bail!(EUCLEAN, bad_field("fatSectors"), "FAT too small for any cluster");
         }
-        if u64::from(clusters) > capacity - 2 {
-            clusters = (capacity - 2) as u32;
+        if u64::from(clusters) > capacity - reserved_entries {
+            clusters = (capacity - reserved_entries) as u32;
         }
         if clusters == 0 {
             bail!(EUCLEAN, bad_field("clusters"), "volume has no data clusters");
@@ -522,7 +525,7 @@ impl BootSector {
                 clusters
             );
         }
-        if self.root_cluster < 2 || self.root_cluster > clusters + 1 {
+        if self.root_cluster < FIRST_CLUSTER || self.root_cluster - FIRST_CLUSTER >= clusters {
             bail!(
                 EUCLEAN,
                 bad_field("rootCluster"),

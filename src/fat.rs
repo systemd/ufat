@@ -32,7 +32,7 @@ use std::cell::RefCell;
 
 use crate::bytes::le32;
 use crate::errno::*;
-use crate::layout::Layout;
+use crate::layout::{Layout, FIRST_CLUSTER};
 use crate::Result;
 use crate::{CorruptPlace, Detail, NoSpaceReason};
 
@@ -49,6 +49,8 @@ fn broken_chain(cluster: u32) -> Detail {
 /// The bits of a FAT32 entry that carry the cluster number. The top four
 /// bits are reserved and preserved when writing.
 pub const ENTRY_MASK: u32 = 0x0FFF_FFFF;
+/// Size of a FAT32 entry in bytes, a little-endian `u32`.
+pub const ENTRY_SIZE: usize = size_of::<u32>();
 /// Entries at or above this value mark the end of a chain.
 pub const END_OF_CHAIN_MIN: u32 = 0x0FFF_FFF8;
 /// The end of chain marker this crate writes.
@@ -209,7 +211,7 @@ impl Fat {
     /// Number of FAT sectors that hold entries for existing clusters. A FAT
     /// may be larger than that; the rest is never read or written.
     pub fn used_sectors(layout: &Layout) -> usize {
-        let needed = (u64::from(layout.fat_entries()) * 4).div_ceil(u64::from(layout.sector_size));
+        let needed = (u64::from(layout.fat_entries()) * ENTRY_SIZE as u64).div_ceil(u64::from(layout.sector_size));
         needed.min(u64::from(layout.fat_sectors)) as usize
     }
 
@@ -218,7 +220,7 @@ impl Fat {
     pub fn first_sector(layout: &Layout, media: u8) -> Vec<u8> {
         let mut sector = vec![0u8; layout.sector_size as usize];
         for (i, value) in [media_entry(media), END_OF_CHAIN, END_OF_CHAIN_MIN].iter().enumerate() {
-            sector[i * 4..i * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            sector[i * ENTRY_SIZE..(i + 1) * ENTRY_SIZE].copy_from_slice(&value.to_le_bytes());
         }
         sector
     }
@@ -248,7 +250,7 @@ impl Fat {
             .max(1)
             .min(sectors.next_power_of_two())
             .next_power_of_two();
-        let per_sector = ss / 4;
+        let per_sector = ss / ENTRY_SIZE;
         let max = layout.max_cluster() as usize;
         let mut free = 0u32;
         let mut may_have_free = BitSet::new(sectors);
@@ -260,9 +262,9 @@ impl Fat {
             for s in 0..n {
                 let first_cluster = (sector + s) * per_sector;
                 let mut any = false;
-                for (i, e) in buf[s * ss..(s + 1) * ss].chunks_exact(4).enumerate() {
+                for (i, e) in buf[s * ss..(s + 1) * ss].chunks_exact(ENTRY_SIZE).enumerate() {
                     let cluster = first_cluster + i;
-                    if cluster < 2 || cluster > max {
+                    if cluster < FIRST_CLUSTER as usize || cluster > max {
                         continue;
                     }
                     if le32(e, 0) & ENTRY_MASK == FREE {
@@ -318,7 +320,7 @@ impl Fat {
 
     /// FAT sector and byte offset of a cluster's entry.
     fn locate(&self, cluster: u32) -> (usize, usize) {
-        let offset = cluster as usize * 4;
+        let offset = cluster as usize * ENTRY_SIZE;
         let ss = self.layout.sector_size as usize;
         (offset / ss, offset % ss)
     }
@@ -398,7 +400,7 @@ impl Fat {
         } else {
             (old & !ENTRY_MASK) | (value & ENTRY_MASK)
         };
-        cache.data[at..at + 4].copy_from_slice(&new.to_le_bytes());
+        cache.data[at..at + ENTRY_SIZE].copy_from_slice(&new.to_le_bytes());
         if !cache.dirty[slot] {
             cache.dirty[slot] = true;
             cache.changed.push(sector);
@@ -514,7 +516,7 @@ impl Fat {
     /// The first free cluster in `lo..=hi`, skipping the FAT sectors known
     /// to be full and remembering the ones found full on the way.
     fn find_free(&mut self, store: &dyn FatStore, lo: u32, hi: u32) -> Result<Option<u32>> {
-        let per_sector = self.layout.sector_size as usize / 4;
+        let per_sector = self.layout.sector_size as usize / ENTRY_SIZE;
         let mut c = lo as usize;
         while c <= hi as usize {
             let sector = c / per_sector;
@@ -528,7 +530,7 @@ impl Fat {
             let found = {
                 let cache = self.cache.borrow();
                 let base = cache.range(slot).start;
-                (c..=end).find(|&x| le32(&cache.data, base + (x % per_sector) * 4) & ENTRY_MASK == FREE)
+                (c..=end).find(|&x| le32(&cache.data, base + (x % per_sector) * ENTRY_SIZE) & ENTRY_MASK == FREE)
             };
             if let Some(x) = found {
                 return Ok(Some(x as u32));
@@ -671,15 +673,15 @@ impl VecStore {
         let mut bytes = self.bytes.borrow_mut();
         let copies = bytes.len() / self.copy_bytes;
         for copy in 0..copies {
-            let at = copy * self.copy_bytes + cluster as usize * 4;
-            bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            let at = copy * self.copy_bytes + cluster as usize * ENTRY_SIZE;
+            bytes[at..at + ENTRY_SIZE].copy_from_slice(&value.to_le_bytes());
         }
     }
 
     /// One entry of one copy.
     pub(crate) fn peek(&self, copy: u32, cluster: u32) -> u32 {
         let bytes = self.bytes.borrow();
-        let at = copy as usize * self.copy_bytes + cluster as usize * 4;
+        let at = copy as usize * self.copy_bytes + cluster as usize * ENTRY_SIZE;
         le32(&bytes, at)
     }
 }
@@ -831,7 +833,9 @@ mod tests {
             runs.iter().map(|(s, d)| (*s, d.len())).collect::<Vec<_>>(),
             vec![(0, 1024), (3, 512)]
         );
-        assert_eq!(&runs[0].1[5 * 4..6 * 4], &END_OF_CHAIN.to_le_bytes());
+        // The entry of cluster 5, in the first run.
+        let at = 5 * ENTRY_SIZE;
+        assert_eq!(&runs[0].1[at..at + ENTRY_SIZE], &END_OF_CHAIN.to_le_bytes());
         assert!(f.take_dirty_runs().is_empty());
         assert!(!f.cache.borrow().dirty.iter().any(|&d| d));
     }

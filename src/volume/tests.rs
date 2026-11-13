@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! Tests of the volume.
 use super::*;
+use crate::fat::{END_OF_CHAIN, ENTRY_SIZE};
 use crate::format::{self, FormatOptions};
 use crate::fsck;
+use crate::layout::FIRST_CLUSTER;
 use crate::test_util::{format_options, volume, TempImage};
 use std::io::{Read, Write};
 use std::time::{Duration, UNIX_EPOCH};
@@ -424,7 +426,7 @@ fn garbage_beyond_the_last_fat_entry_is_ignored() {
     v.close().unwrap();
     // The table ends with the entry of the last cluster; the rest of the
     // FAT's sectors is padding that nothing should depend on.
-    let used = (u64::from(layout.max_cluster()) + 1) * 4;
+    let used = u64::from(layout.fat_entries()) * ENTRY_SIZE as u64;
     let padding = u64::from(layout.fat_sectors) * u64::from(layout.sector_size) - used;
     assert!(padding > 0);
     let dev = img.device();
@@ -449,20 +451,23 @@ fn an_oversized_directory_chain_is_refused() {
     let d = v.metadata("/d").unwrap();
     let layout = *v.layout();
     v.close().unwrap();
-    // Link the directory through every cluster of the volume.
+    // Link the directory through every cluster of the volume but the
+    // root's, which is the first.
     let mut fat = vec![0u8; layout.fat_size() as usize];
     let dev = img.device();
     dev.read_at(layout.fat_offset(0), &mut fat).unwrap();
     let max = layout.max_cluster();
     let mut c = d.first_cluster;
-    for next in 3..=max {
+    for next in FIRST_CLUSTER + 1..=max {
         if next == d.first_cluster {
             continue;
         }
-        fat[c as usize * 4..c as usize * 4 + 4].copy_from_slice(&next.to_le_bytes());
+        let at = c as usize * ENTRY_SIZE;
+        fat[at..at + ENTRY_SIZE].copy_from_slice(&next.to_le_bytes());
         c = next;
     }
-    fat[c as usize * 4..c as usize * 4 + 4].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+    let at = c as usize * ENTRY_SIZE;
+    fat[at..at + ENTRY_SIZE].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
     for copy in 0..layout.fats {
         dev.write_at(layout.fat_offset(copy), &fat).unwrap();
     }
@@ -790,9 +795,10 @@ fn the_volume_is_marked_dirty_while_written() {
     let (img, mut v) = volume(1 << 20, 512, 512);
     let layout = *v.layout();
     let fsinfo = usize::from(v.boot_sector().fsinfo_sector) * layout.sector_size as usize;
+    // FAT entry 1, the second one, of `copy`.
     let entry1 = |bytes: &[u8], copy: u32| {
-        let off = layout.fat_offset(copy) as usize + 4;
-        u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap())
+        let off = layout.fat_offset(copy) as usize + ENTRY_SIZE;
+        u32::from_le_bytes(bytes[off..off + ENTRY_SIZE].try_into().unwrap())
     };
     // Nothing is marked before the first write.
     let bytes = std::fs::read(img.path()).unwrap();
@@ -849,9 +855,10 @@ fn a_volume_closed_unfinished_stays_marked() {
         let bytes = std::fs::read(img.path()).unwrap();
         assert_ne!(bytes[field::NT_FLAGS] & NT_FLAG_DIRTY, 0);
         for copy in 0..layout.fats {
-            let off = layout.fat_offset(copy) as usize + 4;
-            let entry1 = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-            assert_eq!(entry1 & (1 << 27), 0, "FAT {}", copy);
+            // FAT entry 1, the second one, of this copy.
+            let off = layout.fat_offset(copy) as usize + ENTRY_SIZE;
+            let entry1 = u32::from_le_bytes(bytes[off..off + ENTRY_SIZE].try_into().unwrap());
+            assert_eq!(entry1 & ENTRY1_CLEAN_SHUTDOWN, 0, "FAT {}", copy);
         }
         let info = FsInfo::parse(&bytes[fsinfo..fsinfo + FSINFO_SIZE]).unwrap();
         assert_eq!((info.free_clusters, info.next_free), (FSINFO_UNKNOWN, FSINFO_UNKNOWN));

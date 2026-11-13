@@ -25,7 +25,7 @@ use crate::fat::{
     ENTRY_MASK,
 };
 use crate::format::decode_label;
-use crate::layout::Layout;
+use crate::layout::{Layout, FIRST_CLUSTER};
 use crate::name::{
     fold_str, join_long_name, parse_long_name_entry, short_name_to_string, valid_short_char, LongNameEntry,
     LFN_MAX_ENTRIES, LFN_PADDING, LFN_TERMINATOR, LONG_NAME_INVALID, MAX_LONG_NAME,
@@ -1336,7 +1336,7 @@ impl<'a> Checker<'a> {
                 }
             }
         }
-        let bad = (2..=self.layout.max_cluster())
+        let bad = (FIRST_CLUSTER..=self.layout.max_cluster())
             .filter(|&c| matches!(self.fat.get(&self.store(), c), Ok(Entry::Bad)))
             .count() as u32;
         self.report.borrow_mut().bad_clusters = bad;
@@ -1917,7 +1917,7 @@ impl<'a> Checker<'a> {
     fn check_unreferenced(&mut self) {
         let mut lost = 0;
         let mut reserved_bits = 0u64;
-        for c in 2..=self.layout.max_cluster() {
+        for c in FIRST_CLUSTER..=self.layout.max_cluster() {
             let Ok(raw) = self.fat.raw_entry(&self.store(), c) else {
                 self.error(|| Problem::new(ProblemKind::FatReadFailed).cluster(c));
                 break;
@@ -1951,6 +1951,7 @@ impl<'a> Checker<'a> {
 mod tests {
     use super::*;
     use crate::dirent::{ATTR_DIRECTORY, ATTR_RESERVED};
+    use crate::fat::ENTRY_SIZE;
     use crate::name::LFN_LAST_ENTRY;
     use crate::test_util::{volume, TempImage};
     use crate::time::FatTimestamp;
@@ -2022,7 +2023,7 @@ mod tests {
 
         // Shorten a file's chain: its second cluster becomes free.
         let fat0 = layout.fat_offset(0);
-        let entry = |c: u32| fat0 + u64::from(c) * 4;
+        let entry = |c: u32| fat0 + (u64::from(c) * ENTRY_SIZE as u64);
         dev.write_at(entry(kernel.first_cluster), &0u32.to_le_bytes()).unwrap();
         let r = check(&dev).unwrap();
         let has = |r: &Report, kind: ProblemKind| r.problems.iter().any(|p| p.kind == kind);
@@ -2177,7 +2178,7 @@ mod tests {
         let linux = v.metadata("/EFI/Linux").unwrap();
         v.close().unwrap();
         let dev = img.device();
-        let fat_entry = |copy: u32, c: u32| layout.fat_offset(copy) + u64::from(c) * 4;
+        let fat_entry = |copy: u32, c: u32| layout.fat_offset(copy) + (u64::from(c) * ENTRY_SIZE as u64);
         let has = |r: &Report, kind: ProblemKind| r.problems.iter().any(|p| p.kind == kind);
 
         // Entry 1 says "not cleanly unmounted" in both FAT copies.
@@ -2185,7 +2186,7 @@ mod tests {
             dev.write_at(fat_entry(copy, 1), &0x07FF_FFFFu32.to_le_bytes()).unwrap();
         }
         // The reserved nibble of the kernel's first entry is set.
-        let mut raw = [0u8; 4];
+        let mut raw = [0u8; ENTRY_SIZE];
         dev.read_at(fat_entry(0, kernel.first_cluster), &mut raw).unwrap();
         let value = u32::from_le_bytes(raw) | 0xA000_0000;
         for copy in 0..2 {
