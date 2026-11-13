@@ -55,6 +55,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dlopen"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "fold-table"
 version = "0.1.0"
 
