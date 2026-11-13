@@ -47,6 +47,10 @@ pub const LFN_UNITS_PER_ENTRY: usize = 13;
 pub const LFN_LAST_ENTRY: u8 = 0x40;
 /// Largest sequence number of a long name entry.
 pub const LFN_MAX_ENTRIES: usize = 20;
+/// The unit that ends a long name that does not fill its last entry.
+pub const LFN_TERMINATOR: u16 = 0x0000;
+/// The unit that fills the last entry of a long name after its terminator.
+pub const LFN_PADDING: u16 = 0xFFFF;
 
 /// Characters that may not appear in a long name, besides control characters.
 pub(crate) const LONG_NAME_INVALID: &[char] = &['"', '*', '/', ':', '<', '>', '?', '\\', '|'];
@@ -377,12 +381,12 @@ pub fn long_name_entries(name: &LongName, checksum: u8) -> Vec<[u8; DIR_ENTRY_SI
         let start = (seq - 1) * LFN_UNITS_PER_ENTRY;
         for (i, &off) in LFN_UNIT_OFFSETS.iter().enumerate() {
             let pos = start + i;
-            // The name is terminated by one 0x0000 unit and padded with
-            // 0xFFFF; a name that fills its entries has neither.
+            // The name ends with a terminator and is padded after it. A
+            // name that fills its entries has neither.
             let unit = match units.get(pos) {
                 Some(&u) => u,
-                None if pos == units.len() => 0x0000,
-                None => 0xFFFF,
+                None if pos == units.len() => LFN_TERMINATOR,
+                None => LFN_PADDING,
             };
             e[off..off + 2].copy_from_slice(&unit.to_le_bytes());
         }
@@ -425,14 +429,14 @@ pub fn parse_long_name_entry(raw: &[u8; DIR_ENTRY_SIZE]) -> Option<LongNameEntry
 
 /// Joins the units of a complete set of long name entries, given in
 /// sequence order (1 first), into the stored name. Reading stops at the
-/// first 0x0000 unit; 0xFFFF padding without a terminator ends the name as
-/// well, where Linux would decode it as U+FFFF. Nothing this crate writes
-/// has such a name, see [`LongName::new`].
+/// first [`LFN_TERMINATOR`]. [`LFN_PADDING`] without a terminator ends the
+/// name as well, where Linux would decode it as U+FFFF. Nothing this crate
+/// writes has such a name, see [`LongName::new`].
 pub fn join_long_name(entries: &[LongNameEntry]) -> Vec<u16> {
     entries
         .iter()
         .flat_map(|e| e.units)
-        .take_while(|&u| u != 0x0000 && u != 0xFFFF)
+        .take_while(|&u| u != LFN_TERMINATOR && u != LFN_PADDING)
         .collect()
 }
 
@@ -587,8 +591,8 @@ mod tests {
         assert_eq!(p.sequence, 1);
         assert!(p.last);
         let mut expected: Vec<u16> = "Readme.txt".encode_utf16().collect();
-        expected.push(0);
-        expected.extend([0xFFFF, 0xFFFF]);
+        expected.push(LFN_TERMINATOR);
+        expected.extend([LFN_PADDING, LFN_PADDING]);
         assert_eq!(p.units.to_vec(), expected);
         assert_eq!(join_long_name(&[p]), n.units());
 
@@ -607,8 +611,8 @@ mod tests {
         assert_eq!(e[1][0], 0x01);
         let first = parse_long_name_entry(&e[0]).unwrap();
         assert_eq!(first.units[0], 's' as u16);
-        assert_eq!(first.units[1], 0);
-        assert_eq!(first.units[2], 0xFFFF);
+        assert_eq!(first.units[1], LFN_TERMINATOR);
+        assert_eq!(first.units[2], LFN_PADDING);
         let second = parse_long_name_entry(&e[1]).unwrap();
         assert_eq!(join_long_name(&[second, first]), n.units());
     }

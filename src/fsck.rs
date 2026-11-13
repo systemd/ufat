@@ -30,7 +30,7 @@ use crate::format::decode_label;
 use crate::layout::Layout;
 use crate::name::{
     fold_str, join_long_name, parse_long_name_entry, short_name_to_string, valid_short_char, LongNameEntry,
-    LFN_MAX_ENTRIES, LONG_NAME_INVALID, MAX_LONG_NAME,
+    LFN_MAX_ENTRIES, LFN_PADDING, LFN_TERMINATOR, LONG_NAME_INVALID, MAX_LONG_NAME,
 };
 use crate::progress::Progress;
 use crate::volume::DeviceStore;
@@ -1750,11 +1750,12 @@ impl<'a> Checker<'a> {
                     .expected(MAX_LONG_NAME as u64)
             });
         }
-        // After the name there must be one 0x0000 and then only 0xFFFF.
+        // After the name there must be one terminator and then only
+        // padding.
         let all: Vec<u16> = entries.iter().flat_map(|e| e.units).collect();
         if units.len() < all.len() {
             let tail = &all[units.len()..];
-            if tail[0] != 0 || tail[1..].iter().any(|&u| u != 0xFFFF) {
+            if tail[0] != LFN_TERMINATOR || tail[1..].iter().any(|&u| u != LFN_PADDING) {
                 self.warning(|| Problem::new(ProblemKind::LongNamePadding).path(self.path_of(path)));
             }
         }
