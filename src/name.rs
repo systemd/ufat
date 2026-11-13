@@ -27,7 +27,8 @@
 
 use crate::bytes::le16;
 use crate::dirent::{
-    RawDirEntry, ATTR_LONG_NAME, CASE_LOWER_BASE, CASE_LOWER_EXT, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_E5_ESCAPE,
+    self, RawDirEntry, ATTR_LONG_NAME, CASE_LOWER_BASE, CASE_LOWER_EXT, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_E5_ESCAPE,
+    ENTRY_END,
 };
 use crate::errno::*;
 use crate::Result;
@@ -62,8 +63,29 @@ const RESERVED_NAMES: &[&[u8]] = &[
     b"LPT1", b"LPT2", b"LPT3", b"LPT4", b"LPT5", b"LPT6", b"LPT7", b"LPT8", b"LPT9",
 ];
 
-/// Byte offsets of the 13 UTF-16 units inside a long name entry.
-const LFN_UNIT_OFFSETS: [usize; LFN_UNITS_PER_ENTRY] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+/// Byte offsets of the 13 UTF-16 units inside a long name entry: the units
+/// of its three name fields, in order.
+const LFN_UNIT_OFFSETS: [usize; LFN_UNITS_PER_ENTRY] = {
+    let fields = [
+        dirent::lfn_field::NAME1,
+        dirent::lfn_field::NAME2,
+        dirent::lfn_field::NAME3,
+    ];
+    let mut offsets = [0; LFN_UNITS_PER_ENTRY];
+    let mut n = 0;
+    let mut f = 0;
+    while f < fields.len() {
+        let mut off = fields[f].start;
+        while off < fields[f].end {
+            offsets[n] = off;
+            n += 1;
+            off += size_of::<u16>();
+        }
+        f += 1;
+    }
+    assert!(n == LFN_UNITS_PER_ENTRY);
+    offsets
+};
 
 /// A validated long file name.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -375,9 +397,9 @@ pub fn long_name_entries(name: &LongName, checksum: u8) -> Vec<[u8; DIR_ENTRY_SI
     let mut out = Vec::with_capacity(count);
     for seq in (1..=count).rev() {
         let mut e = [0u8; DIR_ENTRY_SIZE];
-        e[0] = seq as u8 | if seq == count { LFN_LAST_ENTRY } else { 0 };
-        e[11] = ATTR_LONG_NAME;
-        e[13] = checksum;
+        e[dirent::lfn_field::ORDER] = seq as u8 | if seq == count { LFN_LAST_ENTRY } else { 0 };
+        e[dirent::lfn_field::ATTR] = ATTR_LONG_NAME;
+        e[dirent::lfn_field::CHECKSUM] = checksum;
         let start = (seq - 1) * LFN_UNITS_PER_ENTRY;
         for (i, &off) in LFN_UNIT_OFFSETS.iter().enumerate() {
             let pos = start + i;
@@ -388,7 +410,7 @@ pub fn long_name_entries(name: &LongName, checksum: u8) -> Vec<[u8; DIR_ENTRY_SI
                 None if pos == units.len() => LFN_TERMINATOR,
                 None => LFN_PADDING,
             };
-            e[off..off + 2].copy_from_slice(&unit.to_le_bytes());
+            e[off..off + size_of::<u16>()].copy_from_slice(&unit.to_le_bytes());
         }
         out.push(e);
     }
@@ -411,18 +433,19 @@ pub struct LongNameEntry {
 /// Decodes a long name entry. Returns None if the slot is not a well formed
 /// long name entry.
 pub fn parse_long_name_entry(raw: &[u8; DIR_ENTRY_SIZE]) -> Option<LongNameEntry> {
-    if raw[11] != ATTR_LONG_NAME || raw[0] == ENTRY_DELETED || raw[0] == 0 {
+    let order = raw[dirent::lfn_field::ORDER];
+    if raw[dirent::lfn_field::ATTR] != ATTR_LONG_NAME || order == ENTRY_DELETED || order == ENTRY_END {
         return None;
     }
-    let sequence = raw[0] & !LFN_LAST_ENTRY;
+    let sequence = order & !LFN_LAST_ENTRY;
     if sequence == 0 || sequence as usize > LFN_MAX_ENTRIES {
         return None;
     }
     let units = LFN_UNIT_OFFSETS.map(|off| le16(raw, off));
     Some(LongNameEntry {
         sequence,
-        last: raw[0] & LFN_LAST_ENTRY != 0,
-        checksum: raw[13],
+        last: order & LFN_LAST_ENTRY != 0,
+        checksum: raw[dirent::lfn_field::CHECKSUM],
         units,
     })
 }
@@ -580,13 +603,14 @@ mod tests {
     #[test]
     fn long_name_entry_layout() {
         let n = LongName::new("Readme.txt").unwrap();
-        let e = long_name_entries(&n, 0x42);
+        let checksum = 0x42;
+        let e = long_name_entries(&n, checksum);
         assert_eq!(e.len(), 1);
-        assert_eq!(e[0][0], 0x41);
-        assert_eq!(e[0][11], ATTR_LONG_NAME);
-        assert_eq!(e[0][12], 0);
-        assert_eq!(e[0][13], 0x42);
-        assert_eq!(&e[0][26..28], &[0, 0]);
+        assert_eq!(e[0][dirent::lfn_field::ORDER], LFN_LAST_ENTRY | 1);
+        assert_eq!(e[0][dirent::lfn_field::ATTR], ATTR_LONG_NAME);
+        assert_eq!(e[0][dirent::lfn_field::TYPE], 0);
+        assert_eq!(e[0][dirent::lfn_field::CHECKSUM], checksum);
+        assert_eq!(&e[0][dirent::lfn_field::FIRST_CLUSTER], &[0, 0]);
         let p = parse_long_name_entry(&e[0]).unwrap();
         assert_eq!(p.sequence, 1);
         assert!(p.last);
@@ -607,8 +631,8 @@ mod tests {
         let n = LongName::new("fourteen_chars").unwrap();
         let e = long_name_entries(&n, 0);
         assert_eq!(e.len(), 2);
-        assert_eq!(e[0][0], 0x42);
-        assert_eq!(e[1][0], 0x01);
+        assert_eq!(e[0][dirent::lfn_field::ORDER], LFN_LAST_ENTRY | 2);
+        assert_eq!(e[1][dirent::lfn_field::ORDER], 1);
         let first = parse_long_name_entry(&e[0]).unwrap();
         assert_eq!(first.units[0], 's' as u16);
         assert_eq!(first.units[1], LFN_TERMINATOR);

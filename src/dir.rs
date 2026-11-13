@@ -985,7 +985,7 @@ mod proofs {
         let lfn: [u8; DIR_ENTRY_SIZE] = kani::any();
         kani::assume(lfn[dirent::field::MARKER] != ENTRY_END && lfn[dirent::field::MARKER] != ENTRY_DELETED);
         data[..DIR_ENTRY_SIZE].copy_from_slice(&lfn);
-        data[11] = ATTR_LONG_NAME;
+        data[dirent::lfn_field::ATTR] = ATTR_LONG_NAME;
         let short: [u8; DIR_ENTRY_SIZE] = kani::any();
         kani::assume(
             short[dirent::field::MARKER] != ENTRY_END
@@ -1055,7 +1055,7 @@ mod proofs {
 mod tests {
     use super::*;
     use crate::dirent::{ATTR_ARCHIVE, ATTR_DIRECTORY};
-    use crate::name::{long_name_entries, LongName};
+    use crate::name::{long_name_entries, LongName, LFN_LAST_ENTRY, LFN_MAX_ENTRIES};
 
     fn dir() -> Directory {
         Directory::new(vec![2], vec![0u8; 512], 512).unwrap()
@@ -1205,11 +1205,14 @@ mod tests {
         let lfn = long_name_entries(&name, short_name_checksum(&s.name));
         d.write_entry(0, &lfn, &s);
         d.write_entry(3, &[], &short(b"OTHER   TXT", ATTR_ARCHIVE));
-        // Sequence 31 with the last bit, a set 0x80 bit and sequence 0:
-        // none of them is a long name entry, none of them a short one.
-        for bad in [0x40 | 31, 0x81, 0x40] {
+        // A sequence above the most a long name has, sequence 1 with bit 7
+        // set, and sequence 0: none of them is a long name entry, none of
+        // them a short one.
+        const ORDER_BIT_7: u8 = 1 << 7;
+        let above = LFN_MAX_ENTRIES as u8 + 1;
+        for bad in [LFN_LAST_ENTRY | above, ORDER_BIT_7 | 1, LFN_LAST_ENTRY] {
             let mut slot = lfn[0];
-            slot[0] = bad;
+            slot[dirent::lfn_field::ORDER] = bad;
             d.set_slot(0, &slot);
             let e = d.entries();
             assert_eq!(e.len(), 2, "{:#x}: {:?}", bad, e);
@@ -1223,7 +1226,7 @@ mod tests {
         // The same byte in the slot right before the short entry.
         d.set_slot(0, &lfn[0]);
         let mut slot = lfn[1];
-        slot[0] = 0x81;
+        slot[dirent::lfn_field::ORDER] = ORDER_BIT_7 | 1;
         d.set_slot(1, &slot);
         let e = d.entries();
         assert_eq!(e.len(), 2);

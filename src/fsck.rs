@@ -1559,7 +1559,7 @@ impl<'a> Checker<'a> {
                             .slot(slot as u32)
                     });
                 }
-                if raw[12] != 0 || raw[26] != 0 || raw[27] != 0 {
+                if raw[dirent::lfn_field::TYPE] != 0 || raw[dirent::lfn_field::FIRST_CLUSTER] != [0, 0] {
                     self.warning(|| {
                         Problem::new(ProblemKind::LongNameReservedBytes)
                             .path(self.chain_path(dir.chain))
@@ -1585,7 +1585,7 @@ impl<'a> Checker<'a> {
                     Problem::new(ProblemKind::LongNameBadSequence)
                         .path(self.chain_path(dir.chain))
                         .slot(slot as u32)
-                        .value(u64::from(raw[0]))
+                        .value(u64::from(raw[dirent::lfn_field::ORDER]))
                 });
                 continue;
             }
@@ -1949,6 +1949,7 @@ impl<'a> Checker<'a> {
 mod tests {
     use super::*;
     use crate::dirent::{ATTR_DIRECTORY, ATTR_RESERVED};
+    use crate::name::LFN_LAST_ENTRY;
     use crate::test_util::{volume, TempImage};
     use crate::time::FatTimestamp;
     use std::io::Write;
@@ -2207,8 +2208,14 @@ mod tests {
         // The attributes of "EFI", the first slot of the root.
         dev.write_at(root_off + dirent::field::ATTR as u64, &[ATTR_DIRECTORY | ATTR_RESERVED])
             .unwrap();
+        // The first cluster field of the third slot of /EFI/Linux, after "."
+        // and "..": the first long name entry of "kernel 0.efi".
         let linux_off = layout.cluster_offset(linux.first_cluster).unwrap();
-        dev.write_at(linux_off + 2 * 32 + 26, &[1, 0]).unwrap();
+        dev.write_at(
+            linux_off + (2 * DIR_ENTRY_SIZE + dirent::lfn_field::FIRST_CLUSTER.start) as u64,
+            &1u16.to_le_bytes(),
+        )
+        .unwrap();
         // The root's last entry is followed by a long name slot with a
         // sequence byte that is out of range.
         let mut root_raw = vec![0u8; layout.cluster_size() as usize];
@@ -2217,9 +2224,10 @@ mod tests {
             .chunks_exact(DIR_ENTRY_SIZE)
             .position(|s| s[dirent::field::MARKER] == ENTRY_END)
             .unwrap();
+        let bad_order = LFN_LAST_ENTRY | (LFN_MAX_ENTRIES as u8 + 1);
         let mut slot = [0u8; DIR_ENTRY_SIZE];
-        slot[0] = 0x40 | 31;
-        slot[11] = ATTR_LONG_NAME;
+        slot[dirent::lfn_field::ORDER] = bad_order;
+        slot[dirent::lfn_field::ATTR] = ATTR_LONG_NAME;
         dev.write_at(root_off + (end * DIR_ENTRY_SIZE) as u64, &slot).unwrap();
 
         let r = check(&dev).unwrap();
@@ -2239,7 +2247,7 @@ mod tests {
         assert!(r
             .problems
             .iter()
-            .any(|p| p.kind == ProblemKind::LongNameBadSequence && p.value == Some(0x5f)));
+            .any(|p| p.kind == ProblemKind::LongNameBadSequence && p.value == Some(u64::from(bad_order))));
         assert!(!has(&r, ProblemKind::FatHardwareErrorFlag), "{:?}", r.problems);
         // The nibble is an error: GRUB loses the file.
         assert!(r

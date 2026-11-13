@@ -71,6 +71,31 @@ pub mod field {
     pub const SIZE: Range<usize> = 28..32;
 }
 
+/// Byte offsets of the fields of a long name entry. The names in the
+/// comments are the ones the FAT specification uses.
+pub mod lfn_field {
+    use std::ops::Range;
+
+    /// Sequence byte: the sequence number and the flag of the last entry,
+    /// LDIR_Ord.
+    pub const ORDER: usize = 0;
+    /// UTF-16 units 1 to 5 of the entry, LDIR_Name1.
+    pub const NAME1: Range<usize> = 1..11;
+    /// Attribute bits, always [`ATTR_LONG_NAME`](super::ATTR_LONG_NAME),
+    /// LDIR_Attr.
+    pub const ATTR: usize = 11;
+    /// Entry type, 0 for an entry that holds part of a long name, LDIR_Type.
+    pub const TYPE: usize = 12;
+    /// Checksum of the short name the entry belongs to, LDIR_Chksum.
+    pub const CHECKSUM: usize = 13;
+    /// UTF-16 units 6 to 11 of the entry, LDIR_Name2.
+    pub const NAME2: Range<usize> = 14..26;
+    /// First cluster, always 0, LDIR_FstClusLO.
+    pub const FIRST_CLUSTER: Range<usize> = 26..28;
+    /// UTF-16 units 12 and 13 of the entry, LDIR_Name3.
+    pub const NAME3: Range<usize> = 28..32;
+}
+
 /// A decoded short directory entry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RawDirEntry {
