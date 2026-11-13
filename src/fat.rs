@@ -46,9 +46,11 @@ fn broken_chain(cluster: u32) -> Detail {
     }
 }
 
-/// The bits of a FAT32 entry that carry the cluster number. The top four
-/// bits are reserved and preserved when writing.
+/// The bits of a FAT32 entry that carry the cluster number.
 pub const ENTRY_MASK: u32 = 0x0FFF_FFFF;
+/// The top four bits of a FAT32 entry, which are reserved: they are kept
+/// as they are when an entry is written.
+pub const RESERVED_BITS: u32 = !ENTRY_MASK;
 /// Size of a FAT32 entry in bytes, a little-endian `u32`.
 pub const ENTRY_SIZE: usize = size_of::<u32>();
 /// Entries at or above this value mark the end of a chain.
@@ -398,7 +400,7 @@ impl Fat {
         let new = if whole {
             value
         } else {
-            (old & !ENTRY_MASK) | (value & ENTRY_MASK)
+            (old & RESERVED_BITS) | (value & ENTRY_MASK)
         };
         cache.data[at..at + ENTRY_SIZE].copy_from_slice(&new.to_le_bytes());
         if !cache.dirty[slot] {
@@ -806,13 +808,17 @@ mod tests {
     fn high_nibble_is_preserved() {
         let l = layout(1, 100);
         let s = VecStore::fresh(&l, 0xF8);
-        s.poke(20, 0xA000_0000);
+        // Two of the reserved bits, so that keeping them is not the same as
+        // setting all of them.
+        let pattern: u32 = (1 << 31) | (1 << 29);
+        assert_eq!(pattern & RESERVED_BITS, pattern);
+        s.poke(20, pattern);
         let mut f = Fat::open(&l, &s, 0, CACHE_BYTES).unwrap();
         f.set(&s, 20, END_OF_CHAIN).unwrap();
-        assert_eq!(f.raw_entry(&s, 20).unwrap(), 0xAFFF_FFFF);
+        assert_eq!(f.raw_entry(&s, 20).unwrap(), pattern | END_OF_CHAIN);
         assert_eq!(f.get(&s, 20).unwrap(), Entry::End);
         flush(&mut f, &s);
-        assert_eq!(s.peek(1, 20), 0xAFFF_FFFF);
+        assert_eq!(s.peek(1, 20), pattern | END_OF_CHAIN);
     }
 
     #[test]

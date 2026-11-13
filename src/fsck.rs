@@ -22,7 +22,7 @@ use crate::dirent::{
 use crate::errno::*;
 use crate::fat::{
     media_entry, BitSet, Entry, Fat, CACHE_BYTES, END_OF_CHAIN_MIN, ENTRY1_CLEAN_SHUTDOWN, ENTRY1_NO_HARD_ERROR,
-    ENTRY_MASK,
+    ENTRY_MASK, RESERVED_BITS,
 };
 use crate::format::decode_label;
 use crate::layout::{Layout, FIRST_CLUSTER};
@@ -1922,7 +1922,7 @@ impl<'a> Checker<'a> {
                 self.error(|| Problem::new(ProblemKind::FatReadFailed).cluster(c));
                 break;
             };
-            if raw & !ENTRY_MASK != 0 {
+            if raw & RESERVED_BITS != 0 {
                 reserved_bits += 1;
             }
             match raw & ENTRY_MASK {
@@ -2188,7 +2188,7 @@ mod tests {
         // The reserved nibble of the kernel's first entry is set.
         let mut raw = [0u8; ENTRY_SIZE];
         dev.read_at(fat_entry(0, kernel.first_cluster), &mut raw).unwrap();
-        let value = u32::from_le_bytes(raw) | 0xA000_0000;
+        let value = u32::from_le_bytes(raw) | RESERVED_BITS;
         for copy in 0..2 {
             dev.write_at(fat_entry(copy, kernel.first_cluster), &value.to_le_bytes())
                 .unwrap();
