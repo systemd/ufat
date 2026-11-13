@@ -4,6 +4,7 @@
 members = [
     ".",
     "src/blkid",
+    "src/cli",
     "src/cpio",
     "src/dlopen",
     "src/dlopen-note",
@@ -24,6 +25,7 @@ members = [
 default-members = [
     ".",
     "src/blkid",
+    "src/cli",
     "src/cpio",
     "src/dlopen",
     "src/dlopen-note",
@@ -48,6 +50,7 @@ publish = false
 
 [workspace.dependencies]
 blkid = { path = "src/blkid" }
+cli = { path = "src/cli" }
 cpio = { path = "src/cpio" }
 dlopen = { path = "src/dlopen" }
 dlopen-note = { path = "src/dlopen-note" }
@@ -77,10 +80,11 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+cli.workspace = true
 fat.workspace = true
 json.workspace = true
-lexopt.workspace = true
 libc.workspace = true
+shared.workspace = true
 varlink.workspace = true
 
 [dev-dependencies]

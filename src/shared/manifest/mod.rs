@@ -4,8 +4,10 @@
 //! of the `uapi16` crate.
 
 mod error;
+mod read;
 mod source;
 mod written;
 
+pub use read::{read_all, MAX_MANIFEST_BYTES};
 pub use source::{DirectorySource, SourceDirectory};
 pub use written::WriteReport;

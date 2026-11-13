@@ -36,6 +36,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
+name = "cli"
+version = "0.1.0"
+dependencies = [
+ "lexopt",
+ "shared",
+]
+
+[[package]]
 name = "cpio"
 version = "0.1.0"
 dependencies = [
@@ -194,11 +202,12 @@ dependencies = [
 name = "ufat"
 version = "0.1.0"
 dependencies = [
+ "cli",
  "cpio",
  "fat",
  "json",
- "lexopt",
  "libc",
+ "shared",
  "varlink",
 ]
 

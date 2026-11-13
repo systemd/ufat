@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-//! What time a copy of a file gets.
+//! What time a copy of a file gets, and what the tools share to handle
+//! times.
 
 use std::time::SystemTime;
 
@@ -24,4 +25,9 @@ impl TimePolicy {
             TimePolicy::Clamp(t) => source.min(t),
         }
     }
+}
+
+/// The current time.
+pub fn now() -> SystemTime {
+    SystemTime::now()
 }
