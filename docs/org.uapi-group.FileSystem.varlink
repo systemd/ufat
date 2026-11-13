@@ -475,9 +475,10 @@ method Assemble(
 	mode: ?AssembleMode,
 	options: ?FormatOptions,
 	content: ?Content,
-	# Hash the whole image window as it is after the call: the written bytes
-	# and the rest, which the implementation knows to be zero when the call
-	# sized or zeroed the image, and reads back otherwise
+	# Hash the filesystem as it is in the image after the call, all size bytes
+	# from offset: the written bytes and the rest, which the implementation
+	# knows to be zero when the call sized or zeroed the image, and reads back
+	# otherwise
 	imageHash: ?HashAlgorithm
 ) -> (
 	# The step in progress, in intermediate replies only

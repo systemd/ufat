@@ -764,7 +764,8 @@ pub(crate) fn capabilities() -> ufat::Result<Object> {
     })
 }
 
-/// The hash of an image window, as `imageHash` asks for it.
+/// The hash of a file system as it is in its image, as `imageHash` asks
+/// for it.
 pub(crate) enum Hash {
     Sha256(Sha256),
     Sha512(Sha512),
@@ -779,9 +780,8 @@ impl Hash {
         }
     }
 
-    /// Reads the whole window of `device` back and returns the hash in
-    /// lowercase hex, telling `progress` how many bytes it read so far after
-    /// every read.
+    /// Reads all of `device` back and returns the hash in lowercase hex,
+    /// telling `progress` how many bytes it read so far after every read.
     pub(crate) fn of(mut self, device: &Device, progress: &mut dyn FnMut(&Progress)) -> ufat::Result<String> {
         let mut buf = vec![0u8; HASH_STEP];
         let mut offset = 0;
