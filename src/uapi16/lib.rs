@@ -15,6 +15,10 @@
 //!   the manifest declares, and with the fields of the [`Features`] the
 //!   manifest records.
 //! - [`Decoder`] does the same with the bytes it is fed, and does no I/O.
+//! - [`Writer`] writes a manifest record by record to a [`Write`], and
+//!   checks it the way the reader does. [`Encoder`] does the same into a
+//!   string, and does no I/O. [`Sha256Context`] computes the hash of a file
+//!   while it is read, and [`Finalize::finalize`] returns it.
 //! - [`RootObject`], [`FileObject`], [`Contents`] and [`Signature`] are the
 //!   objects, and [`Name`], [`InodeType`], [`Mode`], [`DosFlags`],
 //!   [`InodeFlags`], [`Sha256`] and [`Uuid`] what their fields hold. What
@@ -34,11 +38,17 @@
 //! reads a whole record, of up to [`MAX_RECORD_SIZE`] bytes with its record
 //! separator, at once.
 //!
+//! A manifest that does not go to a [`Write`] is put together by an
+//! [`Encoder`]: [`Encoder::begin`], [`Encoder::file`],
+//! [`Encoder::signature`] and [`Encoder::finish`] append its records to a
+//! string, and the caller sends them on.
+//!
 //! A manifest is input from outside and can be very large. Reading one
 //! takes time in proportion to its size, and keeps one record without its
 //! separator and the name of the file object before it in memory: less
 //! than [`MAX_RECORD_SIZE`] and at most [`Name::MAX_LEN`] bytes. Nothing
-//! grows with the manifest.
+//! grows with the manifest. Writing one keeps the record it puts together,
+//! its separator included, and the name of the file object before it.
 //!
 //! Signature objects are read and not verified: that takes an OpenPGP or
 //! an X.509 implementation. [`Reader::signed_len`] says how much of the
@@ -50,6 +60,7 @@
 //!
 //! [UAPI.16 file manifest]: https://uapi-group.org/specifications/specs/file_manifest/
 //! [`Read`]: std::io::Read
+//! [`Write`]: std::io::Write
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -64,6 +75,7 @@ mod name;
 mod object;
 mod reader;
 mod sequence;
+mod writer;
 
 pub use digest::{Digest, Finalize, InvalidDigest, Sha256, Sha256Context};
 pub use error::{Error, ErrorKind, Field, Invalid, Problem};
@@ -75,6 +87,7 @@ pub use object::{
     Uuid, Validity, ValidityWindow,
 };
 pub use reader::{Decoder, Object, Reader, Step};
+pub use writer::{Encoder, Writer};
 
 /// The media type of a manifest, which its first object carries.
 pub const MEDIA_TYPE: &str = "application/vnd.uapi.16.manifest";
@@ -94,8 +107,9 @@ pub(crate) const RECORD_END: u8 = b'\n';
 /// The namespace of the extended attributes of a file object, the one the
 /// specification defines.
 pub(crate) const USER_NAMESPACE: &str = "user";
-/// The largest record a reader takes, from its record separator up to the
-/// next one as the specification counts it, the same as systemd's.
+/// The largest record a reader takes and a writer writes, from its record
+/// separator up to the next one as the specification counts it, the same
+/// as systemd's.
 pub const MAX_RECORD_SIZE: usize = 4 * 1024 * 1024;
 /// The most contents objects a file object can have, the same as for
 /// systemd.
@@ -108,7 +122,7 @@ pub(crate) const STRING_RULES: json::StringRules = json::StringRules::NO_NONCHAR
 /// What the tests of this crate build manifests from.
 #[cfg(test)]
 pub(crate) mod testing {
-    use super::{Error, FileObject, Name, Object, Reader, RootObject, Signature, RECORD_END, RECORD_SEPARATOR};
+    use super::{Error, FileObject, Name, Object, Reader, RootObject, Signature, Writer, RECORD_END, RECORD_SEPARATOR};
 
     /// The root file object that says nothing but that this is a manifest.
     pub(crate) const ROOT: &str = r#"{"mediaType":"application/vnd.uapi.16.manifest"}"#;
@@ -185,5 +199,17 @@ pub(crate) mod testing {
             names.extend(level.iter().cloned());
         }
         names
+    }
+
+    /// Writes the manifest `whole`.
+    pub(crate) fn write_whole(whole: &Whole) -> Result<Vec<u8>, Error> {
+        let mut writer = Writer::begin(Vec::new(), &whole.root)?;
+        for object in &whole.objects {
+            writer.file(object)?;
+        }
+        for signature in &whole.signatures {
+            writer.signature(signature)?;
+        }
+        writer.finish()
     }
 }

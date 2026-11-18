@@ -846,23 +846,31 @@ impl Contents {
     }
 
     /// Checks `encoding` as the encoding of the data: a content coding of
-    /// HTTP, which does not tell upper case from lower case, other than the
-    /// one that stands for none.
+    /// HTTP other than the one that stands for none, in lower case. HTTP
+    /// does not tell upper case from lower case, so a reader lowers the case
+    /// of what it reads first.
     pub(crate) fn check_encoding(encoding: &str, subject: Subject<'_>) -> Result<(), Error> {
-        if encoding.is_empty() || encoding.eq_ignore_ascii_case(IDENTITY_ENCODING) {
-            return Err(Error::manifest(
-                Problem::InvalidContents,
-                format!("{}: encoding '{}' is not permitted", subject, encoding.escape_debug()),
-            )
-            .at(Field::Encoding));
-        }
-        Ok(())
+        let wrong = if encoding.is_empty() || encoding.eq_ignore_ascii_case(IDENTITY_ENCODING) {
+            "is not permitted"
+        } else if encoding.bytes().any(|b| b.is_ascii_uppercase()) {
+            "is not in lower case"
+        } else {
+            return Ok(());
+        };
+        Err(Error::manifest(
+            Problem::InvalidContents,
+            format!("{}: encoding '{}' {}", subject, encoding.escape_debug(), wrong),
+        )
+        .at(Field::Encoding))
     }
 
     /// Checks `headers` as the header fields of the requests for the data
     /// at a URL: a name is a token as RFC 9110 has it, and none comes twice
     /// in any case. A value has no line break.
-    pub(crate) fn check_headers(headers: &[(String, String)], subject: Subject<'_>) -> Result<(), Error> {
+    pub(crate) fn check_headers<'h>(
+        headers: impl IntoIterator<Item = &'h (String, String)>,
+        subject: Subject<'_>,
+    ) -> Result<(), Error> {
         let mut names = HashSet::new();
         for (name, value) in headers {
             let token = !name.is_empty()

@@ -693,6 +693,12 @@ impl FilledIn {
     pub fn remove(&mut self, field: Field) {
         self.0 &= !FilledIn::bit(field);
     }
+
+    /// The fields that either this or `other` notes, such as those of an
+    /// object and those of its inode attributes.
+    pub(crate) const fn union(self, other: FilledIn) -> FilledIn {
+        FilledIn(self.0 | other.0)
+    }
 }
 
 impl fmt::Debug for FilledIn {
