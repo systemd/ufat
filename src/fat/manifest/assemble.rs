@@ -16,8 +16,8 @@ use super::{path_in_volume, EntryKind, ObjectAction, ObjectTriage};
 use crate::errno::*;
 use crate::progress::Progress;
 use crate::sys;
-use crate::volume::{FileWriter, Volume};
-use crate::{Detail, Error, Result};
+use crate::volume::{DirectoryOrigin, FileWriter, NameCollision, Volume};
+use crate::{Error, Result};
 
 /// The directory on the host the files of a manifest are taken from: the
 /// one the manifest lives in, or the one the caller chose instead. It is
@@ -84,16 +84,19 @@ impl Directory for PinnedDirectory {
 }
 
 /// What an assembly does where it could also fail.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct AssembleFlags(u8);
 
 impl AssembleFlags {
-    /// Replace files that exist in the volume instead of failing.
+    /// Use what the volume holds under a name FAT does not tell apart from
+    /// the name of an object, and an existing file of the object's name:
+    /// replace a file, and put the entries of a directory into the one that
+    /// is there.
     pub const REPLACE: AssembleFlags = AssembleFlags(1 << 0);
     /// Skip entries this crate cannot store (see [`EntryKind`]) instead of
     /// failing.
     pub const SKIP_UNSUPPORTED: AssembleFlags = AssembleFlags(1 << 1);
-    /// No flag: an assembly fails in both cases.
+    /// No flag: an assembly fails in both cases. This is the default.
     pub const NONE: AssembleFlags = AssembleFlags(0);
 
     /// Every single flag with its name.
@@ -117,12 +120,15 @@ impl AssembleFlags {
             AssembleFlags(self.0 & !flags.0)
         }
     }
-}
 
-impl Default for AssembleFlags {
-    /// [`AssembleFlags::REPLACE`].
-    fn default() -> AssembleFlags {
-        AssembleFlags::REPLACE
+    /// What an assembly does where the name of an object collides with an
+    /// entry the volume holds, as [`AssembleFlags::REPLACE`] says.
+    fn name_collision(self) -> NameCollision {
+        if self.contains(AssembleFlags::REPLACE) {
+            NameCollision::Replace
+        } else {
+            NameCollision::Fail
+        }
     }
 }
 
@@ -289,8 +295,8 @@ impl PendingFile<'_> {
     fn create(&mut self) -> Result<()> {
         if let Some(volume) = self.volume.take() {
             let time = self.object.inode.mtime().unwrap_or(self.options.default_time);
-            let replace = self.options.flags.contains(AssembleFlags::REPLACE);
-            let mut writer = volume.create_file(self.path, time, replace)?;
+            let collision = self.options.flags.name_collision();
+            let mut writer = volume.create_file(self.path, time, collision)?;
             writer.set_read_only(self.object.inode.is_read_only());
             self.writer = Some(writer);
         }
@@ -373,16 +379,12 @@ impl Assembly<'_> {
     fn store_directory(&mut self, object: &FileObject) -> Result<()> {
         let path = path_in_volume(&object.name);
         let time = object.inode.mtime().unwrap_or(self.options.default_time);
-        match self.volume.metadata(&path) {
-            Ok(md) if md.is_dir => self.volume.set_times(&path, time)?,
-            Ok(_) => bail!(
-                ENOTDIR,
-                Detail::Path(path.clone()),
-                "'{}' exists in the volume and is not a directory",
-                path
-            ),
-            Err(e) if e.errno() == ENOENT => self.volume.create_dir(&path, time)?,
-            Err(e) => return Err(e),
+        match self
+            .volume
+            .find_or_create_dir(&path, time, self.options.flags.name_collision())?
+        {
+            DirectoryOrigin::Created => {}
+            DirectoryOrigin::Existing { .. } => self.volume.set_times(&path, time)?,
         }
         self.report.directories += 1;
         self.observer.progress(&self.report.progress());
@@ -450,11 +452,14 @@ impl Volume {
     /// the last file it supplies, which is found after the trailer of the
     /// manifest.
     ///
-    /// A file the volume holds under the same name, or under a name FAT
-    /// does not tell apart from it, is replaced with
-    /// [`AssembleFlags::REPLACE`] and fails with EEXIST without it. A
-    /// directory the volume holds under such a name gets the directory
-    /// object's time.
+    /// A name FAT does not tell apart from one the volume holds fails with
+    /// EEXIST, and so does a file the volume holds under the same name,
+    /// unless [`AssembleFlags::REPLACE`] is set. A file fails so when its
+    /// first data comes, or at its end when it has none: after the errors
+    /// `source` finds before the data, such as a missing file, and before
+    /// those in the data, such as a hash that does not match. A directory
+    /// the volume holds under the same name gets the directory object's
+    /// time.
     pub fn assemble<R: Read>(
         &mut self,
         reader: &mut Reader<R>,

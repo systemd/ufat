@@ -36,7 +36,7 @@ use fat::populate::{CopyOptions, CopyReport, TimePolicy};
 use fat::probe::Prober;
 use fat::progress::Progress;
 use fat::sha512::Sha512Context;
-use fat::volume::{Metadata, Volume};
+use fat::volume::{Metadata, NameCollision, Volume};
 use fat::{CorruptPlace, Detail, NoSpaceReason, NotFat32Reason, UnsupportedKind};
 use json::{Object, Value};
 use varlink::{Activation, Call, Connection, Info, Reply, Server, Service};
@@ -1085,7 +1085,9 @@ impl Content {
             fill,
             time,
             times,
-            replace: p.bool("replace", true),
+            // Neither method replaces a file that is there, or takes a name
+            // FAT does not tell apart from one that is, unless asked to.
+            replace: p.bool("replace", false),
             fail_unsupported,
             check_validity,
             sink,
@@ -1162,7 +1164,11 @@ impl Content {
     fn copy_options(&self) -> CopyOptions {
         CopyOptions {
             times: self.times,
-            replace: self.replace,
+            name_collision: if self.replace {
+                NameCollision::Replace
+            } else {
+                NameCollision::Fail
+            },
             follow_symlinks: true,
         }
     }

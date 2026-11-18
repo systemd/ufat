@@ -128,7 +128,10 @@ The most common ones:
   to create.
 - `--minimize` makes the file system of `assemble` as small as its
   content allows. A `--size` is then the most it may take.
-- `--no-replace` fails instead of replacing files that exist.
+- `--replace` lets `populate` replace a file that is there already, and
+  lets `assemble` and `populate` take names that FAT does not tell apart,
+  such as `A.TXT` and `a.txt`, as one name. Without it they fail on
+  them.
 - `--unsupported fail` fails on files FAT cannot store, such as FIFOs
   and device nodes. By default they are left out with a message.
 - `--write-manifest PATH` writes a UAPI.16 manifest of what the file
@@ -202,7 +205,8 @@ with `"order": "codepoint"`. `ufat manifest` writes manifests that way.
 since systemd commit 330fab5e90, which is not in a release yet. ufat
 refuses a manifest that does not declare the order, that is out of that
 order, or that names a file twice. Two names that FAT does not tell
-apart, such as `A.TXT` and `a.txt`, are taken as one name.
+apart, such as `A.TXT` and `a.txt`, make `assemble` and `populate` fail
+unless `--replace` is given.
 
 While copying, ufat verifies the size and the SHA-256 hash of every file.
 The data of a file is the part of its file below the SOURCE that starts
@@ -285,24 +289,24 @@ is below the minimum.
 A plan does not compare names. Two names that FAT does not tell apart
 are two names to the plan: names that differ in case only, such as
 `A.TXT` and `a.txt`, and a name and the short name FAT gives another
-one, such as `FOOBAR~1` for `FOO BAR`.
+one, such as `FOOBAR~1` for `FOO BAR`. So they pass the plan also where
+`assemble` refuses them without `--replace`.
 
-When a file replaces another one under such a name, the plan counts
-both. The file system keeps the clusters of every replaced file free
-then. Both also count against the 65536 directory entries a FAT
-directory holds, so the plan of a directory close to that limit can
-fail although the write would fit. A long name takes up to 21 of these
-entries.
+With `--replace` a file under such a name replaces the other one, and
+the plan counts both. The file system keeps the clusters of every
+replaced file free then. Both also count against the 65536 directory
+entries a FAT directory holds, so the plan of a directory close to that
+limit can fail although the write would fit. A long name takes up to 21
+of these entries.
 
-The entries of a directory under two such names, such as `FOO BAR/a`
-and `FOOBAR~1/b`, go into one directory. The plan holds the entries
-under each name to the limit on their own, and only the write sees them
-all in one directory. When they do not fit, `assemble` fails with
-"directory is full".
+With `--replace` the entries of a directory under two such names, such
+as `FOO BAR/a` and `FOOBAR~1/b`, go into one directory. The plan holds
+the entries under each name to the limit on their own, and only the
+write sees them all in one directory. When they do not fit, `assemble`
+fails with "directory is full".
 
 A file and a directory under two such names pass the plan, and
-`assemble` fails on the second one, with or without `--no-replace`.
-Names that `--no-replace` refuses pass the plan too.
+`assemble` fails on the second one, with or without `--replace`.
 
 ## Sector size
 

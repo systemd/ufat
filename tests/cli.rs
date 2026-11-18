@@ -505,20 +505,34 @@ fn assemble_and_populate_take_trees_and_manifests() {
     // The planner sees the same size from the manifest, which needs no
     // SOURCE to be sized.
     assert_eq!(tree_size, ok(&bin, &["assemble", "--plan", "--manifest", m]));
-    // populate fills an existing volume, from a manifest too, replacing.
-    ok(&bin, &["populate", "--manifest", m, a, tree_arg]);
+    // populate fills an existing volume, from a manifest too. A file the
+    // volume holds already it replaces only with --replace.
+    fails(
+        &bin,
+        &["populate", "--manifest", m, a, tree_arg],
+        "'/EFI/Linux/linux.efi' exists",
+    );
+    ok(&bin, &["populate", "--replace", "--manifest", m, a, tree_arg]);
     ok(&bin, &["populate", "--path", "/second", a, tree_arg]);
     assert_eq!(ok(&bin, &["list", a, "/second/EFI/Linux"]), "linux.efi\n");
     assert!(run(&bin, &["check", a]).status.success());
     // "-" takes the file contents from standard input, back to back in
     // manifest order: linux.efi sorts before x.conf.
-    let out = run_in(&bin, &["populate", "--manifest", m, a, "-"], b"kerneltitle x\n");
+    let out = run_in(
+        &bin,
+        &["populate", "--replace", "--manifest", m, a, "-"],
+        b"kerneltitle x\n",
+    );
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(ok(&bin, &["cat", a, "/loader/entries/x.conf"]), "title x\n");
-    let out = run_in(&bin, &["populate", "--manifest", m, a, "-"], b"kern");
+    let out = run_in(&bin, &["populate", "--replace", "--manifest", m, a, "-"], b"kern");
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("ended"));
-    let out = run_in(&bin, &["populate", "--manifest", m, a, "-"], b"kerneltitle x\nmore");
+    let out = run_in(
+        &bin,
+        &["populate", "--replace", "--manifest", m, a, "-"],
+        b"kerneltitle x\nmore",
+    );
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("goes on after the last file"));
     // A populate that fails partway leaves the file system marked as not
@@ -530,7 +544,7 @@ fn assemble_and_populate_take_trees_and_manifests() {
     // under --unsupported fail, a file the stream cannot have without a
     // size or at an offset, one that is missing below the SOURCE, one where
     // the file system has a directory, a name FAT cannot store or one too
-    // long, and a name the file system holds with --no-replace.
+    // long, and a name the file system holds already.
     let clean = image("clean.img");
     let clean = clean.as_str();
     ok(&bin, &["assemble", "--create", "--size", "40M", clean]);
@@ -569,7 +583,7 @@ fn assemble_and_populate_take_trees_and_manifests() {
             "contains the invalid character ':'",
         ),
         (long.as_str(), &[], "-", "is longer than 255 UTF-16 units"),
-        (r#"{"name":"f","size":0}"#, &["--no-replace"], "-", "'/f' exists"),
+        (r#"{"name":"f","size":0}"#, &[], "-", "'/f' exists"),
     ] {
         let refused = root.join("refused.manifest");
         fs::write(
@@ -645,7 +659,11 @@ fn assemble_and_populate_take_trees_and_manifests() {
     );
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(ok(&bin, &["cat", piped, "/loader/entries/x.conf"]), "title x\n");
-    let out = run_in(&bin, &["populate", "--manifest", "-", a, tree_arg], &manifest_bytes);
+    let out = run_in(
+        &bin,
+        &["populate", "--replace", "--manifest", "-", a, tree_arg],
+        &manifest_bytes,
+    );
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let out = run_in(&bin, &["populate", "--manifest", "-", a, "-"], b"");
     assert_eq!(out.status.code(), Some(1));
@@ -727,6 +745,11 @@ fn assemble_and_populate_take_trees_and_manifests() {
         "unknown option",
     );
     fails(&bin, &["assemble", "--create", "--stream", b, m], "unknown option");
+    fails(
+        &bin,
+        &["assemble", "--no-replace", "--create", b, tree_arg],
+        "unknown option",
+    );
     // The files a manifest names are found below the SOURCE when they are
     // copied, and the messages about them name the SOURCE. A SOURCE that is
     // not there leaves nothing behind. A file that is missing, or changed
@@ -786,6 +809,27 @@ fn assemble_and_populate_take_trees_and_manifests() {
     assert_eq!(fs::metadata(c).unwrap().len().to_string() + "\n", tree_size);
     ok(&bin, &["populate", "--manifest", m, c, tree_arg]);
     assert!(run(&bin, &["check", c]).status.success());
+    // Populating it with the same manifest once more fails at its first
+    // file, which is there, before anything is written, with the contents
+    // from the SOURCE and from standard input. So does the tree. The image
+    // stays as it was, byte for byte.
+    let image_before = fs::read(c).unwrap();
+    for (args, stdin) in [
+        (&["populate", "--manifest", m, c, tree_arg][..], &b""[..]),
+        (&["populate", "--manifest", m, c, "-"], b"kerneltitle x\n"),
+        (&["populate", c, tree_arg], b""),
+    ] {
+        let out = run_in(&bin, args, stdin);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{:?}: {}", args, stderr);
+        assert!(
+            stderr.contains("'/EFI/Linux/linux.efi' exists"),
+            "{:?}: {}",
+            args,
+            stderr
+        );
+        assert!(fs::read(c).unwrap() == image_before, "{:?} changed the image", args);
+    }
     // With --size it takes that size, which the --fit directory or what the
     // manifest describes has to fit. A size no file system fits in is
     // refused as it is without them.
@@ -928,6 +972,95 @@ fn manifests_have_to_declare_their_order() {
     fs::write(&manifest, &declared).unwrap();
     ok(&bin, &["populate", "--manifest", m, a, t]);
     assert_eq!(ok(&bin, &["list", a]), "EFI/\nloader/\n");
+}
+
+/// Names FAT does not tell apart are one name: assemble and populate refuse
+/// a second one, in a manifest as well as in a tree, a directory's as well
+/// as a file's, unless --replace says to take it as the first. A tree is
+/// copied in the order of the bytes of its names, as a manifest has them.
+#[test]
+fn names_fat_does_not_tell_apart() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    let both = root.join("both");
+    fs::create_dir_all(&both).unwrap();
+    fs::write(both.join("README.TXT"), "upper\n").unwrap();
+    fs::write(both.join("readme.txt"), "lower\n").unwrap();
+    let path = |name: &str| root.join(name).to_str().unwrap().to_string();
+    let both = path("both");
+    let manifest = root.join("both.manifest");
+    fs::write(&manifest, ok(&bin, &["manifest", &both])).unwrap();
+    let m = manifest.to_str().unwrap();
+    let a = path("a.img");
+    fails(
+        &bin,
+        &["assemble", "--create", "--size", "40M", &a, &both],
+        "'/readme.txt' and '/README.TXT' are names FAT cannot tell apart",
+    );
+    ok(&bin, &["assemble", "--force", "--replace", &a, &both]);
+    assert_eq!(ok(&bin, &["list", &a]), "readme.txt\n");
+    assert_eq!(ok(&bin, &["cat", &a, "/README.TXT"]), "lower\n");
+    fails(
+        &bin,
+        &["assemble", "--force", "--manifest", m, &a, &both],
+        "'/readme.txt' and '/README.TXT' are names FAT cannot tell apart",
+    );
+    ok(&bin, &["assemble", "--force", "--replace", "--manifest", m, &a, &both]);
+    assert_eq!(ok(&bin, &["list", &a]), "readme.txt\n");
+    fails(
+        &bin,
+        &["populate", "--manifest", m, &a, &both],
+        "'/README.TXT' and '/readme.txt' are names FAT cannot tell apart",
+    );
+    ok(&bin, &["populate", "--replace", "--manifest", m, &a, &both]);
+    // A tree's efi is its EFI only with --replace, and takes the entries of
+    // the EFI then.
+    for name in ["EFI/a", "efi/b"] {
+        let file = root.join("dirs").join(name);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, "x\n").unwrap();
+    }
+    let (dirs, d) = (path("dirs"), path("d.img"));
+    fails(
+        &bin,
+        &["assemble", "--create", "--size", "40M", &d, &dirs],
+        "'/efi' and '/EFI' are names FAT cannot tell apart",
+    );
+    ok(&bin, &["assemble", "--force", "--replace", &d, &dirs]);
+    assert_eq!(ok(&bin, &["list", &d, "/EFI"]), "a\nb\n");
+    // A trailing slash means nothing, also to the message, which spells the
+    // path that is there the way the file system does.
+    fails(
+        &bin,
+        &["populate", "--path", "/efi/", &d, &path("dirs/EFI/a")],
+        "'/efi/' and '/EFI' are names FAT cannot tell apart",
+    );
+    fails(
+        &bin,
+        &["populate", "--path", "/efi/A", &d, &path("dirs/EFI/a")],
+        "'/efi/A' and '/EFI/a' are names FAT cannot tell apart",
+    );
+    // A file whose name FAT does not tell apart from a directory's is that
+    // as well, before anything else, and with --replace it cannot take the
+    // directory's place.
+    let mixed = root.join("mixed");
+    fs::create_dir_all(mixed.join("EFI")).unwrap();
+    fs::write(mixed.join("efi"), "x\n").unwrap();
+    let (mixed, e) = (path("mixed"), path("e.img"));
+    fails(
+        &bin,
+        &["assemble", "--create", "--size", "40M", &e, &mixed],
+        "'/efi' and '/EFI' are names FAT cannot tell apart",
+    );
+    fails(
+        &bin,
+        &["assemble", "--force", "--replace", &e, &mixed],
+        "'/efi' is a directory",
+    );
 }
 
 /// A volume too small for what goes into it. A copy that runs out of
@@ -1218,12 +1351,14 @@ fn a_plan_against_a_size_answers_for_assemble() {
     assert_eq!(ok(&bin, &["cat", a, "/d99/f799"]), "x");
 }
 
-/// A plan does not compare names. The entries of a directory under two
-/// names that FAT does not tell apart go into one directory. The plan holds
-/// the entries under each name to the 65536 entries of a FAT directory on
-/// their own, and only the write sees them all in one directory. In two
-/// runs of 1600 names of 255 characters, which take 21 entries each, the
-/// plan passes and `assemble` fails. In one run the plan fails.
+/// A plan does not compare names. With --replace the entries of a
+/// directory under two names that FAT does not tell apart go into one
+/// directory. The plan holds the entries under each name to the 65536
+/// entries of a FAT directory on their own, and only the write sees them
+/// all in one directory. In two runs of 1600 names of 255 characters,
+/// which take 21 entries each, the plan passes and `assemble --replace`
+/// fails. Without --replace the second name fails before. In one run the
+/// plan fails.
 #[test]
 fn directories_under_two_names_fill_up_when_written() {
     let _serial = common::serial();
@@ -1253,8 +1388,24 @@ fn directories_under_two_names_fill_up_when_written() {
     let a = image.to_str().unwrap();
     fails(
         &bin,
-        &["assemble", "--create", "--minimize", "--manifest", s, a, "-"],
+        &[
+            "assemble",
+            "--create",
+            "--minimize",
+            "--replace",
+            "--manifest",
+            s,
+            a,
+            "-",
+        ],
         "directory is full",
+    );
+    let image = root.join("b.img");
+    let b = image.to_str().unwrap();
+    fails(
+        &bin,
+        &["assemble", "--create", "--minimize", "--manifest", s, b, "-"],
+        "'/efi' and '/EFI' are names FAT cannot tell apart",
     );
     let whole = root.join("whole.manifest");
     fs::write(&whole, manifest(&[("EFI", 0..3200)])).unwrap();
@@ -1345,10 +1496,10 @@ fn populate_and_remove_work_on_paths() {
         &["populate", "--parents", "--path", "/EFI/BOOT/BOOTX64.EFI", a, f],
     );
     assert_eq!(ok(&bin, &["cat", a, "/EFI/BOOT/BOOTX64.EFI"]), "loader");
-    fails(
+    fails(&bin, &["populate", "--path", "/EFI/BOOT/BOOTX64.EFI", a, f], "exists");
+    ok(
         &bin,
-        &["populate", "--no-replace", "--path", "/EFI/BOOT/BOOTX64.EFI", a, f],
-        "exists",
+        &["populate", "--replace", "--path", "/EFI/BOOT/BOOTX64.EFI", a, f],
     );
     // No SOURCE: the directory --path, which may exist only with --parents.
     ok(&bin, &["populate", "--path", "/loader", a]);

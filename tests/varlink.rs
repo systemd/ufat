@@ -1478,6 +1478,79 @@ fn manifests_have_to_declare_their_order() {
     assert_eq!(u64_of(&r, "files"), 2);
 }
 
+/// Names FAT does not tell apart: Assemble and Populate refuse the second
+/// one unless replace is set.
+#[test]
+fn assemble_refuses_names_fat_does_not_tell_apart() {
+    let _serial = common::serial();
+    let Some(ufat) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let tree = Temp::dir();
+    build_tree(tree.path(), &[("README.TXT", b"upper\n"), ("readme.txt", b"lower\n")]);
+    let (manifest, _) = manifest_and_blob(tree.path());
+    let scratch = Temp::dir();
+    let mut c = connect_fd3(&ufat);
+    let source = ro(tree.path());
+    let (_image, img) = fresh_image();
+    let e = error_of(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"sourceFileDescriptor":1}}"#,
+        &[img.as_fd(), source.as_fd()],
+    );
+    assert_eq!(e.name, format!("{}.InvalidName", IFACE));
+    assert_eq!(str_of(&e.parameters, "name"), "/readme.txt");
+    assert_eq!(str_of(&e.parameters, "reason"), "caseCollision");
+    let manifest_file = file_with(scratch.path(), "manifest", &manifest);
+    let (image, img) = fresh_image();
+    let with_manifest = |replace: bool| {
+        format!(
+            r#"{{"image":{{"fileDescriptor":0}},"options":{{"minimize":true,"force":true}},"content":{{"manifest":{{"fileDescriptor":1}},"sourceFileDescriptor":2,"replace":{}}}}}"#,
+            replace
+        )
+    };
+    let e = error_of(
+        &mut c,
+        "Assemble",
+        &with_manifest(false),
+        &[img.as_fd(), manifest_file.as_fd(), source.as_fd()],
+    );
+    assert_eq!(e.name, format!("{}.InvalidName", IFACE));
+    assert_eq!(str_of(&e.parameters, "name"), "/readme.txt");
+    assert_eq!(str_of(&e.parameters, "reason"), "caseCollision");
+    let manifest_file = ro(&scratch.path().join("manifest"));
+    let r = reply(call(
+        &mut c,
+        "Assemble",
+        &with_manifest(true),
+        &[img.as_fd(), manifest_file.as_fd(), source.as_fd()],
+    ));
+    assert_eq!(u64_of(&r, "files"), 2);
+    let img_ro = ro(image.path());
+    assert_eq!(
+        names(&call_more(&mut c, "List", IMG, &[img_ro.as_fd()])),
+        ["readme.txt"]
+    );
+    let manifest_file = ro(&scratch.path().join("manifest"));
+    let e = error_of(
+        &mut c,
+        "Populate",
+        r#"{"image":{"fileDescriptor":0},"path":"/","content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        &[img.as_fd(), manifest_file.as_fd(), source.as_fd()],
+    );
+    assert_eq!(e.name, format!("{}.InvalidName", IFACE));
+    assert_eq!(str_of(&e.parameters, "reason"), "caseCollision");
+    let manifest_file = ro(&scratch.path().join("manifest"));
+    let r = reply(call(
+        &mut c,
+        "Populate",
+        r#"{"image":{"fileDescriptor":0},"path":"/","content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2,"replace":true}}"#,
+        &[img.as_fd(), manifest_file.as_fd(), source.as_fd()],
+    ));
+    assert_eq!(u64_of(&r, "files"), 2);
+}
+
 /// Assemble with a manifest and the contents of its files in a stream.
 #[test]
 fn assemble_with_a_manifest_and_a_stream() {
@@ -1697,9 +1770,11 @@ fn warnings(c: &mut Client, image: &Path) -> Vec<String> {
 /// An Assemble that fails after the format leaves the file system as after
 /// a crash: with the files that were complete, and marked as not cleanly
 /// unmounted, which Check reports. It is marked when it fails before the
-/// first file as well. Assembling again makes a clean file system, which a
-/// Populate refused before it writes anything leaves clean, and a Populate
-/// that fails partway leaves marked again.
+/// first file as well. Assembling again makes a clean file system. A
+/// Populate refused before it writes anything leaves it clean. A Populate
+/// of the manifest it was assembled from, or of its tree, fails at the
+/// first file, which is there, and leaves the image as it was, byte for
+/// byte. A Populate that fails partway leaves the file system marked again.
 #[test]
 fn a_failed_assemble_leaves_the_file_system_unfinished() {
     let _serial = common::serial();
@@ -1797,6 +1872,28 @@ fn a_failed_assemble_leaves_the_file_system_unfinished() {
         );
         assert_eq!(e.name, format!("{}.{}", IFACE, error));
         assert!(warnings(&mut c, image.path()).is_empty());
+    }
+    // The manifest it was assembled from, and its tree, fail at the first
+    // file, which is there, before anything is written: the directories
+    // have the times of the manifest already.
+    let manifest_file = ro(&base.path().join("manifest"));
+    let image_before = std::fs::read(image.path()).unwrap();
+    for (content, fds) in [
+        (
+            r#"{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}"#,
+            &[img.as_fd(), manifest_file.as_fd(), source.as_fd()][..],
+        ),
+        (r#"{"sourceFileDescriptor":1}"#, &[img.as_fd(), source.as_fd()]),
+    ] {
+        let e = error_of(
+            &mut c,
+            "Populate",
+            &format!(r#"{{"image":{{"fileDescriptor":0}},"path":"/","content":{}}}"#, content),
+            fds,
+        );
+        assert_eq!(e.name, format!("{}.FileExists", IFACE), "{}", content);
+        assert_eq!(str_of(&e.parameters, "path"), "/EFI/BOOT/BOOTX64.EFI");
+        assert!(std::fs::read(image.path()).unwrap() == image_before, "{}", content);
     }
     std::fs::write(tree.join("loader/loader.conf"), b"timeout 9\n").unwrap();
     let manifest_file = ro(&base.path().join("manifest"));
@@ -2433,21 +2530,21 @@ fn populate_puts_content_into_a_volume() {
         &[img.as_fd(), conf.as_fd()],
     );
     assert_eq!(e.name, format!("{}.NoSuchFile", IFACE));
-    // An existing file is replaced unless replace says otherwise.
-    reply(call(
+    // An existing file is replaced only with replace.
+    let e = error_of(
         &mut c,
         "Populate",
         r#"{"image":{"fileDescriptor":0},"path":"/a/b/c.conf","content":{"sourceFileDescriptor":1}}"#,
         &[img.as_fd(), conf.as_fd()],
-    ));
-    let e = error_of(
-        &mut c,
-        "Populate",
-        r#"{"image":{"fileDescriptor":0},"path":"/a/b/c.conf","content":{"sourceFileDescriptor":1,"replace":false}}"#,
-        &[img.as_fd(), conf.as_fd()],
     );
     assert_eq!(e.name, format!("{}.FileExists", IFACE));
     assert_eq!(str_of(&e.parameters, "path"), "/a/b/c.conf");
+    reply(call(
+        &mut c,
+        "Populate",
+        r#"{"image":{"fileDescriptor":0},"path":"/a/b/c.conf","content":{"sourceFileDescriptor":1,"replace":true}}"#,
+        &[img.as_fd(), conf.as_fd()],
+    ));
     // A manifest names its paths from the root and goes nowhere else.
     let manifest_file = file_with(scratch.path(), "manifest", &manifest);
     let e = error_of(
@@ -2465,15 +2562,15 @@ fn populate_puts_content_into_a_volume() {
         &[img_ro.as_fd()],
     );
     assert_eq!(e.name, format!("{}.NoSuchFile", IFACE));
-    // A manifest's tree, with the manifest of the whole volume written
-    // afterwards.
+    // A manifest's tree over the one that is there, with the manifest of
+    // the whole volume written afterwards.
     let manifest_file = ro(&scratch.path().join("manifest"));
     let out = scratch.path().join("out.manifest");
     let out_file = sink(&out);
     let replies = call_more(
         &mut c,
         "Populate",
-        r#"{"image":{"fileDescriptor":0},"path":"/","content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2,"manifestSink":{"fileDescriptor":3}}}"#,
+        r#"{"image":{"fileDescriptor":0},"path":"/","content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2,"replace":true,"manifestSink":{"fileDescriptor":3}}}"#,
         &[img.as_fd(), manifest_file.as_fd(), source.as_fd(), out_file.as_fd()],
     );
     assert_eq!(phases(&replies), vec!["populating", "reading"]);
@@ -2551,11 +2648,19 @@ fn populate_puts_content_into_a_volume() {
     );
     assert_eq!(e.name, "org.varlink.service.InvalidParameter");
     assert_eq!(str_of(&e.parameters, "parameter"), "content");
-    // A tree into the root of a volume that has things already.
-    let r = reply(call(
+    // A tree into the root of a volume that has its files already, which
+    // it takes only with replace.
+    let e = error_of(
         &mut c,
         "Populate",
         r#"{"image":{"fileDescriptor":0},"path":"/","content":{"sourceFileDescriptor":1}}"#,
+        &[img.as_fd(), source.as_fd()],
+    );
+    assert_eq!(e.name, format!("{}.FileExists", IFACE));
+    let r = reply(call(
+        &mut c,
+        "Populate",
+        r#"{"image":{"fileDescriptor":0},"path":"/","content":{"sourceFileDescriptor":1,"replace":true}}"#,
         &[img.as_fd(), source.as_fd()],
     ));
     assert_eq!(u64_of(&r, "files"), 2);
@@ -3266,14 +3371,14 @@ fn errors_are_typed() {
     let r = reply(call(
         &mut c,
         "Populate",
-        r#"{"image":{"fileDescriptor":0},"path":"/","content":{"sourceFileDescriptor":1}}"#,
+        r#"{"image":{"fileDescriptor":0},"path":"/","content":{"sourceFileDescriptor":1,"replace":true}}"#,
         &[img.as_fd(), source.as_fd()],
     ));
     assert_eq!(u64_of(&r, "skipped"), 1);
     let e = error_of(
         &mut c,
         "Populate",
-        r#"{"image":{"fileDescriptor":0},"path":"/","content":{"sourceFileDescriptor":1,"unsupported":"fail"}}"#,
+        r#"{"image":{"fileDescriptor":0},"path":"/","content":{"sourceFileDescriptor":1,"replace":true,"unsupported":"fail"}}"#,
         &[img.as_fd(), source.as_fd()],
     );
     assert_eq!(e.name, format!("{}.ContentNotSupported", IFACE));

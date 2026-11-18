@@ -361,6 +361,7 @@ mod tests {
     use crate::manifest::HostTree;
     use crate::populate::CopyOptions;
     use crate::test_util::{volume, TempDir, TempImage};
+    use crate::volume::NameCollision;
     use json::Object;
     use std::os::fd::AsFd;
     use std::time::{Duration, UNIX_EPOCH};
@@ -372,7 +373,7 @@ mod tests {
 
     /// Creates a file with `data`.
     fn put(v: &mut Volume, path: &str, data: &[u8], time: SystemTime, read_only: bool) {
-        let mut w = v.create_file(path, time, false).unwrap();
+        let mut w = v.create_file(path, time, NameCollision::Fail).unwrap();
         w.write_all(data).unwrap();
         w.set_read_only(read_only);
         w.finish().unwrap();

@@ -29,6 +29,9 @@ pub enum NameProblem {
     TrailingSpaceOrDot,
     /// More than 255 UTF-16 units, or a path longer than PATH_MAX.
     TooLong,
+    /// The directory has an entry whose name FAT does not tell apart from
+    /// this one, as it does not tell `A` from `a`.
+    CaseCollision,
 }
 
 impl NameProblem {
@@ -41,6 +44,7 @@ impl NameProblem {
             NameProblem::LeadingSpace => "leadingSpace",
             NameProblem::TrailingSpaceOrDot => "trailingSpaceOrDot",
             NameProblem::TooLong => "tooLong",
+            NameProblem::CaseCollision => "caseCollision",
         }
     }
 }
@@ -486,6 +490,17 @@ struct Inner {
 }
 
 impl Error {
+    /// The error for the path `path` when its directory holds the entry
+    /// at the path `existing`, whose name FAT does not tell apart from the
+    /// last name of `path`, as it does not tell `A` from `a`.
+    pub(crate) fn case_collision(path: &str, existing: &str) -> Error {
+        let message = format!("'{}' and '{}' are names FAT cannot tell apart", path, existing);
+        Error::new(EEXIST, message).with(Detail::Name {
+            name: path.to_string(),
+            problem: NameProblem::CaseCollision,
+        })
+    }
+
     /// Creates an error from a positive errno value and a message.
     pub fn new(errno: i32, message: impl Into<String>) -> Self {
         Error(Box::new(Inner {

@@ -3,8 +3,8 @@ use super::*;
 use crate::populate::CopyOptions;
 use crate::progress::Progress;
 use crate::test_util::{volume, TempDir, TempImage};
-use crate::volume::Volume;
-use crate::{ContentProblem, Error, ManifestProblem, SourceProblem};
+use crate::volume::{NameCollision, Volume};
+use crate::{ContentProblem, Error, ManifestProblem, NameProblem, SourceProblem};
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::path::Path;
@@ -228,7 +228,7 @@ fn refusals_at_the_first_object_write_nothing() {
     let (_img, mut v) = volume(8 << 20, 512, 512);
     let t0 = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
     v.create_dir("/d", t0).unwrap();
-    v.write_file("/f", &mut &b"old"[..], t0, false).unwrap();
+    v.write_file("/f", &mut &b"old"[..], t0, NameCollision::Fail).unwrap();
     v.sync().unwrap();
     let keep = AssembleOptions {
         flags: AssembleFlags::NONE,
@@ -802,9 +802,9 @@ fn files_that_change_while_they_are_read() {
 }
 
 /// Names FAT does not tell apart, the second of which an assembly finds
-/// in the volume: taken as the same name.
+/// in the volume: refused by default, taken as the same name with REPLACE.
 #[test]
-fn case_collisions_are_one_name() {
+fn case_collisions_are_refused_unless_replaced() {
     let m = seq(&[
         ROOT,
         r#"{"name":"A.TXT","size":1}"#,
@@ -815,10 +815,44 @@ fn case_collisions_are_one_name() {
         r#"{"name":"efi/y","size":1}"#,
         TRAILER,
     ]);
-    // A file replaces the one it collides with, under its own name, and a
-    // directory takes the entries of the one it collides with.
     let (_img, mut v) = volume(8 << 20, 512, 512);
-    let r = assemble_stream(&mut v, &m, b"Axyyz", &AssembleOptions::default()).unwrap();
+    let e = assemble_stream(&mut v, &m, b"Axyyz", &AssembleOptions::default()).unwrap_err();
+    assert_eq!(e.errno(), EEXIST);
+    assert!(
+        matches!(
+            e.detail(),
+            Some(Detail::Name {
+                name,
+                problem: NameProblem::CaseCollision,
+            }) if name == "/a.txt"
+        ),
+        "{:?}",
+        e
+    );
+    assert_eq!(e.message(), "'/a.txt' and '/A.TXT' are names FAT cannot tell apart");
+    assert_eq!(contents(&v, "/A.TXT"), b"A");
+    // A directory collides the same way.
+    let dirs = seq(&[
+        ROOT,
+        r#"{"name":"EFI","type":"dir"}"#,
+        r#"{"name":"efi","type":"dir"}"#,
+        TRAILER,
+    ]);
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let e = assemble_stream(&mut v, &dirs, b"", &AssembleOptions::default()).unwrap_err();
+    assert!(
+        matches!(e.detail(), Some(Detail::Name { name, problem: NameProblem::CaseCollision }) if name == "/efi"),
+        "{:?}",
+        e
+    );
+    // With REPLACE a file replaces the one it collides with, under its own
+    // name, and a directory takes the entries of the one it collides with.
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let replace = AssembleOptions {
+        flags: AssembleFlags::REPLACE,
+        ..AssembleOptions::default()
+    };
+    let r = assemble_stream(&mut v, &m, b"Axyyz", &replace).unwrap();
     assert_eq!((r.files, r.directories, r.bytes), (4, 2, 5));
     let names = |v: &Volume, path: &str| {
         let mut names: Vec<String> = v.read_dir(path).unwrap().into_iter().map(|md| md.name).collect();
@@ -881,7 +915,8 @@ fn entries_of_the_same_name_that_are_there() {
     let (_img, mut v) = volume(8 << 20, 512, 512);
     let t0 = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
     v.create_dir("/EFI", t0).unwrap();
-    v.write_file("/EFI/x", &mut &b"old"[..], t0, false).unwrap();
+    v.write_file("/EFI/x", &mut &b"old"[..], t0, NameCollision::Fail)
+        .unwrap();
     let m = seq(&[
         ROOT_MTIME,
         r#"{"mTimeNSec":1700000000000000000,"name":"EFI","type":"dir"}"#,
@@ -889,11 +924,7 @@ fn entries_of_the_same_name_that_are_there() {
         r#"{"name":"EFI/y","size":1}"#,
         TRAILER,
     ]);
-    let keep = AssembleOptions {
-        flags: AssembleFlags::NONE,
-        ..AssembleOptions::default()
-    };
-    let e = assemble_stream(&mut v, &m, b"newy", &keep).unwrap_err();
+    let e = assemble_stream(&mut v, &m, b"newy", &AssembleOptions::default()).unwrap_err();
     assert_eq!(e.errno(), EEXIST);
     assert_eq!(e.detail(), Some(&Detail::Path("/EFI/x".into())));
     assert_eq!(
@@ -1340,8 +1371,8 @@ fn long_operations_report_progress() {
 #[test]
 fn assemble_flags() {
     let both = AssembleFlags::REPLACE | AssembleFlags::SKIP_UNSUPPORTED;
-    assert_eq!(AssembleFlags::default(), AssembleFlags::REPLACE);
-    assert_eq!(AssembleOptions::default().flags, AssembleFlags::REPLACE);
+    assert_eq!(AssembleFlags::default(), AssembleFlags::NONE);
+    assert_eq!(AssembleOptions::default().flags, AssembleFlags::NONE);
     assert!(both.contains(AssembleFlags::REPLACE) && both.contains(AssembleFlags::SKIP_UNSUPPORTED));
     assert!(both.contains(both) && both.contains(AssembleFlags::NONE));
     assert!(!AssembleFlags::REPLACE.contains(AssembleFlags::SKIP_UNSUPPORTED));

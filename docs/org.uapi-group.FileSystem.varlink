@@ -347,7 +347,10 @@ type Content(
 	times: ?TimePolicy,
 	# What to do with what cannot be stored, skip by default
 	unsupported: ?UnsupportedPolicy,
-	# Replace files that exist, true by default
+	# Replace files that exist, and take a name the filesystem does not tell
+	# apart from an existing one as that name, false by default. Without it
+	# that is FileExists, or InvalidName with reason caseCollision. A
+	# directory that exists under the same name takes the entries either way
 	replace: ?bool,
 	# Copy extended attributes where the filesystem keeps them, true by default
 	extendedAttributes: ?bool,

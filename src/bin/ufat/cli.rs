@@ -21,7 +21,7 @@ use fat::manifest::{
 use fat::plan::{Plan, PlanOptions};
 use fat::populate::{CopyOptions, TimePolicy};
 use fat::time::civil_from_days;
-use fat::volume::Volume;
+use fat::volume::{NameCollision, Volume};
 use fat::{bail, err, Context, DescriptorProblem, Detail, Error, ManifestProblem, Result};
 
 use crate::service;
@@ -114,7 +114,9 @@ Options for assemble and populate:
                         for a manifest the time of entries that carry none
   --times POLICY        preserve (default), fixed or clamp (clamp is the default
                         when $SOURCE_DATE_EPOCH is set; trees and files)
-  --no-replace          Fail on existing files instead of replacing them
+  --replace             Replace a file that is there already, and take a name
+                        FAT does not tell apart from one that is there as that
+                        name, instead of failing
   --path PATH           The directory a SOURCE tree goes below (default /), the
                         path of a SOURCE file, or the directory to create
   --parents             Create missing parent directories of --path, and
@@ -341,7 +343,7 @@ const FILL_VALUES: &[&str] = &[
     "unsupported",
     "write-manifest",
 ];
-const FILL_FLAGS: &[&str] = &["no-replace", "no-check-validity", "verbose"];
+const FILL_FLAGS: &[&str] = &["no-check-validity", "replace", "verbose"];
 const FORMAT_FLAGS: &[&str] = &[
     "no-align",
     "mkfs-fat-compat",
@@ -692,23 +694,33 @@ impl AssembleObserver for SkipNotes {
     }
 }
 
+/// What a copy does with a name the volume holds already: it takes what is
+/// there with `--replace` and fails without.
+fn name_collision(args: &Args) -> NameCollision {
+    if args.flag("replace") {
+        NameCollision::Replace
+    } else {
+        NameCollision::Fail
+    }
+}
+
 /// How the command line asks a copy of a tree, and the plan of one, to
-/// take it: following symbolic links, and replacing what is there unless
-/// `--no-replace`.
+/// take it: following symbolic links, and replacing what is there with
+/// `--replace`.
 fn copy_options(args: &Args) -> Result<CopyOptions> {
     Ok(CopyOptions {
         times: time_policy(args)?,
-        replace: !args.flag("no-replace"),
+        name_collision: name_collision(args),
         follow_symlinks: true,
     })
 }
 
 /// How the command line asks an assembly, and the plan of one, to store a
-/// manifest's objects: replacing what is there unless `--no-replace`, and
+/// manifest's objects: replacing what is there with `--replace`, and
 /// leaving out what FAT cannot store unless `--unsupported fail`.
 fn assemble_flags(args: &Args) -> Result<AssembleFlags> {
     Ok(AssembleFlags::NONE
-        .with(AssembleFlags::REPLACE, !args.flag("no-replace"))
+        .with(AssembleFlags::REPLACE, args.flag("replace"))
         .with(AssembleFlags::SKIP_UNSUPPORTED, !fail_unsupported(args)?))
 }
 
@@ -1116,7 +1128,7 @@ fn cmd_populate(argv: &[OsString]) -> Result<()> {
         }
         let options = CopyOptions {
             times: time_policy(&args)?,
-            replace: !args.flag("no-replace"),
+            name_collision: name_collision(&args),
             ..CopyOptions::default()
         };
         let mut v = open_volume(&args, image, Access::ReadWrite)?;

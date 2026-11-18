@@ -133,13 +133,13 @@ What the fields mean for vfat:
   short name it is, are two names to it. Content with such names,
   assembled with `replace`, leaves the clusters of every file that was
   replaced free, and the plan of a directory close to the limit of 65536
-  entries can fail although the assembly would fit. The entries of a
-  directory under two such names go into one directory. A plan holds the
-  entries under each name to the limit on their own, and the assembly
-  fails with `NoSpaceLeft` and reason `directoryEntries` when they do not
-  fit together. A file and a directory under two such names pass a plan
-  and fail the assembly, with `replace` or without it, and so do names
-  that an assembly without `replace` refuses.
+  entries can fail although the assembly would fit. With `replace` the
+  entries of a directory under two such names go into one directory. A
+  plan holds the entries under each name to the limit on their own, and
+  the assembly fails with `NoSpaceLeft` and reason `directoryEntries`
+  when they do not fit together. A file and a directory under two such
+  names pass a plan and fail the assembly, with `replace` or without it,
+  and so do names that an assembly without `replace` refuses.
 - `minimalSizeBytes` is the smallest volume: 65525 clusters of 512 bytes
   plus the reserved sectors and two FATs. With 4096 byte sectors the
   minimum is 269045760 bytes. `maximalSizeBytes` is 2^32 - 1 sectors of
@@ -460,7 +460,7 @@ The other fields of `Content`:
 | `manifest` | A UAPI.16 manifest: `fileDescriptor` names it. `checkValidity`, true by default, rejects revoked entries and entries outside their validity window with `EntryNotValid`. |
 | `times` | `preserve` keeps modification times. This is the default. `fixed` sets every entry to the time stamp. `clamp` keeps times up to the time stamp and sets later ones to it. |
 | `unsupported` | `skip`, the default, leaves out what FAT cannot store and counts it in `skipped`. `fail` fails with `ContentNotSupported`: for a tree before anything is written, for a manifest when the object's record comes. |
-| `replace` | Replaces existing files. True by default. With `false`, an existing file fails with `FileExists`. |
+| `replace` | Replaces existing files, and takes a name FAT does not tell apart from one that exists as that name. False by default. With `false`, an existing file fails with `FileExists`, and a name FAT does not tell apart from an existing one, such as `a.txt` for `A.TXT`, fails with `InvalidName` and reason `caseCollision`. A directory that exists under the same name takes the entries in any case. |
 | `extendedAttributes`, `uid`, `gid` | Accepted and ignored. FAT stores none of them. |
 | `manifestSink` | Writes a UAPI.16 manifest of the whole volume after the content is in. |
 
@@ -620,9 +620,9 @@ The service returns no text. Every error is a name with typed fields.
 | `NoSuchFile` | A path does not exist. | `path` |
 | `FileExists` | A file exists and `replace` is false, or a directory exists and `parents` is false. | `path` |
 | `NotADirectory` | A path component is a file. | `path` |
-| `IsADirectory` | `Populate` of a single file at a path that is a directory. | `path` |
+| `IsADirectory` | A file where the file system has a directory: under the same name, as for `Populate` of a single file at a path that is a directory, or with `replace` under a name FAT does not tell apart from the directory's. | `path` |
 | `DirectoryNotEmpty` | `Remove` of a directory with entries, without `recursive`. | `path` |
-| `InvalidName` | A name FAT cannot store. | `name`, `reason` (`empty`, `dotComponent`, `invalidCharacter`, `leadingSpace`, `trailingSpaceOrDot`, `tooLong`) |
+| `InvalidName` | A name FAT cannot store, or with `replace` false a name FAT does not tell apart from one that exists. | `name`, `reason` (`empty`, `dotComponent`, `invalidCharacter`, `leadingSpace`, `trailingSpaceOrDot`, `tooLong`, `caseCollision`) |
 | `InvalidLabel` | A label that breaks the label rules. | `label`, `reason` (`tooLong`, `invalidCharacter`) |
 | `InvalidIdentifier` | A serial number that is not `XXXX-XXXX` or eight hex digits. | `identifier`, `reason` (`malformed`) |
 | `InvalidManifest` | The manifest cannot be parsed or is inconsistent. A key twice in an object is reason `duplicateKey`. With reason `unlistedFeature`, `field` names the field of a feature the manifest does not list, such as `mTimeNSec`. | `reason`, `record`, `name`, `field` |

@@ -1140,7 +1140,7 @@ def image_commands(ufat, img_path, seed_info, small_tree, rng):
         ("describe", [ufat, "describe", img_path], False),
         ("populate-dir", [ufat, "populate", "--path", rng.choice(["/new", "/EFI/new", "/new dir with long name", "/deep/er/new"]), img_path], True),
         ("remove", [ufat, "remove", img_path, rm_target], True),
-        ("populate", [ufat, "populate", img_path, small_tree], True),
+        ("populate", [ufat, "populate", "--replace", img_path, small_tree], True),
     ]
     if rng.random() < 0.2:
         cmds.append(("populate-parents", [ufat, "populate", "--parents", "--path", "/a/b/c/d/e/f", img_path], True))

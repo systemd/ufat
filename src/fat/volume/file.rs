@@ -7,7 +7,9 @@
 use std::io::{self, Read, Write};
 use std::time::SystemTime;
 
-use super::{check_attributes, writable, Located, NewEntry, Placement, Volume, MAX_FILE_SIZE, SETTABLE_ATTRIBUTES};
+use super::{
+    check_attributes, writable, Located, NameCollision, NewEntry, Placement, Volume, MAX_FILE_SIZE, SETTABLE_ATTRIBUTES,
+};
 use crate::dir::{DirEntry, Directory};
 use crate::dirent::{RawDirEntry, ATTR_ARCHIVE, ATTR_READ_ONLY};
 use crate::errno::*;
@@ -30,9 +32,12 @@ impl Volume {
     /// written to the directory until the file is finished: its slots are
     /// reserved in memory and the entry goes in, complete, after the data
     /// and the FAT. So a crash while the file is written leaves the
-    /// directory as it was, never an empty file. With `replace` an existing
-    /// file of the same name stays in place until the new one is complete
-    /// and is removed then; without it an existing file is an EEXIST error.
+    /// directory as it was, never an empty file. With
+    /// [`NameCollision::Replace`] an existing file of the same name, or of a
+    /// name FAT does not tell apart from it, stays in place until the new
+    /// one is complete and is removed then. With [`NameCollision::Fail`] an
+    /// existing file is an EEXIST error, which for a name of another
+    /// spelling says that FAT does not tell the two apart.
     ///
     /// The token borrows nothing, so any number of files can be open at
     /// once and the volume stays usable in between; whether another
@@ -44,15 +49,23 @@ impl Volume {
     /// Nothing is written for a file that is refused: a name FAT cannot
     /// store or one that is too long, a parent that is missing, damaged or
     /// full, too few free clusters for the parent to grow, a directory of
-    /// the name, or a file of the name without `replace`.
-    pub fn begin_file(&mut self, path: &str, time: SystemTime, replace: bool) -> Result<OpenFile> {
+    /// the name, or under [`NameCollision::Fail`] a file of the name or one
+    /// FAT does not tell apart from it.
+    pub fn begin_file(&mut self, path: &str, time: SystemTime, collision: NameCollision) -> Result<OpenFile> {
         let (dir_cluster, name) = self.locate_parent(path)?;
         let (placement, replaced) = self.with_directory_mut(dir_cluster, |vol, parent| {
+            // A name of another spelling is a case collision first, as for
+            // a directory, see Volume::find_or_create_dir.
             let replaced = match Self::find(parent, name.as_str()) {
+                Some(existing) if collision == NameCollision::Fail && existing.name() != name.as_str() => {
+                    return Err(vol.case_collision(path, &existing));
+                }
                 Some(existing) if existing.short.is_directory() => {
                     bail!(EISDIR, Detail::Path(path.to_string()), "'{}' is a directory", path);
                 }
-                Some(_) if !replace => bail!(EEXIST, Detail::Path(path.to_string()), "'{}' exists", path),
+                Some(_) if collision == NameCollision::Fail => {
+                    bail!(EEXIST, Detail::Path(path.to_string()), "'{}' exists", path)
+                }
                 existing => existing,
             };
             let placement = vol
@@ -98,8 +111,8 @@ impl Volume {
     /// Creates a file and returns a writer for its contents; see
     /// [`Volume::begin_file`] for what happens when and [`FileWriter`] for
     /// the guard that aborts an unfinished file on drop.
-    pub fn create_file(&mut self, path: &str, time: SystemTime, replace: bool) -> Result<FileWriter<'_>> {
-        let file = self.begin_file(path, time, replace)?;
+    pub fn create_file(&mut self, path: &str, time: SystemTime, collision: NameCollision) -> Result<FileWriter<'_>> {
+        let file = self.begin_file(path, time, collision)?;
         Ok(FileWriter {
             volume: self,
             file: Some(file),

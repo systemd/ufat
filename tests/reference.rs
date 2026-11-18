@@ -16,7 +16,7 @@ use fat::device::{Access, Device};
 use fat::format::{self, FormatOptions};
 use fat::host;
 use fat::populate::{CopyOptions, TimePolicy};
-use fat::volume::Volume;
+use fat::volume::{NameCollision, Volume};
 
 /// A source tree resolved once, the way the tool resolves its arguments.
 fn source(path: &Path) -> OwnedFd {
@@ -128,14 +128,21 @@ fn populate(image: &Path, source: &Path, sector_size: u32, cluster_size: Option<
     v.copy_tree(self::source(source).as_fd(), "/", &CopyOptions::default())
         .unwrap();
     // Some churn: a deleted file and a replaced one.
-    v.create_file("/deleted.tmp", UNIX_EPOCH + Duration::from_secs(1_700_000_000), false)
-        .unwrap()
-        .finish()
-        .unwrap();
+    v.create_file(
+        "/deleted.tmp",
+        UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        NameCollision::Fail,
+    )
+    .unwrap()
+    .finish()
+    .unwrap();
     v.remove_file("/deleted.tmp").unwrap();
     let readme = host::open_file(&source.join("readme.txt")).unwrap();
-    v.copy_file(readme.as_fd(), "/readme.txt", &CopyOptions::default())
-        .unwrap();
+    let replace = CopyOptions {
+        name_collision: NameCollision::Replace,
+        ..CopyOptions::default()
+    };
+    v.copy_file(readme.as_fd(), "/readme.txt", &replace).unwrap();
     v.close().unwrap();
 }
 
@@ -342,7 +349,7 @@ fn matches_mtools_byte_for_byte() {
             "/",
             &CopyOptions {
                 times: TimePolicy::Preserve,
-                replace: true,
+                name_collision: NameCollision::Replace,
                 follow_symlinks: false,
             },
         )

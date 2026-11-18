@@ -70,7 +70,7 @@ class Probes:
         for t in ["18446744073709551615", "9223372036854775808", "9223372036854775807", "-1", "1e3", "4354819199", "99999999999999999"]:
             self.run("populate --timestamp %s" % t, [self.ufat, "populate", "--timestamp", t, "--path", "/t" + t[:3], img])
         for t in ["18446744073709551615", "9223372036854775808", "abc", "", " 1700000000", "1700000000.5"]:
-            self.run("populate SOURCE_DATE_EPOCH=%r" % t, [self.ufat, "populate", img, self.small_tree], env={"SOURCE_DATE_EPOCH": t})
+            self.run("populate SOURCE_DATE_EPOCH=%r" % t, [self.ufat, "populate", "--replace", img, self.small_tree], env={"SOURCE_DATE_EPOCH": t})
         for t in ["18446744073709551615", "9223372036854775808"]:
             self.run("assemble --timestamp %s" % t, [self.ufat, "assemble", "--create", "--size", "40M", "--timestamp", t, os.path.join(self.work, "ts.img")])
             self.run("assemble --plan SOURCE_DATE_EPOCH=%s" % t, [self.ufat, "assemble", "--plan", self.small_tree], env={"SOURCE_DATE_EPOCH": t})
@@ -164,7 +164,7 @@ class Probes:
                 open(os.path.join(tree, "f%d" % i), "wb").close()
             img = os.path.join(self.work, "big-%d.img" % n)
             self.run("populate %d files in one dir" % n, [self.ufat, "assemble", "--create", "--fit", tree, img], timeout=60)
-            self.run("populate %d files in one dir (2)" % n, [self.ufat, "populate", img, tree], timeout=300)
+            self.run("populate %d files in one dir (2)" % n, [self.ufat, "populate", "--replace", img, tree], timeout=300)
             shutil.rmtree(tree)
 
     def manifests(self):

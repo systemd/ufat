@@ -98,6 +98,14 @@ pub(crate) fn join(dir: &str, name: &str) -> String {
     format!("{}{}{}", dir.trim_end_matches(SEPARATOR), SEPARATOR, name)
 }
 
+/// The path of the directory `path` is in: "/a/b" and "/a/b/" are in
+/// "/a", "/b" and "b" in "", which is the root to [`join`].
+pub(crate) fn parent(path: &str) -> &str {
+    path.trim_end_matches(SEPARATOR)
+        .rsplit_once(SEPARATOR)
+        .map_or("", |(parent, _)| parent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +147,18 @@ mod tests {
         assert_eq!(join("", "EFI"), "/EFI");
         assert_eq!(join("/EFI/", "Linux"), "/EFI/Linux");
         assert_eq!(join("/EFI", "Linux"), "/EFI/Linux");
+        for (path, parent_path) in [
+            ("/EFI/Linux", "/EFI"),
+            ("/EFI/Linux/", "/EFI"),
+            ("EFI/Linux", "EFI"),
+            ("/EFI", ""),
+            ("/EFI/", ""),
+            ("EFI", ""),
+            ("", ""),
+        ] {
+            assert_eq!(parent(path), parent_path, "{}", path);
+        }
+        assert_eq!(join(parent("/EFI/"), "efi"), "/efi");
         let long = format!("/{}", "x".repeat(MAX_PATH - 1));
         assert_eq!(components(&long).unwrap().len(), 1);
         assert_eq!(components(&format!("{}x", long)).unwrap_err().errno(), ENAMETOOLONG);

@@ -43,7 +43,7 @@ use fat::name::{
     MAX_LONG_NAME,
 };
 use fat::time::FatTimestamp;
-use fat::volume::Volume;
+use fat::volume::{NameCollision, Volume};
 
 /// Subsets enumerated per epoch before the generator samples instead.
 /// UFAT_CRASH_FULL=1 lifts the cap.
@@ -148,7 +148,7 @@ enum Op {
     Write {
         path: String,
         data: Vec<u8>,
-        replace: bool,
+        collision: NameCollision,
         chunk: usize,
     },
     Remove(String),
@@ -168,11 +168,14 @@ impl Op {
             Op::Write {
                 path,
                 data,
-                replace,
+                collision,
                 chunk,
             } => format!(
                 "{} {} ({} bytes, {} per write)",
-                if *replace { "replace" } else { "write" },
+                match collision {
+                    NameCollision::Replace => "replace",
+                    NameCollision::Fail => "write",
+                },
                 path,
                 data.len(),
                 chunk
@@ -185,7 +188,9 @@ impl Op {
     fn replaces(&self) -> Option<&str> {
         match self {
             Op::Write {
-                path, replace: true, ..
+                path,
+                collision: NameCollision::Replace,
+                ..
             } => Some(path),
             _ => None,
         }
@@ -202,45 +207,51 @@ fn scenario(slots_per_cluster: usize) -> Vec<Op> {
     let mut rng = Rng(SEED);
     let mut ops: Vec<Op> = Vec::new();
     let whole = 1 << 20;
-    let mut file = |ops: &mut Vec<Op>, path: &str, len: usize, replace: bool, chunk: usize| {
+    let mut file = |ops: &mut Vec<Op>, path: &str, len: usize, collision: NameCollision, chunk: usize| {
         ops.push(Op::Write {
             path: path.to_string(),
             data: rng.bytes(len),
-            replace,
+            collision,
             chunk,
         });
     };
     let kernel = |n: usize| format!("/EFI/Linux/linux-6.12.{}-200.fc41.x86_64+3.efi", n);
     ops.push(Op::Mkdir("/EFI/BOOT".into()));
-    file(&mut ops, "/EFI/BOOT/BOOTX64.EFI", 70_000, false, 4096);
+    file(&mut ops, "/EFI/BOOT/BOOTX64.EFI", 70_000, NameCollision::Fail, 4096);
     ops.push(Op::Mkdir("/EFI/Linux".into()));
     // More clusters than a 512 byte FAT sector has entries go to a file
     // before /EFI/Linux grows. So with 512 byte sectors the FAT entries of
     // its first cluster and of the one it grows by are in different
     // sectors.
-    file(&mut ops, "/EFI/BOOT/mmx64.efi", 300_000, false, whole);
+    file(&mut ops, "/EFI/BOOT/mmx64.efi", 300_000, NameCollision::Fail, whole);
     // Enough long names to grow the directory past its first cluster.
     let kernels = slots_per_cluster / 4 + 2;
     for i in 0..kernels {
-        file(&mut ops, &kernel(i + 1), 1500 + 700 * i, false, whole);
+        file(&mut ops, &kernel(i + 1), 1500 + 700 * i, NameCollision::Fail, whole);
     }
     ops.push(Op::Mkdir("/loader/entries".into()));
-    file(&mut ops, "/loader/entries/fedora.conf", 300, false, whole);
-    file(&mut ops, "/loader/loader.conf", 40, false, whole);
-    file(&mut ops, "/loader/random-seed", 32, false, whole);
-    file(&mut ops, "/loader/entries.srel", 5, false, whole);
-    file(&mut ops, "/EFI/BOOT/BOOTX64.EFI", 72_000, true, 4096);
+    file(&mut ops, "/loader/entries/fedora.conf", 300, NameCollision::Fail, whole);
+    file(&mut ops, "/loader/loader.conf", 40, NameCollision::Fail, whole);
+    file(&mut ops, "/loader/random-seed", 32, NameCollision::Fail, whole);
+    file(&mut ops, "/loader/entries.srel", 5, NameCollision::Fail, whole);
+    file(&mut ops, "/EFI/BOOT/BOOTX64.EFI", 72_000, NameCollision::Replace, 4096);
     ops.push(Op::Remove(kernel(4)));
-    file(&mut ops, "/loader/loader.conf", 60, true, whole);
+    file(&mut ops, "/loader/loader.conf", 60, NameCollision::Replace, whole);
     // The new entry goes into the slots the removed kernel left, which
     // straddle a sector boundary with 512 byte sectors.
-    file(&mut ops, &kernel(3), 5000, true, whole);
+    file(&mut ops, &kernel(3), 5000, NameCollision::Replace, whole);
     ops.push(Op::Mkdir("/EFI/systemd/drop-ins/deep".into()));
-    file(&mut ops, "/EFI/systemd/systemd-bootx64.efi", 9000, false, whole);
-    file(&mut ops, &kernel(kernels + 1), 2048, false, whole);
+    file(
+        &mut ops,
+        "/EFI/systemd/systemd-bootx64.efi",
+        9000,
+        NameCollision::Fail,
+        whole,
+    );
+    file(&mut ops, &kernel(kernels + 1), 2048, NameCollision::Fail, whole);
     // Now the only room is in the directory's second cluster: the old
     // entry's deletion and the new entry are two cluster writes.
-    file(&mut ops, &kernel(2), 4000, true, whole);
+    file(&mut ops, &kernel(2), 4000, NameCollision::Replace, whole);
     // A directory made where its parent has room, and one made in /full
     // after empty files with long names fill the first cluster of /full to
     // its last slot, so that /full grows for the entry. The new cluster of
@@ -265,7 +276,7 @@ fn scenario(slots_per_cluster: usize) -> Vec<Op> {
             let len = (LFN_UNITS_PER_ENTRY * (k - 1)).min(MAX_LONG_NAME);
             format!("{}{}", prefix, "x".repeat(len - prefix.len()))
         };
-        file(&mut ops, &format!("/full/{}", name), 0, false, whole);
+        file(&mut ops, &format!("/full/{}", name), 0, NameCollision::Fail, whole);
         free -= k;
         n += 1;
     }
@@ -670,10 +681,10 @@ impl Harness {
                 Op::Write {
                     path,
                     data,
-                    replace,
+                    collision,
                     chunk,
                 } => {
-                    let mut w = v.create_file(path, fixed_time(), *replace).unwrap();
+                    let mut w = v.create_file(path, fixed_time(), *collision).unwrap();
                     for piece in data.chunks(*chunk) {
                         w.write_all(piece).unwrap();
                     }

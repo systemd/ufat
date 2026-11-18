@@ -22,15 +22,17 @@
 //! The planner does not compare names. Two names that FAT does not tell
 //! apart, such as `A.TXT` and `a.txt`, or `FOO BAR` and `FOOBAR~1`, the
 //! short name of `FOO BAR`, are two entries to the planner and one to a
-//! copy. A file under the second name replaces the one under the first,
-//! or fails without [`CopyOptions::replace`] or [`AssembleFlags::REPLACE`],
-//! whichever the copy takes. The plan counts both files, so the volume
-//! keeps the clusters of the replaced one free. The entries of a directory
-//! under both names go into one directory, which the plan counts as two,
-//! each held to the limit of entry slots on its own. The copy can then
-//! still run out of entry slots in it. A file and a directory under such
-//! names pass the plan, and the copy fails on the second one, replacing or
-//! not.
+//! copy. The second name fails the copy unless
+//! [`CopyOptions::name_collision`] is
+//! [`NameCollision::Replace`](crate::volume::NameCollision::Replace) or the
+//! assembly has [`AssembleFlags::REPLACE`]. Then a file under the second
+//! name replaces the one under the first, and the plan counts both files,
+//! so the volume keeps the clusters of the replaced one free. The entries
+//! of a directory under both names go into one directory then, which the
+//! plan counts as two, each held to the limit of entry slots on its own.
+//! The copy can then still run out of entry slots in it. A file and a
+//! directory under such names pass the plan, and the copy fails on the
+//! second one, replacing or not.
 
 use std::io::Read;
 use std::iter::Peekable;
@@ -573,8 +575,8 @@ mod tests {
     use crate::manifest::{AssembleOptions, DirectorySource, PinnedDirectory, StreamSource};
     use crate::path::MAX_PATH;
     use crate::test_util::{TempDir, TempImage};
-    use crate::volume::Volume;
-    use crate::ManifestProblem;
+    use crate::volume::{NameCollision, Volume};
+    use crate::{ManifestProblem, NameProblem};
     use std::os::fd::AsFd;
     use std::path::Path;
     use uapi16::{Features, FileObject, InodeType, Name, RootObject, Writer};
@@ -600,7 +602,7 @@ mod tests {
     /// what is there.
     fn no_links() -> CopyOptions {
         CopyOptions {
-            replace: true,
+            name_collision: NameCollision::Replace,
             follow_symlinks: false,
             ..CopyOptions::default()
         }
@@ -1079,7 +1081,7 @@ mod tests {
             assert_eq!(volume.read_dir("/efi").unwrap().len(), 2);
         }
         // Without replacing, the assembly fails at a.txt, which the plan
-        // took.
+        // took, as a case collision.
         let (_image, mut volume) = planned_volume(&plan(AssembleFlags::NONE), &options);
         let mut contents = DirectorySource::new(PinnedDirectory::new(crate::host::open_dir(tmp.path()).unwrap()));
         let not_replacing = AssembleOptions {
@@ -1090,15 +1092,23 @@ mod tests {
             .assemble(&mut Reader::open(&manifest[..]).unwrap(), &mut contents, &not_replacing)
             .unwrap_err();
         assert_eq!(e.errno(), EEXIST);
+        assert_eq!(
+            e.detail(),
+            Some(&Detail::Name {
+                name: "/a.txt".to_string(),
+                problem: NameProblem::CaseCollision,
+            })
+        );
     }
 
     /// A file and a directory under names that FAT does not tell apart
     /// pass the plan, and the assembly fails on the second one, replacing
-    /// or not: ENOTDIR for the directory after the file, EISDIR for the
-    /// file after the directory.
+    /// or not: as a case collision without replacing, and with it ENOTDIR
+    /// for the directory after the file, EISDIR for the file after the
+    /// directory.
     #[test]
     fn a_file_and_a_directory_under_one_name() {
-        for (tree, errno) in [
+        for (tree, replacing) in [
             ([("A", Some(1)), ("a", None), ("a/x", Some(1))], ENOTDIR),
             ([("A", None), ("A/x", Some(1)), ("a", Some(1))], EISDIR),
         ] {
@@ -1121,7 +1131,20 @@ mod tests {
                         &options,
                     )
                     .unwrap_err();
-                assert_eq!(e.errno(), errno, "{:?} {:?}", tree, e);
+                if flags.contains(AssembleFlags::REPLACE) {
+                    assert_eq!(e.errno(), replacing, "{:?} {:?}", tree, e);
+                } else {
+                    assert_eq!(e.errno(), EEXIST, "{:?} {:?}", tree, e);
+                    assert_eq!(
+                        e.detail(),
+                        Some(&Detail::Name {
+                            name: "/a".to_string(),
+                            problem: NameProblem::CaseCollision,
+                        }),
+                        "{:?}",
+                        tree
+                    );
+                }
             }
         }
     }

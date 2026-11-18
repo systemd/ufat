@@ -34,11 +34,11 @@ use crate::errno::*;
 use crate::fat::{Entry, Extent, Fat, FatStore, CACHE_BYTES, ENTRY1_CLEAN_SHUTDOWN};
 use crate::layout::Layout;
 use crate::name::{fold_str, long_name_entries, short_name_to_string, Alias, LongName};
-use crate::path::components;
+use crate::path::{components, SEPARATOR};
 use crate::probe::Prober;
 use crate::time::FatTimestamp;
 use crate::Result;
-use crate::{CorruptPlace, Detail, NoSpaceReason, NotFat32Reason};
+use crate::{CorruptPlace, Detail, Error, NoSpaceReason, NotFat32Reason};
 
 mod file;
 #[cfg(test)]
@@ -78,6 +78,32 @@ pub struct Metadata {
     /// How `name` came out of the units the entry stores. A short name
     /// always comes out as the entry stores it.
     pub(crate) name_decoding: NameDecoding,
+}
+
+/// What creating a file or a directory does where its name collides with
+/// an entry the volume holds: one of the same name, or one whose name FAT
+/// does not tell apart from it, as it does not tell `A` from `a`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameCollision {
+    /// Fail with EEXIST, for an entry of another spelling with
+    /// [`crate::NameProblem::CaseCollision`]. A directory of the same name
+    /// is no collision for [`Volume::find_or_create_dir`], which takes it.
+    Fail,
+    /// Take what is there: a file is replaced, and a directory under a name
+    /// of another spelling is the directory of this name.
+    Replace,
+}
+
+/// The directory [`Volume::find_or_create_dir`] makes sure is there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectoryOrigin {
+    /// The volume had none, and it was made.
+    Created,
+    /// It was there already.
+    Existing {
+        /// The attributes of its entry.
+        attributes: u8,
+    },
 }
 
 /// Where a path led: the root, or an entry and the first cluster of the
@@ -679,10 +705,19 @@ impl Volume {
     /// Descends from the root along `comps`, which must all be directories,
     /// and returns the first cluster of the directory reached.
     fn walk(&self, comps: &[&str]) -> Result<u32> {
+        self.walk_with(comps, |_| {})
+    }
+
+    /// [`Volume::walk`], handing `visit` the entry of every directory it
+    /// descends into.
+    fn walk_with(&self, comps: &[&str], mut visit: impl FnMut(&DirEntry)) -> Result<u32> {
         let mut cluster = self.boot.root_cluster;
         for (i, name) in comps.iter().enumerate() {
             cluster = match self.with_directory(cluster, |dir| Ok(Self::find(dir, name)))? {
-                Some(e) if e.short.is_directory() => e.short.first_cluster,
+                Some(e) if e.short.is_directory() => {
+                    visit(&e);
+                    e.short.first_cluster
+                }
                 Some(_) => {
                     let p = format!("/{}", comps[..=i].join("/"));
                     bail!(ENOTDIR, Detail::Path(p.clone()), "'{}' is not a directory", p);
@@ -694,6 +729,28 @@ impl Volume {
             };
         }
         Ok(cluster)
+    }
+
+    /// The path of the directory `dir` as the volume spells the names on
+    /// it: "/efi" is "/EFI" where the volume holds EFI, and the root is "".
+    fn stored_path(&self, dir: &str) -> Result<String> {
+        let mut stored = String::new();
+        self.walk_with(&components(dir)?, |entry| {
+            stored.push(SEPARATOR);
+            stored.push_str(&entry.name());
+        })?;
+        Ok(stored)
+    }
+
+    /// The error of a case collision of `path` with `existing`, the entry
+    /// its directory holds under a name FAT does not tell apart from the
+    /// last name of `path`. It names `existing` by its path as the volume
+    /// spells it.
+    fn case_collision(&self, path: &str, existing: &DirEntry) -> Error {
+        match self.stored_path(crate::path::parent(path)) {
+            Ok(dir) => Error::case_collision(path, &crate::path::join(&dir, &existing.name())),
+            Err(e) => e,
+        }
     }
 
     fn locate(&self, path: &str) -> Result<Located> {
@@ -997,6 +1054,45 @@ impl Volume {
         })?;
         self.keep_directory(child);
         Ok(())
+    }
+
+    /// Makes sure there is a directory at `path` for content to go into, as
+    /// a copy or an assembly finds one or makes one with `time`, and says
+    /// which. A directory of the same name is that one. One under a name FAT
+    /// does not tell apart from the last name of `path` is that one with
+    /// [`NameCollision::Replace`], and a case collision with
+    /// [`NameCollision::Fail`], which comes before anything else about the
+    /// entry. A file of that name fails with ENOTDIR. The parent has to
+    /// exist. Only making a directory writes to the volume, and nothing
+    /// is written for one that is refused, as with [`Volume::create_dir`].
+    pub fn find_or_create_dir(
+        &mut self,
+        path: &str,
+        time: SystemTime,
+        collision: NameCollision,
+    ) -> Result<DirectoryOrigin> {
+        let (parent, name) = self.locate_parent(path)?;
+        self.with_directory_mut(parent, |vol, parent| {
+            let Some(existing) = Self::find(parent, name.as_str()) else {
+                let child = vol.make_directory(parent, &name, time).map_err(|e| e.at_path(path))?;
+                vol.keep_directory(child);
+                return Ok(DirectoryOrigin::Created);
+            };
+            if collision == NameCollision::Fail && existing.name() != name.as_str() {
+                return Err(vol.case_collision(path, &existing));
+            }
+            if !existing.short.is_directory() {
+                bail!(
+                    ENOTDIR,
+                    Detail::Path(path.to_string()),
+                    "'{}' exists in the volume and is not a directory",
+                    path
+                );
+            }
+            Ok(DirectoryOrigin::Existing {
+                attributes: existing.short.attr,
+            })
+        })
     }
 
     /// Creates a directory and any missing parents. Existing directories
