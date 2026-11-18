@@ -212,7 +212,8 @@ While copying, ufat verifies the size and the SHA-256 hash of every file.
 The data of a file is the part of its file below the SOURCE that starts
 at the offset the manifest gives and is as long as the manifest says,
 whatever else that file holds. A file that is missing below the SOURCE,
-too short for the data, or does not match fails the command, and the file
+too short for the data, or does not match fails the command. If
+`--create` made the image, nothing is left of it. Otherwise the file
 system is left marked as not cleanly unmounted, with the files that were
 complete.
 
@@ -303,7 +304,8 @@ With `--replace` the entries of a directory under two such names, such
 as `FOO BAR/a` and `FOOBAR~1/b`, go into one directory. The plan holds
 the entries under each name to the limit on their own, and only the
 write sees them all in one directory. When they do not fit, `assemble`
-fails with "directory is full".
+fails with "directory is full", and nothing is left of an image that
+`--create` made.
 
 A file and a directory under two such names pass the plan, and
 `assemble` fails on the second one, with or without `--replace`.
@@ -359,12 +361,51 @@ unmounted, the way Linux, Windows and EDK2 expect. ufat removes the mark
 when it closes the volume. After a crash, the mark tells readers and
 `ufat check` to look at the volume.
 
-When `assemble` fails after it has formatted the file system, ufat
-leaves the file system marked as not cleanly unmounted, as after a
-crash. It holds the files that were complete when the command failed.
-`ufat check` and fsck.fat report the mark, and Linux warns about it when
-it mounts the file system read-write. Running `assemble --force` again
-formats the file system anew.
+An image that `assemble --create` makes gets its name only when
+everything else succeeded, its hash included. Until then it has no name,
+so a failed `assemble` leaves nothing of it. If a file takes the name
+meanwhile, `assemble` fails and leaves that file as it is. On a file
+system that cannot make a file without a name, such as NFS or FAT, the
+image has a temporary name in the same directory until then: `.#`
+followed by its name and 16 hex digits. A kill or a crash leaves that
+file behind. Once the image and the files written next to it have their
+names, ufat syncs their directories, so that a power cut does not lose
+the names. It does that also when `assemble` fails after the image got
+its name. It does not sync a directory on a file system that cannot sync
+directories, such as vboxsf, or a directory it may not read.
+
+There are exceptions. A file system that can neither rename a file
+without replacing another one nor make hard links, such as vboxsf, does
+not let the image wait for its name. There the image gets its name right
+away, and a failed `assemble` removes it again, but a kill or a crash
+leaves it. ufat removes such a name only while it still refers to the
+image, but another file can take the name between that check and the
+removal, and is removed then. Another file that takes the temporary name
+of the image just before ufat renames the image gets the name of the
+image, and `assemble` fails and leaves it there. When another process
+locks the new image first, `assemble` fails and leaves the image to that
+process: under its temporary name where it has one, or under its name on
+a file system such as vboxsf. A file system that makes files without a
+name but cannot give them one, such as a FUSE file system without hard
+links, fails `assemble` at its very end. An image that has its name
+keeps it when a file written next to it cannot get its own, and when
+syncing its directory or checking its name fails, which ufat says. A
+name that cannot be removed stays, and ufat says so after the error.
+
+The files that `--write-manifest` and `--write-hash` write get their
+names after the image, and a failed `assemble` leaves what is at their
+paths as it was. A regular file there is replaced, not written over, so
+other hard links to it keep what it held. A pipe, a device or a symbolic
+link at such a path is written to as `assemble` goes, like standard
+output. A hash that `--hash` prints is printed once the image has its
+name.
+
+When `assemble` fails after it has formatted the file system in an image
+that was there before, ufat leaves the file system marked as not cleanly
+unmounted, as after a crash. It holds the files that were complete when
+the command failed. `ufat check` and fsck.fat report the mark, and Linux
+warns about it when it mounts the file system read-write. Running
+`assemble --force` again formats the file system anew.
 
 When `populate` fails while it writes a tree or a manifest, ufat leaves
 the file system marked the same way, unless nothing was written yet. A

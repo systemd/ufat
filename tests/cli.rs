@@ -8,7 +8,7 @@ mod common;
 
 use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use common::{ufat, Temp};
@@ -753,10 +753,11 @@ fn assemble_and_populate_take_trees_and_manifests() {
     // The files a manifest names are found below the SOURCE when they are
     // copied, and the messages about them name the SOURCE. A SOURCE that is
     // not there leaves nothing behind. A file that is missing, or changed
-    // since the manifest was written, fails the copy, and the file system
-    // holds what was complete before it, marked as not cleanly unmounted,
-    // the way a crash would leave it. A file that grew still has the data
-    // the manifest describes at its start, and that is what is copied.
+    // since the manifest was written, fails the copy. An image made for the
+    // file system is not kept then. One that was there holds what was
+    // complete before the failure, marked as not cleanly unmounted, the way
+    // a crash would leave it. A file that grew still has the data the
+    // manifest describes at its start, and that is what is copied.
     let d = image("d.img");
     let d = d.as_str();
     fails(
@@ -768,14 +769,18 @@ fn assemble_and_populate_take_trees_and_manifests() {
     let empty = root.join("empty");
     let empty = empty.to_str().unwrap();
     fs::create_dir(empty).unwrap();
+    let missing = format!(
+        "ufat: {}: EFI/Linux/linux.efi: failed to open EFI/Linux/linux.efi",
+        empty
+    );
     fails(
         &bin,
         &["assemble", "--create", "--minimize", "--manifest", m, d, empty],
-        &format!(
-            "ufat: {}: EFI/Linux/linux.efi: failed to open EFI/Linux/linux.efi",
-            empty
-        ),
+        &missing,
     );
+    assert!(!Path::new(d).exists());
+    fs::write(d, b"").unwrap();
+    fails(&bin, &["assemble", "--minimize", "--manifest", m, d, empty], &missing);
     assert_eq!(ok(&bin, &["list", d, "/EFI/Linux"]), "");
     fs::write(root.join("tree/EFI/Linux/linux.efi"), b"kernel and more").unwrap();
     ok(&bin, &["assemble", "--force", "--manifest", m, d, tree_arg]);
@@ -1001,7 +1006,8 @@ fn names_fat_does_not_tell_apart() {
         &["assemble", "--create", "--size", "40M", &a, &both],
         "'/readme.txt' and '/README.TXT' are names FAT cannot tell apart",
     );
-    ok(&bin, &["assemble", "--force", "--replace", &a, &both]);
+    assert!(!Path::new(&a).exists(), "a failed assemble left its image behind");
+    ok(&bin, &["assemble", "--create", "--size", "40M", "--replace", &a, &both]);
     assert_eq!(ok(&bin, &["list", &a]), "readme.txt\n");
     assert_eq!(ok(&bin, &["cat", &a, "/README.TXT"]), "lower\n");
     fails(
@@ -1030,7 +1036,7 @@ fn names_fat_does_not_tell_apart() {
         &["assemble", "--create", "--size", "40M", &d, &dirs],
         "'/efi' and '/EFI' are names FAT cannot tell apart",
     );
-    ok(&bin, &["assemble", "--force", "--replace", &d, &dirs]);
+    ok(&bin, &["assemble", "--create", "--size", "40M", "--replace", &d, &dirs]);
     assert_eq!(ok(&bin, &["list", &d, "/EFI"]), "a\nb\n");
     // A trailing slash means nothing, also to the message, which spells the
     // path that is there the way the file system does.
@@ -1058,19 +1064,23 @@ fn names_fat_does_not_tell_apart() {
     );
     fails(
         &bin,
-        &["assemble", "--force", "--replace", &e, &mixed],
+        &["assemble", "--create", "--size", "40M", "--replace", &e, &mixed],
         "'/efi' is a directory",
     );
+    assert!(!Path::new(&e).exists(), "a failed assemble left its image behind");
 }
 
 /// A volume too small for what goes into it. A copy that runs out of
 /// clusters says which file did not fit and leaves what came before it in
 /// a consistent file system. `assemble --minimize` with a `--size` the
-/// content does not fit says so before it sizes or formats anything: a
-/// file `--create` made is gone again and an existing file is as it was.
-/// So do `--fit` and `--manifest` without a SOURCE, and a size of 0, which
-/// no file system fits in. With `--minimize` and without a size an
-/// existing file is grown to the fit and never shrunk. Without
+/// content does not fit says so before it sizes or formats anything:
+/// nothing is left of a file `--create` made, and an existing file is as
+/// it was. So do `--fit` and `--manifest` without a SOURCE, and a size of
+/// 0, which no file system fits in. Without `--minimize` content that does
+/// not fit is found while it is written: nothing is left of a file
+/// `--create` made then either, and an existing file keeps what was
+/// written, marked as not cleanly unmounted. With `--minimize` and without
+/// a size an existing file is grown to the fit and never shrunk. Without
 /// `--minimize` the file system takes the size given or the whole file.
 #[test]
 fn too_small_volumes_fail_cleanly() {
@@ -1134,6 +1144,56 @@ fn too_small_volumes_fail_cleanly() {
         );
         assert!(!new.exists(), "a failed assemble left its image behind");
     }
+    // Without --minimize content that does not fit is found while it is
+    // written. The image made for it is not kept then either, and neither
+    // is it when the manifest of what was written or its hash cannot be
+    // written.
+    fails(
+        &bin,
+        &["assemble", "--create", "--size", "34M", n, t],
+        "copying big.bin: no free clusters left",
+    );
+    assert!(!new.exists(), "a failed assemble left its image behind");
+    fails(
+        &bin,
+        &["assemble", "--create", "--size", "34M", "--manifest", m, n, t],
+        "copying big.bin: no free clusters left",
+    );
+    assert!(!new.exists(), "a failed assemble left its image behind");
+    let nowhere = root.join("missing/m.json");
+    let nowhere = nowhere.to_str().unwrap();
+    fails(
+        &bin,
+        &[
+            "assemble",
+            "--create",
+            "--size",
+            "64M",
+            "--write-manifest",
+            nowhere,
+            n,
+            t,
+        ],
+        "cannot create",
+    );
+    assert!(!new.exists(), "a failed assemble left its image behind");
+    fails(
+        &bin,
+        &[
+            "assemble",
+            "--create",
+            "--size",
+            "64M",
+            "--hash",
+            "sha256",
+            "--write-hash",
+            nowhere,
+            n,
+            t,
+        ],
+        "cannot write",
+    );
+    assert!(!new.exists(), "a failed assemble left its image behind");
     let existing = root.join("existing.img");
     let e = existing.to_str().unwrap();
     fs::write(&existing, b"").unwrap();
@@ -1143,6 +1203,15 @@ fn too_small_volumes_fail_cleanly() {
         "holds 1048576 bytes but the content needs",
     );
     assert_eq!(fs::metadata(&existing).unwrap().len(), 0);
+    // An image that was there keeps what was written, marked as not
+    // cleanly unmounted.
+    fails(
+        &bin,
+        &["assemble", "--size", "34M", e, t],
+        "copying big.bin: no free clusters left",
+    );
+    assert_eq!(fs::metadata(&existing).unwrap().len(), 34 << 20);
+    assert!(ok(&bin, &["check", e]).contains("marked dirty"));
 
     let size: u64 = ok(&bin, &["assemble", "--plan", t]).trim().parse().unwrap();
     // A plan against a size says whether the tree fits it, the way
@@ -1339,7 +1408,7 @@ fn a_plan_against_a_size_answers_for_assemble() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{}", stderr);
     assert!(stderr.contains("no free clusters left"), "{}", stderr);
-    fs::remove_file(&image).unwrap();
+    assert!(!image.exists(), "a failed assemble left its image behind");
     // 400 MiB holds them, and the plan says so.
     ok(&bin, &["assemble", "--plan", "--size", "400M", "--manifest", m]);
     let out = run_in(
@@ -1400,6 +1469,7 @@ fn directories_under_two_names_fill_up_when_written() {
         ],
         "directory is full",
     );
+    assert!(!image.exists(), "a failed assemble left its image behind");
     let image = root.join("b.img");
     let b = image.to_str().unwrap();
     fails(
@@ -1407,6 +1477,7 @@ fn directories_under_two_names_fill_up_when_written() {
         &["assemble", "--create", "--minimize", "--manifest", s, b, "-"],
         "'/efi' and '/EFI' are names FAT cannot tell apart",
     );
+    assert!(!image.exists(), "a failed assemble left its image behind");
     let whole = root.join("whole.manifest");
     fs::write(&whole, manifest(&[("EFI", 0..3200)])).unwrap();
     fails(
@@ -1414,6 +1485,902 @@ fn directories_under_two_names_fill_up_when_written() {
         &["assemble", "--plan", "--manifest", whole.to_str().unwrap()],
         "'/EFI' needs more than the 65536 entry slots a FAT32 directory holds",
     );
+}
+
+/// The names in `dir` that a new file waits under where O_TMPFILE is
+/// refused: `.#`, its name and 16 hex digits.
+fn temporary_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".#"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Whether the file system of `dir` makes a file without a name
+/// (O_TMPFILE), as ufat tries first.
+fn makes_unnamed_files(dir: &Path) -> bool {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a NUL terminated path and plain flags.
+    let fd = unsafe { libc::open(dir.as_ptr(), libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC, 0o600) };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: a descriptor the kernel just handed out, owned by nothing
+    // else.
+    drop(unsafe { OwnedFd::from_raw_fd(fd) });
+    true
+}
+
+/// Runs `command` with its standard output a pipe whose reader is gone, so
+/// that its first write there fails, and returns how it ended.
+fn with_a_closed_pipe(mut command: Command) -> Output {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::process::Stdio;
+    let mut fds = [0; 2];
+    // SAFETY: pipe2() stores two new descriptors in the array.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: both descriptors were just created and nothing else owns
+    // them.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    drop(read);
+    command
+        .env("SOURCE_DATE_EPOCH", "1700000000")
+        .stdout(Stdio::from(write))
+        .stderr(Stdio::piped())
+        .output()
+        .expect("ufat runs")
+}
+
+/// assemble gives the image it makes its name only once everything else
+/// succeeded, the hash included, and the files it writes next to the
+/// image, the manifest and the hash, theirs after the image. A failure
+/// before leaves none of them behind: what was at their paths stays as it
+/// was, also where the manifest was written before the hash failed. On
+/// success they replace what is there, and what is not a regular file,
+/// such as /dev/stdout, is written to as the command goes.
+#[test]
+fn assemble_names_what_it_made_at_the_end() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    let tree = root.join("tree");
+    let t = tree.to_str().unwrap();
+    let image = root.join("a.img");
+    let a = image.to_str().unwrap();
+    let manifest = root.join("a.manifest");
+    let m = manifest.to_str().unwrap();
+    let hash = root.join("a.sha256");
+    let h = hash.to_str().unwrap();
+    fs::write(&manifest, b"old manifest\n").unwrap();
+    fs::write(&hash, b"old hash\n").unwrap();
+    let nowhere = root.join("missing/a.sha256");
+    let nowhere = nowhere.to_str().unwrap();
+    let assemble = |hash| {
+        let args = ["assemble", "--create", "--size", "40M", "--write-manifest", m];
+        [&args[..], &["--hash", "sha256", "--write-hash", hash, a, t]].concat()
+    };
+    fails(&bin, &assemble(nowhere), &format!("cannot write {}", nowhere));
+    assert!(!image.exists(), "a failed assemble left its image behind");
+    assert_eq!(fs::read(&manifest).unwrap(), b"old manifest\n");
+    assert_eq!(fs::read(&hash).unwrap(), b"old hash\n");
+    assert_eq!(temporary_names(root), Vec::<String>::new());
+    ok(&bin, &assemble(h));
+    let digest = fat::manifest::Sha256::digest(&fs::read(&image).unwrap());
+    assert_eq!(fs::read_to_string(&hash).unwrap(), format!("{}\n", digest));
+    let described = ok(&bin, &["describe", "--write-manifest", "-", a]);
+    assert_eq!(fs::read_to_string(&manifest).unwrap(), described);
+    assert!(ok(&bin, &["check", a]).ends_with("; 0 errors, 0 warnings\n"));
+    assert_eq!(temporary_names(root), Vec::<String>::new());
+    // The name is taken now, and what is there is formatted anew.
+    fails(&bin, &assemble(h), "use --force to format it anyway");
+    let written = ok(&bin, &["assemble", "--force", "--write-manifest", "/dev/stdout", a, t]);
+    assert_eq!(written, ok(&bin, &["describe", "--write-manifest", "-", a]));
+    assert_eq!(temporary_names(root), Vec::<String>::new());
+}
+
+/// A manifest on standard output is written before the image gets its
+/// name. SIGPIPE ends assemble when the reader of the pipe is gone, and no
+/// image is left. A hash is printed once the image has its name, so there
+/// SIGPIPE leaves the image complete.
+#[test]
+fn a_killed_assemble_leaves_no_image() {
+    use std::os::unix::process::ExitStatusExt;
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    let tree = root.join("tree");
+    let image = root.join("a.img");
+    let mut command = Command::new(&bin);
+    command
+        .args(["assemble", "--create", "--size", "40M", "--write-manifest", "-"])
+        .args([&image, &tree]);
+    let out = with_a_closed_pipe(command);
+    assert_eq!(out.status.signal(), Some(libc::SIGPIPE), "{:?}", out);
+    assert!(!image.exists(), "a killed assemble left its image behind");
+    if makes_unnamed_files(root) {
+        assert_eq!(temporary_names(root), Vec::<String>::new());
+    }
+    let mut command = Command::new(&bin);
+    command
+        .args(["assemble", "--create", "--size", "40M", "--hash", "sha256"])
+        .args([&image, &tree]);
+    let out = with_a_closed_pipe(command);
+    assert_eq!(out.status.signal(), Some(libc::SIGPIPE), "{:?}", out);
+    assert!(ok(&bin, &["check", image.to_str().unwrap()]).ends_with("; 0 errors, 0 warnings\n"));
+}
+
+/// Where ufat, running as `pid`, makes an image in `dir`: its descriptor of
+/// the file without a name, /proc/PID/fd/N, or where O_TMPFILE is refused
+/// the temporary name of the file. Only once the image has its size, which
+/// comes after the probe that can rename the file, so that its name holds.
+fn image_in_the_making(pid: u32, dir: &Path) -> Option<PathBuf> {
+    let unnamed = format!("{}/#", fs::canonicalize(dir).unwrap().display());
+    let open = fs::read_dir(format!("/proc/{}/fd", pid)).ok().and_then(|fds| {
+        fds.flatten()
+            .map(|fd| fd.path())
+            .find(|fd| fs::read_link(fd).is_ok_and(|target| target.to_string_lossy().starts_with(&unnamed)))
+    });
+    open.or_else(|| temporary_names(dir).first().map(|name| dir.join(name)))
+        .filter(|image| fs::metadata(image).is_ok_and(|metadata| metadata.len() > 0))
+}
+
+/// Runs `command`, ufat assembling with `--manifest -` an image in `dir`,
+/// with the manifest `text` on its standard input. The root object goes
+/// first: assemble reads it before it makes the image, and the record
+/// separator of the next object ends it. Once the image is in the making,
+/// `meanwhile` gets where it is, and the rest of the manifest goes in.
+fn assemble_meanwhile(mut command: Command, dir: &Path, text: &str, meanwhile: impl FnOnce(&Path)) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let (first, rest) = text.split_at(text[1..].find('\x1e').unwrap() + 2);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("ufat runs");
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(first.as_bytes()).unwrap();
+    let started = Instant::now();
+    let image = loop {
+        if let Some(image) = image_in_the_making(child.id(), dir) {
+            break image;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("ufat ended before it made the image: {}", status);
+        }
+        assert!(started.elapsed() < Duration::from_secs(60), "ufat made no image");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    meanwhile(&image);
+    // ufat may fail before it read all of it.
+    let _ = stdin.write_all(rest.as_bytes());
+    drop(stdin);
+    child.wait_with_output().unwrap()
+}
+
+/// Gives the file at `from` the name `to` as well. `from` can be one of
+/// the /proc/PID/fd/N of ufat, which is followed to the file, also to one
+/// without a name.
+fn hard_link(from: &Path, to: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let (from, to) = (
+        std::ffi::CString::new(from.as_os_str().as_bytes()).unwrap(),
+        std::ffi::CString::new(to.as_os_str().as_bytes()).unwrap(),
+    );
+    // SAFETY: NUL terminated paths and plain flags.
+    let linked = unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    };
+    assert_eq!(linked, 0, "{}", std::io::Error::last_os_error());
+}
+
+/// A name that something else takes while assemble makes the image stays
+/// as it is: the image does not get it, and nothing is left of the image
+/// or of the manifest written next to it.
+#[test]
+fn a_name_taken_meanwhile_stays_as_it_is() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    let tree = root.join("tree");
+    let text = ok(&bin, &["manifest", tree.to_str().unwrap()]);
+    let image = root.join("a.img");
+    let manifest = root.join("a.manifest");
+    fs::write(&manifest, b"old\n").unwrap();
+    let mut command = Command::new(&bin);
+    command
+        .env("SOURCE_DATE_EPOCH", "1700000000")
+        .args([
+            "assemble",
+            "--create",
+            "--size",
+            "40M",
+            "--manifest",
+            "-",
+            "--write-manifest",
+        ])
+        .args([&manifest, &image, &tree]);
+    let out = assemble_meanwhile(command, root, &text, |_| fs::write(&image, b"theirs").unwrap());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr);
+    let taken = format!(
+        "failed to create {}: {}",
+        image.display(),
+        std::io::Error::from_raw_os_error(libc::EEXIST)
+    );
+    assert!(stderr.contains(&taken), "{}", stderr);
+    assert_eq!(fs::read(&image).unwrap(), b"theirs");
+    assert_eq!(fs::read(&manifest).unwrap(), b"old\n");
+    assert_eq!(temporary_names(root), Vec::<String>::new());
+}
+
+/// An image assemble gives up after it wrote part of the content is not
+/// written to anymore. So a file system that got another name while it was
+/// made, a hard link through ufat's descriptor or through the temporary
+/// name where O_TMPFILE is refused, keeps the marks of one that is being
+/// written and is never taken for a finished one.
+#[test]
+fn a_given_up_image_keeps_its_marks() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    let tree = root.join("tree");
+    let text = ok(&bin, &["manifest", tree.to_str().unwrap()]);
+    let empty = root.join("empty");
+    fs::create_dir(&empty).unwrap();
+    let image = root.join("a.img");
+    let kept = root.join("kept.img");
+    let unnamed = Command::new(&bin);
+    for command in [Some(unnamed), refusing(&bin, &[Refused::TMPFILE])]
+        .into_iter()
+        .flatten()
+    {
+        let mut command = command;
+        command
+            .env("SOURCE_DATE_EPOCH", "1700000000")
+            .args(["assemble", "--create", "--size", "40M", "--manifest", "-"])
+            .args([&image, &empty]);
+        let out = assemble_meanwhile(command, root, &text, |made| hard_link(made, &kept));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{}", stderr);
+        assert!(stderr.contains("failed to open EFI/Linux/linux.efi"), "{}", stderr);
+        assert!(!image.exists(), "a failed assemble left its image behind");
+        assert_eq!(temporary_names(root), Vec::<String>::new());
+        let report = ok(&bin, &["check", kept.to_str().unwrap()]);
+        assert!(report.contains("marked dirty"), "{}", report);
+        fs::remove_file(&kept).unwrap();
+    }
+}
+
+/// A system call that fails with `errno` under a seccomp filter on ufat,
+/// where its argument at the index of `flag` has that flag set, or always
+/// without a `flag`. ufat runs then the way it runs where the kernel or the
+/// file system refuses what the call asks for.
+#[derive(Clone, Copy, Debug)]
+struct Refused {
+    call: libc::c_long,
+    flag: Option<(usize, u32)>,
+    errno: i32,
+}
+
+/// The flags of include/uapi/linux/audit.h that make an AUDIT_ARCH of a
+/// machine of elf.h, the architecture a seccomp filter compares with.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const AUDIT_ARCH_64BIT: u32 = 0x8000_0000;
+#[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64"))]
+const AUDIT_ARCH_LE: u32 = 0x4000_0000;
+
+/// The AUDIT_ARCH of the system calls of ufat, where the filters know it.
+/// Each of these is little endian, so the low 32 bits of an argument come
+/// first.
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH: Option<u32> = Some(libc::EM_X86_64 as u32 | AUDIT_ARCH_64BIT | AUDIT_ARCH_LE);
+#[cfg(target_arch = "x86")]
+const AUDIT_ARCH: Option<u32> = Some(libc::EM_386 as u32 | AUDIT_ARCH_LE);
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH: Option<u32> = Some(libc::EM_AARCH64 as u32 | AUDIT_ARCH_64BIT | AUDIT_ARCH_LE);
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+const AUDIT_ARCH: Option<u32> = None;
+
+impl Refused {
+    /// O_TMPFILE, refused as a file system without it refuses it.
+    const TMPFILE: Refused = Refused {
+        call: libc::SYS_openat,
+        flag: Some((2, (libc::O_TMPFILE & !libc::O_DIRECTORY) as u32)),
+        errno: libc::EOPNOTSUPP,
+    };
+    /// linkat() with AT_EMPTY_PATH, refused as without CAP_DAC_READ_SEARCH
+    /// before Linux 6.10.
+    const EMPTY_PATH_LINK: Refused = Refused {
+        call: libc::SYS_linkat,
+        flag: Some((4, libc::AT_EMPTY_PATH as u32)),
+        errno: libc::ENOENT,
+    };
+    /// renameat2() with RENAME_NOREPLACE, refused as NFS refuses it.
+    const NOREPLACE: Refused = Refused {
+        call: libc::SYS_renameat2,
+        flag: Some((4, libc::RENAME_NOREPLACE)),
+        errno: libc::EINVAL,
+    };
+    /// Every linkat(), refused as a file system without hard links refuses
+    /// it (vfs_link()).
+    const LINK: Refused = Refused {
+        call: libc::SYS_linkat,
+        flag: None,
+        errno: libc::EPERM,
+    };
+    /// Every flock(), refused as where another process holds the lock.
+    const FLOCK: Refused = Refused {
+        call: libc::SYS_flock,
+        flag: None,
+        errno: libc::EWOULDBLOCK,
+    };
+    /// Every flock(), refused as NFS without its lock manager refuses it.
+    const NO_LOCKS: Refused = Refused {
+        call: libc::SYS_flock,
+        flag: None,
+        errno: libc::ENOLCK,
+    };
+    /// Every linkat(), failing for another reason than hard links being
+    /// refused.
+    const LINK_FAILS: Refused = Refused {
+        call: libc::SYS_linkat,
+        flag: None,
+        errno: libc::EIO,
+    };
+    /// Every renameat(), a rename that may replace, failing. glibc renames
+    /// with it on x86_64 and x86, where it is a system call of its own.
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    const RENAME: Refused = Refused {
+        call: libc::SYS_renameat,
+        flag: None,
+        errno: libc::EIO,
+    };
+
+    /// The seccomp filter: another architecture, another system call or
+    /// the call without the flag is allowed.
+    fn filter(self, arch: u32) -> Vec<libc::sock_filter> {
+        use std::mem::offset_of;
+        let load = |offset: usize| libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: offset as u32,
+        };
+        let jump = |code: u32, k: u32| libc::sock_filter {
+            code: (libc::BPF_JMP | code | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k,
+        };
+        let give = |action: u32| libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: action,
+        };
+        let mut filter = vec![
+            load(offset_of!(libc::seccomp_data, arch)),
+            jump(libc::BPF_JEQ, arch),
+            load(offset_of!(libc::seccomp_data, nr)),
+            jump(libc::BPF_JEQ, self.call as u32),
+        ];
+        if let Some((arg, flag)) = self.flag {
+            filter.push(load(offset_of!(libc::seccomp_data, args) + arg * size_of::<u64>()));
+            filter.push(jump(libc::BPF_JSET, flag));
+        }
+        filter.push(give(libc::SECCOMP_RET_ERRNO | self.errno as u32));
+        filter.push(give(libc::SECCOMP_RET_ALLOW));
+        // Every test that fails jumps to the last instruction, which allows
+        // the call.
+        let last = filter.len() - 1;
+        for (at, instruction) in filter.iter_mut().enumerate() {
+            if instruction.code == (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16
+                || instruction.code == (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16
+            {
+                instruction.jf = (last - at - 1) as u8;
+            }
+        }
+        filter
+    }
+}
+
+/// ufat with the system calls of `refused` refused, or None where seccomp
+/// filters cannot be had: on an architecture the filters do not know, or
+/// under qemu-user, which does not pass them on.
+fn refusing(bin: &Path, refused: &[Refused]) -> Option<Command> {
+    static USABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let arch = AUDIT_ARCH?;
+    let usable = *USABLE.get_or_init(|| {
+        let mut probe = filtered(bin, arch, &[Refused::TMPFILE]);
+        probe.arg("--version").output().is_ok_and(|out| out.status.success())
+    });
+    usable.then(|| filtered(bin, arch, refused))
+}
+
+/// ufat with the system calls of `refused` refused on the architecture
+/// `arch`.
+fn filtered(bin: &Path, arch: u32, refused: &[Refused]) -> Command {
+    use std::os::unix::process::CommandExt;
+    let filters: Vec<Vec<libc::sock_filter>> = refused.iter().map(|r| r.filter(arch)).collect();
+    let mut command = Command::new(bin);
+    command.env("SOURCE_DATE_EPOCH", "1700000000");
+    // SAFETY: between fork and exec the closure makes prctl() calls only,
+    // with filters made before the fork.
+    unsafe {
+        command.pre_exec(move || {
+            let (on, unused): (libc::c_ulong, libc::c_ulong) = (1, 0);
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, on, unused, unused, unused) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for filter in &filters {
+                let program = libc::sock_fprog {
+                    len: filter.len() as u16,
+                    filter: filter.as_ptr().cast_mut(),
+                };
+                let mode = libc::SECCOMP_MODE_FILTER as libc::c_ulong;
+                if libc::prctl(libc::PR_SET_SECCOMP, mode, std::ptr::from_ref(&program)) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
+/// Where O_TMPFILE is refused, the image waits under a temporary name in
+/// its directory, `.#`, its name and 16 hex digits, and so do the files
+/// written next to it. Success renames them, with RENAME_NOREPLACE for the
+/// image, and where that is refused too with a link and the removal of the
+/// temporary name. A failure, also one after part of the content was
+/// written, removes them. A kill leaves the temporary name of the image.
+/// Where a link with AT_EMPTY_PATH is refused, the files are linked through
+/// /proc/self/fd. seccomp filters on ufat do the refusing; qemu-user does
+/// not pass them on, and an architecture the filters do not know skips
+/// the test.
+#[test]
+fn assemble_where_o_tmpfile_or_more_is_refused() {
+    use std::os::unix::process::ExitStatusExt;
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    if refusing(&bin, &[]).is_none() {
+        return eprintln!("skipping: no seccomp filters here");
+    }
+    let refused = |refused: &[Refused], args: &[&str]| {
+        let mut command = refusing(&bin, refused)?;
+        command.args(args);
+        command.output().ok()
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    let tree = root.join("tree");
+    let t = tree.to_str().unwrap();
+    let empty = root.join("empty");
+    fs::create_dir(&empty).unwrap();
+    let image = root.join("a.img");
+    let a = image.to_str().unwrap();
+    let manifest = root.join("a.manifest");
+    let m = manifest.to_str().unwrap();
+    fs::write(&manifest, ok(&bin, &["manifest", t])).unwrap();
+    let written = root.join("written.manifest");
+    let w = written.to_str().unwrap();
+    fs::write(&written, b"old\n").unwrap();
+    let creates = ["assemble", "--create", "--size", "40M", "--write-manifest", w];
+    let tmpfile = &[Refused::TMPFILE][..];
+    // A file missing below the SOURCE, after the directories were written.
+    let out = refused(
+        tmpfile,
+        &[&creates[..], &["--manifest", m, a, empty.to_str().unwrap()]].concat(),
+    )
+    .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{:?}", out);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("failed to open EFI/Linux/linux.efi"));
+    assert!(!image.exists(), "a failed assemble left its image behind");
+    assert_eq!(fs::read(&written).unwrap(), b"old\n");
+    assert_eq!(temporary_names(root), Vec::<String>::new());
+    // A hash that cannot be written, after the manifest was.
+    let nowhere = root.join("missing/a.sha256");
+    let hashed = ["--hash", "sha256", "--write-hash", nowhere.to_str().unwrap(), a, t];
+    let out = refused(tmpfile, &[&creates[..], &hashed].concat()).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{:?}", out);
+    assert!(!image.exists(), "a failed assemble left its image behind");
+    assert_eq!(fs::read(&written).unwrap(), b"old\n");
+    assert_eq!(temporary_names(root), Vec::<String>::new());
+    for refusals in [
+        tmpfile,
+        &[Refused::TMPFILE, Refused::NOREPLACE],
+        &[Refused::EMPTY_PATH_LINK],
+    ] {
+        let out = refused(refusals, &[&creates[..], &[a, t]].concat()).unwrap();
+        assert!(out.status.success(), "{:?}: {:?}", refusals, out);
+        assert!(ok(&bin, &["check", a]).ends_with("; 0 errors, 0 warnings\n"));
+        assert_eq!(
+            fs::read_to_string(&written).unwrap(),
+            ok(&bin, &["describe", "--write-manifest", "-", a])
+        );
+        assert_eq!(temporary_names(root), Vec::<String>::new());
+        fs::remove_file(&image).unwrap();
+        fs::write(&written, b"old\n").unwrap();
+    }
+    let mut command = refusing(&bin, tmpfile).unwrap();
+    command.args(["assemble", "--create", "--size", "40M", "--write-manifest", "-", a, t]);
+    let out = with_a_closed_pipe(command);
+    assert_eq!(out.status.signal(), Some(libc::SIGPIPE), "{:?}", out);
+    assert!(!image.exists(), "a killed assemble left its image behind");
+    let left = temporary_names(root);
+    assert_eq!(left.len(), 1, "{:?}", left);
+    let digits = left[0].strip_prefix(".#a.img").unwrap();
+    assert!(
+        digits.len() == 16 && digits.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{:?}",
+        left
+    );
+}
+
+/// Where a file system has neither O_TMPFILE nor RENAME_NOREPLACE nor hard
+/// links, as vboxsf and orangefs have none of them, assemble finds that out
+/// when it makes the image and takes the image's name right away, as it
+/// always did. A failure removes the image by that name again. The files
+/// next to the image get their names by a plain rename, which replaces.
+#[test]
+fn assemble_where_only_a_plain_rename_works() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    if refusing(&bin, &[]).is_none() {
+        return eprintln!("skipping: no seccomp filters here");
+    }
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    let tree = root.join("tree");
+    let empty = root.join("empty");
+    fs::create_dir(&empty).unwrap();
+    let image = root.join("a.img");
+    let manifest = root.join("a.manifest");
+    fs::write(&manifest, ok(&bin, &["manifest", tree.to_str().unwrap()])).unwrap();
+    let written = root.join("written.manifest");
+    fs::write(&written, b"old\n").unwrap();
+    let assemble = || {
+        let mut command = refusing(&bin, &[Refused::TMPFILE, Refused::NOREPLACE, Refused::LINK]).unwrap();
+        command.args(["assemble", "--create", "--size", "40M", "--write-manifest"]);
+        command.args([&written, &image]);
+        command
+    };
+    let out = assemble()
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg(&empty)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr);
+    assert!(stderr.contains("failed to open EFI/Linux/linux.efi"), "{}", stderr);
+    assert!(!image.exists(), "a failed assemble left its image behind");
+    assert_eq!(fs::read(&written).unwrap(), b"old\n");
+    assert_eq!(temporary_names(root), Vec::<String>::new());
+    let out = assemble().arg(&tree).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let a = image.to_str().unwrap();
+    assert!(ok(&bin, &["check", a]).ends_with("; 0 errors, 0 warnings\n"));
+    assert_eq!(
+        fs::read_to_string(&written).unwrap(),
+        ok(&bin, &["describe", "--write-manifest", "-", a])
+    );
+    assert_eq!(temporary_names(root), Vec::<String>::new());
+}
+
+/// A file that takes the temporary name of the image while assemble makes
+/// it is left where it is. Before the image gets its name, by a rename of
+/// the temporary name with RENAME_NOREPLACE or, where the flag is refused,
+/// by a link of its descriptor, assemble checks that the temporary name
+/// still refers to the image. It fails then, and says that the other file
+/// is left alone.
+#[test]
+fn a_temporary_name_taken_meanwhile_is_left_alone() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    if refusing(&bin, &[]).is_none() {
+        return eprintln!("skipping: no seccomp filters here");
+    }
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    let tree = root.join("tree");
+    let text = ok(&bin, &["manifest", tree.to_str().unwrap()]);
+    let image = root.join("a.img");
+    let theirs = root.join("theirs");
+    for refusals in [&[Refused::TMPFILE][..], &[Refused::TMPFILE, Refused::NOREPLACE]] {
+        let mut command = refusing(&bin, refusals).unwrap();
+        command
+            .args(["assemble", "--create", "--size", "40M", "--manifest", "-"])
+            .args([&image, &tree]);
+        let mut taken = PathBuf::new();
+        let out = assemble_meanwhile(command, root, &text, |made| {
+            fs::write(&theirs, b"theirs").unwrap();
+            fs::rename(&theirs, made).unwrap();
+            taken = made.to_path_buf();
+        });
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{:?}: {}", refusals, stderr);
+        let failed = format!(
+            "failed to create {}: {} refers to another file now",
+            image.display(),
+            taken.display()
+        );
+        assert!(stderr.contains(&failed), "{:?}: {}", refusals, stderr);
+        let left_alone = format!("{} refers to another file now, which is left alone", taken.display());
+        assert!(stderr.contains(&left_alone), "{:?}: {}", refusals, stderr);
+        assert!(!image.exists(), "{:?}: {}", refusals, stderr);
+        assert_eq!(fs::read(&taken).unwrap(), b"theirs");
+        fs::remove_file(&taken).unwrap();
+        assert_eq!(temporary_names(root), Vec::<String>::new());
+    }
+}
+
+/// Where the lock of a new image is refused, another process holds the
+/// file: assemble fails and leaves it its name, which it says. Where the
+/// lock cannot be had at all, as NFS without its lock manager refuses it
+/// with ENOLCK, assemble fails with that and leaves nothing.
+#[test]
+fn a_new_image_locked_by_another_process_keeps_its_name() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    if refusing(&bin, &[]).is_none() {
+        return eprintln!("skipping: no seccomp filters here");
+    }
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    let image = root.join("a.img");
+    let assemble = |refusals: &[Refused]| {
+        let mut command = refusing(&bin, refusals).unwrap();
+        command
+            .args(["assemble", "--create", "--size", "40M"])
+            .args([&image, &root.join("tree")]);
+        command.output().unwrap()
+    };
+    let out = assemble(&[Refused::TMPFILE, Refused::FLOCK]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr);
+    assert!(!image.exists());
+    let left = temporary_names(root);
+    assert_eq!(left.len(), 1, "{:?}", left);
+    let used = format!("{} is being used by another process", root.join(&left[0]).display());
+    assert!(stderr.contains(&used), "{}", stderr);
+    fs::remove_file(root.join(&left[0])).unwrap();
+    for refusals in [&[Refused::TMPFILE, Refused::NO_LOCKS][..], &[Refused::NO_LOCKS]] {
+        let out = assemble(refusals);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{:?}: {}", refusals, stderr);
+        let failed = format!("failed to create {}: failed to lock ", image.display());
+        assert!(stderr.contains(&failed), "{:?}: {}", refusals, stderr);
+        let unlocked = std::io::Error::from_raw_os_error(libc::ENOLCK).to_string();
+        assert!(stderr.contains(&unlocked), "{:?}: {}", refusals, stderr);
+        assert!(!image.exists());
+        assert_eq!(temporary_names(root), Vec::<String>::new());
+    }
+}
+
+/// Where the file system makes files without a name but refuses to link
+/// them, assemble says so at its end, and nothing is left. A link that
+/// fails for another reason says only that.
+#[test]
+fn a_file_system_that_cannot_name_the_image() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    if refusing(&bin, &[]).is_none() {
+        return eprintln!("skipping: no seccomp filters here");
+    }
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    if !makes_unnamed_files(root) {
+        return eprintln!("skipping: no O_TMPFILE here");
+    }
+    let image = root.join("a.img");
+    let refused = format!(
+        "failed to create {}: the file system made the file but refuses to give it its name",
+        image.display()
+    );
+    // In the words of the C library, which musl and glibc put differently.
+    let failed = format!(
+        "failed to create {}: {}",
+        image.display(),
+        std::io::Error::from_raw_os_error(libc::EIO)
+    );
+    for (refusal, says) in [(Refused::LINK, &refused), (Refused::LINK_FAILS, &failed)] {
+        let mut command = refusing(&bin, &[refusal]).unwrap();
+        command
+            .args(["assemble", "--create", "--size", "40M"])
+            .args([&image, &root.join("tree")]);
+        let out = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{}", stderr);
+        assert!(stderr.contains(says.as_str()), "{}", stderr);
+        assert!(!image.exists());
+        assert_eq!(temporary_names(root), Vec::<String>::new());
+    }
+}
+
+/// assemble makes an image in a directory it may search and write to but
+/// not read, as one of mode 0300. The image and the manifest written next
+/// to it get their names, and the directory, which cannot be opened to
+/// sync it, is left as it is.
+#[test]
+fn assemble_in_a_directory_it_cannot_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    let images = root.join("images");
+    fs::create_dir(&images).unwrap();
+    let (image, written) = (images.join("a.img"), images.join("a.manifest"));
+    let (a, w) = (image.to_str().unwrap(), written.to_str().unwrap());
+    let assemble = ["assemble", "--create", "--size", "40M", "--write-manifest", w, a];
+    fs::set_permissions(&images, fs::Permissions::from_mode(0o300)).unwrap();
+    let unreadable = fs::read_dir(&images).is_err();
+    let out = run(&bin, &[&assemble[..], &[root.join("tree").to_str().unwrap()]].concat());
+    fs::set_permissions(&images, fs::Permissions::from_mode(0o755)).unwrap();
+    if !unreadable {
+        eprintln!("the directory can be read here, so it was synced");
+    }
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(ok(&bin, &["check", a]).ends_with("; 0 errors, 0 warnings\n"));
+    assert_eq!(
+        fs::read_to_string(&written).unwrap(),
+        ok(&bin, &["describe", "--write-manifest", "-", a])
+    );
+}
+
+/// A file written next to the image that cannot get its name, where the
+/// name exists and the rename onto it fails, takes its temporary name with
+/// it, also with O_TMPFILE. The image keeps its name.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[test]
+fn an_output_that_cannot_replace_leaves_no_temporary_name() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    if refusing(&bin, &[]).is_none() {
+        return eprintln!("skipping: no seccomp filters here");
+    }
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    if !makes_unnamed_files(root) {
+        return eprintln!("skipping: no O_TMPFILE here");
+    }
+    let image = root.join("a.img");
+    let written = root.join("written.manifest");
+    fs::write(&written, b"old\n").unwrap();
+    let mut command = refusing(&bin, &[Refused::RENAME]).unwrap();
+    command
+        .args(["assemble", "--create", "--size", "40M", "--write-manifest"])
+        .args([&written, &image, &root.join("tree")]);
+    let out = command.output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr);
+    assert!(
+        stderr.contains(&format!("cannot write {}", written.display())),
+        "{}",
+        stderr
+    );
+    assert_eq!(fs::read(&written).unwrap(), b"old\n");
+    assert!(ok(&bin, &["check", image.to_str().unwrap()]).ends_with("; 0 errors, 0 warnings\n"));
+    assert_eq!(temporary_names(root), Vec::<String>::new());
+}
+
+/// Where O_TMPFILE is refused and the temporary name of an image assemble
+/// gives up cannot be removed, a line of its own names the image that
+/// stays. Where another file took the temporary name meanwhile, that file
+/// stays, and a line says so.
+#[test]
+fn what_stays_of_a_given_up_image_is_reported() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    if refusing(&bin, &[]).is_none() {
+        return eprintln!("skipping: no seccomp filters here");
+    }
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    let tree = root.join("tree");
+    let text = ok(&bin, &["manifest", tree.to_str().unwrap()]);
+    let empty = root.join("empty");
+    fs::create_dir(&empty).unwrap();
+    let image = root.join("a.img");
+    let assemble = || {
+        let mut command = refusing(&bin, &[Refused::TMPFILE]).unwrap();
+        command
+            .args(["assemble", "--create", "--size", "40M", "--manifest", "-"])
+            .args([&image, &empty]);
+        command
+    };
+    let chmod = |mode| fs::set_permissions(root, fs::Permissions::from_mode(mode)).unwrap();
+    // SAFETY: geteuid() reads the effective user id and nothing else.
+    if unsafe { libc::geteuid() } != 0 {
+        let out = assemble_meanwhile(assemble(), root, &text, |_| chmod(0o555));
+        chmod(0o755);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{}", stderr);
+        let stays = format!(
+            "ufat: the unfinished {} stays: failed to remove {}",
+            image.display(),
+            root.join(".#a.img").display()
+        );
+        // What failed comes first, then what that left behind.
+        let failed = stderr.find("failed to open EFI/Linux/linux.efi");
+        assert!(
+            failed.is_some_and(|failed| stderr.find(&stays).is_some_and(|stays| failed < stays)),
+            "{}",
+            stderr
+        );
+        let left = temporary_names(root);
+        assert_eq!(left.len(), 1, "{:?}", left);
+        fs::remove_file(root.join(&left[0])).unwrap();
+    }
+    let theirs = root.join("theirs");
+    let mut taken = PathBuf::new();
+    let out = assemble_meanwhile(assemble(), root, &text, |made| {
+        fs::write(&theirs, b"theirs").unwrap();
+        fs::rename(&theirs, made).unwrap();
+        taken = made.to_path_buf();
+    });
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr);
+    let left_alone = format!("{} refers to another file now, which is left alone", taken.display());
+    assert!(stderr.contains(&left_alone), "{}", stderr);
+    assert_eq!(fs::read(&taken).unwrap(), b"theirs");
+    assert!(!image.exists(), "a failed assemble left its image behind");
 }
 
 /// Paths on the host are taken as the bytes they are, UTF-8 or not. Paths

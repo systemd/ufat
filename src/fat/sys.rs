@@ -25,7 +25,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::errno::{
-    EAGAIN, EBADF, EINVAL, EIO, ELOOP, ENODEV, ENOENT, ENOSYS, ENOTDIR, ENOTTY, ENXIO, EOPNOTSUPP, EPERM,
+    EAGAIN, EBADF, EINVAL, EIO, EISDIR, ELOOP, ENODEV, ENOENT, ENOSYS, ENOTDIR, ENOTTY, ENXIO, EOPNOTSUPP, EPERM,
 };
 
 // The open(2) flags. libc has the values of each architecture: alpha,
@@ -57,7 +57,7 @@ pub(crate) const O_PATH: c_int = libc::O_PATH;
 pub(crate) use uapi::{O_EMPTYPATH, O_LARGEFILE};
 
 /// NAME_MAX, include/uapi/linux/limits.h: the longest file name.
-const NAME_MAX: usize = libc::NAME_MAX as usize;
+pub(crate) const NAME_MAX: usize = libc::NAME_MAX as usize;
 
 /// Steps a resolution by hand may take before we assume a loop, the
 /// CHASE_MAX of src/basic/chase.h: if people change the tree behind our
@@ -160,6 +160,141 @@ pub(crate) fn unlink_at(dir: BorrowedFd<'_>, name: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Makes a regular file without a name in the directory `dir`, open for
+/// reading and writing like [`create_file_at`] opens one: open(2) with
+/// O_TMPFILE. It goes away with its last descriptor unless [`link_fd`]
+/// gives it a name. A file system without O_TMPFILE refuses it with
+/// EOPNOTSUPP (vfs_tmpfile() in fs/namei.c), and a kernel that does not
+/// know the flag opens the directory for writing, which is EISDIR.
+pub(crate) fn create_unnamed_file(dir: BorrowedFd<'_>, mode: u32) -> io::Result<File> {
+    let flags = libc::O_TMPFILE | O_RDWR | O_NONBLOCK | O_NOCTTY;
+    Ok(File::from(open_at(dir.as_raw_fd(), c".", flags, mode)?))
+}
+
+/// `linkat(2)`, with the directories as descriptors or AT_FDCWD.
+fn linkat(old_dir: c_int, old: &CStr, new_dir: c_int, new: &CStr, flags: c_int) -> io::Result<()> {
+    // SAFETY: NUL terminated names and plain integers; linkat reads the
+    // names for the duration of the call and nothing else.
+    if unsafe { libc::linkat(old_dir, old.as_ptr(), new_dir, new.as_ptr(), flags) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Gives the file `fd` refers to the name `name` in the directory `dir`,
+/// as systemd's link_fd() does. The file can be one [`create_unnamed_file`]
+/// made, and a name that exists is EEXIST. linkat() with an empty path and
+/// AT_EMPTY_PATH links the descriptor itself. Since 42bd2af59504 ("vfs:
+/// relax linkat() AT_EMPTY_PATH - aka flink() - requirements") the process
+/// that opened the file may do that as long as its credentials did not
+/// change. Otherwise it needs CAP_DAC_READ_SEARCH, and without it the
+/// kernel says ENOENT. Then the file is linked through its magic link
+/// /proc/self/fd/N, followed with AT_SYMLINK_FOLLOW, which needs procfs.
+/// Both are tried every time: a command links a file or two.
+pub(crate) fn link_fd(fd: BorrowedFd<'_>, dir: BorrowedFd<'_>, name: &[u8]) -> io::Result<()> {
+    let name = filename(name)?;
+    match linkat(fd.as_raw_fd(), c"", dir.as_raw_fd(), &name, libc::AT_EMPTY_PATH) {
+        Err(e) if e.raw_os_error() == Some(ENOENT) => {}
+        linked => return linked,
+    }
+    let link = cstring(format!("/proc/self/fd/{}", fd.as_raw_fd()).as_bytes())?;
+    match linkat(libc::AT_FDCWD, &link, dir.as_raw_fd(), &name, libc::AT_SYMLINK_FOLLOW) {
+        // The ENOENT can be about the directory as well, so it is replaced
+        // only where /proc is not procfs, as link_fd() does it.
+        Err(e) if e.raw_os_error() == Some(ENOENT) => match proc_kind() {
+            Ok(FsKind::Proc) => Err(e),
+            Ok(_) => Err(procfs_missing("link")),
+            Err(missing) if missing.raw_os_error() == Some(ENOENT) => Err(procfs_missing("link")),
+            Err(_) => Err(e),
+        },
+        linked => linked,
+    }
+}
+
+/// Renames the entry `old` of the directory `dir` to `new` in the same
+/// directory, in place of what has that name: renameat(2).
+pub(crate) fn rename_at(dir: BorrowedFd<'_>, old: &[u8], new: &[u8]) -> io::Result<()> {
+    let (old, new) = (filename(old)?, filename(new)?);
+    // SAFETY: NUL terminated names and plain integers; renameat reads the
+    // names for the duration of the call and nothing else.
+    if unsafe { libc::renameat(dir.as_raw_fd(), old.as_ptr(), dir.as_raw_fd(), new.as_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Renames the entry `old` of the directory `dir` to `new` in the same
+/// directory unless something has that name, which is EEXIST:
+/// renameat2(2) with RENAME_NOREPLACE, through syscall(2), since the musl
+/// that Rust links its musl targets with has no renameat2(). NFS, CephFS
+/// and 9p, among others, refuse the flag with EINVAL (their rename
+/// operations take no flags), and a kernel without renameat2() says
+/// ENOSYS.
+pub(crate) fn rename_noreplace_at(dir: BorrowedFd<'_>, old: &[u8], new: &[u8]) -> io::Result<()> {
+    let (old, new) = (filename(old)?, filename(new)?);
+    // SAFETY: NUL terminated names and plain integers; renameat2 reads the
+    // names for the duration of the call and nothing else.
+    let renamed = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            dir.as_raw_fd(),
+            old.as_ptr(),
+            dir.as_raw_fd(),
+            new.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if renamed < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// What an error says about a request that not every file system or kernel
+/// takes: whether it was refused for that reason, rather than failed.
+pub(crate) trait Refusal {
+    /// O_TMPFILE refused, see [`create_unnamed_file`].
+    fn refuses_unnamed_files(&self) -> bool;
+    /// The flags of renameat2() refused, see [`rename_noreplace_at`].
+    fn refuses_rename_flags(&self) -> bool;
+    /// Hard links refused: EPERM from a file system without a link
+    /// operation (vfs_link() in fs/namei.c, also for a FUSE server without
+    /// FUSE_LINK), EOPNOTSUPP from one whose link operation does not take
+    /// the file.
+    fn refuses_hard_links(&self) -> bool;
+    /// An fsync of a directory refused: EINVAL from a file system without
+    /// an fsync operation for its directories (vfs_fsync_range() in
+    /// fs/sync.c), as vboxsf, orangefs, AFS and 9p without 9P2000.L have
+    /// none.
+    fn refuses_syncing_directories(&self) -> bool;
+    /// Opening for reading refused: EACCES from a directory we may not
+    /// read, as one of mode 0300, which can be searched and written to but
+    /// not opened to sync it.
+    fn refuses_reading(&self) -> bool;
+}
+
+impl Refusal for io::Error {
+    fn refuses_unnamed_files(&self) -> bool {
+        matches!(self.raw_os_error(), Some(EOPNOTSUPP | EISDIR))
+    }
+
+    fn refuses_rename_flags(&self) -> bool {
+        matches!(self.raw_os_error(), Some(EINVAL | ENOSYS | EOPNOTSUPP))
+    }
+
+    fn refuses_hard_links(&self) -> bool {
+        matches!(self.raw_os_error(), Some(EPERM | EOPNOTSUPP))
+    }
+
+    fn refuses_syncing_directories(&self) -> bool {
+        self.raw_os_error() == Some(EINVAL)
+    }
+
+    fn refuses_reading(&self) -> bool {
+        self.raw_os_error() == Some(libc::EACCES)
+    }
+}
+
 /// What a probe of the running kernel found out so far: nothing yet, that
 /// it offers the feature, or that it does not.
 const PROBE_UNKNOWN: u8 = 0;
@@ -224,16 +359,27 @@ pub(crate) fn reopen(fd: BorrowedFd<'_>, flags: c_int) -> io::Result<OwnedFd> {
 /// EBADF when it is and the descriptor is not, and the ENOENT itself when
 /// it cannot tell.
 fn proc_fd_enoent_errno() -> io::Error {
-    match open_path(None, Path::new("/proc"), true).and_then(|proc| fs_kind(proc.as_fd())) {
+    match proc_kind() {
         Ok(FsKind::Proc) => errno(EBADF),
-        Ok(_) => procfs_missing(),
-        Err(e) if e.raw_os_error() == Some(ENOENT) => procfs_missing(),
+        Ok(_) => procfs_missing("reopen"),
+        Err(e) if e.raw_os_error() == Some(ENOENT) => procfs_missing("reopen"),
         Err(_) => errno(ENOENT),
     }
 }
 
-fn procfs_missing() -> io::Error {
-    crate::Error::new(ENOSYS, "procfs is not mounted on /proc, cannot reopen a descriptor").into()
+/// The kind of file system on /proc; ENOENT where there is no /proc.
+fn proc_kind() -> io::Result<FsKind> {
+    open_path(None, Path::new("/proc"), true).and_then(|proc| fs_kind(proc.as_fd()))
+}
+
+/// The error for a descriptor that cannot be reopened or linked, as
+/// `action` says, through /proc/self/fd/N for want of procfs.
+fn procfs_missing(action: &str) -> io::Error {
+    crate::Error::new(
+        ENOSYS,
+        format!("procfs is not mounted on /proc, cannot {} a descriptor", action),
+    )
+    .into()
 }
 
 /// Whether openat2 is available: unknown, yes, or no (an old kernel, or a
@@ -815,6 +961,63 @@ pub(crate) fn set_status_flags(fd: BorrowedFd<'_>, flags: c_int) -> io::Result<(
     Ok(())
 }
 
+/// Makes the system call `call` fail with `errno` in the calling thread
+/// from here on, for the tests of what a file system or kernel refuses: a
+/// seccomp filter without TSYNC, which no other thread gets. Returns false
+/// where seccomp filters cannot be had: on an architecture this does not
+/// know, or under qemu-user, which refuses them.
+#[cfg(test)]
+pub(crate) fn refuse_in_this_thread(call: c_long, errno: c_int) -> bool {
+    // The flags of include/uapi/linux/audit.h that make the AUDIT_ARCH a
+    // filter compares with of a machine of elf.h.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    const AUDIT_ARCH_64BIT: u32 = 0x8000_0000;
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64"))]
+    const AUDIT_ARCH_LE: u32 = 0x4000_0000;
+    #[cfg(target_arch = "x86_64")]
+    const ARCH: Option<u32> = Some(libc::EM_X86_64 as u32 | AUDIT_ARCH_64BIT | AUDIT_ARCH_LE);
+    #[cfg(target_arch = "x86")]
+    const ARCH: Option<u32> = Some(libc::EM_386 as u32 | AUDIT_ARCH_LE);
+    #[cfg(target_arch = "aarch64")]
+    const ARCH: Option<u32> = Some(libc::EM_AARCH64 as u32 | AUDIT_ARCH_64BIT | AUDIT_ARCH_LE);
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+    const ARCH: Option<u32> = None;
+    let Some(arch) = ARCH else {
+        return false;
+    };
+    let statement = |code: u32, k: u32, jf: u8| libc::sock_filter {
+        code: code as u16,
+        jt: 0,
+        jf,
+        k,
+    };
+    let load = libc::BPF_LD | libc::BPF_W | libc::BPF_ABS;
+    let equal = libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K;
+    let give = libc::BPF_RET | libc::BPF_K;
+    // Another architecture or another call jumps to the last statement,
+    // which allows it.
+    let filter = [
+        statement(load, std::mem::offset_of!(libc::seccomp_data, arch) as u32, 0),
+        statement(equal, arch, 3),
+        statement(load, std::mem::offset_of!(libc::seccomp_data, nr) as u32, 0),
+        statement(equal, call as u32, 1),
+        statement(give, libc::SECCOMP_RET_ERRNO | errno as u32, 0),
+        statement(give, libc::SECCOMP_RET_ALLOW, 0),
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr().cast_mut(),
+    };
+    let (on, unused): (libc::c_ulong, libc::c_ulong) = (1, 0);
+    let mode = libc::SECCOMP_MODE_FILTER as libc::c_ulong;
+    // SAFETY: prctl() takes plain values and a filter, which it copies
+    // before it returns.
+    unsafe {
+        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, on, unused, unused, unused) == 0
+            && libc::prctl(libc::PR_SET_SECCOMP, mode, std::ptr::from_ref(&program)) == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,6 +1028,64 @@ mod tests {
 
     fn code(e: io::Error) -> i32 {
         e.raw_os_error().unwrap_or(0)
+    }
+
+    /// _LINUX_CAPABILITY_VERSION_3 of include/uapi/linux/capability.h, which
+    /// takes two of the data structs below.
+    const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    /// CAP_DAC_READ_SEARCH, the capability that links any descriptor.
+    const CAP_DAC_READ_SEARCH: u32 = 2;
+
+    #[repr(C)]
+    struct CapabilityHeader {
+        version: u32,
+        pid: c_int,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct CapabilityData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    /// Gives the calling thread new credentials with the same capabilities,
+    /// as capset(2) always does, and says whether CAP_DAC_READ_SEARCH is
+    /// among them.
+    fn renew_credentials() -> bool {
+        let mut header = CapabilityHeader {
+            version: CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapabilityData::default(); 2];
+        // SAFETY: a header and two data structs of the kernel's layout for
+        // version 3; capget fills them in, capset reads them.
+        unsafe {
+            let header = std::ptr::from_mut(&mut header);
+            assert_eq!(libc::syscall(libc::SYS_capget, header, data.as_mut_ptr()), 0);
+            assert_eq!(libc::syscall(libc::SYS_capset, header, data.as_ptr()), 0);
+        }
+        data[0].effective & (1 << CAP_DAC_READ_SEARCH) != 0
+    }
+
+    /// Once the credentials that opened a file changed, linkat() with
+    /// AT_EMPTY_PATH is ENOENT without CAP_DAC_READ_SEARCH, and link_fd()
+    /// links the file through /proc/self/fd. The new credentials live and
+    /// die with the thread of the test.
+    #[test]
+    fn link_fd_goes_through_proc_where_it_has_to() {
+        let tmp = TempDir::new("link");
+        let dir = open_path(None, tmp.path(), true).unwrap();
+        let file = create_unnamed_file(dir.as_fd(), 0o600).unwrap();
+        let capable = renew_credentials();
+        let direct = linkat(file.as_raw_fd(), c"", dir.as_raw_fd(), c"direct", libc::AT_EMPTY_PATH);
+        if !capable {
+            assert_eq!(code(direct.unwrap_err()), ENOENT);
+        }
+        link_fd(file.as_fd(), dir.as_fd(), b"linked").unwrap();
+        assert!(tmp.path().join("linked").exists());
+        assert_eq!(code(link_fd(file.as_fd(), dir.as_fd(), b"linked").unwrap_err()), EEXIST);
     }
 
     fn sorted(mut names: Vec<Vec<u8>>) -> Vec<Vec<u8>> {

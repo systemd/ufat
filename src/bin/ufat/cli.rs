@@ -25,7 +25,7 @@ use fat::volume::{NameCollision, Volume};
 use fat::{bail, err, Context, DescriptorProblem, Detail, Error, ManifestProblem, Result};
 
 use crate::service;
-use crate::util::{self, GivenSize, ImageFlags, ManifestInput, ManifestUse, SizeMode, SizeRequest};
+use crate::util::{self, Failure, GivenSize, ImageFlags, ManifestInput, ManifestUse, NewVolume, SizeMode, SizeRequest};
 
 const USAGE: &str = "\
 Usage: ufat COMMAND [OPTIONS...] ARGS...
@@ -99,7 +99,9 @@ Options for assemble:
   --mkfs-fat-compat     Reproduce mkfs.fat's layout quirks exactly
   --zero                Zero the whole data area
   --create              Create IMAGE if it does not exist (it then needs --size,
-                        --minimize, --fit, or --manifest without a SOURCE)
+                        --minimize, --fit, or --manifest without a SOURCE).
+                        IMAGE gets its name only once assemble succeeded (the
+                        README says when a failure leaves it nonetheless)
   --force, -f           Format IMAGE whatever it holds
   --fit DIR             Size IMAGE for DIR and leave it empty (no SOURCE):
                         --size, which DIR has to fit, or else the smallest
@@ -762,17 +764,19 @@ fn manifest_to_stdout(args: &Args) -> bool {
 /// Writes the UAPI.16 manifest of everything `v` holds to the file `path`,
 /// or to standard output for "-", for `--write-manifest`.
 fn write_manifest(v: &Volume, path: &Path) -> Result<()> {
-    let features = Features::DEFAULT;
-    let (report, shown) = if path == Path::new("-") {
-        let out = std::io::BufWriter::new(std::io::stdout().lock());
-        let report = v.write_manifest(v.root_time()?, features, out)?;
-        (report, STDOUT_MANIFEST.to_string())
+    if path == Path::new("-") {
+        write_manifest_to(v, std::io::stdout().lock(), STDOUT_MANIFEST)
     } else {
         let file = std::fs::File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
-        let report = v.write_manifest(v.root_time()?, features, std::io::BufWriter::new(file))?;
-        (report, path.display().to_string())
-    };
-    warn_about_manifest(&report, &shown);
+        write_manifest_to(v, file, &path.display().to_string())
+    }
+}
+
+/// Writes the UAPI.16 manifest of everything `v` holds to `out`, which the
+/// messages call `shown`.
+fn write_manifest_to(v: &Volume, out: impl Write, shown: &str) -> Result<()> {
+    let report = v.write_manifest(v.root_time()?, Features::DEFAULT, std::io::BufWriter::new(out))?;
+    warn_about_manifest(&report, shown);
     Ok(())
 }
 
@@ -901,7 +905,7 @@ fn plan(args: &Args) -> Result<()> {
 /// `--size` or of the image, or with `--minimize` the smallest one. The
 /// `--fit` directory or what `--manifest` describes has to fit a size
 /// given, and without one the file system is the smallest that holds it.
-fn assemble_empty(args: &Args, path: &Path) -> Result<Volume> {
+fn assemble_empty(args: &Args, path: &Path) -> std::result::Result<NewVolume, Failure> {
     let mut options = format_options(args)?;
     let fit = args.paths("fit");
     let target = util::Target {
@@ -926,23 +930,23 @@ fn assemble_empty(args: &Args, path: &Path) -> Result<Volume> {
         Some(source) => source.into_plan(plan, args).map(drop),
         None => bail!(errno::EINVAL, "the content is planned once"),
     };
-    let (volume, estimate) = util::fit_and_format(&target, &mut options, SizeRequest::new(mode, &mut add))
-        .map_err(|e| e.into_error(path))?;
+    let (new, estimate) = util::fit_and_format(&target, &mut options, SizeRequest::new(mode, &mut add))?;
     if let Some(estimate) = estimate {
         report_estimate(args, path, &estimate);
     }
-    Ok(volume)
+    Ok(new)
 }
 
 /// `assemble` with a SOURCE: the file system of the size of `--size` or of
 /// the image, or with `--minimize` the smallest that holds it, filled with
 /// it.
-fn assemble_filled(args: &Args, path: &Path, paths: &[&Path]) -> Result<Volume> {
+fn assemble_filled(args: &Args, path: &Path, paths: &[&Path]) -> std::result::Result<NewVolume, Failure> {
     if !args.paths("fit").is_empty() {
-        bail!(
+        return Err(err!(
             errno::EINVAL,
             "--fit sizes an empty file system; with a SOURCE --minimize sizes it for the SOURCE"
-        );
+        )
+        .into());
     }
     let mode = if args.flag("minimize") {
         SizeMode::Minimize
@@ -963,24 +967,15 @@ fn assemble_filled(args: &Args, path: &Path, paths: &[&Path]) -> Result<Volume> 
         flags: args.image_flags(),
     };
     let mut add = |plan: &mut Plan| source.add_to(plan, args).map(drop);
-    let (mut v, estimate) = util::fit_and_format(&target, &mut options, SizeRequest::new(mode, &mut add))
-        .map_err(|e| e.into_error(path))?;
+    let (mut new, estimate) = util::fit_and_format(&target, &mut options, SizeRequest::new(mode, &mut add))?;
     if let Some(estimate) = estimate {
         report_estimate(args, path, &estimate);
     }
-    match source.fill(&mut v, args) {
-        Ok(()) => Ok(v),
-        Err(e) => Err(unfinished(v, e)),
+    if let Err(e) = source.fill(new.volume_mut(), args) {
+        let leftovers = new.abandon();
+        return Err(Failure::new(e, leftovers));
     }
-}
-
-/// Closes the file system `assemble` failed to finish with `e`, marked as
-/// not cleanly unmounted as after a crash, so that nobody takes it for a
-/// finished one. Returns `e`: an error of the close is not the one the
-/// user needs to hear about.
-fn unfinished(v: Volume, e: Error) -> Error {
-    let _ = v.close_unfinished();
-    e
+    Ok(new)
 }
 
 fn report_estimate(args: &Args, path: &Path, estimate: &fat::plan::Estimate) {
@@ -1007,7 +1002,7 @@ fn force_hint(e: Error) -> Error {
     }
 }
 
-fn cmd_assemble(argv: &[OsString]) -> Result<()> {
+fn cmd_assemble(argv: &[OsString]) -> std::result::Result<(), Failure> {
     let args = Args::parse(
         argv,
         &with(
@@ -1021,7 +1016,7 @@ fn cmd_assemble(argv: &[OsString]) -> Result<()> {
     fail_unsupported(&args)?;
     time_policy(&args)?;
     if args.flag("plan") {
-        return plan(&args);
+        return Ok(plan(&args)?);
     }
     let hash = match args.value("hash") {
         None => None,
@@ -1032,48 +1027,88 @@ fn cmd_assemble(argv: &[OsString]) -> Result<()> {
     };
     let hash_path = args.path("write-hash");
     if hash_path.is_some() && hash.is_none() {
-        bail!(errno::EINVAL, "--write-hash needs --hash");
+        return Err(err!(errno::EINVAL, "--write-hash needs --hash").into());
     }
     if hash_path == Some(Path::new("-")) && manifest_to_stdout(&args) {
-        bail!(
+        return Err(err!(
             errno::EINVAL,
             "--write-manifest - and --write-hash - cannot both write to standard output"
-        );
+        )
+        .into());
     }
     let (path, paths) = match args.positional_paths().split_first() {
         Some((&i, s)) => (i, s.to_vec()),
-        None => bail!(errno::EINVAL, "assemble takes an IMAGE and a SOURCE"),
+        None => return Err(err!(errno::EINVAL, "assemble takes an IMAGE and a SOURCE").into()),
     };
-    let v = if paths.is_empty() {
+    let mut new = if paths.is_empty() {
         assemble_empty(&args, path)
     } else {
         assemble_filled(&args, path, &paths)
     }
-    .map_err(force_hint)?;
-    if let Some(m) = args.path("write-manifest") {
-        if let Err(e) = write_manifest(&v, m) {
-            return Err(unfinished(v, e));
+    .map_err(|failure| Failure::new(force_hint(failure.error), failure.leftovers))?;
+    // The image and the files written next to it get their names only once
+    // everything else succeeded, the hash of the file system included, so
+    // a failure before leaves none of them behind.
+    let digest = match write_outputs(&args, path, &mut new, hash, hash_path) {
+        Ok(digest) => digest,
+        Err(e) => {
+            let leftovers = new.abandon();
+            return Err(Failure::new(e, leftovers));
         }
+    };
+    let leftovers = new.link()?;
+    for line in leftovers.lines() {
+        eprintln!("ufat: {}", line);
     }
-    let layout = *v.layout();
-    // The hash is of the file system's own bytes, which with --minimize can
-    // end before --size does.
-    let window = v.device().len();
-    v.close()?;
-    report_layout(path, &layout, args.flag("verbose"));
-    if let Some(hash) = hash {
-        let offset = args.size("offset")?.unwrap_or(0);
-        let image = util::open_image(path, offset, Some(window), Access::ReadOnly)?;
-        let digest = hash.of(&image, &mut |_| {})?;
-        match hash_path {
-            Some(p) if p != Path::new("-") => {
-                std::fs::write(p, format!("{}\n", digest)).with_context(|| format!("cannot write {}", p.display()))?
-            }
-            None if manifest_to_stdout(&args) => eprintln!("{}", digest),
-            _ => println!("{}", digest),
-        }
+    // Unlike a manifest, which streams, the hash is complete before the
+    // image gets its name, and printed only once it has it.
+    match digest {
+        Some(digest) if manifest_to_stdout(&args) => eprintln!("{}", digest),
+        Some(digest) => writeln!(std::io::stdout().lock(), "{}", digest).with_context(|| "cannot write the hash")?,
+        None => {}
     }
     Ok(())
+}
+
+/// Writes what `assemble` writes about the file system it made in the
+/// image `path`: the manifest of `--write-manifest`, and the hash of
+/// `--hash`, which is taken through the descriptor the file system was
+/// written through, once it is synced. Returns the hash where it is printed
+/// rather than written to `--write-hash`.
+fn write_outputs(
+    args: &Args,
+    path: &Path,
+    new: &mut NewVolume,
+    hash: Option<service::Hash>,
+    hash_path: Option<&Path>,
+) -> Result<Option<String>> {
+    match args.path("write-manifest") {
+        Some(m) if m != Path::new("-") => {
+            let out = new
+                .output(m)
+                .with_context(|| format!("cannot create {}", m.display()))?;
+            write_manifest_to(new.volume(), out, &m.display().to_string())?;
+        }
+        Some(m) => write_manifest(new.volume(), m)?,
+        None => {}
+    }
+    report_layout(path, new.volume().layout(), args.flag("verbose"));
+    let Some(hash) = hash else {
+        return Ok(None);
+    };
+    // The device of the volume covers the file system's own bytes, which
+    // with --minimize can end before --size does.
+    new.volume_mut().sync()?;
+    let digest = hash.of(new.volume().device(), &mut |_| {})?;
+    match hash_path {
+        Some(p) if p != Path::new("-") => {
+            let cannot = || format!("cannot write {}", p.display());
+            let mut out = new.output(p).with_context(cannot)?;
+            writeln!(out, "{}", digest).with_context(cannot)?;
+            Ok(None)
+        }
+        _ => Ok(Some(digest)),
+    }
 }
 
 /// The path of the parent directory of `path`, None for one at the root.
@@ -1417,7 +1452,7 @@ fn cmd_manifest(argv: &[OsString]) -> Result<()> {
     Ok(())
 }
 
-fn run(argv: &[OsString]) -> Result<ExitCode> {
+fn run(argv: &[OsString]) -> std::result::Result<ExitCode, Failure> {
     let Some(command) = argv.first() else {
         eprint!("{}", USAGE);
         return Ok(ExitCode::FAILURE);
@@ -1442,11 +1477,11 @@ fn run(argv: &[OsString]) -> Result<ExitCode> {
         "remove" => cmd_remove(rest)?,
         "list" => cmd_list(rest)?,
         "describe" => cmd_describe(rest)?,
-        "check" => return cmd_check(rest),
+        "check" => return Ok(cmd_check(rest)?),
         "capabilities" => cmd_capabilities(rest)?,
         "cat" => cmd_cat(rest)?,
         "manifest" => cmd_manifest(rest)?,
-        other => bail!(errno::EINVAL, "unknown command '{}'", other),
+        other => return Err(err!(errno::EINVAL, "unknown command '{}'", other).into()),
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1464,8 +1499,12 @@ pub(crate) fn main() -> ExitCode {
     let argv: Vec<OsString> = std::env::args_os().skip(1).collect();
     match run(&argv) {
         Ok(code) => code,
-        Err(e) => {
-            eprintln!("ufat: {}", e);
+        Err(failure) => {
+            // What failed, then what that left behind.
+            eprintln!("ufat: {}", failure.error);
+            for line in failure.leftovers.lines() {
+                eprintln!("ufat: {}", line);
+            }
             ExitCode::FAILURE
         }
     }

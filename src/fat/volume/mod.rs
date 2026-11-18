@@ -233,7 +233,8 @@ pub struct Volume {
     /// Something has been written since open() or the last sync(): the
     /// volume carries its dirty marks, see [`Volume::begin_write`].
     writing: bool,
-    /// Closed with [`Volume::close_unfinished`]: the marks stay.
+    /// Closed with [`Volume::close_unfinished`] or given up with
+    /// [`Volume::abandon`]: dropping it writes nothing, so the marks stay.
     unfinished: bool,
     layout: Layout,
     fat: Fat,
@@ -1317,6 +1318,15 @@ impl Volume {
         self.begin_write()?;
         self.flush()?;
         self.device.sync()
+    }
+
+    /// Gives up a volume whose contents are not complete without writing
+    /// anything more: what was written stays as it is, the marks it carries
+    /// while it is written included, and nothing is synced. This is for a
+    /// caller that throws the image away, such as a new file that never
+    /// gets its name, see [`crate::host::NewFile`].
+    pub fn abandon(mut self) {
+        self.unfinished = true;
     }
 }
 

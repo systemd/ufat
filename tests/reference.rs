@@ -732,12 +732,14 @@ fn fsck_fat_sees_a_failed_assemble() {
     std::fs::write(manifest.path(), run(&ufat, &["manifest", src], &[])).unwrap();
     // b.txt changes after the manifest was written and keeps its size.
     std::fs::write(tree.path().join("b.txt"), b"SECOND").unwrap();
+    // An image that is there already: nothing would be left of one made for
+    // the assembly.
     let image = Temp::new(".img");
+    std::fs::write(&image.0, b"").unwrap();
     let img = image.0.to_str().unwrap();
     let out = std::process::Command::new(&ufat)
         .args([
             "assemble",
-            "--create",
             "--minimize",
             "--manifest",
             manifest.0.to_str().unwrap(),

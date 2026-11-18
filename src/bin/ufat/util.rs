@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fat::device::{Access, Device};
 use fat::errno;
 use fat::format::FormatOptions;
+use fat::host::{LinkError, Linked, Naming, NewFile};
 use fat::layout::Layout;
 use fat::manifest::{Order, Reader, RootObject};
 use fat::plan::{Estimate, Plan, PlanOptions};
@@ -452,35 +453,330 @@ pub(crate) struct SizeDecision {
 /// command line makes a volume, and what the Varlink Assemble method does
 /// in two steps with [`decide_size`] and [`format_sized`]. The image is
 /// opened once; a block device is planned for its logical block size, a
-/// regular image file is grown, never shrunk, to the size, and created
-/// first with [`ImageFlags::CREATE`]. What can be found out before the
-/// first write is found out while the image is untouched: a size no file
-/// system fits in and, when the content is planned, a source tree that
-/// cannot be read, a manifest that cannot be planned, and content that
-/// does not fit a size given. A file created for the file system is
-/// removed again then, so a failed command leaves nothing behind. Without
-/// [`ImageFlags::FORCE`], an image that holds a file system, a partition
-/// table or other data is not formatted over ([`Prober::ensure_empty`]).
+/// regular image file is grown, never shrunk, to the size, and made first
+/// with [`ImageFlags::CREATE`]. What can be found out before the first
+/// write is found out while the image is untouched: a size no file system
+/// fits in and, when the content is planned, a source tree that cannot be
+/// read, a manifest that cannot be planned, and content that does not fit
+/// a size given. Without [`ImageFlags::FORCE`], an image that holds a file
+/// system, a partition table or other data is not formatted over
+/// ([`Prober::ensure_empty`]). An image file made for the file system has
+/// no name yet, see [`fat::device::Device::create`]. It goes away again
+/// when this fails, and is handed over in the [`NewVolume`] otherwise.
+/// Errors are the command line's, see [`FitError::into_error`].
 pub(crate) fn fit_and_format(
     target: &Target<'_>,
     options: &mut FormatOptions,
     request: SizeRequest<'_>,
-) -> std::result::Result<(Volume, Option<Estimate>), FitError> {
+) -> std::result::Result<(NewVolume, Option<Estimate>), Failure> {
     let mut device = open_target(target)?;
-    let decision = match decide_size(&mut device, target.offset, target.size, options, false, request) {
-        Ok(decision) => decision,
+    let created = device.take_created().map(|file| Pending { file });
+    match format_fitted(device, target, options, request) {
+        Ok((volume, estimate)) => Ok((NewVolume::new(volume, created), estimate)),
         Err(e) => {
-            // Nothing has been written. The error of the removal, if any,
-            // is not the one the user needs to hear about.
-            let _ = device.remove_if_created();
-            return Err(e);
+            let mut leftovers = Leftovers::default();
+            if let Some(created) = created {
+                created.discard(&mut leftovers);
+            }
+            Err(Failure::new(e.into_error(target.path), leftovers))
         }
-    };
+    }
+}
+
+/// What [`fit_and_format`] does once the image is open.
+fn format_fitted(
+    mut device: Device,
+    target: &Target<'_>,
+    options: &mut FormatOptions,
+    request: SizeRequest<'_>,
+) -> std::result::Result<(Volume, Option<Estimate>), FitError> {
+    let decision = decide_size(&mut device, target.offset, target.size, options, false, request)?;
     if !target.flags.contains(ImageFlags::FORCE) {
         Prober::new().ensure_empty(&device, target.offset, Some(decision.size))?;
     }
     let volume = format_sized(device, target.offset, decision.size, options)?;
     Ok((volume, decision.estimate))
+}
+
+/// What of the files a command made stays where it gave them up or named
+/// them, one line each, which the command line prints after its error,
+/// or as warnings after a command that succeeded.
+#[derive(Debug, Default)]
+pub(crate) struct Leftovers(Vec<String>);
+
+impl Leftovers {
+    /// The lines, in the order the files were given up or named.
+    pub(crate) fn lines(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(String::as_str)
+    }
+
+    fn note(&mut self, line: String) {
+        self.0.push(line);
+    }
+}
+
+/// An error a command of the command line failed with, and what of the
+/// files it made stays, which the command line prints after the error:
+/// what failed, then what that left behind.
+#[derive(Debug)]
+pub(crate) struct Failure {
+    pub error: Error,
+    pub leftovers: Leftovers,
+}
+
+impl Failure {
+    pub(crate) fn new(error: Error, leftovers: Leftovers) -> Failure {
+        Failure { error, leftovers }
+    }
+}
+
+impl From<Error> for Failure {
+    fn from(error: Error) -> Failure {
+        Failure::new(error, Leftovers::default())
+    }
+}
+
+/// A file the command line tool made, which gets its name once the command
+/// succeeded.
+struct Pending {
+    file: NewFile,
+}
+
+impl Pending {
+    /// Gives the file up, noting in `leftovers` what of it stays.
+    fn discard(self, leftovers: &mut Leftovers) {
+        if let Some(line) = self.file.give_up() {
+            leftovers.note(line);
+        }
+    }
+
+    /// Gives the file its name, and puts it into `linked` once it has it,
+    /// also where checking the name failed then. One that does not get it
+    /// is given up, with what of it stays noted in `leftovers`, and its
+    /// error gets `context` and the path in front. A temporary name the
+    /// file was linked from that stays after it got its name goes into
+    /// `leftovers` too.
+    fn link(self, context: &str, linked: &mut Vec<Linked>, leftovers: &mut Leftovers) -> Result<()> {
+        match self.file.link() {
+            Ok(named) => {
+                if let Some(stray) = named.stray() {
+                    leftovers.note(stray.to_string());
+                }
+                linked.push(named);
+                Ok(())
+            }
+            Err(failed) => Err(Pending::failed(failed, context, linked, leftovers)),
+        }
+    }
+
+    /// The error of the link `failed`. A file that did not get its name is
+    /// given up, with what of it stays noted in `leftovers`, and `context`
+    /// and its path go in front of the error. A file that has its name goes
+    /// into `linked`, and its error, which says so, stays as it is.
+    fn failed(failed: LinkError, context: &str, linked: &mut Vec<Linked>, leftovers: &mut Leftovers) -> Error {
+        match failed {
+            LinkError::Unnamed { error, file } => {
+                let path = file.path().display().to_string();
+                Pending { file }.discard(leftovers);
+                error.context(format!("{} {}", context, path))
+            }
+            LinkError::Unchecked { error, linked: named } => {
+                linked.push(named);
+                error
+            }
+        }
+    }
+}
+
+/// A file system the command line tool made, the image file it made for it
+/// with [`ImageFlags::CREATE`] if it made one, and the files it writes next
+/// to the image. None of these files gets its name before the command
+/// succeeded ([`NewVolume::link`]), so a command that fails, is killed or
+/// crashes before leaves nothing under their names, but where the file
+/// system leaves the image no other way than the last resort of
+/// [`NewFile`].
+///
+/// A new volume that is dropped before [`NewVolume::link`] or
+/// [`NewVolume::abandon`], as by an early return, is given up the way
+/// abandon() gives it up, without a word: an image made for it goes away
+/// with nothing more written to it, and an image that was there is closed
+/// as not cleanly unmounted. While a panic unwinds nothing more is written
+/// to that one either: it keeps the mark of a file system that was being
+/// written, but a panic before the first write leaves the file system as
+/// it was formatted, empty and clean.
+pub(crate) struct NewVolume {
+    /// The image file made for the file system.
+    created: Option<Pending>,
+    /// The file system, until it is closed or given up.
+    volume: Option<Volume>,
+    /// The files written next to the image.
+    outputs: Vec<Pending>,
+}
+
+impl NewVolume {
+    fn new(volume: Volume, created: Option<Pending>) -> NewVolume {
+        NewVolume {
+            created,
+            volume: Some(volume),
+            outputs: Vec::new(),
+        }
+    }
+
+    /// The file system. A new volume holds it until it is closed or given
+    /// up, which consumes the new volume.
+    pub(crate) fn volume(&self) -> &Volume {
+        self.volume.as_ref().expect("a new volume holds its volume")
+    }
+
+    /// The file system, to fill it.
+    pub(crate) fn volume_mut(&mut self) -> &mut Volume {
+        self.volume.as_mut().expect("a new volume holds its volume")
+    }
+
+    /// A file to write to `path` next to the image, for `--write-manifest`
+    /// and `--write-hash`. Where nothing or a regular file is there, it is
+    /// a new file, which gets the name after the image got its own, in
+    /// place of what is there ([`Naming::Replacing`]), and is given up with
+    /// the image. What is there and not a regular file, such as a pipe, a
+    /// device or a symbolic link, is opened for writing as File::create()
+    /// opens it and written to as the command goes: as with standard
+    /// output, nothing written there can be taken back.
+    pub(crate) fn output(&mut self, path: &Path) -> Result<File> {
+        let regular = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata.is_file(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+            Err(e) => return Err(e.into()),
+        };
+        if !regular {
+            return Ok(File::create(path)?);
+        }
+        let pending = Pending {
+            file: NewFile::create(path, Naming::Replacing)?,
+        };
+        let writer = pending.file.file().try_clone();
+        // Kept before anything can fail, so that giving up gives it up.
+        self.outputs.push(pending);
+        Ok(writer?)
+    }
+
+    /// Gives up the file system after the command failed, and returns what
+    /// of the image or the files next to it stays, where something does,
+    /// for the command line to print after its error. An image file made
+    /// for the file system goes away with nothing more written to it, and
+    /// so do the files next to it. Any other image keeps what was written,
+    /// closed as not cleanly unmounted, as after a crash, so that nobody
+    /// takes it for a finished file system. An error of that close is not
+    /// the one the user needs to hear about.
+    pub(crate) fn abandon(mut self) -> Leftovers {
+        self.give_up_volume();
+        let mut leftovers = Leftovers::default();
+        let created = self.created.take();
+        for pending in created.into_iter().chain(std::mem::take(&mut self.outputs)) {
+            pending.discard(&mut leftovers);
+        }
+        leftovers
+    }
+
+    /// Closes the finished file system and gives the image file made for it
+    /// its name, and then the files written next to it theirs, each synced
+    /// before (the image by the close). The image takes no name that
+    /// something else took while it was made (EEXIST), and the files next
+    /// to it replace what has their names. Once all of them have their
+    /// names, each directory they are in is synced once, so that the names
+    /// last too. Where closing the file system or naming its image file
+    /// fails, these files go away as after any other failure. A file next
+    /// to the image that cannot get its own name goes away with the ones
+    /// after it, and the image keeps its name. A file that has its name
+    /// keeps it, also where checking it or syncing its directory fails,
+    /// and the error says so. Its directory is synced also where something
+    /// fails after it got its name. Returns what stays besides, such as a
+    /// temporary name that could not be removed, for the command line to
+    /// warn about. A failure carries that as well.
+    pub(crate) fn link(mut self) -> std::result::Result<Leftovers, Failure> {
+        let mut leftovers = Leftovers::default();
+        match self.link_all(&mut leftovers) {
+            Ok(()) => Ok(leftovers),
+            Err(e) => Err(Failure::new(e, leftovers)),
+        }
+    }
+
+    /// What [`NewVolume::link`] does, noting in `leftovers` what stays. The
+    /// directories of the files that got their names are synced also where
+    /// something failed after, since those files keep their names. A sync
+    /// that fails then goes into `leftovers`, after what came before.
+    fn link_all(&mut self, leftovers: &mut Leftovers) -> Result<()> {
+        let mut linked = Vec::new();
+        let named = self.give_names(&mut linked, leftovers);
+        let synced = Linked::sync_directories(&linked);
+        match (named, synced) {
+            (Err(e), Err(unsynced)) => {
+                leftovers.note(unsynced.to_string());
+                Err(e)
+            }
+            (named, synced) => named.and(synced),
+        }
+    }
+
+    /// Closes the file system and gives the image file made for it and the
+    /// files next to it their names, as [`NewVolume::link`] says. Each file
+    /// that got its name goes into `linked`.
+    fn give_names(&mut self, linked: &mut Vec<Linked>, leftovers: &mut Leftovers) -> Result<()> {
+        let mut outputs = std::mem::take(&mut self.outputs).into_iter();
+        let closed = self.volume.take().map_or(Ok(()), Volume::close);
+        let created = self.created.take();
+        if let Err(e) = closed {
+            for pending in created.into_iter().chain(outputs) {
+                pending.discard(leftovers);
+            }
+            return Err(e);
+        }
+        if let Some(created) = created {
+            // The image's file is given up already where this fails, or it
+            // keeps its name.
+            if let Err(e) = created.link("failed to create", linked, leftovers) {
+                outputs.for_each(|pending| pending.discard(leftovers));
+                return Err(e);
+            }
+        }
+        while let Some(pending) = outputs.next() {
+            let named = match pending.file.file().sync_all() {
+                Ok(()) => pending.link("cannot write", linked, leftovers),
+                Err(e) => {
+                    let e = Error::from(e).context(format!("cannot write {}", pending.file.path().display()));
+                    pending.discard(leftovers);
+                    Err(e)
+                }
+            };
+            if let Err(e) = named {
+                outputs.by_ref().for_each(|pending| pending.discard(leftovers));
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Gives up the file system, if it is still held, without a word: with
+    /// nothing more written to an image made for it or while a panic
+    /// unwinds, and closed as not cleanly unmounted otherwise.
+    fn give_up_volume(&mut self) {
+        let Some(volume) = self.volume.take() else {
+            return;
+        };
+        if self.created.is_some() || std::thread::panicking() {
+            volume.abandon();
+        } else {
+            let _ = volume.close_unfinished();
+        }
+    }
+}
+
+impl Drop for NewVolume {
+    fn drop(&mut self) {
+        // Only an early return or a panic comes here with the volume. The
+        // image file and the files next to it give themselves up when they
+        // are dropped right after.
+        self.give_up_volume();
+    }
 }
 
 /// Decides the size of a new file system the way `request` says. Nothing
@@ -586,4 +882,303 @@ pub(crate) fn format_sized(mut device: Device, offset: u64, size: u64, options: 
     size_image(&mut device, offset, size)?;
     let device = device.window(offset, Some(size))?;
     Volume::create(device, options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fat::fsck::{self, ProblemKind};
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
+
+    /// The size of the test images: room for the 65525 clusters of the
+    /// smallest FAT32 file system with 512 byte clusters.
+    const IMAGE_SIZE: u64 = 40 << 20;
+
+    /// A directory below TMPDIR, removed with what is in it when dropped.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            let dir = std::env::temp_dir().join(format!("ufat-{}-{}", name, std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Whether the file system in the image `path` is marked as not cleanly
+    /// unmounted.
+    fn marked_dirty(path: &Path) -> bool {
+        let report = fsck::check(&Device::open(path, Access::ReadOnly).unwrap()).unwrap();
+        report
+            .problems
+            .iter()
+            .any(|problem| problem.kind == ProblemKind::DirtyFlag)
+    }
+
+    /// A new volume, as fit_and_format() makes it: not being written yet.
+    fn formatted(target: &Target<'_>) -> NewVolume {
+        fit_and_format(target, &mut FormatOptions::default(), SizeRequest::Given)
+            .unwrap()
+            .0
+    }
+
+    /// A new volume with a directory written into it: being written, with
+    /// the marks of that on the image.
+    fn written(target: &Target<'_>) -> NewVolume {
+        let mut new = formatted(target);
+        new.volume_mut().create_dir("/d", now()).unwrap();
+        new
+    }
+
+    /// Gives the file `file`, whatever its names, the name `to` as well,
+    /// through its magic link in /proc/self/fd.
+    fn hard_link(file: &File, to: &Path) {
+        let from = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
+        let to = CString::new(to.as_os_str().as_bytes()).unwrap();
+        // SAFETY: NUL terminated paths and plain flags.
+        let linked = unsafe {
+            libc::linkat(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::AT_SYMLINK_FOLLOW,
+            )
+        };
+        assert_eq!(linked, 0, "{}", io::Error::last_os_error());
+    }
+
+    /// A new volume over an image that was there, dropped without link() or
+    /// abandon(), as an early return drops it, leaves the file system marked
+    /// as not cleanly unmounted. One that is linked leaves it clean.
+    #[test]
+    fn a_dropped_new_volume_leaves_its_image_marked() {
+        let dir = TempDir::new("dropped");
+        let path = dir.0.join("a.img");
+        File::create(&path).unwrap().set_len(IMAGE_SIZE).unwrap();
+        let target = Target {
+            path: &path,
+            offset: 0,
+            size: None,
+            flags: ImageFlags::FORCE,
+        };
+        let leftovers = written(&target).link().unwrap();
+        assert_eq!(leftovers.lines().count(), 0);
+        assert!(!marked_dirty(&path));
+        drop(written(&target));
+        assert!(marked_dirty(&path));
+    }
+
+    /// Giving up an image made for a new volume writes nothing more to it:
+    /// not the marks a volume that is not being written would get from a
+    /// close as unfinished, and not the clean marks a close would put back
+    /// on one that is. A name the image got meanwhile, through its
+    /// descriptor, keeps the bytes it had.
+    #[test]
+    fn abandon_writes_nothing() {
+        let dir = TempDir::new("abandoned");
+        let path = dir.0.join("a.img");
+        let kept = dir.0.join("kept.img");
+        let target = Target {
+            path: &path,
+            offset: 0,
+            size: Some(IMAGE_SIZE),
+            flags: ImageFlags::CREATE,
+        };
+        for new in [formatted(&target), written(&target)] {
+            hard_link(new.created.as_ref().unwrap().file.file(), &kept);
+            let before = std::fs::read(&kept).unwrap();
+            let leftovers = new.abandon();
+            assert_eq!(leftovers.lines().count(), 0);
+            assert!(!path.exists());
+            assert!(std::fs::read(&kept).unwrap() == before, "abandon() wrote to the image");
+            std::fs::remove_file(&kept).unwrap();
+        }
+    }
+
+    /// A new volume over an image that was there, dropped while a panic
+    /// unwinds, writes nothing more to it either, not even the marks of a
+    /// close as unfinished: what the volume holds in memory is not to be
+    /// trusted then.
+    #[test]
+    fn a_new_volume_dropped_by_a_panic_writes_nothing() {
+        let dir = TempDir::new("panicked");
+        let path = dir.0.join("a.img");
+        File::create(&path).unwrap().set_len(IMAGE_SIZE).unwrap();
+        let target = Target {
+            path: &path,
+            offset: 0,
+            size: None,
+            flags: ImageFlags::FORCE,
+        };
+        let mut before = Vec::new();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let new = formatted(&target);
+            before = std::fs::read(&path).unwrap();
+            let _held = new;
+            panic!("unwinding with a new volume");
+        }));
+        assert!(unwound.is_err());
+        assert!(std::fs::read(&path).unwrap() == before, "a panic wrote to the image");
+        assert!(!marked_dirty(&path));
+    }
+
+    /// A link that fails gives a file that did not get its name up, and its
+    /// error says what was being made. A file that got its name and only
+    /// the check after failed goes with the others that have their names,
+    /// to sync its directory, and its error says that it has its name, with
+    /// nothing in front of it.
+    #[test]
+    fn a_failed_link_says_whether_the_file_has_its_name() {
+        let dir = TempDir::new("unlinked");
+        let path = dir.0.join("a.img");
+        let new = || NewFile::create(&path, Naming::Exclusive).unwrap();
+        let (mut linked, mut leftovers) = (Vec::new(), Leftovers::default());
+        let unnamed = LinkError::Unnamed {
+            error: err!(errno::EIO, "why"),
+            file: new(),
+        };
+        let e = Pending::failed(unnamed, "failed to create", &mut linked, &mut leftovers);
+        assert_eq!(e.to_string(), format!("failed to create {}: why", path.display()));
+        assert!(linked.is_empty());
+        let unchecked = LinkError::Unchecked {
+            error: err!(errno::EIO, "why"),
+            linked: new().link().unwrap(),
+        };
+        let e = Pending::failed(unchecked, "failed to create", &mut linked, &mut leftovers);
+        assert_eq!(e.to_string(), "why");
+        assert_eq!(linked.len(), 1);
+        assert_eq!(leftovers.lines().count(), 0);
+    }
+
+    /// Makes the system call `call` fail with `errno` in the calling thread
+    /// from here on, with a seccomp filter of the thread's own: every call,
+    /// or with `flags` only one whose third argument, the flags of
+    /// openat(2), has one of those bits set. Returns false where seccomp
+    /// filters cannot be had: on an architecture this does not know, or
+    /// under qemu-user, which refuses them.
+    fn refuse_in_this_thread(call: libc::c_long, errno: i32, flags: Option<libc::c_int>) -> bool {
+        // The flags of include/uapi/linux/audit.h that make the AUDIT_ARCH a
+        // filter compares with of a machine of elf.h.
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        const AUDIT_ARCH_64BIT: u32 = 0x8000_0000;
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64"))]
+        const AUDIT_ARCH_LE: u32 = 0x4000_0000;
+        #[cfg(target_arch = "x86_64")]
+        const ARCH: Option<u32> = Some(libc::EM_X86_64 as u32 | AUDIT_ARCH_64BIT | AUDIT_ARCH_LE);
+        #[cfg(target_arch = "x86")]
+        const ARCH: Option<u32> = Some(libc::EM_386 as u32 | AUDIT_ARCH_LE);
+        #[cfg(target_arch = "aarch64")]
+        const ARCH: Option<u32> = Some(libc::EM_AARCH64 as u32 | AUDIT_ARCH_64BIT | AUDIT_ARCH_LE);
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+        const ARCH: Option<u32> = None;
+        let Some(arch) = ARCH else {
+            return false;
+        };
+        let statement = |code: u32, k: u32, jt: u8, jf: u8| libc::sock_filter {
+            code: code as u16,
+            jt,
+            jf,
+            k,
+        };
+        let load = libc::BPF_LD | libc::BPF_W | libc::BPF_ABS;
+        let equal = libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K;
+        let any_of = libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K;
+        let onward = libc::BPF_JMP | libc::BPF_JA;
+        let give = libc::BPF_RET | libc::BPF_K;
+        // Each of these architectures is little endian, so the low 32 bits
+        // of the third argument come first.
+        let third = std::mem::offset_of!(libc::seccomp_data, args) + 2 * size_of::<u64>();
+        // Without flags the call is refused whatever its third argument is.
+        let refused = match flags {
+            Some(bits) => statement(any_of, bits as u32, 0, 1),
+            None => statement(onward, 0, 0, 0),
+        };
+        // Another architecture, another call or flags without those bits
+        // jump to the last statement, which allows the call.
+        let filter = [
+            statement(load, std::mem::offset_of!(libc::seccomp_data, arch) as u32, 0, 0),
+            statement(equal, arch, 0, 5),
+            statement(load, std::mem::offset_of!(libc::seccomp_data, nr) as u32, 0, 0),
+            statement(equal, call as u32, 0, 3),
+            statement(load, third as u32, 0, 0),
+            refused,
+            statement(give, libc::SECCOMP_RET_ERRNO | errno as u32, 0, 0),
+            statement(give, libc::SECCOMP_RET_ALLOW, 0, 0),
+        ];
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr().cast_mut(),
+        };
+        let (on, unused): (libc::c_ulong, libc::c_ulong) = (1, 0);
+        let mode = libc::SECCOMP_MODE_FILTER as libc::c_ulong;
+        // SAFETY: prctl() takes plain values and a filter, which it copies
+        // before it returns.
+        unsafe {
+            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, on, unused, unused, unused) == 0
+                && libc::prctl(libc::PR_SET_SECCOMP, mode, std::ptr::from_ref(&program)) == 0
+        }
+    }
+
+    /// Where a file written next to the image cannot get its name after the
+    /// image got its own, the image keeps its name, and its directory is
+    /// synced all the same, so that a crash does not take the name of an
+    /// image that the command said it kept. Filters of the test's own thread
+    /// refuse the rename that the file next to the image gets its name by,
+    /// and the opening of a directory, which the sync of the image's
+    /// directory starts with, so that the sync fails and says so. Nothing
+    /// else the link does opens a directory.
+    #[test]
+    fn a_failure_after_the_image_got_its_name_syncs_its_directory() {
+        // What a rename that may replace is: renameat() where there is one,
+        // renameat2() without flags elsewhere.
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        const RENAME: libc::c_long = libc::SYS_renameat;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+        const RENAME: libc::c_long = libc::SYS_renameat2;
+        let dir = TempDir::new("named");
+        let (path, written) = (dir.0.join("a.img"), dir.0.join("a.manifest"));
+        std::fs::write(&written, b"old\n").unwrap();
+        let image = Pending {
+            file: NewFile::create(&path, Naming::Exclusive).unwrap(),
+        };
+        let output = Pending {
+            file: NewFile::create(&written, Naming::Replacing).unwrap(),
+        };
+        let new = NewVolume {
+            created: Some(image),
+            volume: None,
+            outputs: vec![output],
+        };
+        let linked = std::thread::spawn(move || {
+            let refused = refuse_in_this_thread(RENAME, libc::EIO, None)
+                && refuse_in_this_thread(libc::SYS_openat, libc::EIO, Some(libc::O_DIRECTORY));
+            refused.then(|| new.link())
+        })
+        .join()
+        .unwrap();
+        let Some(linked) = linked else {
+            return eprintln!("skipping: no seccomp filters here");
+        };
+        let failure = linked.unwrap_err();
+        let failed = format!("cannot write {}: ", written.display());
+        assert!(failure.error.message().starts_with(&failed), "{}", failure.error);
+        let unsynced = format!(
+            "{} is complete and has its name, but syncing its directory failed: ",
+            path.display()
+        );
+        let lines: Vec<&str> = failure.leftovers.lines().collect();
+        assert!(lines.len() == 1 && lines[0].starts_with(&unsynced), "{:?}", lines);
+        assert!(path.exists());
+        assert_eq!(std::fs::read(&written).unwrap(), b"old\n");
+    }
 }
