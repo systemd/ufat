@@ -3,8 +3,9 @@
 //! a compact serializer.
 //!
 //! [`parse`] reads a text into a [`Value`], and a `Value` prints itself as
-//! compact text. [`Parser`] reads a text value by value, for a caller that
-//! has types of its own and does not want a `Value` in between.
+//! compact text. [`Parser`] reads a text value by value, and
+//! [`ObjectWriter`] and [`ArrayWriter`] write one member by member, for a
+//! caller that has types of its own and does not want a `Value` in between.
 //!
 //! Numbers keep their nature: anything written without a fraction or an
 //! exponent that fits into 128 bits stays an integer, so 64-bit sizes and
@@ -17,7 +18,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::str::FromStr;
 
 /// A JSON value.
@@ -1157,83 +1158,248 @@ pub fn parse(text: &str) -> Result<Value, ParseError> {
     Ok(value)
 }
 
-/// Writes `s` as a JSON string. The runs between escapes go out as they
-/// are.
+/// Writes the inside of the JSON string for `s`: the runs between escapes
+/// as they are, and an escape for every character that needs one.
+fn escape<W: fmt::Write + ?Sized>(out: &mut W, s: &str) -> fmt::Result {
+    let bytes = s.as_bytes();
+    // Where the current unescaped run starts.
+    let mut unescaped = 0;
+    loop {
+        let at = unescaped + Word::unescaped_len(&bytes[unescaped..]);
+        let Some(&b) = bytes.get(at) else {
+            return out.write_str(&s[unescaped..]);
+        };
+        out.write_str(&s[unescaped..at])?;
+        match b {
+            QUOTE => out.write_str("\\\"")?,
+            ESCAPE => out.write_str("\\\\")?,
+            b'\n' => out.write_str("\\n")?,
+            b'\r' => out.write_str("\\r")?,
+            b'\t' => out.write_str("\\t")?,
+            BACKSPACE => out.write_str("\\b")?,
+            FORM_FEED => out.write_str("\\f")?,
+            _ => write!(out, "{}{:0digits$x}", UNICODE_ESCAPE, b, digits = UNICODE_ESCAPE_DIGITS)?,
+        }
+        unescaped = at + 1;
+    }
+}
+
+/// Writes `s` as a JSON string.
 fn write_string<W: fmt::Write + ?Sized>(out: &mut W, s: &str) -> fmt::Result {
     out.write_char('"')?;
-    let mut plain = 0;
-    for (i, c) in s.char_indices() {
-        let escape = match c {
-            '"' => Some("\\\""),
-            '\\' => Some("\\\\"),
-            '\n' => Some("\\n"),
-            '\r' => Some("\\r"),
-            '\t' => Some("\\t"),
-            '\u{08}' => Some("\\b"),
-            '\u{0c}' => Some("\\f"),
-            c if u32::from(c) < 0x20 => None,
-            _ => continue,
-        };
-        out.write_str(&s[plain..i])?;
-        match escape {
-            Some(escape) => out.write_str(escape)?,
-            None => write!(out, "\\u{:04x}", u32::from(c))?,
-        }
-        plain = i + c.len_utf8();
-    }
-    out.write_str(&s[plain..])?;
+    escape(out, s)?;
     out.write_char('"')
 }
 
-fn write_value<W: fmt::Write + ?Sized>(out: &mut W, v: &Value) -> fmt::Result {
-    match v {
-        Value::Null => out.write_str("null"),
-        Value::Bool(b) => out.write_str(if *b { "true" } else { "false" }),
-        Value::Int(i) => write!(out, "{}", i),
-        // A float that is a whole number keeps a fraction, so that it reads
-        // back as a float.
-        Value::Float(f) if f.is_finite() && f.fract() == 0.0 => write!(out, "{}.0", f),
-        Value::Float(f) if f.is_finite() => write!(out, "{}", f),
-        Value::Float(_) => out.write_str("null"),
-        Value::String(s) => write_string(out, s),
-        Value::Array(a) => {
-            out.write_char('[')?;
-            for (i, item) in a.iter().enumerate() {
-                if i > 0 {
-                    out.write_char(',')?;
-                }
-                write_value(out, item)?;
-            }
-            out.write_char(']')
-        }
-        Value::Object(o) => write_object(out, o),
-    }
-}
-
-fn write_object<W: fmt::Write + ?Sized>(out: &mut W, o: &Object) -> fmt::Result {
-    out.write_char('{')?;
-    for (i, (k, item)) in o.iter().enumerate() {
-        if i > 0 {
-            out.write_char(',')?;
-        }
-        write_string(out, k)?;
-        out.write_char(':')?;
-        write_value(out, item)?;
-    }
-    out.write_char('}')
+/// Appends `s` to `out` as a JSON string.
+fn push_string(out: &mut String, s: &str) {
+    write_string(out, s).expect("a String takes any write");
 }
 
 impl fmt::Display for Value {
     /// Compact serialization without any whitespace.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_value(f, self)
+        match self {
+            Value::Null => f.write_str("null"),
+            Value::Bool(b) => f.write_str(if *b { "true" } else { "false" }),
+            Value::Int(i) => write!(f, "{}", i),
+            // Debug writes the shortest text that reads back as the same
+            // float, and always one that reads back as a float.
+            Value::Float(x) if x.is_finite() => write!(f, "{:?}", x),
+            Value::Float(_) => f.write_str("null"),
+            Value::String(s) => write_string(f, s),
+            Value::Array(a) => {
+                f.write_char('[')?;
+                for (i, item) in a.iter().enumerate() {
+                    if i > 0 {
+                        f.write_char(',')?;
+                    }
+                    item.fmt(f)?;
+                }
+                f.write_char(']')
+            }
+            Value::Object(o) => o.fmt(f),
+        }
     }
 }
 
 impl fmt::Display for Object {
     /// Compact serialization without any whitespace.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_object(f, self)
+        f.write_char('{')?;
+        for (i, (k, item)) in self.iter().enumerate() {
+            if i > 0 {
+                f.write_char(',')?;
+            }
+            write_string(f, k)?;
+            f.write_char(':')?;
+            item.fmt(f)?;
+        }
+        f.write_char('}')
+    }
+}
+
+/// Writes a JSON object into a string member by member, without a
+/// [`Value`] in between. The object is closed when the writer is dropped.
+///
+/// A member is written together with its value, so a member whose value
+/// is never written is left out:
+///
+/// ```
+/// let mut text = String::new();
+/// let mut object = json::ObjectWriter::new(&mut text);
+/// object.key("name").string("a\"b");
+/// object.key("sizes").array().element().unsigned(3);
+/// let label: Option<&str> = None;
+/// let value = object.key("label");
+/// if let Some(label) = label {
+///     value.string(label);
+/// }
+/// drop(object);
+/// assert_eq!(text, r#"{"name":"a\"b","sizes":[3]}"#);
+/// ```
+#[derive(Debug)]
+pub struct ObjectWriter<'a> {
+    out: &'a mut String,
+    /// Whether a member was written, so the next one needs a comma.
+    members: bool,
+}
+
+impl<'a> ObjectWriter<'a> {
+    /// Opens an object at the end of `out`.
+    pub fn new(out: &'a mut String) -> ObjectWriter<'a> {
+        out.push('{');
+        ObjectWriter { out, members: false }
+    }
+
+    /// Starts the member `key`. What is returned writes the member when it
+    /// writes the value, and nothing if it is dropped without one. The
+    /// caller keeps the keys of an object distinct.
+    pub fn key<'k>(&'k mut self, key: &'k str) -> ValueWriter<'k> {
+        ValueWriter {
+            out: self.out,
+            key: Some(key),
+            follows: &mut self.members,
+        }
+    }
+}
+
+impl Drop for ObjectWriter<'_> {
+    fn drop(&mut self) {
+        self.out.push('}');
+    }
+}
+
+/// Writes a JSON array into a string element by element, without a
+/// [`Value`] in between. The array is closed when the writer is dropped.
+#[derive(Debug)]
+pub struct ArrayWriter<'a> {
+    out: &'a mut String,
+    /// Whether an element was written, so the next one needs a comma.
+    elements: bool,
+}
+
+impl<'a> ArrayWriter<'a> {
+    /// Opens an array at the end of `out`.
+    pub fn new(out: &'a mut String) -> ArrayWriter<'a> {
+        out.push('[');
+        ArrayWriter { out, elements: false }
+    }
+
+    /// Starts an element. What is returned writes the element when it
+    /// writes the value, and nothing if it is dropped without one.
+    pub fn element(&mut self) -> ValueWriter<'_> {
+        ValueWriter {
+            out: self.out,
+            key: None,
+            follows: &mut self.elements,
+        }
+    }
+}
+
+impl Drop for ArrayWriter<'_> {
+    fn drop(&mut self) {
+        self.out.push(']');
+    }
+}
+
+/// The place of one value in the text an [`ObjectWriter`] or an
+/// [`ArrayWriter`] writes. Every method writes the value, and with it the
+/// comma in front of it and the key of a member. A `ValueWriter` that is
+/// dropped without a value writes nothing.
+#[derive(Debug)]
+#[must_use = "a member or an element is only written with its value"]
+pub struct ValueWriter<'a> {
+    out: &'a mut String,
+    /// The key of a member, none for an element.
+    key: Option<&'a str>,
+    /// Whether the object or the array has a value already, so this one
+    /// needs a comma in front. Set when this one is written.
+    follows: &'a mut bool,
+}
+
+impl<'a> ValueWriter<'a> {
+    /// Writes what goes in front of the value: the comma after the value
+    /// before it and the key of a member. Returns where the value goes.
+    fn begin(self) -> &'a mut String {
+        if *self.follows {
+            self.out.push(',');
+        }
+        *self.follows = true;
+        if let Some(key) = self.key {
+            push_string(self.out, key);
+            self.out.push(':');
+        }
+        self.out
+    }
+
+    /// Writes `null`.
+    pub fn null(self) {
+        self.begin().push_str("null");
+    }
+
+    /// Writes `true` or `false`.
+    pub fn bool(self, value: bool) {
+        self.begin().push_str(if value { "true" } else { "false" });
+    }
+
+    /// Writes an integer.
+    pub fn unsigned(self, value: u64) {
+        write!(self.begin(), "{}", value).expect("a String takes any write");
+    }
+
+    /// Writes a string.
+    pub fn string(self, value: &str) {
+        push_string(self.begin(), value);
+    }
+
+    /// Writes what `value` prints as a string.
+    pub fn display(self, value: impl fmt::Display) {
+        /// Escapes what is written to it.
+        struct Escaper<'a>(&'a mut String);
+
+        impl fmt::Write for Escaper<'_> {
+            fn write_str(&mut self, s: &str) -> fmt::Result {
+                escape(self.0, s)
+            }
+        }
+
+        let out = self.begin();
+        out.push('"');
+        write!(Escaper(out), "{}", value).expect("a Display implementation returned an error");
+        out.push('"');
+    }
+
+    /// Opens an object as the value. The member or the element is written
+    /// with it, even if the object stays empty.
+    pub fn object(self) -> ObjectWriter<'a> {
+        ObjectWriter::new(self.begin())
+    }
+
+    /// Opens an array as the value. The member or the element is written
+    /// with it, even if the array stays empty.
+    pub fn array(self) -> ArrayWriter<'a> {
+        ArrayWriter::new(self.begin())
     }
 }
 
@@ -1263,7 +1429,10 @@ mod tests {
             (1.0, "1.0"),
             (-0.0, "-0.0"),
             (1.5, "1.5"),
-            (1e21, "1000000000000000000000.0"),
+            (1e15, "1000000000000000.0"),
+            (1e21, "1e21"),
+            (-2.5e-8, "-2.5e-8"),
+            (5e-324, "5e-324"),
             (f64::NAN, "null"),
             (f64::INFINITY, "null"),
         ] {
@@ -1401,6 +1570,51 @@ mod tests {
         let v = Value::from("a\"b\\c\n\t\u{01}é");
         assert_eq!(v.to_string(), "\"a\\\"b\\\\c\\n\\t\\u0001é\"");
         assert_eq!(parse(&v.to_string()).unwrap(), v);
+        // Every control character has an escape, the ones with a letter
+        // of their own use it.
+        let all: String = (0u8..0x20).map(char::from).collect();
+        let text = Value::from(all.as_str()).to_string();
+        assert!(text.starts_with("\"\\u0000\\u0001") && text.contains("\\b\\t\\n\\u000b\\f\\r\\u000e"));
+        assert!(text.ends_with("\\u001f\""), "{}", text);
+        assert_eq!(parse(&text).unwrap().as_str(), Some(all.as_str()));
+        // What needs an escape gets it wherever it is in the string, and
+        // nothing else does.
+        let escape_of = |c: char| match c {
+            '"' => "\\\"".to_string(),
+            '\\' => "\\\\".to_string(),
+            '\n' => "\\n".to_string(),
+            '\u{1}' => "\\u0001".to_string(),
+            c => c.to_string(),
+        };
+        for filler in [
+            "a",
+            " ",
+            "!",
+            "#",
+            "[",
+            "]",
+            "\x7f",
+            "\u{e9}",
+            "\u{a2}",
+            "\u{9f}",
+            "\u{70c}",
+            "\u{1f600}",
+        ] {
+            for before in 0..(2 * Word::SIZE + 2) {
+                for special in ['"', '\\', '\n', '\u{1}', 'x'] {
+                    for behind in ["", "y", "the rest of the string"] {
+                        let string = format!("{}{}{}{}", filler.repeat(before), special, behind, special);
+                        let escaped: String = string.chars().map(escape_of).collect();
+                        let text = Value::from(string.as_str()).to_string();
+                        assert_eq!(text, format!("\"{}\"", escaped), "{:?}", string);
+                        assert_eq!(parse(&text).unwrap().as_str(), Some(string.as_str()));
+                        let mut written = String::new();
+                        ObjectWriter::new(&mut written).key(&string).display(&string);
+                        assert_eq!(written, format!("{{\"{}\":\"{}\"}}", escaped, escaped), "{:?}", string);
+                    }
+                }
+            }
+        }
     }
 
     /// Reads `text` with the methods named after the kinds and writes what
@@ -1962,5 +2176,96 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn writers() {
+        let mut text = String::new();
+        {
+            let mut object = ObjectWriter::new(&mut text);
+            object.key("s").string("a\"b\\c\n\u{1}é");
+            object.key("key \"quoted\"").null();
+            object.key("t").bool(true);
+            object.key("f").bool(false);
+            object.key("zero").unsigned(0);
+            object.key("ten").unsigned(10);
+            object.key("max").unsigned(u64::MAX);
+            object.key("shown").display(format_args!("{}:{:?}", 5, "x\ty"));
+            object.key("empty object").object();
+            object.key("empty array").array();
+            let mut array = object.key("array").array();
+            array.element().unsigned(1);
+            array.element().string("two");
+            array.element().array().element().null();
+            let mut inner = array.element().object();
+            inner.key("k").unsigned(3);
+            drop(inner);
+            drop(array);
+            object.key("last").string("");
+        }
+        assert_eq!(
+            text,
+            concat!(
+                r#"{"s":"a\"b\\c\n\u0001é","key \"quoted\"":null,"t":true,"f":false,"zero":0,"ten":10,"#,
+                r#""max":18446744073709551615,"shown":"5:\"x\\ty\"","empty object":{},"empty array":[],"#,
+                r#""array":[1,"two",[null],{"k":3}],"last":""}"#
+            )
+        );
+        // What the writers write is what the value prints.
+        let value = parse(&text).unwrap();
+        assert_eq!(value.to_string(), text);
+        assert_eq!(value.get("s").unwrap().as_str(), Some("a\"b\\c\n\u{1}é"));
+        assert_eq!(value.get("shown").unwrap().as_str(), Some("5:\"x\\ty\""));
+        assert_eq!(value.get("max").unwrap().as_u64(), Some(u64::MAX));
+        // A writer appends to what the string holds.
+        let mut text = String::from("\u{1e}");
+        ArrayWriter::new(&mut text).element().unsigned(7);
+        text.push('\n');
+        assert_eq!(text, "\u{1e}[7]\n");
+    }
+
+    #[test]
+    fn dropped_value_writers_write_nothing() {
+        // A member or an element whose value is never written is left
+        // out, in the first, a middle and the last place.
+        let values = [("a", 1), ("b", 2), ("c", 3)];
+        for (left_out, object_text, array_text) in [
+            (0, r#"{"b":2,"c":3}"#, "[2,3]"),
+            (1, r#"{"a":1,"c":3}"#, "[1,3]"),
+            (2, r#"{"a":1,"b":2}"#, "[1,2]"),
+        ] {
+            let mut object_written = String::new();
+            let mut array_written = String::new();
+            {
+                let mut object = ObjectWriter::new(&mut object_written);
+                let mut array = ArrayWriter::new(&mut array_written);
+                for (place, (key, value)) in values.into_iter().enumerate() {
+                    let member = object.key(key);
+                    let element = array.element();
+                    if place != left_out {
+                        member.unsigned(value);
+                        element.unsigned(value);
+                    }
+                }
+            }
+            assert_eq!(object_written, object_text);
+            assert_eq!(array_written, array_text);
+        }
+        // Nor does a writer dropped with let _ write anything, nor the
+        // only one of an object or an array.
+        let mut text = String::new();
+        {
+            let mut object = ObjectWriter::new(&mut text);
+            let _ = object.key("a");
+            let mut inner = object.key("b").object();
+            let _ = inner.key("c");
+            drop(inner);
+            let mut inner = object.key("d").array();
+            let _ = inner.element();
+            drop(inner);
+            let _ = object.key("e");
+        }
+        assert_eq!(text, r#"{"b":{},"d":[]}"#);
+        assert_eq!(parse(&text).unwrap().to_string(), text);
     }
 }
