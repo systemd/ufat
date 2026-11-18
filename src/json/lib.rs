@@ -300,7 +300,8 @@ pub struct ParseError {
     pub offset: usize,
     /// What went wrong.
     pub message: &'static str,
-    /// Whether the text is not JSON or has a key twice in an object.
+    /// Whether the text is not JSON, has a key twice in an object, or
+    /// breaks a rule of the parser.
     pub kind: ParseErrorKind,
 }
 
@@ -312,6 +313,8 @@ pub enum ParseErrorKind {
     /// An object has a key twice. RFC 8259 leaves open what such an object
     /// means, and the parser refuses it.
     DuplicateKey,
+    /// A string breaks one of the [`StringRules`] the parser was made with.
+    StringRule,
 }
 
 impl fmt::Display for ParseError {
@@ -490,6 +493,116 @@ impl From<Number> for Value {
     }
 }
 
+/// What the strings of a text may not hold beyond what JSON forbids.
+///
+/// JSON lets a string hold any Unicode scalar value. Formats built on JSON
+/// often rule out more, and a [`Parser`] made with
+/// [`Parser::with_rules`] refuses those strings, keys included, however
+/// they are written: as they are or with escapes.
+///
+/// ```
+/// use json::{Parser, StringRules};
+///
+/// let mut parser = Parser::with_rules(r#""a\u0000b""#, StringRules::NO_NUL);
+/// assert_eq!(parser.string().unwrap_err().message, "NUL in string");
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct StringRules(u8);
+
+impl StringRules {
+    /// No noncharacter, as I-JSON (RFC 7493) asks: U+FDD0 to U+FDEF and
+    /// the last two code points of every plane, U+FFFE and U+FFFF, U+1FFFE
+    /// and U+1FFFF and so on.
+    pub const NO_NONCHARACTERS: StringRules = StringRules(1 << 0);
+    /// No NUL character, which JSON only lets a string have as `\u0000`.
+    pub const NO_NUL: StringRules = StringRules(1 << 1);
+    /// No rule beyond those of JSON.
+    pub const NONE: StringRules = StringRules(0);
+
+    /// Whether every rule of `rules` is among these.
+    pub const fn contains(self, rules: StringRules) -> bool {
+        self.0 & rules.0 == rules.0
+    }
+
+    /// These rules and those of `rules`.
+    pub const fn union(self, rules: StringRules) -> StringRules {
+        StringRules(self.0 | rules.0)
+    }
+
+    /// These rules but those of `rules`.
+    pub const fn without(self, rules: StringRules) -> StringRules {
+        StringRules(self.0 & !rules.0)
+    }
+
+    /// Whether the string `s` keeps to these rules.
+    pub fn admits(self, s: &str) -> bool {
+        self.broken_in(s).is_none()
+    }
+
+    /// Which of these rules the string `s` breaks first, if one.
+    fn broken_in(self, s: &str) -> Option<&'static str> {
+        if self == StringRules::NONE {
+            return None;
+        }
+        // A string without a byte as high as NONCHARACTER_LEAD has no
+        // noncharacter, so only a NUL can break a rule. Such bytes are
+        // looked for many at a time: by is_ascii, the cheapest look for
+        // ASCII strings, which most are, and by a fold without an early
+        // end, which the compiler turns into vector instructions. A look at
+        // every character takes about fifteen instructions for each.
+        let lead = !s.is_ascii() && s.bytes().fold(false, |lead, b| lead | (b >= NONCHARACTER_LEAD));
+        if lead {
+            s.chars().find_map(|c| self.broken_by(c))
+        } else {
+            (self.contains(StringRules::NO_NUL) && s.contains(NUL)).then_some(NUL_IN_STRING)
+        }
+    }
+
+    /// Whether a string holding `c` breaks one of these rules, and which.
+    fn broken_by(self, c: char) -> Option<&'static str> {
+        if c == NUL && self.contains(StringRules::NO_NUL) {
+            Some(NUL_IN_STRING)
+        } else if self.contains(StringRules::NO_NONCHARACTERS) && is_noncharacter(c) {
+            Some("noncharacter in string")
+        } else {
+            None
+        }
+    }
+}
+
+/// The character [`StringRules::NO_NUL`] rules out, and what a string that
+/// holds it is told.
+const NUL: char = '\0';
+const NUL_IN_STRING: &str = "NUL in string";
+
+impl std::ops::BitOr for StringRules {
+    type Output = StringRules;
+
+    fn bitor(self, rules: StringRules) -> StringRules {
+        self.union(rules)
+    }
+}
+
+/// The noncharacters that are not at the end of a plane.
+const NONCHARACTER_BLOCK: std::ops::RangeInclusive<u32> = 0xFDD0..=0xFDEF;
+/// The bits that are set in the last two code points of every plane, and
+/// only in them.
+const PLANE_END: u32 = 0xFFFE;
+/// The first byte of the lowest noncharacter in UTF-8. Higher characters
+/// start with the same byte or a higher one, and no byte after the first
+/// one of a character is as high, so a string without it has none.
+const NONCHARACTER_LEAD: u8 = match char::from_u32(*NONCHARACTER_BLOCK.start()) {
+    Some(lowest) => lowest.encode_utf8(&mut [0; 4]).as_bytes()[0],
+    None => panic!("the lowest noncharacter is a character"),
+};
+
+/// Whether `c` is a noncharacter, a code point Unicode keeps for use
+/// inside a program.
+fn is_noncharacter(c: char) -> bool {
+    let code = u32::from(c);
+    NONCHARACTER_BLOCK.contains(&code) || code & PLANE_END == PLANE_END
+}
+
 /// An array or an object the parser is inside of.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Container {
@@ -640,11 +753,19 @@ pub struct Parser<'a> {
     keys: Keys<'a>,
     /// What [`Parser::skip`] keeps of the value it reads.
     skipped: SkippedValue<'a>,
+    /// What strings may not hold beyond what JSON forbids.
+    rules: StringRules,
 }
 
 impl<'a> Parser<'a> {
     /// A parser in front of the value `text` holds.
     pub fn new(text: &'a str) -> Parser<'a> {
+        Parser::with_rules(text, StringRules::NONE)
+    }
+
+    /// A parser in front of the value `text` holds that refuses strings
+    /// which break `rules`.
+    pub fn with_rules(text: &'a str, rules: StringRules) -> Parser<'a> {
         Parser {
             text,
             pos: 0,
@@ -653,6 +774,7 @@ impl<'a> Parser<'a> {
             empty: false,
             keys: Keys::default(),
             skipped: SkippedValue::default(),
+            rules,
         }
     }
 
@@ -854,6 +976,9 @@ impl<'a> Parser<'a> {
         if self.byte() == Some(QUOTE) {
             let unescaped = &self.text[start..self.pos];
             self.pos += 1;
+            // The unescaped run ends at every control character, so only an
+            // escape can put a NUL into a string.
+            self.check_rules(unescaped, self.rules.without(StringRules::NO_NUL))?;
             return Ok(Cow::Borrowed(unescaped));
         }
         let mut out = String::from(&self.text[start..self.pos]);
@@ -901,7 +1026,19 @@ impl<'a> Parser<'a> {
             self.skip_unescaped();
             out.push_str(&self.text[start..self.pos]);
         }
+        self.check_rules(&out, self.rules)?;
         Ok(Cow::Owned(out))
+    }
+
+    /// Fails if the string `s` breaks one of `rules`, rules of the parser.
+    fn check_rules(&self, s: &str, rules: StringRules) -> Result<(), ParseError> {
+        match rules.broken_in(s) {
+            Some(message) => Err(ParseError {
+                kind: ParseErrorKind::StringRule,
+                ..self.error(message)
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Reads the value if it is a string. A string without an escape is
@@ -1909,6 +2046,207 @@ mod tests {
                 let e = three_ways(&nested(MAX_DEPTH + 1, inner)).unwrap_err();
                 assert_eq!(e.message, "nesting too deep", "{}", inner);
                 assert_eq!(e.offset, open.len() * (MAX_DEPTH + 1));
+            }
+        }
+    }
+
+    #[test]
+    fn parser_applies_string_rules() {
+        let strict = StringRules::NO_NONCHARACTERS | StringRules::NO_NUL;
+        // Reads `text` the way a reader of a format with these rules does:
+        // every key and every value, also those it passes over.
+        let read = |text: &str, rules: StringRules| -> Result<(), ParseError> {
+            let mut parser = Parser::with_rules(text, rules);
+            parser.skip()?;
+            parser.end()
+        };
+        let refused = [
+            ("\"\u{fdd0}\"", "noncharacter in string"),
+            ("\"\u{fdef}\"", "noncharacter in string"),
+            ("\"a\u{fffe}\"", "noncharacter in string"),
+            ("\"\u{ffff}\"", "noncharacter in string"),
+            ("\"\u{1fffe}\"", "noncharacter in string"),
+            ("\"\u{10ffff}\"", "noncharacter in string"),
+            (r#""﷐""#, "noncharacter in string"),
+            (r#""￿""#, "noncharacter in string"),
+            (r#""🿾""#, "noncharacter in string"),
+            (r#""􏿿""#, "noncharacter in string"),
+            (r#""a\u0000b""#, "NUL in string"),
+            (r#"{"a\u0000":1}"#, "NUL in string"),
+            ("{\"\u{ffff}\":1}", "noncharacter in string"),
+            (r#"{"x":["￿"]}"#, "noncharacter in string"),
+        ];
+        for (text, message) in refused {
+            assert!(read(text, StringRules::NONE).is_ok(), "{}", text);
+            assert_eq!(read(text, strict).unwrap_err().message, message, "{}", text);
+        }
+        // Each rule on its own.
+        assert!(read(r#""\u0000""#, StringRules::NO_NONCHARACTERS).is_ok());
+        assert!(read(r#""￿""#, StringRules::NO_NUL).is_ok());
+        // Their neighbours and the replacement character are fine.
+        for text in [
+            "\"\u{fdcf}\u{fdf0}\u{fffd}\u{e000}\u{1fffd}\u{10fffd}\"",
+            r#""﷏ﷰ�🿽\u0001""#,
+            r#"{"a":"b","c":[1,"d"]}"#,
+        ] {
+            assert!(read(text, strict).is_ok(), "{}", text);
+        }
+    }
+
+    /// How many code points a plane has.
+    const PLANE_SIZE: u32 = 1 << 16;
+
+    /// Every noncharacter: those of the block and the last two code points
+    /// of each of the 17 planes.
+    fn noncharacters() -> Vec<char> {
+        let planes = 0..=u32::from(char::MAX) / PLANE_SIZE;
+        let ends = planes.flat_map(|plane| [plane * PLANE_SIZE + PLANE_END, plane * PLANE_SIZE + PLANE_END + 1]);
+        NONCHARACTER_BLOCK.chain(ends).filter_map(char::from_u32).collect()
+    }
+
+    /// `c` written with `\u` escapes, two of them for a surrogate pair.
+    fn escaped(c: char) -> String {
+        c.encode_utf16(&mut [0; 2]).iter().fold(String::new(), |mut out, unit| {
+            write!(out, "\\u{:04x}", unit).expect("a String takes any write");
+            out
+        })
+    }
+
+    /// The rules are checked character by character only in strings
+    /// beyond ASCII, and a NUL is only looked for in strings with an
+    /// escape: what they find is the same for every kind of string.
+    #[test]
+    fn string_rules_in_every_kind_of_string() {
+        let strict = StringRules::NO_NONCHARACTERS | StringRules::NO_NUL;
+        let read = |text: &str, rules: StringRules| -> Result<(), ParseError> {
+            let mut parser = Parser::with_rules(text, rules);
+            parser.skip()?;
+            parser.end()
+        };
+        // A string as a value and as a key, with nothing else in the text.
+        let texts = |string: &str| [format!("\"{}\"", string), format!("{{\"{}\":[1]}}", string)];
+        // The strings with `c` written into them: alone, behind ASCII,
+        // ahead of it, behind more than a word of it, with an escape
+        // before it, and next to characters beyond ASCII that start with
+        // a lower byte than any noncharacter and with the same byte.
+        let strings = |c: &str| {
+            let long = "x".repeat(70);
+            [
+                c.to_string(),
+                format!("abc{}", c),
+                format!("{}abc", c),
+                format!("{}{}", long, c),
+                format!("{}{}{}", long, c, long),
+                format!("a\\n{}", c),
+                format!("\u{e9}{}", c),
+                format!("{}\u{efff}{}", long, c),
+                format!("{}\u{f000}", c),
+            ]
+        };
+        // Unicode has 66 of them.
+        let noncharacters = noncharacters();
+        assert_eq!(noncharacters.len(), 66);
+        for &c in &noncharacters {
+            for written in [c.to_string(), escaped(c)] {
+                for string in strings(&written) {
+                    let [value, key] = texts(&string);
+                    for rules in [strict, StringRules::NO_NONCHARACTERS] {
+                        // Reported right behind the string.
+                        let e = read(&value, rules).unwrap_err();
+                        assert_eq!(
+                            (e.message, e.offset),
+                            ("noncharacter in string", value.len()),
+                            "{:?}",
+                            value
+                        );
+                        assert_eq!(e.kind, ParseErrorKind::StringRule);
+                        let e = read(&key, rules).unwrap_err();
+                        let behind = string.len() + "{\"\"".len();
+                        assert_eq!((e.message, e.offset), ("noncharacter in string", behind), "{:?}", key);
+                    }
+                }
+                for text in strings(&written).iter().flat_map(|string| texts(string)) {
+                    assert!(read(&text, StringRules::NO_NUL).is_ok(), "{:?}", text);
+                    assert!(read(&text, StringRules::NONE).is_ok(), "{:?}", text);
+                }
+            }
+            for string in strings(&c.to_string()) {
+                assert!(!strict.admits(&string), "{:?}", string);
+                assert!(StringRules::NO_NUL.admits(&string), "{:?}", string);
+            }
+        }
+        // The code points next to them are none.
+        let neighbours = (0..=u32::from(char::MAX) / PLANE_SIZE)
+            .map(|plane| plane * PLANE_SIZE + PLANE_END - 1)
+            .chain([*NONCHARACTER_BLOCK.start() - 1, *NONCHARACTER_BLOCK.end() + 1]);
+        for c in neighbours.filter_map(char::from_u32) {
+            for written in [c.to_string(), escaped(c)] {
+                for text in strings(&written).iter().flat_map(|string| texts(string)) {
+                    assert!(read(&text, strict).is_ok(), "{:?}", text);
+                }
+            }
+            assert!(strings(&c.to_string()).iter().all(|string| strict.admits(string)));
+        }
+        // A NUL can only be written as an escape: as it is, it is a control
+        // character, which no string may have.
+        for string in strings("\0") {
+            let e = read(&format!("\"{}\"", string), StringRules::NONE).unwrap_err();
+            assert_eq!(e.message, "control character in string");
+        }
+        for string in strings(r"\u0000") {
+            let [value, key] = texts(&string);
+            for rules in [strict, StringRules::NO_NUL] {
+                let e = read(&value, rules).unwrap_err();
+                assert_eq!((e.message, e.offset), ("NUL in string", value.len()), "{:?}", value);
+                assert_eq!(e.kind, ParseErrorKind::StringRule);
+                let e = read(&key, rules).unwrap_err();
+                let behind = string.len() + "{\"\"".len();
+                assert_eq!((e.message, e.offset), ("NUL in string", behind), "{:?}", key);
+            }
+            for text in [value, key] {
+                assert!(read(&text, StringRules::NO_NONCHARACTERS).is_ok(), "{:?}", text);
+            }
+        }
+        for string in strings("\0") {
+            assert!(
+                !strict.admits(&string) && !StringRules::NO_NUL.admits(&string),
+                "{:?}",
+                string
+            );
+            assert!(StringRules::NO_NONCHARACTERS.admits(&string), "{:?}", string);
+        }
+        // What breaks a rule first is what is reported.
+        for (text, message) in [
+            (r#""\u0000\ufdd0""#, "NUL in string"),
+            (r#""\ufdd0\u0000""#, "noncharacter in string"),
+            ("\"\u{fdd0}\\u0000\"", "noncharacter in string"),
+            ("\"\\u0000\u{fdd0}\"", "NUL in string"),
+        ] {
+            assert_eq!(read(text, strict).unwrap_err().message, message, "{}", text);
+        }
+        assert_eq!(strict.without(StringRules::NO_NUL), StringRules::NO_NONCHARACTERS);
+        assert_eq!(strict.without(strict), StringRules::NONE);
+        assert_eq!(
+            StringRules::NO_NUL.without(StringRules::NO_NONCHARACTERS),
+            StringRules::NO_NUL
+        );
+    }
+
+    /// What looking for a noncharacter by the bytes of a string relies on,
+    /// for every character there is.
+    #[test]
+    fn noncharacters_start_with_a_high_byte() {
+        let mut utf8 = [0; 4];
+        let lowest = char::from_u32(*NONCHARACTER_BLOCK.start()).unwrap();
+        assert_eq!(lowest.encode_utf8(&mut utf8).as_bytes()[0], NONCHARACTER_LEAD);
+        let mut first = 0;
+        for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+            let (&lead, rest) = c.encode_utf8(&mut utf8).as_bytes().split_first().unwrap();
+            assert!(rest.iter().all(|&b| b < NONCHARACTER_LEAD), "{:?}", c);
+            assert!(lead >= first, "{:?}", c);
+            first = lead;
+            if is_noncharacter(c) {
+                assert!(lead >= NONCHARACTER_LEAD, "{:?}", c);
             }
         }
     }
