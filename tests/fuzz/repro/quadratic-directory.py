@@ -16,19 +16,27 @@ every entry is an empty file whose contents come from the stream or from a
 source directory; with `lossy` the files share one 8.3 alias prefix, which
 adds the numeric-tail search on top (2000 files: 7.5 s before the index,
 16000 files 0.17 s with it).
+
+The manifest declares the code point order, which ufat requires, and the
+numbers in the names have leading zeros so that the names are in it.
 """
 import sys
 
 n = int(sys.argv[1]) if len(sys.argv) > 1 else 16000
 kind = sys.argv[2] if len(sys.argv) > 2 else "dir"
+digits = len(str(max(n - 1, 0)))
 out = sys.stdout.buffer
 RS = b"\x1e"
-out.write(RS + b'{"mediaType":"application/vnd.uapi.16.manifest"}\n')
+out.write(RS + b'{"mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}\n')
+if kind == "lossy":
+    out.write(RS + b'{"name":"EFI","type":"dir"}\n')
+    out.write(RS + b'{"name":"EFI/Linux","type":"dir"}\n')
 for i in range(n):
+    number = b"%0*d" % (digits, i)
     if kind == "dir":
-        out.write(RS + b'{"name":"d%d","type":"dir"}\n' % i)
+        out.write(RS + b'{"name":"d%s","type":"dir"}\n' % number)
     elif kind == "lossy":
-        out.write(RS + b'{"name":"EFI/Linux/linux-6.12.%d-200.fc41.x86_64.efi","size":0}\n' % i)
+        out.write(RS + b'{"name":"EFI/Linux/linux-6.12.%s-200.fc41.x86_64.efi","size":0}\n' % number)
     else:
-        out.write(RS + b'{"name":"f%d","size":0}\n' % i)
+        out.write(RS + b'{"name":"f%s","size":0}\n' % number)
 out.write(RS + b'{"mediaType":"application/vnd.uapi.16.trailer"}\n')

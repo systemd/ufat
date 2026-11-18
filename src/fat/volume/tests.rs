@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! Tests of the volume.
 use super::*;
+use crate::dirent::lfn_field;
 use crate::fat::{END_OF_CHAIN, ENTRY_SIZE};
 use crate::format::{self, FormatOptions};
 use crate::fsck;
 use crate::layout::FIRST_CLUSTER;
+use crate::name::{LFN_PADDING, LFN_TERMINATOR};
 use crate::test_util::{format_options, volume, TempImage};
 use std::io::{Read, Write};
 use std::time::{Duration, UNIX_EPOCH};
@@ -232,16 +234,25 @@ fn growing_a_directory_without_space_changes_nothing() {
     w.write_all(&vec![0u8; free as usize * 512]).unwrap();
     w.finish().unwrap();
     assert_eq!(v.free_clusters(), 0);
-    // Growing /sub needs a cluster there is not.
+    // Growing /sub needs a cluster there is not. That is found before
+    // anything is written.
+    v.sync().unwrap();
+    let bytes = std::fs::read(img.path()).unwrap();
     assert_eq!(v.create_file("/sub/F14", t(0), false).unwrap_err().errno(), ENOSPC);
     assert_eq!(names(&v, "/sub").len(), 14);
-    // With one free cluster a new directory gets its own cluster but
+    assert_eq!(std::fs::read(img.path()).unwrap(), bytes);
+    assert!(!v.is_writing());
+    // With one free cluster a new directory could get its own cluster but
     // /sub cannot grow to hold its entry: nothing changes either.
     v.remove_file("/junk").unwrap();
     assert_eq!(v.free_clusters(), 1);
+    v.sync().unwrap();
+    let bytes = std::fs::read(img.path()).unwrap();
     assert_eq!(v.create_dir("/sub/d", t(0)).unwrap_err().errno(), ENOSPC);
     assert_eq!(v.free_clusters(), 1);
     assert_eq!(names(&v, "/sub").len(), 14);
+    assert_eq!(std::fs::read(img.path()).unwrap(), bytes);
+    assert!(!v.is_writing());
     // A file without contents only needs the directory to grow.
     v.create_file("/sub/F14", t(0), false).unwrap().finish().unwrap();
     assert_eq!(v.free_clusters(), 0);
@@ -251,6 +262,222 @@ fn growing_a_directory_without_space_changes_nothing() {
     assert_eq!(r.errors(), 0, "{:?}", r.problems);
     let v = Volume::open(img.device()).unwrap();
     assert_eq!(names(&v, "/sub").len(), 15);
+}
+
+/// A directory with every one of its MAX_SLOTS entry slots in use takes no
+/// more entries, and refusing one writes nothing. The directory is made on
+/// the image itself: one entry at a time would take too long.
+#[test]
+fn a_full_directory_refuses_before_it_writes() {
+    let cs = 4096;
+    let per_cluster = cs / DIR_ENTRY_SIZE;
+    let (img, mut v) = volume(8 << 20, 512, cs as u32);
+    v.create_dir("/d", t(0)).unwrap();
+    let d = v.metadata("/d").unwrap();
+    let more = u32::try_from(MAX_SLOTS / per_cluster - 1).unwrap();
+    let extent = v.allocate(more).unwrap();
+    assert_eq!(extent.count, more);
+    v.link(d.first_cluster, extent.first).unwrap();
+    let layout = *v.layout();
+    v.close().unwrap();
+    // The dot entries stay; every other slot gets a file of its own name.
+    let dev = img.device();
+    let chain = std::iter::once(d.first_cluster).chain(extent.first..extent.first + more);
+    for (i, cluster) in chain.enumerate() {
+        let offset = layout.cluster_offset(cluster).unwrap();
+        let mut data = vec![0u8; cs];
+        dev.read_at(offset, &mut data).unwrap();
+        for (j, slot) in data.chunks_exact_mut(DIR_ENTRY_SIZE).enumerate() {
+            let n = i * per_cluster + j;
+            if n < 2 {
+                continue;
+            }
+            let mut name = [b' '; SHORT_NAME_SIZE];
+            name[..8].copy_from_slice(format!("{:08X}", n).as_bytes());
+            let mut entry = RawDirEntry {
+                name,
+                attr: ATTR_ARCHIVE,
+                ..RawDirEntry::default()
+            };
+            entry.set_times(FatTimestamp::from_system_time(t(0)));
+            slot.copy_from_slice(&entry.to_bytes());
+        }
+        dev.write_at(offset, &data).unwrap();
+    }
+    drop(dev);
+    let mut v = Volume::open(img.device()).unwrap();
+    let bytes = std::fs::read(img.path()).unwrap();
+    assert_eq!(v.read_dir("/d").unwrap().len(), MAX_SLOTS - 2);
+    for e in [
+        v.create_file("/d/x", t(0), false).map(drop).unwrap_err(),
+        v.create_dir("/d/y", t(0)).unwrap_err(),
+        v.create_dir_all("/d/y/z", t(0)).unwrap_err(),
+    ] {
+        assert_eq!(e.errno(), ENOSPC);
+        assert!(
+            matches!(
+                e.detail(),
+                Some(Detail::NoSpace {
+                    reason: NoSpaceReason::DirectoryEntries,
+                    ..
+                })
+            ),
+            "{:?}",
+            e
+        );
+    }
+    assert_eq!(std::fs::read(img.path()).unwrap(), bytes);
+    assert!(!v.is_writing());
+}
+
+/// growth_for() counts the clusters free_run() appends from the free
+/// slots at the end, which the first cluster appended continues, and
+/// refuses growth past MAX_SLOTS slots but not growth up to it.
+#[test]
+fn growth_for_continues_the_free_slots_at_the_end() {
+    let cs = 512;
+    let per_cluster = cs / DIR_ENTRY_SIZE;
+    let (_img, v) = volume(1 << 20, 512, cs as u32);
+    // A directory of `clusters` clusters whose first `used` slots hold
+    // entries, with nothing after them.
+    let dir = |clusters: usize, used: usize| {
+        let mut data = vec![0u8; clusters * cs];
+        for (n, slot) in data.chunks_exact_mut(DIR_ENTRY_SIZE).take(used).enumerate() {
+            let mut name = [b' '; SHORT_NAME_SIZE];
+            name[..8].copy_from_slice(format!("{:08X}", n).as_bytes());
+            let entry = RawDirEntry {
+                name,
+                attr: ATTR_ARCHIVE,
+                ..RawDirEntry::default()
+            };
+            slot.copy_from_slice(&entry.to_bytes());
+        }
+        let first = FIRST_CLUSTER;
+        Directory::new((first..first + clusters as u32).collect(), data, cs).unwrap()
+    };
+    let full = |e: crate::Error| {
+        e.errno() == ENOSPC
+            && matches!(
+                e.detail(),
+                Some(Detail::NoSpace {
+                    reason: NoSpaceReason::DirectoryEntries,
+                    ..
+                })
+            )
+    };
+    // Four slots free at the end: the first cluster appended continues them.
+    let d = dir(2, 2 * per_cluster - 4);
+    assert_eq!(d.free_at_end(), 4);
+    assert_eq!(v.growth_for(&d, 5).unwrap(), 1);
+    assert_eq!(v.growth_for(&d, 4 + per_cluster).unwrap(), 1);
+    assert_eq!(v.growth_for(&d, 5 + per_cluster).unwrap(), 2);
+    // None free at the end: every slot of the run is a new one.
+    let d = dir(2, 2 * per_cluster);
+    assert_eq!(d.free_at_end(), 0);
+    assert_eq!(v.growth_for(&d, per_cluster).unwrap(), 1);
+    assert_eq!(v.growth_for(&d, per_cluster + 1).unwrap(), 2);
+    // A cluster short of MAX_SLOTS: growing up to it is fine, past it not.
+    let most = MAX_SLOTS / per_cluster;
+    let d = dir(most - 1, (most - 1) * per_cluster - 4);
+    assert_eq!(d.free_at_end(), 4);
+    assert_eq!(v.growth_for(&d, 4 + per_cluster).unwrap(), 1);
+    assert!(full(v.growth_for(&d, 5 + per_cluster).unwrap_err()));
+    // At MAX_SLOTS the free slots at the end still take a run that fits
+    // them, and nothing longer.
+    let d = dir(most, MAX_SLOTS - 4);
+    assert_eq!(d.find_free_run(4), Some(MAX_SLOTS - 4));
+    assert!(full(v.growth_for(&d, 5).unwrap_err()));
+}
+
+/// An entry that continues the free slots at the end of a directory needs
+/// the clusters past them only, and exactly that many free clusters do.
+/// One less refuses it before anything is written.
+#[test]
+fn growing_from_the_free_slots_at_the_end_takes_the_clusters_it_needs() {
+    let (img, mut v) = volume(1 << 20, 512, 512);
+    v.create_dir("/d", t(0)).unwrap();
+    // The dots and 13 one-slot entries leave the last slot of /d free.
+    for i in 0..13 {
+        v.create_file(&format!("/d/F{}", i), t(0), false)
+            .unwrap()
+            .finish()
+            .unwrap();
+    }
+    let d = v.metadata("/d").unwrap();
+    assert_eq!(v.load_directory(d.first_cluster).unwrap().free_at_end(), 1);
+    let free = v.free_clusters();
+    let mut w = v.create_file("/fill", t(0), false).unwrap();
+    w.write_all(&vec![0u8; (free as usize - 1) * 512]).unwrap();
+    w.finish().unwrap();
+    assert_eq!(v.free_clusters(), 1);
+    v.sync().unwrap();
+    let bytes = std::fs::read(img.path()).unwrap();
+    // A name of two slots needs a cluster for /d, and a directory of that
+    // name one more for itself.
+    assert_eq!(v.create_dir("/d/abcdefghi", t(0)).unwrap_err().errno(), ENOSPC);
+    assert_eq!(std::fs::read(img.path()).unwrap(), bytes);
+    assert!(!v.is_writing());
+    // A file of that name takes the one, and its entry starts in the last
+    // slot of the first cluster.
+    v.create_file("/d/abcdefghi", t(0), false).unwrap().finish().unwrap();
+    assert_eq!(v.free_clusters(), 0);
+    let dir = v.load_directory(d.first_cluster).unwrap();
+    assert_eq!(dir.chain().len(), 2);
+    let e = dir.entries().into_iter().find(|e| e.name() == "abcdefghi").unwrap();
+    assert_eq!(e.first_slot(), 15);
+    v.close().unwrap();
+    let r = fsck::check(&img.device()).unwrap();
+    assert_eq!(r.errors(), 0, "{:?}", r.problems);
+}
+
+/// create_dir_all() walks through directories whatever their names, such
+/// as " x", which Linux writes and ufat does not, and checks only the
+/// names of the directories it creates.
+#[test]
+fn create_dir_all_walks_through_names_it_would_not_write() {
+    let (img, mut v) = volume(1 << 20, 512, 512);
+    v.create_dir("/abcdefghij", t(0)).unwrap();
+    let root = v.boot.root_cluster;
+    let first_slot = v
+        .load_directory(root)
+        .unwrap()
+        .entries()
+        .into_iter()
+        .find(|e| e.name() == "abcdefghij")
+        .unwrap()
+        .first_slot();
+    let layout = *v.layout();
+    v.close().unwrap();
+    // Its one long name slot gets the name " x".
+    let at = layout.cluster_offset(root).unwrap() + (first_slot * DIR_ENTRY_SIZE) as u64;
+    let dev = img.device();
+    let mut slot = [0u8; DIR_ENTRY_SIZE];
+    dev.read_at(at, &mut slot).unwrap();
+    let units = [u16::from(b' '), u16::from(b'x'), LFN_TERMINATOR]
+        .into_iter()
+        .chain(std::iter::repeat(LFN_PADDING));
+    let offsets = [lfn_field::NAME1, lfn_field::NAME2, lfn_field::NAME3]
+        .into_iter()
+        .flat_map(|field| field.step_by(2));
+    for (off, unit) in offsets.zip(units) {
+        slot[off..off + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    dev.write_at(at, &slot).unwrap();
+    drop(dev);
+    let mut v = Volume::open(img.device()).unwrap();
+    assert_eq!(names(&v, "/"), vec![" x"]);
+    assert_eq!(LongName::new(" x").unwrap_err().errno(), EINVAL);
+    v.create_dir_all("/ x/y/z", t(0)).unwrap();
+    assert!(v.metadata("/ x/y/z").unwrap().is_dir);
+    // A name it creates is checked, before anything is written.
+    v.sync().unwrap();
+    let bytes = std::fs::read(img.path()).unwrap();
+    assert_eq!(v.create_dir_all("/ x/y/ w/v", t(0)).unwrap_err().errno(), EINVAL);
+    assert_eq!(std::fs::read(img.path()).unwrap(), bytes);
+    assert!(!v.is_writing());
+    v.close().unwrap();
+    let r = fsck::check(&img.device()).unwrap();
+    assert_eq!(r.errors(), 0, "{:?}", r.problems);
 }
 
 #[test]
@@ -369,14 +596,21 @@ fn a_damaged_directory_is_read_but_not_written() {
         )
         .unwrap();
     let mut v = Volume::open(img.device()).unwrap();
+    let bytes = std::fs::read(img.path()).unwrap();
     // Reading stops at the marker, like Linux.
     assert_eq!(names(&v, "/d"), vec!["x"]);
     assert!(v.metadata("/d/x").is_ok());
-    // Writing is refused in every form.
+    // Writing is refused in every form, before anything is written: the
+    // directory's entry in the root does not get the time its dot entries
+    // cannot.
     assert_eq!(v.create_file("/d/y", t(0), false).unwrap_err().errno(), EUCLEAN);
     assert_eq!(v.create_dir("/d/sub", t(0)).unwrap_err().errno(), EUCLEAN);
+    assert_eq!(v.create_dir_all("/d/sub/deeper", t(0)).unwrap_err().errno(), EUCLEAN);
+    assert_eq!(v.set_times("/d/x", t(1_700_000_000)).unwrap_err().errno(), EUCLEAN);
+    assert_eq!(v.set_times("/d", t(1_700_000_000)).unwrap_err().errno(), EUCLEAN);
+    assert_eq!(std::fs::read(img.path()).unwrap(), bytes);
+    assert!(!v.is_writing());
     assert_eq!(v.remove_file("/d/x").unwrap_err().errno(), EUCLEAN);
-    assert_eq!(v.set_times("/d/x", t(1)).unwrap_err().errno(), EUCLEAN);
     assert_eq!(names(&v, "/d"), vec!["x"]);
     // The rest of the volume is still usable.
     v.create_file("/ok", t(0), false).unwrap().finish().unwrap();
@@ -416,6 +650,14 @@ fn set_times() {
     }
     assert_eq!(v.set_times("/", t(0)).unwrap_err().errno(), EINVAL);
     assert_eq!(v.set_times("/missing", t(0)).unwrap_err().errno(), ENOENT);
+    // The time an entry has already is not written.
+    v.sync().unwrap();
+    v.set_times("/d", t(1_600_000_000)).unwrap();
+    v.set_times("/d/f", t(1_700_000_000)).unwrap();
+    assert!(!v.is_writing());
+    v.set_times("/d", t(1_700_000_000)).unwrap();
+    assert!(v.is_writing());
+    assert_eq!(v.metadata("/d").unwrap().modified, t(1_700_000_000));
 }
 
 #[test]
@@ -836,9 +1078,50 @@ fn the_volume_is_marked_dirty_while_written() {
     );
 }
 
+/// What the volume refuses before it would write leaves it as it was: a
+/// name FAT cannot store, one that is too long, one that is taken or is a
+/// directory, a parent that is missing. Nothing is marked, and the image
+/// does not change.
+#[test]
+fn refusals_leave_the_volume_unmarked() {
+    let (img, mut v) = volume(1 << 20, 512, 512);
+    v.create_dir("/d", t(0)).unwrap();
+    v.create_file("/f", t(0), false).unwrap().finish().unwrap();
+    v.sync().unwrap();
+    let bytes = std::fs::read(img.path()).unwrap();
+    let long = format!("/{}", "x".repeat(256));
+    let long_below_missing = format!("/missing/{}", "x".repeat(256));
+    for (e, errno) in [
+        (v.create_dir("/a:b", t(0)), EINVAL),
+        (v.create_dir("/d", t(0)), EEXIST),
+        (v.create_dir("/missing/x", t(0)), ENOENT),
+        (v.create_dir(&long, t(0)), ENAMETOOLONG),
+        (v.create_dir_all("/d/a:b", t(0)), EINVAL),
+        (v.create_dir_all("/f/x", t(0)), ENOTDIR),
+        (v.create_dir_all("/missing/a:b", t(0)), EINVAL),
+        (v.create_dir_all(&long_below_missing, t(0)), ENAMETOOLONG),
+        (v.create_file("/d", t(0), true).map(drop), EISDIR),
+        (v.create_file("/f", t(0), false).map(drop), EEXIST),
+        (v.create_file("/a:b", t(0), true).map(drop), EINVAL),
+        (v.create_file(&long, t(0), true).map(drop), ENAMETOOLONG),
+    ] {
+        assert_eq!(e.unwrap_err().errno(), errno);
+    }
+    // Directories that are there are no write either.
+    v.create_dir_all("/d", t(0)).unwrap();
+    v.create_dir_all("/", t(0)).unwrap();
+    // The image is read while the volume is open: closing it would put back
+    // marks a refusal set. A writing session lasts until the volume is
+    // synced, so is_writing() covers every refusal above as well.
+    assert_eq!(std::fs::read(img.path()).unwrap(), bytes);
+    assert!(!v.is_writing());
+    assert_eq!(v.metadata("/missing").unwrap_err().errno(), ENOENT);
+}
+
 /// A volume closed unfinished keeps the marks of a writing session, as a
 /// crash would leave them, and what was written before is on disk. One
-/// that nothing was written to since it was opened gets the marks too.
+/// that nothing was written to since it was opened gets the marks too. A
+/// volume is being written from its first write on, until it is synced.
 #[test]
 fn a_volume_closed_unfinished_stays_marked() {
     use crate::boot::{field, FsInfo, FSINFO_SIZE, FSINFO_UNKNOWN, NT_FLAG_DIRTY};
@@ -846,11 +1129,16 @@ fn a_volume_closed_unfinished_stays_marked() {
         let (img, mut v) = volume(1 << 20, 512, 512);
         let layout = *v.layout();
         let fsinfo = usize::from(v.boot_sector().fsinfo_sector) * layout.sector_size as usize;
+        assert!(!v.is_writing());
         if written {
             let mut w = v.create_file("/f", t(0), false).unwrap();
             w.write_all(b"data").unwrap();
             w.finish().unwrap();
+            v.sync().unwrap();
+            assert!(!v.is_writing());
+            v.create_dir("/d", t(0)).unwrap();
         }
+        assert_eq!(v.is_writing(), written);
         v.close_unfinished().unwrap();
         let bytes = std::fs::read(img.path()).unwrap();
         assert_ne!(bytes[field::NT_FLAGS] & NT_FLAG_DIRTY, 0);
@@ -1009,6 +1297,48 @@ fn root_time() {
     let v = Volume::open(img.device()).unwrap();
     assert_eq!(v.label().unwrap().as_deref(), Some("TEST"));
     assert_eq!(v.root_time().unwrap(), Some(t(1_650_000_000)));
+}
+
+/// set_times() writes the dot entries of a directory where only they
+/// differ: its entry has the time already and its "." and ".." do not.
+#[test]
+fn set_times_writes_dot_entries_that_differ() {
+    let (img, mut v) = volume(1 << 20, 512, 512);
+    v.create_dir("/e", t(0)).unwrap();
+    let e = v.metadata("/e").unwrap();
+    let layout = *v.layout();
+    v.close().unwrap();
+    // The dot entries get another time on the image.
+    let offset = layout.cluster_offset(e.first_cluster).unwrap();
+    let dev = img.device();
+    for slot in 0..2u64 {
+        let at = offset + slot * DIR_ENTRY_SIZE as u64;
+        let mut bytes = [0u8; DIR_ENTRY_SIZE];
+        dev.read_at(at, &mut bytes).unwrap();
+        let mut dot = RawDirEntry::from_bytes(&bytes);
+        dot.set_times(FatTimestamp::from_system_time(t(1_600_000_000)));
+        dev.write_at(at, &dot.to_bytes()).unwrap();
+    }
+    drop(dev);
+    let mut v = Volume::open(img.device()).unwrap();
+    v.set_times("/e", t(0)).unwrap();
+    assert!(v.is_writing());
+    let expected = FatTimestamp::from_system_time(t(0));
+    let dots: Vec<DirEntry> = v
+        .load_directory(e.first_cluster)
+        .unwrap()
+        .entries()
+        .into_iter()
+        .filter(|entry| entry.is_dot())
+        .collect();
+    assert_eq!(dots.len(), 2);
+    for dot in dots {
+        assert_eq!(
+            (dot.short.write_date, dot.short.write_time),
+            (expected.date, expected.time)
+        );
+    }
+    assert_eq!(v.metadata("/e").unwrap().modified, e.modified);
 }
 
 #[test]

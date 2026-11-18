@@ -26,9 +26,11 @@ fn run(bin: &Path, args: &[&str]) -> Output {
         .expect("ufat runs")
 }
 
-/// Runs ufat with `stdin` fed to its standard input.
+/// Runs ufat with `stdin` fed to its standard input. ufat may exit before
+/// it reads its input, for one when it refuses an argument first or its
+/// SOURCE is a tree.
 fn run_in(bin: &Path, args: &[&str], stdin: &[u8]) -> Output {
-    use std::io::Write;
+    use std::io::{ErrorKind, Write};
     use std::process::Stdio;
     let mut child = Command::new(bin)
         .args(args)
@@ -38,8 +40,44 @@ fn run_in(bin: &Path, args: &[&str], stdin: &[u8]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("ufat runs");
-    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    if let Err(e) = child.stdin.take().unwrap().write_all(stdin) {
+        assert_eq!(e.kind(), ErrorKind::BrokenPipe, "{}", e);
+    }
     child.wait_with_output().expect("ufat runs")
+}
+
+/// Runs ufat with the file at `path` as its standard input.
+fn run_from(bin: &Path, args: &[&str], path: &Path) -> Output {
+    Command::new(bin)
+        .args(args)
+        .env("SOURCE_DATE_EPOCH", "1700000000")
+        .stdin(fs::File::open(path).unwrap())
+        .output()
+        .expect("ufat runs")
+}
+
+/// Runs ufat with a pipe that holds `stdin` as its standard input, the
+/// writing end closed. Returns what ufat left in the pipe as well. `stdin`
+/// has to fit into the pipe.
+fn run_from_pipe(bin: &Path, args: &[&str], stdin: &[u8]) -> (Output, Vec<u8>) {
+    use std::io::{Read, Write};
+    use std::os::fd::FromRawFd;
+    let mut fds = [0; 2];
+    // SAFETY: pipe2() fills in two descriptors, which are owned here.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: both are open and owned by nothing else.
+    let (mut reader, mut writer) = unsafe { (fs::File::from_raw_fd(fds[0]), fs::File::from_raw_fd(fds[1])) };
+    writer.write_all(stdin).unwrap();
+    drop(writer);
+    let out = Command::new(bin)
+        .args(args)
+        .env("SOURCE_DATE_EPOCH", "1700000000")
+        .stdin(reader.try_clone().unwrap())
+        .output()
+        .expect("ufat runs");
+    let mut left = Vec::new();
+    reader.read_to_end(&mut left).unwrap();
+    (out, left)
 }
 
 fn ok(bin: &Path, args: &[&str]) -> String {
@@ -429,8 +467,9 @@ fn assemble_and_populate_take_trees_and_manifests() {
     tree(&root.join("tree"));
     let tree_arg = root.join("tree");
     let tree_arg = tree_arg.to_str().unwrap();
-    let a = root.join("a.img");
-    let a = a.to_str().unwrap();
+    let image = |name: &str| root.join(name).to_str().unwrap().to_string();
+    let a = image("a.img");
+    let a = a.as_str();
     // A tree: created, formatted and filled in one command. The size is
     // given so that the replacements below have room: a replacement holds
     // the old file until the new one is complete, and a volume sized to fit
@@ -440,15 +479,16 @@ fn assemble_and_populate_take_trees_and_manifests() {
     assert!(run(&bin, &["check", a]).status.success());
     let tree_size = ok(&bin, &["assemble", "--plan", tree_arg]);
     // A manifest of the tree, kept outside it, builds the same content; the
-    // one SOURCE says where the files are.
+    // one SOURCE says where the files are. assemble reads it twice.
     let manifest = root.join("tree.manifest");
     fs::write(&manifest, ok(&bin, &["manifest", tree_arg])).unwrap();
     let m = manifest.to_str().unwrap();
-    let b = root.join("b.img");
-    let b = b.to_str().unwrap();
+    let b = image("b.img");
+    let b = b.as_str();
     ok(&bin, &["assemble", "--create", "--manifest", m, b, tree_arg]);
     assert_eq!(ok(&bin, &["list", b, "/loader/entries"]), "x.conf\n");
     assert_eq!(ok(&bin, &["cat", b, "/EFI/Linux/linux.efi"]), "kernel");
+    assert_eq!(fs::metadata(b).unwrap().len().to_string() + "\n", tree_size);
     // The planner sees the same size from the manifest, which needs no
     // SOURCE to be sized.
     assert_eq!(tree_size, ok(&bin, &["assemble", "--plan", "--manifest", m]));
@@ -468,10 +508,124 @@ fn assemble_and_populate_take_trees_and_manifests() {
     let out = run_in(&bin, &["populate", "--manifest", m, a, "-"], b"kerneltitle x\nmore");
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("goes on after the last file"));
+    // A populate that fails partway leaves the file system marked as not
+    // cleanly unmounted, with what was complete.
+    assert!(ok(&bin, &["check", a]).contains("not cleanly unmounted"));
+    // One whose manifest is refused at its first object, before anything
+    // was written, leaves the file system as it was: an object that has
+    // expired, one that comes before its directory, one FAT cannot store
+    // under --unsupported fail, a file the stream cannot have without a
+    // size or at an offset, one that is missing below the SOURCE, one where
+    // the file system has a directory, a name FAT cannot store or one too
+    // long, and a name the file system holds with --no-replace.
+    let clean = image("clean.img");
+    let clean = clean.as_str();
+    ok(&bin, &["assemble", "--create", "--size", "40M", clean]);
+    let old = root.join("old.txt");
+    fs::write(&old, b"old").unwrap();
+    ok(&bin, &["populate", "--path", "/d", clean]);
+    ok(&bin, &["populate", "--path", "/f", clean, old.to_str().unwrap()]);
+    let long = format!(r#"{{"name":"{}","size":0}}"#, "x".repeat(256));
+    for (object, options, source, message) in [
+        (
+            r#"{"name":"x","size":0,"validUntilUSec":1}"#,
+            &[][..],
+            tree_arg,
+            "has expired",
+        ),
+        (r#"{"name":"d/x","size":0}"#, &[], tree_arg, "does not come right after"),
+        (
+            r#"{"name":"x","type":"fifo"}"#,
+            &["--unsupported", "fail"],
+            tree_arg,
+            "which FAT cannot store",
+        ),
+        (r#"{"name":"x"}"#, &[], "-", "cannot be streamed"),
+        (
+            r#"{"contents":[{"file":"x","offset":1}],"name":"x","size":1}"#,
+            &[],
+            "-",
+            "offset cannot be used",
+        ),
+        (r#"{"name":"x","size":1}"#, &[], tree_arg, "failed to open x"),
+        (r#"{"name":"d","size":0}"#, &[], "-", "'/d' is a directory"),
+        (
+            r#"{"name":"a:b","size":0}"#,
+            &[],
+            "-",
+            "contains the invalid character ':'",
+        ),
+        (long.as_str(), &[], "-", "is longer than 255 UTF-16 units"),
+        (r#"{"name":"f","size":0}"#, &["--no-replace"], "-", "'/f' exists"),
+    ] {
+        let refused = root.join("refused.manifest");
+        fs::write(
+            &refused,
+            format!(
+                "\x1e{{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}}\n\x1e{}\n\x1e{{\"mediaType\":\"application/vnd.uapi.16.trailer\"}}\n",
+                object
+            ),
+        )
+        .unwrap();
+        let refused = refused.to_str().unwrap();
+        let mut args = vec!["populate"];
+        args.extend_from_slice(options);
+        args.extend_from_slice(&["--manifest", refused, clean, source]);
+        let out = run_in(&bin, &args, b"x");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{}: {}", object, stderr);
+        assert!(stderr.contains(message), "{}: {}", object, stderr);
+        let report = ok(&bin, &["check", clean]);
+        assert!(report.ends_with("; 0 errors, 0 warnings\n"), "{}: {}", object, report);
+    }
+    assert_eq!(ok(&bin, &["cat", clean, "/f"]), "old");
+    let out = run_in(&bin, &["populate", "--manifest", m, clean, "-"], b"kern");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(ok(&bin, &["check", clean]).contains("not cleanly unmounted"));
     // --manifest - reads the manifest from standard input, which then
-    // cannot carry the file contents as well.
+    // cannot carry the file contents as well. A pipe is read once.
+    // assemble with a SOURCE plans the content before it writes it, so it
+    // refuses one before it reads anything of it: all of it is left in the
+    // pipe. assemble --plan and assemble without a SOURCE read the
+    // manifest once and take one. assemble --plan takes standard input
+    // that is the file itself as well.
     let manifest_bytes = fs::read(&manifest).unwrap();
-    let out = run_in(&bin, &["assemble", "--plan", "--manifest", "-"], &manifest_bytes);
+    let not_a_file = "standard input is not a regular file: assemble with a SOURCE needs the manifest in one";
+    let piped = image("piped.img");
+    let piped = piped.as_str();
+    for args in [
+        &["assemble", "--create", "--manifest", "-", piped, tree_arg][..],
+        &[
+            "assemble",
+            "--create",
+            "--size",
+            "40M",
+            "--manifest",
+            "-",
+            piped,
+            tree_arg,
+        ],
+    ] {
+        let (out, left) = run_from_pipe(&bin, args, &manifest_bytes);
+        assert_eq!(out.status.code(), Some(1), "{:?}", args);
+        assert!(String::from_utf8_lossy(&out.stderr).contains(not_a_file), "{:?}", args);
+        assert_eq!(left, manifest_bytes, "{:?}", args);
+        assert!(!Path::new(piped).exists());
+    }
+    let (out, left) = run_from_pipe(
+        &bin,
+        &["assemble", "--create", "--manifest", "-", piped],
+        &manifest_bytes,
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(left.is_empty(), "{} bytes left", left.len());
+    assert_eq!(fs::metadata(piped).unwrap().len().to_string() + "\n", tree_size);
+    assert!(run(&bin, &["check", piped]).status.success());
+    let (out, left) = run_from_pipe(&bin, &["assemble", "--plan", "--manifest", "-"], &manifest_bytes);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), tree_size);
+    assert!(left.is_empty(), "{} bytes left", left.len());
+    let out = run_from(&bin, &["assemble", "--plan", "--manifest", "-"], &manifest);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), tree_size);
     let out = run_in(&bin, &["populate", "--manifest", "-", a, tree_arg], &manifest_bytes);
@@ -479,7 +633,15 @@ fn assemble_and_populate_take_trees_and_manifests() {
     let out = run_in(&bin, &["populate", "--manifest", "-", a, "-"], b"");
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("cannot both read standard input"));
-    let out = run_in(&bin, &["assemble", "--plan", "--manifest", "-"], b"not a manifest");
+    fs::write(root.join("not-a-manifest"), b"not a manifest").unwrap();
+    let out = run_from(
+        &bin,
+        &["assemble", "--plan", "--manifest", "-"],
+        &root.join("not-a-manifest"),
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("standard input is not a UAPI.16 manifest"));
+    let out = run_in(&bin, &["populate", "--manifest", "-", a, tree_arg], b"not a manifest");
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("standard input is not a UAPI.16 manifest"));
     // A SOURCE is a directory, or for populate one file that needs --path;
@@ -509,6 +671,19 @@ fn assemble_and_populate_take_trees_and_manifests() {
         ],
         "is not a UAPI.16 manifest",
     );
+    // A manifest whose objects are out of order is refused when the object
+    // that breaks the order comes.
+    let unsorted = root.join("unsorted.manifest");
+    let text = String::from_utf8(manifest_bytes.clone()).unwrap();
+    let records: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut swapped = records.clone();
+    swapped.swap(1, records.len() - 2);
+    fs::write(&unsorted, swapped.concat()).unwrap();
+    fails(
+        &bin,
+        &["populate", "--manifest", unsorted.to_str().unwrap(), a, tree_arg],
+        &format!("{}: manifest object 1 (loader/entries/x.conf):", unsorted.display()),
+    );
     // A manifest takes exactly one SOURCE and no --path.
     let nowhere = root.join("nowhere");
     let nowhere = nowhere.to_str().unwrap();
@@ -535,65 +710,59 @@ fn assemble_and_populate_take_trees_and_manifests() {
         "unknown option",
     );
     fails(&bin, &["assemble", "--create", "--stream", b, m], "unknown option");
-    // The files a manifest names are checked below the SOURCE before an
-    // image is created, so a wrong tree leaves nothing behind.
-    let d = root.join("d.img");
-    let d = d.to_str().unwrap();
-    fs::create_dir(root.join("empty")).unwrap();
-    fails(
-        &bin,
-        &[
-            "assemble",
-            "--create",
-            "--manifest",
-            m,
-            d,
-            root.join("empty").to_str().unwrap(),
-        ],
-        "linux.efi",
-    );
-    assert!(!Path::new(d).exists());
+    // The files a manifest names are found below the SOURCE when they are
+    // copied, and the messages about them name the SOURCE. A SOURCE that is
+    // not there leaves nothing behind. A file that is missing, or changed
+    // since the manifest was written, fails the copy, and the file system
+    // holds what was complete before it, marked as not cleanly unmounted,
+    // the way a crash would leave it. A file that grew still has the data
+    // the manifest describes at its start, and that is what is copied.
+    let d = image("d.img");
+    let d = d.as_str();
     fails(&bin, &["assemble", "--create", "--manifest", m, d, nowhere], "nowhere");
     assert!(!Path::new(d).exists());
-    // A file that grew since the manifest was written is caught the same
-    // way.
-    fs::write(root.join("tree/EFI/Linux/linux.efi"), b"kernel and more").unwrap();
+    let empty = root.join("empty");
+    let empty = empty.to_str().unwrap();
+    fs::create_dir(empty).unwrap();
     fails(
         &bin,
-        &["assemble", "--create", "--manifest", m, d, tree_arg],
-        ": EFI/Linux/linux.efi: EFI/Linux/linux.efi is 15 bytes, the manifest says 6",
+        &["assemble", "--create", "--manifest", m, d, empty],
+        &format!(
+            "ufat: {}: EFI/Linux/linux.efi: failed to open EFI/Linux/linux.efi",
+            empty
+        ),
     );
-    assert!(!Path::new(d).exists());
-    // One whose contents changed fails while it is copied. The messages
-    // name the file the way the manifest does.
+    assert_eq!(ok(&bin, &["list", d, "/EFI/Linux"]), "");
+    fs::write(root.join("tree/EFI/Linux/linux.efi"), b"kernel and more").unwrap();
+    ok(&bin, &["assemble", "--force", "--manifest", m, d, tree_arg]);
+    assert_eq!(ok(&bin, &["cat", d, "/EFI/Linux/linux.efi"]), "kernel");
     fs::write(root.join("tree/EFI/Linux/linux.efi"), b"kernal").unwrap();
     fails(
         &bin,
-        &["assemble", "--create", "--manifest", m, d, tree_arg],
-        "ufat: 'EFI/Linux/linux.efi' does not match the hash in the manifest",
+        &["assemble", "--force", "--manifest", m, d, tree_arg],
+        &format!(
+            "ufat: {}: 'EFI/Linux/linux.efi' does not match the hash in the manifest",
+            tree_arg
+        ),
     );
     fs::write(root.join("tree/EFI/Linux/linux.efi"), b"kernel").unwrap();
-    // What a failed assemble wrote is left the way a crash would leave it:
-    // the files that were complete, in a file system marked as not cleanly
-    // unmounted. check reports the mark.
     fs::write(root.join("tree/loader/entries/x.conf"), b"title y\n").unwrap();
-    let e = root.join("e.img");
-    let e = e.to_str().unwrap();
     fails(
         &bin,
-        &["assemble", "--create", "--manifest", m, e, tree_arg],
+        &["assemble", "--force", "--manifest", m, d, tree_arg],
         "'loader/entries/x.conf' does not match the hash",
     );
-    assert_eq!(ok(&bin, &["cat", e, "/EFI/Linux/linux.efi"]), "kernel");
-    let report = ok(&bin, &["check", e]);
+    assert_eq!(ok(&bin, &["cat", d, "/EFI/Linux/linux.efi"]), "kernel");
+    let report = ok(&bin, &["check", d]);
     assert!(report.contains("marked dirty"), "{}", report);
-    assert!(report.contains("0 errors, 2 warnings"), "{}", report);
+    assert!(report.ends_with("; 0 errors, 2 warnings\n"), "{}", report);
     fs::write(root.join("tree/loader/entries/x.conf"), b"title x\n").unwrap();
     // Without a SOURCE assemble makes an empty file system, sized for a
     // manifest as well, and takes no --fit with it.
-    let c = root.join("c.img");
-    let c = c.to_str().unwrap();
+    let c = image("c.img");
+    let c = c.as_str();
     ok(&bin, &["assemble", "--create", "--manifest", m, c]);
+    assert_eq!(fs::metadata(c).unwrap().len().to_string() + "\n", tree_size);
     ok(&bin, &["populate", "--manifest", m, c, tree_arg]);
     assert!(run(&bin, &["check", c]).status.success());
     fails(
@@ -666,6 +835,54 @@ fn assemble_and_populate_take_trees_and_manifests() {
     for name in ["new/", "newdir/", "new.txt"] {
         assert!(!listed.lines().any(|l| l == name), "{}", listed);
     }
+}
+
+/// A manifest has to declare the code point order. One that does not is
+/// refused before anything is written, also when its objects are sorted,
+/// from a file and from standard input.
+#[test]
+fn manifests_have_to_declare_their_order() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    let t = root.join("tree");
+    let t = t.to_str().unwrap();
+    let declared = ok(&bin, &["manifest", t]);
+    let undeclared = declared.replacen(r#","order":"codepoint""#, "", 1);
+    assert_ne!(undeclared, declared);
+    let manifest = root.join("undeclared.manifest");
+    fs::write(&manifest, &undeclared).unwrap();
+    let m = manifest.to_str().unwrap();
+    let refused = "the manifest does not declare \"order\": \"codepoint\" in its root file object";
+    let image = root.join("a.img");
+    let a = image.to_str().unwrap();
+    fails(
+        &bin,
+        &["assemble", "--create", "--size", "40M", "--manifest", m, a, t],
+        &format!("ufat: {}: {}", m, refused),
+    );
+    assert!(!image.exists());
+    fails(&bin, &["assemble", "--plan", "--manifest", m], refused);
+    fails(&bin, &["assemble", "--create", "--manifest", m, a], refused);
+    assert!(!image.exists());
+    ok(&bin, &["assemble", "--create", "--size", "40M", a]);
+    fails(&bin, &["populate", "--manifest", m, a, t], refused);
+    let out = run_in(&bin, &["populate", "--manifest", "-", a, t], undeclared.as_bytes());
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&format!("ufat: standard input: {}", refused)),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(ok(&bin, &["list", a]), "");
+    // With the declaration it is taken.
+    fs::write(&manifest, &declared).unwrap();
+    ok(&bin, &["populate", "--manifest", m, a, t]);
+    assert_eq!(ok(&bin, &["list", a]), "EFI/\nloader/\n");
 }
 
 /// A volume too small for what goes into it. A copy that runs out of
@@ -861,6 +1078,47 @@ fn populate_and_remove_work_on_paths() {
     );
     assert!(!ok(&bin, &["list", a, "/"]).contains("fifo-fail"));
     fails(&bin, &["populate", "--unsupported", "maybe", a, t], "skip or fail");
+    // A plan refuses it too, from a tree or a manifest, and so does
+    // assemble, which plans first, before the image is touched.
+    fails(
+        &bin,
+        &["assemble", "--plan", "--unsupported", "fail", t],
+        "cannot be stored on FAT",
+    );
+    let manifest = root.join("fifo.manifest");
+    fs::write(
+        &manifest,
+        concat!(
+            "\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n",
+            "\x1e{\"name\":\"a\",\"size\":0}\n",
+            "\x1e{\"name\":\"f\",\"type\":\"fifo\"}\n",
+            "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
+        ),
+    )
+    .unwrap();
+    let m = manifest.to_str().unwrap();
+    let fifo = "'/f' is a fifo, which FAT cannot store";
+    fails(
+        &bin,
+        &["assemble", "--plan", "--unsupported", "fail", "--manifest", m],
+        fifo,
+    );
+    let blank = root.join("blank.img");
+    fs::File::create(&blank).unwrap().set_len(40 << 20).unwrap();
+    fails(
+        &bin,
+        &[
+            "assemble",
+            "--unsupported",
+            "fail",
+            "--manifest",
+            m,
+            blank.to_str().unwrap(),
+            t,
+        ],
+        fifo,
+    );
+    assert!(fs::read(&blank).unwrap().iter().all(|&b| b == 0));
 }
 
 /// Creates a FIFO without spawning mkfifo(1).
@@ -936,11 +1194,7 @@ fn manifests_of_what_was_written() {
     ]);
     assert_eq!(stdout, fs::read(&written).unwrap());
     // What --hash sha256 prints for an image sized to fit.
-    let sha256_line = |image: &str| {
-        let mut h = fat::sha256::Sha256::new();
-        h.update(&fs::read(image).unwrap());
-        format!("{}\n", fat::sha256::to_hex(&h.finalize()))
-    };
+    let sha256_line = |image: &str| format!("{}\n", fat::manifest::Sha256::digest(&fs::read(image).unwrap()));
     assert_eq!(stderr, sha256_line(c));
     // --write-hash writes the hash to a file of its own, or for "-" to
     // standard output, which the manifest then cannot have as well.
@@ -1158,9 +1412,10 @@ fn hashes_and_capabilities() {
     let a = root.join("a.img");
     let a = a.to_str().unwrap();
     let hash = ok(&bin, &["assemble", "--create", "--hash", "sha256", a, t]);
-    let mut h = fat::sha256::Sha256::new();
-    h.update(&fs::read(a).unwrap());
-    assert_eq!(hash, format!("{}\n", fat::sha256::to_hex(&h.finalize())));
+    assert_eq!(
+        hash,
+        format!("{}\n", fat::manifest::Sha256::digest(&fs::read(a).unwrap()))
+    );
     let hash = ok(&bin, &["assemble", "--force", "--hash", "sha512", a, t]);
     assert_eq!(hash.trim().len(), 128);
     fails(&bin, &["assemble", "--hash", "md5", a, t], "sha256 or sha512");

@@ -1,116 +1,51 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
-//! Assembling a volume from a manifest: where file contents come from, and
-//! the walk over the manifest that creates directories and files and
-//! verifies sizes and hashes.
+//! Assembling a volume from a manifest while it is read: the directory on
+//! the host the contents of the files come from, and the walk over the
+//! records that creates directories and files and verifies sizes and
+//! hashes.
 
-use std::io::{Read, Write};
+use std::fmt;
+use std::io::{self, Read, Write};
+use std::ops::{BitOr, BitOrAssign};
 use std::os::fd::{AsFd, OwnedFd};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{Contents, Entry, InodeType, Manifest, Storable};
+use uapi16::{ContentSource, Directory, ErrorKind, FileObject, Name, Object, OpenError, Order, Reader};
+
+use super::{path_in_volume, EntryKind, ObjectAction, ObjectTriage};
 use crate::errno::*;
 use crate::progress::Progress;
-use crate::sha256::{Sha256, DIGEST_SIZE};
 use crate::sys;
-use crate::volume::Volume;
-use crate::{ContentProblem, Detail, ManifestProblem, SourceProblem, UnsupportedKind};
-use crate::{Context, Error, Result};
+use crate::volume::{FileWriter, Volume};
+use crate::{Detail, Error, Result};
 
-/// Supplies the data of regular files during assembly.
-pub trait ContentSource {
-    /// Writes the data of `entry` to `sink`: exactly `entry.size` bytes when
-    /// the size is known. `contents` is the contents entry chosen by
-    /// [`Entry::fat_contents`], if there is one.
-    fn copy(&mut self, entry: &Entry, contents: Option<&Contents>, sink: &mut dyn Write) -> Result<()>;
-
-    /// Called after the data of `last`, the last file whose data comes from
-    /// the source, was copied and checked, before that file is stored. A
-    /// source that has more data than the manifest's files fails here.
-    fn end(&mut self, _last: &Entry) -> Result<()> {
-        Ok(())
-    }
-}
-
-/// Size of the buffer a source copies through.
-const COPY_BUFFER: usize = 1024 * 1024;
-
-/// The buffer a source copies through, allocated on first use and kept.
-fn copy_buffer(buf: &mut Vec<u8>) -> &mut [u8] {
-    if buf.len() != COPY_BUFFER {
-        buf.resize(COPY_BUFFER, 0);
-    }
-    buf
-}
-
-/// Reads file data from the directory the manifest lives in, or from the
-/// directory the caller chose instead.
+/// The directory on the host the files of a manifest are taken from: the
+/// one the manifest lives in, or the one the caller chose instead. It is
+/// opened once and never looked up again, and each file below it is
+/// pinned before it is opened.
+///
+/// A [`uapi16::DirectorySource`] reads the data of the files from it for an
+/// assembly. A file that is missing, is not a regular file or is too short
+/// for the data the manifest says it holds fails the assembly when its
+/// object comes.
 #[derive(Debug)]
-pub struct DirectorySource {
+pub struct PinnedDirectory {
     dir: OwnedFd,
     follow_symlinks: bool,
-    buf: Vec<u8>,
 }
 
-/// The detail of a file the manifest names that is not below the source
-/// directory as described.
-fn mismatch(name: &str, problem: SourceProblem, size: Option<u64>, expected: Option<u64>) -> Detail {
-    Detail::Source {
-        name: name.to_string(),
-        problem,
-        size,
-        expected,
-    }
-}
-
-/// The detail of file contents that do not match the manifest.
-fn differs(name: &str, problem: ContentProblem, size: Option<u64>, expected: Option<u64>) -> Detail {
-    Detail::Content {
-        name: name.to_string(),
-        problem,
-        size,
-        expected,
-    }
-}
-
-/// The detail of something the manifest asks for that cannot be done.
-fn unsupported(name: &str, what: UnsupportedKind, value: Option<&str>) -> Detail {
-    Detail::Unsupported {
-        name: Some(name.to_string()),
-        what,
-        value: value.map(str::to_string),
-    }
-}
-
-/// A failure to reach a file the manifest names, as the source mismatch of
-/// the entry `name` where the failure says the file is not what the
-/// manifest describes: missing (or behind something that is not a
-/// directory), or not a regular file.
-fn source_failure(e: Error, name: &str) -> Error {
-    let problem = match e.errno() {
-        ENOENT | ENOTDIR => Some(SourceProblem::Missing),
-        EINVAL => Some(SourceProblem::NotRegular),
-        _ => None,
-    };
-    let e = e.context(name);
-    match problem {
-        Some(p) => e.with(mismatch(name, p, None, None)),
-        None => e,
-    }
-}
-
-impl DirectorySource {
-    /// Reads files below the open directory `dir`, which the caller resolved
+impl PinnedDirectory {
+    /// The files below the open directory `dir`, which the caller resolved
     /// once (with [`crate::host::open_dir`] when it has a path) and which is
     /// never looked up again. A file reference is resolved below it the way
     /// systemd's chase() resolves a path below a root: an absolute symbolic
     /// link target starts over at `dir`, `..` at `dir` stays there, nothing
     /// resolves to anything outside it, and symbolic links are followed
-    /// only when [`DirectorySource::follow_symlinks`] allows them.
-    pub fn new(dir: OwnedFd) -> DirectorySource {
-        DirectorySource {
+    /// only when [`PinnedDirectory::follow_symlinks`] allows them.
+    pub fn new(dir: OwnedFd) -> PinnedDirectory {
+        PinnedDirectory {
             dir,
             follow_symlinks: false,
-            buf: Vec::new(),
         }
     }
 
@@ -119,339 +54,113 @@ impl DirectorySource {
     /// tree would otherwise make a privileged assembly read any file on the
     /// host.
     #[must_use]
-    pub fn follow_symlinks(mut self, follow: bool) -> DirectorySource {
+    pub fn follow_symlinks(mut self, follow: bool) -> PinnedDirectory {
         self.follow_symlinks = follow;
         self
     }
 
-    /// Opens the file `relative` names below the directory: pinned, checked
-    /// to be a regular file, and only then opened for reading.
-    fn open(&self, relative: &str) -> Result<(std::fs::File, std::fs::Metadata)> {
-        let failed = || format!("failed to open {}", relative);
-        let pinned =
-            sys::chase(self.dir.as_fd(), relative.as_bytes(), self.follow_symlinks, false).with_context(failed)?;
-        let md = sys::fstat(pinned.as_fd()).with_context(failed)?;
+    /// Pins the file `file` names below the directory and checks that it
+    /// is a regular file. Returns it with its size.
+    fn pin(&self, file: &Name) -> std::result::Result<(OwnedFd, u64), OpenError> {
+        let pinned = sys::chase(self.dir.as_fd(), file.as_bytes(), self.follow_symlinks, false)?;
+        let md = sys::fstat(pinned.as_fd())?;
         if !md.is_file() {
-            bail!(EINVAL, "{} is not a regular file", relative);
+            return Err(OpenError::NotRegular);
         }
-        let fd = sys::reopen(pinned.as_fd(), sys::O_RDONLY | sys::O_NONBLOCK | sys::O_NOCTTY).with_context(failed)?;
-        Ok((std::fs::File::from(fd), md))
-    }
-
-    /// Checks, without reading any data, that every file the manifest would
-    /// read from the directory is there, is a regular file and is as long
-    /// as the manifest says: one lookup and one fstat each, found the way
-    /// the copy will find them. Run before an image is created or
-    /// formatted, so that a wrong source directory fails with nothing
-    /// half-made left behind. Entries the assembly cannot store, literal
-    /// contents and contents it would refuse anyway are passed over here;
-    /// the sizes and hashes of the data itself are checked while copying.
-    pub fn verify(&self, manifest: &Manifest) -> Result<()> {
-        for entry in &manifest.entries {
-            if !matches!(entry.inode_type, InodeType::Regular) || entry.check_supported().is_err() {
-                continue;
-            }
-            let Ok(contents) = entry.fat_contents() else { continue };
-            if contents.is_some_and(|c| c.literal.is_some()) {
-                continue;
-            }
-            let Ok(source) = reference(entry, contents) else {
-                continue;
-            };
-            let name = entry.name.as_deref().unwrap_or_default();
-            let failed = |e: std::io::Error| {
-                source_failure(
-                    Error::from(e).context(format_args!("failed to open {}", source.relative)),
-                    name,
-                )
-            };
-            let pinned = sys::chase(
-                self.dir.as_fd(),
-                source.relative.as_bytes(),
-                self.follow_symlinks,
-                false,
-            )
-            .map_err(failed)?;
-            let md = sys::fstat(pinned.as_fd()).map_err(failed)?;
-            if !md.is_file() {
-                bail!(
-                    EINVAL,
-                    mismatch(name, SourceProblem::NotRegular, None, None),
-                    "{}: {} is not a regular file",
-                    name,
-                    source.relative
-                );
-            }
-            source.check_len(name, md.len(), entry.size, |found, expected| {
-                mismatch(name, SourceProblem::Size, found, expected)
-            })?;
-        }
-        Ok(())
+        Ok((pinned, md.len()))
     }
 }
 
-/// The file below the source directory a regular entry's data comes from.
-struct Reference {
-    /// The file's path below the source directory.
-    relative: String,
-    /// Where the entry's data starts in the file.
-    offset: u64,
-    /// The size the manifest declares for the whole file, if any.
-    original_size: Option<u64>,
-    /// The hash the manifest declares for the whole file, if any.
-    original_sha256: Option<[u8; DIGEST_SIZE]>,
-}
+impl Directory for PinnedDirectory {
+    type File = std::fs::File;
 
-impl Reference {
-    /// Checks the length `len` of the file against the manifest, for the
-    /// entry `name` of `size` bytes, and returns the size of its data: the
-    /// rest of the file after the offset when the manifest gives none.
-    /// A reference without an offset and without `originalSize` is the
-    /// whole file, which has to be exactly `size` bytes long. A part of a
-    /// file, at an offset or out of a larger `originalSize`, has to fit
-    /// into it. `detail` makes the error's detail of the length found and
-    /// the one expected.
-    fn check_len(
-        &self,
-        name: &str,
-        len: u64,
-        size: Option<u64>,
-        detail: impl Fn(Option<u64>, Option<u64>) -> Detail,
-    ) -> Result<u64> {
-        if let Some(total) = self.original_size {
-            if total != len {
-                bail!(
-                    EBADMSG,
-                    detail(Some(len), Some(total)),
-                    "{}: {} is {} bytes, the manifest says {}",
-                    name,
-                    self.relative,
-                    len,
-                    total
-                );
-            }
-        }
-        let size = size.unwrap_or(len.saturating_sub(self.offset));
-        // Without an offset and without originalSize the file holds the
-        // data and nothing else, as systemd-sysupdate takes it. A file that
-        // grew since the manifest was written would otherwise be cut short.
-        if self.offset == 0 && self.original_size.is_none() && len != size {
-            bail!(
-                EBADMSG,
-                detail(Some(len), Some(size)),
-                "{}: {} is {} bytes, the manifest says {}",
-                name,
-                self.relative,
-                len,
-                size
-            );
-        }
-        if self.offset.checked_add(size).is_none_or(|end| end > len) {
-            bail!(
-                EBADMSG,
-                detail(Some(len), self.offset.checked_add(size)),
-                "{}: {} is too short for offset {} and size {}",
-                name,
-                self.relative,
-                self.offset,
-                size
-            );
-        }
-        Ok(size)
+    /// Opens the file: pinned, checked to be a regular file, and only then
+    /// opened for reading.
+    fn open(&self, file: &Name) -> std::result::Result<(std::fs::File, u64), OpenError> {
+        let (pinned, len) = self.pin(file)?;
+        let fd = sys::reopen(pinned.as_fd(), sys::O_RDONLY | sys::O_NONBLOCK | sys::O_NOCTTY)?;
+        Ok((std::fs::File::from(fd), len))
     }
 }
 
-/// Where a regular entry's data comes from. Contents that would have to be
-/// fetched or decoded are refused (EOPNOTSUPP).
-fn reference(entry: &Entry, contents: Option<&Contents>) -> Result<Reference> {
-    let path = entry.path();
-    match contents {
-        None => Ok(Reference {
-            relative: entry.name.clone().unwrap_or_default(),
-            offset: 0,
-            original_size: None,
-            original_sha256: None,
-        }),
-        Some(c) => {
-            if c.url.is_some() {
-                bail!(
-                    EOPNOTSUPP,
-                    unsupported(&path, UnsupportedKind::Url, None),
-                    "{}: fetching contents from a URL is not supported",
-                    path
-                );
-            }
-            if let Some(enc) = &c.encoding {
-                bail!(
-                    EOPNOTSUPP,
-                    unsupported(&path, UnsupportedKind::Encoding, Some(enc)),
-                    "{}: contents encoded with '{}' are not supported",
-                    path,
-                    enc
-                );
-            }
-            Ok(Reference {
-                relative: c.file.clone().or_else(|| entry.name.clone()).unwrap_or_default(),
-                offset: c.offset,
-                original_size: c.original_size,
-                original_sha256: c.original_sha256,
-            })
+/// What an assembly does where it could also fail.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AssembleFlags(u8);
+
+impl AssembleFlags {
+    /// Replace files that exist in the volume instead of failing.
+    pub const REPLACE: AssembleFlags = AssembleFlags(1 << 0);
+    /// Skip entries this crate cannot store (see [`EntryKind`]) instead of
+    /// failing.
+    pub const SKIP_UNSUPPORTED: AssembleFlags = AssembleFlags(1 << 1);
+    /// No flag: an assembly fails in both cases.
+    pub const NONE: AssembleFlags = AssembleFlags(0);
+
+    /// Every single flag with its name.
+    const NAMES: [(AssembleFlags, &'static str); 2] = [
+        (AssembleFlags::REPLACE, "REPLACE"),
+        (AssembleFlags::SKIP_UNSUPPORTED, "SKIP_UNSUPPORTED"),
+    ];
+
+    /// Whether every flag of `flags` is among these.
+    pub const fn contains(self, flags: AssembleFlags) -> bool {
+        self.0 & flags.0 == flags.0
+    }
+
+    /// These flags with `flags` among them if `on` says so, and without
+    /// them if not.
+    #[must_use]
+    pub const fn with(self, flags: AssembleFlags, on: bool) -> AssembleFlags {
+        if on {
+            AssembleFlags(self.0 | flags.0)
+        } else {
+            AssembleFlags(self.0 & !flags.0)
         }
     }
 }
 
-impl ContentSource for DirectorySource {
-    fn copy(&mut self, entry: &Entry, contents: Option<&Contents>, sink: &mut dyn Write) -> Result<()> {
-        let name = entry.name.as_deref().unwrap_or_default();
-        let source = reference(entry, contents)?;
-        let (mut file, md) = self.open(&source.relative).map_err(|e| source_failure(e, name))?;
-        let size = source.check_len(name, md.len(), entry.size, |found, expected| {
-            differs(name, ContentProblem::Size, found, expected)
-        })?;
-        let offset = source.offset;
-        // The hash of the whole source, when given, is checked by reading
-        // everything; the part before the offset is hashed but not copied.
-        let mut hasher = source.original_sha256.map(|_| Sha256::new());
-        let buf = copy_buffer(&mut self.buf);
-        let mut pos = 0u64;
-        loop {
-            let n = crate::host::read_some(&mut file, buf)?;
-            if n == 0 {
-                break;
-            }
-            let chunk = &buf[..n];
-            if let Some(h) = hasher.as_mut() {
-                h.update(chunk);
-            }
-            let start = offset.saturating_sub(pos).min(n as u64) as usize;
-            let end = (offset + size).saturating_sub(pos).min(n as u64) as usize;
-            if start < end {
-                sink.write_all(&chunk[start..end])?;
-            }
-            pos += n as u64;
-            if hasher.is_none() && pos >= offset + size {
-                break;
-            }
-        }
-        if let (Some(h), Some(expected)) = (hasher, source.original_sha256) {
-            if h.finalize() != expected {
-                bail!(
-                    EBADMSG,
-                    differs(name, ContentProblem::Hash, None, None),
-                    "{}: {} does not match the hash in the manifest",
-                    name,
-                    source.relative
-                );
-            }
-        }
-        Ok(())
+impl Default for AssembleFlags {
+    /// [`AssembleFlags::REPLACE`].
+    fn default() -> AssembleFlags {
+        AssembleFlags::REPLACE
     }
 }
 
-/// Reads file data from one stream carrying every streamed file's contents
-/// back to back in manifest order.
-pub struct StreamSource<'a> {
-    reader: &'a mut dyn Read,
-    buf: Vec<u8>,
-}
+impl BitOr for AssembleFlags {
+    type Output = AssembleFlags;
 
-impl std::fmt::Debug for StreamSource<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StreamSource").finish_non_exhaustive()
+    fn bitor(self, other: AssembleFlags) -> AssembleFlags {
+        AssembleFlags(self.0 | other.0)
     }
 }
 
-impl<'a> StreamSource<'a> {
-    /// Wraps the stream.
-    pub fn new(reader: &'a mut dyn Read) -> StreamSource<'a> {
-        StreamSource {
-            reader,
-            buf: Vec::new(),
-        }
+impl BitOrAssign for AssembleFlags {
+    fn bitor_assign(&mut self, other: AssembleFlags) {
+        self.0 |= other.0;
     }
 }
 
-impl ContentSource for StreamSource<'_> {
-    fn copy(&mut self, entry: &Entry, contents: Option<&Contents>, sink: &mut dyn Write) -> Result<()> {
-        let path = entry.path();
-        if let Some(c) = contents {
-            if c.encoding.is_some() || c.offset != 0 {
-                let what = if c.encoding.is_some() {
-                    UnsupportedKind::Encoding
-                } else {
-                    UnsupportedKind::Offset
-                };
-                bail!(
-                    EOPNOTSUPP,
-                    unsupported(&path, what, c.encoding.as_deref()),
-                    "{}: encodings and offsets cannot be used with streamed contents",
-                    path
-                );
+impl fmt::Debug for AssembleFlags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names = AssembleFlags::NAMES.iter().filter(|(flag, _)| self.contains(*flag));
+        f.write_str("AssembleFlags(")?;
+        for (i, (_, name)) in names.enumerate() {
+            if i > 0 {
+                f.write_str(" | ")?;
             }
+            f.write_str(name)?;
         }
-        let total = entry.size.ok_or_else(|| {
-            err!(
-                EINVAL,
-                Detail::Manifest {
-                    problem: ManifestProblem::NoSize,
-                    record: None,
-                    name: Some(path.clone()),
-                    field: Some("size".into()),
-                },
-                "{}: streamed contents need a known size",
-                path
-            )
-        })?;
-        let mut remaining = total;
-        let buf = copy_buffer(&mut self.buf);
-        while remaining > 0 {
-            let want = (buf.len() as u64).min(remaining) as usize;
-            let n = crate::host::read_some(&mut *self.reader, &mut buf[..want])?;
-            if n == 0 {
-                let name = entry.name.as_deref().unwrap_or_default();
-                bail!(
-                    EBADMSG,
-                    differs(name, ContentProblem::StreamEnded, Some(total - remaining), Some(total)),
-                    "{}: the stream ended {} bytes early",
-                    name,
-                    remaining
-                );
-            }
-            sink.write_all(&buf[..n])?;
-            remaining -= n as u64;
-        }
-        Ok(())
-    }
-
-    /// The stream ends with the last file. Anything after it would be data
-    /// the manifest does not describe, so the last file got more than the
-    /// manifest says.
-    fn end(&mut self, last: &Entry) -> Result<()> {
-        let mut byte = [0u8; 1];
-        if crate::host::read_some(&mut *self.reader, &mut byte)? > 0 {
-            let name = last.name.as_deref().unwrap_or_default();
-            bail!(
-                EBADMSG,
-                differs(name, ContentProblem::Size, None, last.size),
-                "{}: the stream goes on after the last file",
-                name
-            );
-        }
-        Ok(())
+        f.write_str(")")
     }
 }
 
 /// Options for [`Volume::assemble`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssembleOptions {
-    /// Time stamped on entries without `mTimeNSec` and on directories
-    /// created implicitly.
+    /// Time stamped on entries without `mTimeNSec`.
     pub default_time: SystemTime,
-    /// Replace files that exist in the volume instead of failing.
-    pub replace: bool,
-    /// Skip entries this crate cannot store (see [`Entry::check_supported`])
-    /// instead of failing.
-    pub skip_unsupported: bool,
+    /// What to do where an assembly could also fail.
+    pub flags: AssembleFlags,
     /// The current time for validity checks, or None to skip them.
     pub now_usec: Option<u64>,
 }
@@ -460,15 +169,14 @@ impl Default for AssembleOptions {
     fn default() -> Self {
         AssembleOptions {
             default_time: UNIX_EPOCH,
-            replace: true,
-            skip_unsupported: false,
+            flags: AssembleFlags::default(),
             now_usec: None,
         }
     }
 }
 
 /// What an assembly did.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AssembleReport {
     /// Files written.
     pub files: u64,
@@ -477,39 +185,12 @@ pub struct AssembleReport {
     pub directories: u64,
     /// File bytes written.
     pub bytes: u64,
-    /// Entries skipped because they cannot be stored.
-    pub skipped: Vec<String>,
-}
-
-/// Hashes what passes through it and tells `progress` after every write how
-/// many bytes it took, on top of what `done` counts.
-struct HashingWriter<'a> {
-    inner: &'a mut dyn Write,
-    hasher: Sha256,
-    written: u64,
-    done: Progress,
-    progress: &'a mut dyn FnMut(&Progress),
-}
-
-impl Write for HashingWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.write_all(buf)?;
-        self.hasher.update(buf);
-        self.written += buf.len() as u64;
-        (self.progress)(&Progress {
-            bytes: self.done.bytes + self.written,
-            ..self.done
-        });
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
+    /// File objects left out, see [`SkipReason`].
+    pub skipped: u64,
 }
 
 impl AssembleReport {
-    /// What the assembly has done so far, as a progress callback hears it.
+    /// What the assembly has done so far, as an observer hears it.
     fn progress(&self) -> Progress {
         Progress {
             files: self.files,
@@ -519,175 +200,297 @@ impl AssembleReport {
     }
 }
 
-impl Volume {
-    /// Creates the directories and files a manifest describes, each at its
-    /// name below the root directory. Data comes from `source` for regular
-    /// files without literal contents. Sizes and SHA-256 hashes in the
-    /// manifest are verified; a mismatch removes the file again and fails
-    /// with EBADMSG. So does data the source has after the last file it
-    /// supplies. A directory object listed after its children, or for a
-    /// directory that already exists, sets the directory's timestamp.
-    pub fn assemble(
-        &mut self,
-        manifest: &Manifest,
-        source: &mut dyn ContentSource,
-        options: &AssembleOptions,
-    ) -> Result<AssembleReport> {
-        self.assemble_with_progress(manifest, source, options, &mut |_| {})
-    }
+/// Why an assembly leaves a file object out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SkipReason {
+    /// This crate cannot store the object, see [`EntryKind`], and
+    /// [`AssembleFlags::SKIP_UNSUPPORTED`] says to leave it out.
+    Unsupported,
+    /// The object is below a directory that is left out.
+    BelowSkipped,
+}
 
-    /// [`Volume::assemble`], telling `progress` what it wrote so far after
-    /// every directory, every file and every chunk of a file.
-    pub fn assemble_with_progress(
-        &mut self,
-        manifest: &Manifest,
-        source: &mut dyn ContentSource,
-        options: &AssembleOptions,
-        progress: &mut dyn FnMut(&Progress),
-    ) -> Result<AssembleReport> {
-        let mut report = AssembleReport::default();
-        if let Some(now) = options.now_usec {
-            manifest.root.check_validity(now)?;
-        }
-        // The source has to end with the last file it supplies.
-        let last = manifest.entries.iter().rposition(Entry::is_streamed);
-        for (index, entry) in manifest.entries.iter().enumerate() {
-            let name = entry.name.clone().unwrap_or_default();
-            let path = format!("/{name}");
-            // An invalid directory takes its children with it: the directory
-            // object comes first and fails the whole assembly here.
-            if let Some(now) = options.now_usec {
-                entry.check_validity(now)?;
-            }
-            let storable = match entry.storable() {
-                Ok(storable) => storable,
-                Err(e) if e.errno() == EOPNOTSUPP && options.skip_unsupported => {
-                    report.skipped.push(name);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            let time = entry.mtime().unwrap_or(options.default_time);
-            if let Some((parent, _)) = name.rsplit_once('/') {
-                self.create_dir_all(&format!("/{parent}"), options.default_time)?;
-            }
-            match storable {
-                Storable::Directory => {
-                    match self.metadata(&path) {
-                        Ok(m) if m.is_dir => self.set_times(&path, time)?,
-                        Ok(_) => bail!(
-                            ENOTDIR,
-                            Detail::Path(path.clone()),
-                            "'{}' exists in the volume and is not a directory",
-                            path
-                        ),
-                        Err(e) if e.errno() == ENOENT => self.create_dir(&path, time)?,
-                        Err(e) => return Err(e),
-                    }
-                    report.directories += 1;
-                    progress(&report.progress());
-                }
-                Storable::File(contents) => {
-                    // The writer aborts the file when it is dropped on an
-                    // error.
-                    let mut writer = self.create_file(&path, time, options.replace)?;
-                    writer.set_read_only(entry.is_read_only());
-                    let mut hashing = HashingWriter {
-                        inner: &mut writer,
-                        hasher: Sha256::new(),
-                        written: 0,
-                        done: report.progress(),
-                        progress: &mut *progress,
-                    };
-                    match contents.and_then(|c| c.literal.as_ref()) {
-                        Some(literal) => {
-                            // An offset or a size beyond the literal takes it
-                            // all; the checks below find the difference.
-                            let offset = usize::try_from(contents.map_or(0, |c| c.offset)).unwrap_or(usize::MAX);
-                            let data = literal.get(offset..).unwrap_or(&[]);
-                            let data = match entry.size.map(usize::try_from) {
-                                Some(Ok(size)) => data.get(..size).unwrap_or(data),
-                                _ => data,
-                            };
-                            hashing.write_all(data)?;
-                        }
-                        None => source.copy(entry, contents, &mut hashing)?,
-                    }
-                    let HashingWriter { written, hasher, .. } = hashing;
-                    let digest = hasher.finalize();
-                    if let Some(size) = entry.size {
-                        if written != size {
-                            bail!(
-                                EBADMSG,
-                                differs(&name, ContentProblem::Size, Some(written), Some(size)),
-                                "'{}' is {} bytes, the manifest says {}",
-                                name,
-                                written,
-                                size
-                            );
-                        }
-                    }
-                    if let Some(expected) = entry.sha256 {
-                        if digest != expected {
-                            bail!(
-                                EBADMSG,
-                                differs(&name, ContentProblem::Hash, None, None),
-                                "'{}' does not match the hash in the manifest",
-                                name
-                            );
-                        }
-                    }
-                    if last == Some(index) {
-                        source.end(entry)?;
-                    }
-                    writer.finish()?;
-                    report.files += 1;
-                    report.bytes += written;
-                    progress(&report.progress());
-                }
-            }
-        }
-        Ok(report)
+/// What an assembly tells its caller while it runs. Every method does
+/// nothing unless an observer has it do something.
+///
+/// A closure that takes a [`Progress`] is an observer of the progress.
+pub trait AssembleObserver {
+    /// What was written so far, after every directory, every file and
+    /// every chunk of a file's contents.
+    fn progress(&mut self, _progress: &Progress) {}
+
+    /// The file object of the name `name` is left out, for the reason
+    /// `reason`.
+    fn skipped(&mut self, _name: &Name, _reason: SkipReason) {}
+}
+
+impl<F: FnMut(&Progress)> AssembleObserver for F {
+    fn progress(&mut self, progress: &Progress) {
+        self(progress);
     }
 }
 
-impl crate::plan::Plan {
-    /// Adds the files and directories of a manifest. Returns the entries
-    /// that cannot be stored (see [`Entry::check_supported`]), which the
-    /// assembler skips or refuses, so a plan and an assembly with
-    /// `skip_unsupported` cover the same entries.
-    pub fn add_manifest(&mut self, manifest: &Manifest) -> Result<Vec<String>> {
-        let mut skipped = Vec::new();
-        for entry in &manifest.entries {
-            let name = entry.name.clone().unwrap_or_default();
-            let storable = match entry.storable() {
-                Ok(storable) => storable,
-                Err(e) if e.errno() == EOPNOTSUPP => {
-                    skipped.push(name);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            match storable {
-                Storable::Directory => self.add_dir(&format!("/{}", name))?,
-                Storable::File(_) => {
-                    let Some(size) = entry.size else {
-                        bail!(
-                            EINVAL,
-                            Detail::Manifest {
-                                problem: ManifestProblem::NoSize,
-                                record: None,
-                                name: Some(format!("/{}", name)),
-                                field: Some("size".into()),
-                            },
-                            "'{}' has no size in the manifest",
-                            name
-                        );
-                    };
-                    self.add_file(&format!("/{}", name), size)?;
-                }
+/// A writer that passes everything on to `inner` and tells the observer
+/// after every write how many bytes went through, on top of what `done`
+/// counts.
+struct ProgressWriter<'a> {
+    inner: &'a mut dyn Write,
+    written: u64,
+    done: Progress,
+    observer: &'a mut dyn AssembleObserver,
+}
+
+impl Write for ProgressWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write_all(buf)?;
+        self.written += buf.len() as u64;
+        self.observer.progress(&Progress {
+            bytes: self.done.bytes + self.written,
+            ..self.done
+        });
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A file an assembly writes, created in the volume when its first data
+/// comes, or when it is finished without any. So a file object whose
+/// source refuses it, such as a stream that needs its size, leaves nothing
+/// in the volume, not even the marks of a write.
+struct PendingFile<'a> {
+    /// The volume, until the file is created in it.
+    volume: Option<&'a mut Volume>,
+    /// The file once it is created. It is aborted when it is dropped
+    /// unfinished.
+    writer: Option<FileWriter<'a>>,
+    /// Where the file goes in the volume.
+    path: &'a str,
+    /// The file object the file is made for.
+    object: &'a FileObject,
+    /// The assembly's options. The file takes their `default_time` where
+    /// its object has no time, and their `flags` say whether it replaces a
+    /// file of the same name.
+    options: &'a AssembleOptions,
+}
+
+impl PendingFile<'_> {
+    /// Whether the file is created.
+    fn is_created(&self) -> bool {
+        self.writer.is_some()
+    }
+
+    /// Creates the file unless it is created: with the object's time, or
+    /// the assembly's where it gives none, read-only as the object is, and
+    /// replacing a file of the same name where the assembly says so.
+    fn create(&mut self) -> Result<()> {
+        if let Some(volume) = self.volume.take() {
+            let time = self.object.inode.mtime().unwrap_or(self.options.default_time);
+            let replace = self.options.flags.contains(AssembleFlags::REPLACE);
+            let mut writer = volume.create_file(self.path, time, replace)?;
+            writer.set_read_only(self.object.inode.is_read_only());
+            self.writer = Some(writer);
+        }
+        Ok(())
+    }
+
+    /// Finishes the file that was created.
+    fn finish(self) -> Result<()> {
+        match self.writer {
+            Some(writer) => writer.finish(),
+            None => Err(self.not_created()),
+        }
+    }
+
+    /// The error of a write or a finish after the file could not be
+    /// created.
+    fn not_created(&self) -> Error {
+        err!(EBADF, "'{}' was not created", self.path)
+    }
+}
+
+impl Write for PendingFile<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.create()?;
+        match &mut self.writer {
+            Some(writer) => writer.write(buf),
+            None => Err(self.not_created().into()),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match &mut self.writer {
+            Some(writer) => writer.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// An assembly while the records of its manifest come.
+struct Assembly<'a> {
+    volume: &'a mut Volume,
+    source: &'a mut dyn ContentSource,
+    options: &'a AssembleOptions,
+    observer: &'a mut dyn AssembleObserver,
+    report: AssembleReport,
+    triage: ObjectTriage,
+}
+
+impl Assembly<'_> {
+    /// Applies the file object that came next: stores it as a file or as a
+    /// directory, or leaves it out. An object that is not valid fails the
+    /// assembly, also one that would be left out.
+    fn apply(&mut self, object: &FileObject) -> Result<()> {
+        // An invalid directory takes its entries with it: its object comes
+        // first and fails the whole assembly.
+        if let Some(now) = self.options.now_usec {
+            object.check_validity(now)?;
+        }
+        match self.triage.decide(object, self.options.flags)? {
+            ObjectAction::Store(EntryKind::Directory) => self.store_directory(object),
+            ObjectAction::Store(EntryKind::File) => self.store_file(object),
+            ObjectAction::Skip(reason) => self.skip(object, reason),
+        }
+    }
+
+    /// Leaves `object` out. A source that hands out the contents in
+    /// manifest order has them all the same, and passes over them with the
+    /// checks of a copy: data that does not match the object's size and
+    /// hash means that the stream is out of step with the manifest, and
+    /// every object after it would get the wrong bytes.
+    fn skip(&mut self, object: &FileObject, reason: SkipReason) -> Result<()> {
+        self.report.skipped += 1;
+        self.observer.skipped(&object.name, reason);
+        self.source.skip(object)?;
+        Ok(())
+    }
+
+    /// Creates the directory `object` describes, or gives the one that is
+    /// there its time.
+    fn store_directory(&mut self, object: &FileObject) -> Result<()> {
+        let path = path_in_volume(&object.name);
+        let time = object.inode.mtime().unwrap_or(self.options.default_time);
+        match self.volume.metadata(&path) {
+            Ok(md) if md.is_dir => self.volume.set_times(&path, time)?,
+            Ok(_) => bail!(
+                ENOTDIR,
+                Detail::Path(path.clone()),
+                "'{}' exists in the volume and is not a directory",
+                path
+            ),
+            Err(e) if e.errno() == ENOENT => self.volume.create_dir(&path, time)?,
+            Err(e) => return Err(e),
+        }
+        self.report.directories += 1;
+        self.observer.progress(&self.report.progress());
+        Ok(())
+    }
+
+    /// Creates the file `object` describes, with its contents checked
+    /// against the manifest. The file is created when its first data comes,
+    /// see [`PendingFile`].
+    fn store_file(&mut self, object: &FileObject) -> Result<()> {
+        let path = path_in_volume(&object.name);
+        let mut file = PendingFile {
+            volume: Some(&mut *self.volume),
+            writer: None,
+            path: &path,
+            object,
+            options: self.options,
+        };
+        let mut sink = ProgressWriter {
+            inner: &mut file,
+            written: 0,
+            done: self.report.progress(),
+            observer: &mut *self.observer,
+        };
+        let copied = object.copy_contents(self.source, &mut sink);
+        // An error of the volume comes back from the copy as an I/O error.
+        // One of creating the file is as the volume said it. One of writing
+        // it knows nothing of the file it was writing, while those of the
+        // manifest and of its files name the file already.
+        let named = |e: Error| e.at_path(&path).context(format!("copying {}", object.name));
+        let written = copied.map_err(|e| match e.kind() {
+            ErrorKind::Io if file.is_created() => named(e.into()),
+            _ => e.into(),
+        })?;
+        file.create()?;
+        file.finish().map_err(named)?;
+        self.report.files += 1;
+        self.report.bytes += written;
+        self.observer.progress(&self.report.progress());
+        Ok(())
+    }
+
+    /// Ends the assembly after the trailer of the manifest.
+    fn finish(self) -> Result<AssembleReport> {
+        self.source.end()?;
+        Ok(self.report)
+    }
+}
+
+impl Volume {
+    /// Creates the directories and files a manifest describes, each at its
+    /// name below the root directory, while `reader` reads the manifest to
+    /// its end. The caller opened the reader, and the reader read the root
+    /// file object then.
+    ///
+    /// The manifest has to declare the code point order, see
+    /// [`Order::CodePoint`], in its root file object, as UAPI.16 asks of a
+    /// manifest that a file system is made from. One that does not fails
+    /// with EBADMSG before anything is written. The reader checks the file
+    /// objects against that order, so it refuses a name that comes twice,
+    /// and every directory comes before what is in it. Data comes from
+    /// `source` for regular files without literal contents. Sizes and
+    /// SHA-256 hashes in the manifest are verified; a mismatch removes the
+    /// file again and fails with EBADMSG. So does data the source has after
+    /// the last file it supplies, which is found after the trailer of the
+    /// manifest.
+    ///
+    /// A file the volume holds under the same name, or under a name FAT
+    /// does not tell apart from it, is replaced with
+    /// [`AssembleFlags::REPLACE`] and fails with EEXIST without it. A
+    /// directory the volume holds under such a name gets the directory
+    /// object's time.
+    pub fn assemble<R: Read>(
+        &mut self,
+        reader: &mut Reader<R>,
+        source: &mut dyn ContentSource,
+        options: &AssembleOptions,
+    ) -> Result<AssembleReport> {
+        self.assemble_with_observer(reader, source, options, &mut |_: &Progress| {})
+    }
+
+    /// [`Volume::assemble`], telling `observer` what it wrote so far after
+    /// every directory, every file and every chunk of a file, and every
+    /// object it leaves out.
+    pub fn assemble_with_observer<R: Read>(
+        &mut self,
+        reader: &mut Reader<R>,
+        source: &mut dyn ContentSource,
+        options: &AssembleOptions,
+        observer: &mut dyn AssembleObserver,
+    ) -> Result<AssembleReport> {
+        reader.root().require_order(Order::CodePoint)?;
+        if let Some(now) = options.now_usec {
+            reader.root().check_validity(now)?;
+        }
+        let mut assembly = Assembly {
+            volume: self,
+            source,
+            options,
+            observer,
+            report: AssembleReport::default(),
+            triage: ObjectTriage::default(),
+        };
+        for object in reader {
+            if let Object::File(object) = object? {
+                assembly.apply(&object)?;
             }
         }
-        Ok(skipped)
+        assembly.finish()
     }
 }

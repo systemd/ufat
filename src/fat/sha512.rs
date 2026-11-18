@@ -1,25 +1,19 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! SHA-512 (FIPS 180-4), for the hash of a whole image a caller may ask
-//! for. The hashes inside manifests stay SHA-256, see [`crate::sha256`].
-//! The sha2 crate computes it.
+//! for. The sha2 crate computes it. A SHA-256 hash, of an image or of the
+//! files of a manifest, is computed with [`crate::manifest::Sha256Context`].
 
 use sha2::Digest;
-
-pub use crate::sha256::to_hex;
 
 /// Size of a digest in bytes.
 pub const DIGEST_SIZE: usize = 64;
 
-/// A streaming SHA-512 computation.
+/// A streaming SHA-512 computation, started with
+/// [`Sha512Context::default`].
 #[derive(Clone, Debug, Default)]
-pub struct Sha512(sha2::Sha512);
+pub struct Sha512Context(sha2::Sha512);
 
-impl Sha512 {
-    /// Starts a new computation.
-    pub fn new() -> Sha512 {
-        Sha512(sha2::Sha512::new())
-    }
-
+impl Sha512Context {
     /// Feeds data.
     pub fn update(&mut self, data: &[u8]) {
         self.0.update(data);
@@ -34,6 +28,17 @@ impl Sha512 {
 /// The digest of `data`.
 pub fn digest(data: &[u8]) -> [u8; DIGEST_SIZE] {
     sha2::Sha512::digest(data).into()
+}
+
+/// Lower case hex encoding.
+pub fn to_hex(digest: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for &b in digest {
+        hex.push(char::from(DIGITS[usize::from(b >> 4)]));
+        hex.push(char::from(DIGITS[usize::from(b & 0x0f)]));
+    }
+    hex
 }
 
 #[cfg(test)]
@@ -124,14 +129,14 @@ mod tests {
             "9001a3f2cd24e4c46c751ab62e0c2f071ef9c319d5a90477d214905270b23d02e8ed527bd332f2dc5d45f7a0c5265f00a45afdf5120ba46709581e81818a57a2"
         );
         for chunk in [1usize, 7, 63, 64, 65, 111, 112, 113, 127, 128, 129, 200, 999] {
-            let mut h = Sha512::new();
+            let mut h = Sha512Context::default();
             for piece in data.chunks(chunk) {
                 h.update(piece);
             }
             assert_eq!(h.finalize(), expected, "chunk size {}", chunk);
         }
         // Pieces of varying size, including empty ones.
-        let mut h = Sha512::new();
+        let mut h = Sha512Context::default();
         let mut pos = 0;
         for (i, step) in [0usize, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377]
             .iter()
@@ -151,6 +156,7 @@ mod tests {
     #[test]
     fn hex() {
         assert_eq!(to_hex(&[0, 0x0f, 0xf0, 0xff]), "000ff0ff");
+        assert_eq!(to_hex(&[]), "");
         assert_eq!(to_hex(&digest(b"")).len(), 2 * DIGEST_SIZE);
     }
 }

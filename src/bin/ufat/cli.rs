@@ -14,16 +14,19 @@ use fat::format::{self, FormatOptions, VolumeId};
 use fat::fsck;
 use fat::host;
 use fat::layout::MIN_SECTOR_SIZE;
-use fat::manifest::{self, AssembleOptions, DirectorySource, Features, HostTree, StreamSource, WriteReport};
+use fat::manifest::{
+    AssembleFlags, AssembleObserver, AssembleOptions, DirectorySource, Features, HostTree, Name, PinnedDirectory,
+    Problem, SkipReason, StreamSource, WriteReport,
+};
 use fat::plan::{Plan, PlanOptions};
 use fat::populate::{CopyOptions, TimePolicy};
 use fat::probe::Prober;
 use fat::time::civil_from_days;
 use fat::volume::Volume;
-use fat::{bail, err, Context, Detail, Error, Result};
+use fat::{bail, err, Context, DescriptorProblem, Detail, Error, ManifestProblem, Result};
 
 use crate::service;
-use crate::util::{self, ImageFlags};
+use crate::util::{self, ImageFlags, ManifestInput, ManifestUse};
 
 const USAGE: &str = "\
 Usage: ufat COMMAND [OPTIONS...] ARGS...
@@ -59,7 +62,11 @@ Without a SOURCE it creates the directory --path.
 
 A SOURCE is a directory tree, or for populate one file. With --manifest the
 one SOURCE is the tree the manifest describes, where its file contents are
-read, or - for the contents on standard input, back to back in manifest order:
+read, or - for the contents on standard input, back to back in manifest order.
+The manifest has to declare \"order\": \"codepoint\" and be in that order.
+assemble with a SOURCE reads the manifest twice, to plan the file system and
+to fill it, and needs it in a regular file. populate, assemble --plan and
+assemble without a SOURCE read it once and take a pipe:
   --manifest PATH       Build what the UAPI.16 manifest at PATH, or on standard
                         input for -, describes
   --no-check-validity   Accept revoked and expired manifest entries
@@ -419,13 +426,14 @@ enum Source {
     None,
     /// A directory tree, pinned.
     Tree { path: PathBuf, dir: OwnedFd },
-    /// The manifest `--manifest` named, read once, and where the contents
-    /// of its files come from.
+    /// The manifest `--manifest` named, open with its root file object
+    /// read, and where the contents of its files come from.
     Manifest {
         /// How messages name the manifest: its path, or standard input.
         name: String,
-        manifest: Box<manifest::Manifest>,
-        /// None for the commands that only size.
+        manifest: Box<ManifestInput>,
+        /// None for the commands that only size, and once the contents
+        /// were written.
         contents: Option<ContentOrigin>,
     },
 }
@@ -434,17 +442,29 @@ enum Source {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Sourcing {
     /// The caller sizes a file system for the SOURCE and writes nothing of
-    /// it. A manifest takes no SOURCE then, since it carries the sizes.
+    /// it. A manifest takes no SOURCE then, since it carries the sizes, and
+    /// is planned on from its root file object, so it is read once.
     Size,
-    /// The caller writes the SOURCE into a file system. A manifest takes one
-    /// SOURCE then: the directory its file contents are read from, or "-"
-    /// for standard input.
-    Write,
+    /// The caller writes the SOURCE into a file system, and reads a manifest
+    /// as the use says. A manifest takes one SOURCE then: the directory its
+    /// file contents are read from, or "-" for standard input.
+    Write(ManifestUse),
 }
 
-/// Reads and parses the manifest `path` names, or the one on standard input
-/// for "-". Returns it with the name messages give it.
-fn read_manifest(path: &Path) -> Result<(manifest::Manifest, String)> {
+impl Sourcing {
+    /// What the command does with a manifest.
+    fn manifest_use(self) -> ManifestUse {
+        match self {
+            Sourcing::Size => ManifestUse::PlanOnly,
+            Sourcing::Write(manifest_use) => manifest_use,
+        }
+    }
+}
+
+/// Opens the manifest `path` names, or the one on standard input for "-",
+/// for `manifest_use`, and reads its first record. Returns it with the name
+/// messages give it.
+fn read_manifest(path: &Path, manifest_use: ManifestUse) -> Result<(ManifestInput, String)> {
     let (file, name) = if path == Path::new("-") {
         // A descriptor of our own, since the reader closes it.
         let fd = std::io::stdin().as_fd().try_clone_to_owned()?;
@@ -452,14 +472,25 @@ fn read_manifest(path: &Path) -> Result<(manifest::Manifest, String)> {
     } else {
         (host::open_file(path)?, path.display().to_string())
     };
-    let manifest = util::read_manifest(file).map_err(|e| {
-        if e.is_manifest() {
-            e.context(format_args!("{} is not a UAPI.16 manifest", name))
-        } else {
-            e.context(format_args!("cannot read {} as a manifest", name))
-        }
+    let input = ManifestInput::open(file, manifest_use).map_err(|e| match e.detail() {
+        // A manifest, but not one ufat takes.
+        Some(Detail::Manifest {
+            problem: ManifestProblem::Malformed(Problem::NoOrder),
+            ..
+        }) => e.context(&name),
+        // A pipe, refused before anything was read from it.
+        Some(Detail::Descriptor {
+            problem: DescriptorProblem::WrongType,
+            ..
+        }) => err!(
+            errno::EINVAL,
+            "{} is not a regular file: assemble with a SOURCE needs the manifest in one",
+            name
+        ),
+        _ if e.is_manifest() => e.context(format_args!("{} is not a UAPI.16 manifest", name)),
+        _ => e.context(format_args!("cannot read {} as a manifest", name)),
     })?;
-    Ok((manifest, name))
+    Ok((input, name))
 }
 
 impl Source {
@@ -468,7 +499,9 @@ impl Source {
     /// With it, it is the directory the manifest describes or "-" for the
     /// file contents on standard input; [`Sourcing::Size`] takes none, the
     /// manifest carries the sizes. `--path` is for trees only. The SOURCE
-    /// arguments and `--path` are checked before anything is opened.
+    /// arguments and `--path` are checked before anything is opened. The
+    /// manifest is opened last, for what `sourcing` does with it, and its
+    /// root file object is read.
     fn open(args: &Args, paths: &[&Path], sourcing: Sourcing) -> Result<Source> {
         let Some(m) = args.path("manifest") else {
             return match paths {
@@ -492,7 +525,7 @@ impl Source {
                 ),
             };
         };
-        if m == Path::new("-") && sourcing == Sourcing::Write && matches!(paths, [p] if *p == Path::new("-")) {
+        if m == Path::new("-") && sourcing != Sourcing::Size && matches!(paths, [p] if *p == Path::new("-")) {
             bail!(
                 errno::EINVAL,
                 "--manifest - and a SOURCE of - cannot both read standard input"
@@ -510,17 +543,17 @@ impl Source {
                 errno::EINVAL,
                 "--manifest carries the sizes, no SOURCE or --fit directory is taken with it"
             ),
-            (Sourcing::Write, [path]) if *path == Path::new("-") => Some(ContentOrigin::Stdin),
-            (Sourcing::Write, [path]) => Some(ContentOrigin::Directory {
+            (Sourcing::Write(_), [path]) if *path == Path::new("-") => Some(ContentOrigin::Stdin),
+            (Sourcing::Write(_), [path]) => Some(ContentOrigin::Directory {
                 path: path.to_path_buf(),
                 dir: host::open_dir(path)?,
             }),
-            (Sourcing::Write, _) => bail!(
+            (Sourcing::Write(_), _) => bail!(
                 errno::EINVAL,
                 "--manifest takes exactly one SOURCE: the directory the manifest describes, or - for the file contents on standard input"
             ),
         };
-        let (manifest, name) = read_manifest(m)?;
+        let (manifest, name) = read_manifest(m, sourcing.manifest_use())?;
         Ok(Source::Manifest {
             name,
             manifest: Box::new(manifest),
@@ -529,67 +562,59 @@ impl Source {
     }
 
     /// What can be checked before an image is created, formatted or
-    /// written: that the manifest and, under `--unsupported fail`, the tree
-    /// can be stored, and that every file the manifest names is below the
-    /// SOURCE with the size it says.
+    /// written: under `--unsupported fail`, that the tree can be stored. A
+    /// manifest is checked as it is written.
     fn check(&self, args: &Args) -> Result<()> {
-        let fail = fail_unsupported(args)?;
         match self {
-            Source::Tree { path, dir } if fail => {
-                let mut plan = Plan::new(PlanOptions::new(MIN_SECTOR_SIZE));
-                if let Some(skipped) = plan.add_tree(dir.as_fd(), dest(args), true)?.first() {
+            Source::Tree { .. } if fail_unsupported(args)? => {
+                self.add_to(&mut Plan::new(PlanOptions::new(MIN_SECTOR_SIZE)), args)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Adds the source to a plan, the way [`Source::fill`] writes it, and
+    /// returns how many objects of a manifest are left out. Under
+    /// `--unsupported fail` what FAT cannot store of a tree fails the plan.
+    /// The plan reads the manifest once more from its start, so its content
+    /// can be written after.
+    fn add_to(&self, plan: &mut Plan, args: &Args) -> Result<u64> {
+        match self {
+            Source::None => Ok(0),
+            Source::Tree { path, dir } => {
+                let skipped = plan.add_tree(dir.as_fd(), dest(args), true)?;
+                if let (Some(skipped), true) = (skipped.first(), fail_unsupported(args)?) {
                     bail!(
                         errno::EINVAL,
                         "{} cannot be stored on FAT",
                         path.join(skipped).display()
                     );
                 }
+                Ok(0)
             }
-            Source::Manifest {
-                name,
-                manifest,
-                contents,
-            } => {
-                if fail {
-                    manifest.check_supported()?;
-                }
-                if let Some(ContentOrigin::Directory { path, dir }) = contents {
-                    DirectorySource::new(dir.try_clone()?)
-                        .follow_symlinks(true)
-                        .verify(manifest)
-                        .map_err(|e| {
-                            e.context(format!(
-                                "the files {} describes are not all below {}",
-                                name,
-                                path.display()
-                            ))
-                        })?;
-                }
-            }
-            Source::None | Source::Tree { .. } => {}
+            Source::Manifest { name, manifest, .. } => plan
+                .add_records(&mut manifest.plan_reader()?, assemble_flags(args)?)
+                .map_err(about_manifest(name)),
         }
-        Ok(())
     }
 
-    /// Adds the source to a plan, the way [`Source::fill`] writes it.
-    fn add_to(&self, plan: &mut Plan, args: &Args) -> Result<()> {
+    /// Adds the source to a plan when nothing is written after it, and
+    /// returns how many objects of a manifest are left out. The manifest is
+    /// read on from its root file object, so it is read once.
+    fn into_plan(self, plan: &mut Plan, args: &Args) -> Result<u64> {
         match self {
-            Source::None => {}
-            Source::Tree { dir, .. } => {
-                plan.add_tree(dir.as_fd(), dest(args), true)?;
-            }
-            Source::Manifest { manifest, .. } => {
-                for skipped in plan.add_manifest(manifest)? {
-                    eprintln!("ufat: not counted {}: it cannot be stored on FAT", skipped);
-                }
-            }
+            Source::Manifest { name, mut manifest, .. } => plan
+                .add_records(manifest.reader(), assemble_flags(args)?)
+                .map_err(about_manifest(&name)),
+            source => source.add_to(plan, args),
         }
-        Ok(())
     }
 
     /// Writes the source into an open volume: the tree copied, or the
-    /// manifest assembled.
-    fn fill(&self, volume: &mut Volume, args: &Args) -> Result<()> {
+    /// manifest assembled while it is read, which takes the contents of its
+    /// files.
+    fn fill(&mut self, volume: &mut Volume, args: &Args) -> Result<()> {
         let copy = CopyOptions {
             times: time_policy(args)?,
             replace: !args.flag("no-replace"),
@@ -619,24 +644,25 @@ impl Source {
                 contents: origin,
             } => {
                 let options = assemble_options(args)?;
-                let report = match origin {
+                let reader = manifest.reader();
+                let report = match origin.take() {
                     Some(ContentOrigin::Stdin) => {
                         let stdin = std::io::stdin();
                         let mut lock = stdin.lock();
-                        volume.assemble(manifest, &mut StreamSource::new(&mut lock), &options)?
+                        let mut source = StreamSource::new(&mut lock);
+                        volume.assemble_with_observer(reader, &mut source, &options, &mut SkipNotes)
                     }
-                    Some(ContentOrigin::Directory { dir, .. }) => volume.assemble(
-                        manifest,
-                        &mut DirectorySource::new(dir.try_clone()?).follow_symlinks(true),
-                        &options,
-                    )?,
+                    Some(ContentOrigin::Directory { path, dir }) => {
+                        let mut source = DirectorySource::new(PinnedDirectory::new(dir).follow_symlinks(true));
+                        volume
+                            .assemble_with_observer(reader, &mut source, &options, &mut SkipNotes)
+                            .map_err(about_source_directory(&path))
+                    }
                     None => bail!(errno::EINVAL, "a manifest needs a SOURCE to be filled from"),
-                };
+                }
+                .map_err(about_manifest(name))?;
                 if args.flag("verbose") {
                     eprintln!("{}: {}", name, contents(report.files, report.directories, report.bytes));
-                }
-                for skipped in report.skipped {
-                    eprintln!("ufat: skipped {}: it cannot be stored on FAT", skipped);
                 }
             }
         }
@@ -644,18 +670,54 @@ impl Source {
     }
 }
 
+/// Says what an assembly leaves out, on standard error.
+struct SkipNotes;
+
+impl AssembleObserver for SkipNotes {
+    fn skipped(&mut self, name: &Name, reason: SkipReason) {
+        match reason {
+            SkipReason::Unsupported => eprintln!("ufat: skipped {}: it cannot be stored on FAT", name),
+            _ => eprintln!("ufat: skipped {}: the directory it is in was skipped", name),
+        }
+    }
+}
+
+/// How the command line asks an assembly, and the plan of one, to store a
+/// manifest's objects: replacing what is there unless `--no-replace`, and
+/// leaving out what FAT cannot store unless `--unsupported fail`.
+fn assemble_flags(args: &Args) -> Result<AssembleFlags> {
+    Ok(AssembleFlags::NONE
+        .with(AssembleFlags::REPLACE, !args.flag("no-replace"))
+        .with(AssembleFlags::SKIP_UNSUPPORTED, !fail_unsupported(args)?))
+}
+
+/// What the command line asks of an assembly.
 fn assemble_options(args: &Args) -> Result<AssembleOptions> {
     let (time, _) = stamp_time(args)?;
     Ok(AssembleOptions {
         default_time: time,
-        replace: !args.flag("no-replace"),
-        skip_unsupported: !fail_unsupported(args)?,
+        flags: assemble_flags(args)?,
         now_usec: if args.flag("no-check-validity") {
             None
         } else {
             Some(fat::time::to_usec(util::now()))
         },
     })
+}
+
+/// Names the manifest `name` in an error that is about it.
+fn about_manifest(name: &str) -> impl Fn(Error) -> Error + '_ {
+    move |e| if e.is_manifest() { e.context(name) } else { e }
+}
+
+/// Names the directory `path`, where the contents of a manifest's files
+/// are looked up, in an error about one of its files: one that is missing
+/// or not a regular file, or whose contents are not what the manifest says.
+fn about_source_directory(path: &Path) -> impl Fn(Error) -> Error + '_ {
+    move |e| match e.detail() {
+        Some(Detail::Source { .. } | Detail::Content { .. }) => e.context(path.display()),
+        _ => e,
+    }
 }
 
 /// Whether `--write-manifest -` puts the manifest on standard output. What
@@ -752,8 +814,16 @@ fn plan(args: &Args) -> Result<()> {
     }
     let options = format_options(args)?;
     let mut plan = Plan::new(PlanOptions::from_format_options(&options, None)?);
+    // Nothing is written after a plan, so it reads the manifest on from its
+    // root file object, and the manifest is read once. A pipe will do.
     let source = Source::open(args, &args.positional_paths(), Sourcing::Size)?;
-    source.add_to(&mut plan, args)?;
+    let skipped = source.into_plan(&mut plan, args)?;
+    if skipped > 0 {
+        eprintln!(
+            "ufat: not counted: {}",
+            plural(skipped, "object FAT cannot store", "objects FAT cannot store")
+        );
+    }
     let e = plan.estimate()?;
     if let Some(size) = args.size("size")? {
         if e.size() > size {
@@ -805,9 +875,15 @@ fn assemble_empty(args: &Args, path: &Path) -> Result<Volume> {
         format::format(&device, &options)?;
         return Volume::open(device);
     }
-    let source = Source::open(args, &fit, Sourcing::Size)?;
-    let (volume, estimate) = util::fit_and_format(&target, &mut options, &mut |plan| source.add_to(plan, args))
-        .map_err(|e| e.into_error(path))?;
+    // Nothing of the content is written, so a manifest is planned on from
+    // its root file object, through the reader that read it, and is read
+    // once: a pipe will do. fit_and_format() plans the content once.
+    let mut source = Some(Source::open(args, &fit, Sourcing::Size)?);
+    let mut add = |plan: &mut Plan| match source.take() {
+        Some(source) => source.into_plan(plan, args).map(drop),
+        None => bail!(errno::EINVAL, "the content is planned once"),
+    };
+    let (volume, estimate) = util::fit_and_format(&target, &mut options, &mut add).map_err(|e| e.into_error(path))?;
     report_estimate(args, path, &estimate);
     Ok(volume)
 }
@@ -821,8 +897,9 @@ fn assemble_filled(args: &Args, path: &Path, paths: &[&Path]) -> Result<Volume> 
             "--fit sizes an empty file system; with a SOURCE the file system is sized for it"
         );
     }
-    let source = Source::open(args, paths, Sourcing::Write)?;
-    // Better to learn about a bad manifest or tree before an image is sized
+    // The manifest is planned before its content is written.
+    let mut source = Source::open(args, paths, Sourcing::Write(ManifestUse::Plan))?;
+    // Better to learn about a tree FAT cannot hold before an image is sized
     // and formatted.
     source.check(args)?;
     let mut options = format_options(args)?;
@@ -832,8 +909,9 @@ fn assemble_filled(args: &Args, path: &Path, paths: &[&Path]) -> Result<Volume> 
         size: args.size("size")?,
         flags: args.image_flags(),
     };
-    let (mut v, estimate) = util::fit_and_format(&target, &mut options, &mut |plan| source.add_to(plan, args))
-        .map_err(|e| e.into_error(path))?;
+    let (mut v, estimate) =
+        util::fit_and_format(&target, &mut options, &mut |plan| source.add_to(plan, args).map(drop))
+            .map_err(|e| e.into_error(path))?;
     report_estimate(args, path, &estimate);
     match source.fill(&mut v, args) {
         Ok(()) => Ok(v),
@@ -1023,13 +1101,23 @@ fn cmd_populate(argv: &[OsString]) -> Result<()> {
         }
         return v.close();
     }
-    let source = Source::open(&args, &paths, Sourcing::Write)?;
+    let mut source = Source::open(&args, &paths, Sourcing::Write(ManifestUse::Write))?;
     source.check(&args)?;
     let mut v = open_volume(&args, image, Access::ReadWrite)?;
     if matches!(source, Source::Tree { .. }) {
         ensure_dir(&mut v, path, parents, time)?;
     }
-    source.fill(&mut v, &args)?;
+    if let Err(e) = source.fill(&mut v, &args) {
+        // Once something was written, the file system is left marked as not
+        // cleanly unmounted, as after a crash, with what was complete. A
+        // SOURCE refused before that, such as a manifest refused at its
+        // first object, leaves it as it was. An error of the close is not
+        // the one the user needs to hear about.
+        if v.is_writing() {
+            let _ = v.close_unfinished();
+        }
+        return Err(e);
+    }
     if let Some(m) = args.path("write-manifest") {
         write_manifest(&v, m)?;
     }

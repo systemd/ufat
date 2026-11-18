@@ -7,7 +7,7 @@
 use std::io::{self, Read, Write};
 use std::time::SystemTime;
 
-use super::{check_attributes, writable, Located, Placement, Volume, MAX_FILE_SIZE, SETTABLE_ATTRIBUTES};
+use super::{check_attributes, writable, Located, NewEntry, Placement, Volume, MAX_FILE_SIZE, SETTABLE_ATTRIBUTES};
 use crate::dir::{DirEntry, Directory};
 use crate::dirent::{RawDirEntry, ATTR_ARCHIVE, ATTR_READ_ONLY};
 use crate::errno::*;
@@ -40,8 +40,12 @@ impl Volume {
     /// finished. A token that is dropped leaves its clusters allocated until
     /// the next fsck; [`Volume::create_file`] wraps it in a guard that
     /// aborts instead.
+    ///
+    /// Nothing is written for a file that is refused: a name FAT cannot
+    /// store or one that is too long, a parent that is missing, damaged or
+    /// full, too few free clusters for the parent to grow, a directory of
+    /// the name, or a file of the name without `replace`.
     pub fn begin_file(&mut self, path: &str, time: SystemTime, replace: bool) -> Result<OpenFile> {
-        self.begin_write()?;
         let (dir_cluster, name) = self.locate_parent(path)?;
         let (placement, replaced) = self.with_directory_mut(dir_cluster, |vol, parent| {
             let replaced = match Self::find(parent, name.as_str()) {
@@ -52,7 +56,7 @@ impl Volume {
                 existing => existing,
             };
             let placement = vol
-                .place_entry(parent, &name, replaced.as_ref())
+                .place_entry(parent, &name, replaced.as_ref(), NewEntry::File)
                 .map_err(|e| e.at_path(path))?;
             if !vol.reserve_slots(parent, placement.start, placement.long.len() + 1) {
                 bail!(

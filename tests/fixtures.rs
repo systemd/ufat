@@ -16,7 +16,10 @@ use fat::dirent::ATTR_READ_ONLY;
 use fat::errno::{EINVAL, EOPNOTSUPP};
 use fat::format::{self, FormatOptions};
 use fat::host;
-use fat::manifest::{self, AssembleOptions, DirectorySource, Features, HostTree, InodeType, Manifest, StreamSource};
+use fat::manifest::{
+    AssembleFlags, AssembleObserver, AssembleOptions, AssembleReport, ContentSource, DirectorySource, Features,
+    FileObject, HostTree, InodeType, Name, Object, PinnedDirectory, Reader, RootObject, SkipReason, StreamSource,
+};
 use fat::plan::{Plan, PlanOptions};
 use fat::volume::Volume;
 
@@ -24,10 +27,51 @@ fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
+/// A fixture manifest, read to its end: a test can hold one whole.
+struct Manifest {
+    bytes: Vec<u8>,
+    root: RootObject,
+    entries: Vec<FileObject>,
+    signatures: usize,
+}
+
+impl Manifest {
+    /// A reader of the manifest from its start, which has read the root
+    /// file object.
+    fn reader(&self) -> Reader<&[u8]> {
+        Reader::open(&self.bytes[..]).unwrap()
+    }
+
+    /// Assembles the manifest into `v`.
+    fn assemble(
+        &self,
+        v: &mut Volume,
+        source: &mut dyn ContentSource,
+        options: &AssembleOptions,
+    ) -> fat::Result<AssembleReport> {
+        v.assemble(&mut self.reader(), source, options)
+    }
+}
+
 fn load(case: &str, name: &str) -> Manifest {
     let path = fixtures().join(case).join(name);
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
-    manifest::parse(&bytes).unwrap_or_else(|e| panic!("{}: {}", path.display(), e))
+    let mut reader = Reader::open(&bytes[..]).unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
+    let root = reader.root().clone();
+    let mut entries = Vec::new();
+    let mut signatures = 0;
+    for object in &mut reader {
+        match object.unwrap_or_else(|e| panic!("{}: {}", path.display(), e)) {
+            Object::File(object) => entries.push(*object),
+            _ => signatures += 1,
+        }
+    }
+    Manifest {
+        bytes,
+        root,
+        entries,
+        signatures,
+    }
 }
 
 fn tree(case: &str) -> PathBuf {
@@ -35,8 +79,8 @@ fn tree(case: &str) -> PathBuf {
 }
 
 /// The fixture's tree as a content source: the directory resolved once.
-fn source(case: &str) -> DirectorySource {
-    DirectorySource::new(host::open_dir(&tree(case)).unwrap())
+fn source(case: &str) -> DirectorySource<PinnedDirectory> {
+    DirectorySource::new(PinnedDirectory::new(host::open_dir(&tree(case)).unwrap()))
 }
 
 fn time(nsec: u64) -> SystemTime {
@@ -44,16 +88,19 @@ fn time(nsec: u64) -> SystemTime {
 }
 
 fn names(m: &Manifest) -> Vec<&str> {
-    m.entries.iter().filter_map(|e| e.name.as_deref()).collect()
+    m.entries.iter().map(|e| e.name.as_str()).collect()
 }
 
-/// Formats an image of exactly the planned size and returns it open.
-fn planned_volume(m: &Manifest) -> (Temp, Volume, Vec<String>) {
+/// Formats an image of exactly the planned size and returns it open, with
+/// the number of objects the plan left out.
+fn planned_volume(m: &Manifest) -> (Temp, Volume, u64) {
     let mut plan = Plan::new(PlanOptions {
         allow_small: true,
         ..PlanOptions::new(512)
     });
-    let skipped = plan.add_manifest(m).unwrap();
+    let skipped = plan
+        .add_records(&mut m.reader(), AssembleFlags::SKIP_UNSUPPORTED)
+        .unwrap();
     let estimate = plan.estimate().unwrap();
     let img = Temp::image(estimate.size());
     let mut options = FormatOptions {
@@ -66,6 +113,15 @@ fn planned_volume(m: &Manifest) -> (Temp, Volume, Vec<String>) {
     (img, v, skipped)
 }
 
+/// A log of the objects an assembly leaves out, by name.
+struct SkipLog<'a>(&'a mut Vec<String>);
+
+impl AssembleObserver for SkipLog<'_> {
+    fn skipped(&mut self, name: &Name, _reason: SkipReason) {
+        self.0.push(name.to_string());
+    }
+}
+
 fn read_back(v: &Volume, path: &str) -> Vec<u8> {
     let mut out = Vec::new();
     v.open_file(path).unwrap().read_to_end(&mut out).unwrap();
@@ -76,8 +132,8 @@ fn read_back(v: &Volume, path: &str) -> Vec<u8> {
 /// contents and the manifest's time; every directory object is there too.
 fn check_against_tree(m: &Manifest, v: &Volume, tree: &Path) {
     for e in &m.entries {
-        let name = e.name.as_deref().unwrap();
-        let path = e.path();
+        let name = e.name.as_str();
+        let path = format!("/{}", name);
         match e.inode_type {
             InodeType::Regular => {
                 let md = v.metadata(&path).unwrap_or_else(|err| panic!("{}: {}", path, err));
@@ -87,15 +143,15 @@ fn check_against_tree(m: &Manifest, v: &Volume, tree: &Path) {
                 if let Some(size) = e.size {
                     assert_eq!(md.size, size, "{}", path);
                 }
-                if let Some(t) = e.mtime_nsec {
+                if let Some(t) = e.inode.mtime_nsec {
                     assert_eq!(md.modified, time(t), "{}", path);
                 }
-                assert_eq!(md.attributes & ATTR_READ_ONLY != 0, e.is_read_only(), "{}", path);
+                assert_eq!(md.attributes & ATTR_READ_ONLY != 0, e.inode.is_read_only(), "{}", path);
             }
             InodeType::Directory => {
                 let md = v.metadata(&path).unwrap_or_else(|err| panic!("{}: {}", path, err));
                 assert!(md.is_dir, "{}", path);
-                if let Some(t) = e.mtime_nsec {
+                if let Some(t) = e.inode.mtime_nsec {
                     assert_eq!(md.modified, time(t), "{}", path);
                 }
             }
@@ -121,8 +177,7 @@ fn every_fixture_parses() {
             .count(),
         6
     );
-    assert_eq!(esp.root.inode_type, InodeType::Directory);
-    assert_eq!(esp.root.mtime_nsec, Some(1_699_999_000_000_000_000));
+    assert_eq!(esp.root.inode.mtime_nsec, Some(1_699_999_000_000_000_000));
     assert_eq!(esp.signatures, 0);
     assert_eq!(
         names(&esp),
@@ -144,9 +199,9 @@ fn every_fixture_parses() {
     );
     let uki = &esp.entries[4];
     assert_eq!(uki.size, Some(6395));
-    assert_eq!(uki.mode, Some(0o664));
-    assert_eq!(uki.mtime_nsec, Some(1_700_000_002_000_000_000));
-    assert!(!uki.is_read_only());
+    assert_eq!(uki.inode.mode.map(u32::from), Some(0o664));
+    assert_eq!(uki.inode.mtime_nsec, Some(1_700_000_002_000_000_000));
+    assert!(!uki.inode.is_read_only());
     assert!(uki.contents.is_empty());
 
     // The signature does not change the file objects.
@@ -158,18 +213,18 @@ fn every_fixture_parses() {
     // Fewer fields, same tree.
     let lean = load("esp", "size-hash-mtime.Uapi16Manifest");
     assert_eq!(names(&lean), names(&esp));
-    assert!(lean.entries.iter().all(|e| e.mode.is_none()));
+    assert!(lean.entries.iter().all(|e| e.inode.mode.is_none()));
     assert!(lean
         .entries
         .iter()
         .zip(&esp.entries)
-        .all(|(a, b)| a.size == b.size && a.sha256 == b.sha256 && a.mtime_nsec == b.mtime_nsec));
+        .all(|(a, b)| a.size == b.size && a.sha256 == b.sha256 && a.inode.mtime_nsec == b.inode.mtime_nsec));
     let none = load("esp", "none.Uapi16Manifest");
     assert_eq!(names(&none), names(&esp));
     assert!(none
         .entries
         .iter()
-        .all(|e| e.size.is_none() && e.sha256.is_none() && e.mtime_nsec.is_none()));
+        .all(|e| e.size.is_none() && e.sha256.is_none() && e.inode.mtime_nsec.is_none()));
 
     let special = load("special", "Uapi16Manifest");
     assert_eq!(special.entries.len(), 13);
@@ -181,26 +236,22 @@ fn every_fixture_parses() {
         .iter()
         .find(|e| e.inode_type == InodeType::Symlink)
         .unwrap();
-    assert_eq!(link.contents[0].literal.as_deref(), Some(&b"a.txt"[..]));
+    assert_eq!(link.contents[0].literal(), Some(&b"a.txt"[..]));
     let hardlinks: Vec<&str> = special
         .entries
         .iter()
         .filter(|e| e.inode_token.is_some())
-        .filter_map(|e| e.name.as_deref())
+        .map(|e| e.name.as_str())
         .collect();
     assert_eq!(hardlinks, vec!["sub/hl_a", "sub/hl_b"]);
-    let readonly = special
-        .entries
-        .iter()
-        .find(|e| e.name.as_deref() == Some("sub/readonly.bin"))
-        .unwrap();
-    assert_eq!(readonly.mode, Some(0o444));
-    assert!(readonly.is_read_only());
+    let readonly = special.entries.iter().find(|e| e.name == "sub/readonly.bin").unwrap();
+    assert_eq!(readonly.inode.mode.map(u32::from), Some(0o444));
+    assert!(readonly.inode.is_read_only());
     assert!(names(&special).contains(&"sub/\u{fc}mlaut \u{221e}.txt"));
 
     let empty = load("empty", "Uapi16Manifest");
     assert!(empty.entries.is_empty());
-    assert_eq!(empty.root.mtime_nsec, Some(1_700_000_200_000_000_000));
+    assert_eq!(empty.root.inode.mtime_nsec, Some(1_700_000_200_000_000_000));
 }
 
 #[test]
@@ -212,15 +263,17 @@ fn esp_assembles_from_the_tree_into_the_planned_size() {
     ] {
         let m = load("esp", name);
         let (img, mut v, skipped) = planned_volume(&m);
-        assert!(skipped.is_empty());
-        let report = v.assemble(&m, &mut source("esp"), &AssembleOptions::default()).unwrap();
+        assert_eq!(skipped, 0);
+        let report = m
+            .assemble(&mut v, &mut source("esp"), &AssembleOptions::default())
+            .unwrap();
         assert_eq!(
             (report.files, report.directories, report.bytes),
             (7, 6, 14718),
             "{}",
             name
         );
-        assert!(report.skipped.is_empty());
+        assert_eq!(report.skipped, 0);
         assert_eq!(v.free_clusters(), 0, "{}: the plan was not exact", name);
         check_against_tree(&m, &v, &tree("esp"));
         v.close().unwrap();
@@ -233,15 +286,14 @@ fn esp_assembles_from_a_stream() {
     let m = load("esp", "Uapi16Manifest");
     let mut blob = Vec::new();
     for e in &m.entries {
-        if e.is_streamed() {
-            blob.extend(std::fs::read(tree("esp").join(e.name.as_deref().unwrap())).unwrap());
+        if e.has_external_data() {
+            blob.extend(std::fs::read(tree("esp").join(e.name.as_str())).unwrap());
         }
     }
-    assert_eq!(m.streamed_bytes().unwrap(), blob.len() as u64);
     let (img, mut v, _) = planned_volume(&m);
     let mut reader: &[u8] = &blob;
-    let report = v
-        .assemble(&m, &mut StreamSource::new(&mut reader), &AssembleOptions::default())
+    let report = m
+        .assemble(&mut v, &mut StreamSource::new(&mut reader), &AssembleOptions::default())
         .unwrap();
     assert_eq!((report.files, report.directories, report.bytes), (7, 6, 14718));
     assert!(reader.is_empty(), "the stream had bytes left over");
@@ -256,8 +308,8 @@ fn esp_assembles_from_a_stream() {
     bad[last] ^= 0x80;
     let (_img, mut v, _) = planned_volume(&m);
     let mut reader: &[u8] = &bad;
-    let e = v
-        .assemble(&m, &mut StreamSource::new(&mut reader), &AssembleOptions::default())
+    let e = m
+        .assemble(&mut v, &mut StreamSource::new(&mut reader), &AssembleOptions::default())
         .unwrap_err();
     assert!(e.message().contains("hash"), "{}", e);
     assert!(v.metadata("/loader/random-seed").is_err());
@@ -267,20 +319,29 @@ fn esp_assembles_from_a_stream() {
 #[test]
 fn special_skips_what_fat_cannot_hold() {
     let m = load("special", "Uapi16Manifest");
-    assert_eq!(m.check_supported().unwrap_err().errno(), EOPNOTSUPP);
     let (img, mut v, skipped) = planned_volume(&m);
-    assert_eq!(skipped, vec!["link", "sub/fifo"]);
-    let e = v
-        .assemble(&m, &mut source("special"), &AssembleOptions::default())
+    assert_eq!(skipped, 2);
+    let e = m
+        .assemble(&mut v, &mut source("special"), &AssembleOptions::default())
         .unwrap_err();
     assert_eq!(e.errno(), EOPNOTSUPP);
     assert!(e.message().contains("link"), "{}", e);
+    // What came before the link is there, and is replaced.
     let options = AssembleOptions {
-        skip_unsupported: true,
+        flags: AssembleFlags::REPLACE | AssembleFlags::SKIP_UNSUPPORTED,
         ..AssembleOptions::default()
     };
-    let report = v.assemble(&m, &mut source("special"), &options).unwrap();
+    let mut left_out = Vec::new();
+    let report = v
+        .assemble_with_observer(
+            &mut m.reader(),
+            &mut source("special"),
+            &options,
+            &mut SkipLog(&mut left_out),
+        )
+        .unwrap();
     assert_eq!(report.skipped, skipped);
+    assert_eq!(left_out, ["link", "sub/fifo"]);
     assert_eq!((report.files, report.directories), (8, 3));
     assert_eq!(v.free_clusters(), 0);
     check_against_tree(&m, &v, &tree("special"));
@@ -305,8 +366,12 @@ fn names_only_manifests_assemble_but_cannot_be_planned() {
         allow_small: true,
         ..PlanOptions::new(512)
     });
-    assert_eq!(plan.add_manifest(&m).unwrap_err().errno(), EINVAL);
-    assert_eq!(m.streamed_bytes().unwrap_err().errno(), EINVAL);
+    assert_eq!(
+        plan.add_records(&mut m.reader(), AssembleFlags::SKIP_UNSUPPORTED)
+            .unwrap_err()
+            .errno(),
+        EINVAL
+    );
 
     let img = Temp::image(1 << 20);
     let options = FormatOptions {
@@ -318,9 +383,9 @@ fn names_only_manifests_assemble_but_cannot_be_planned() {
     format::format(&Device::open(img.path(), Access::ReadWrite).unwrap(), &options).unwrap();
     let mut v = Volume::open(Device::open(img.path(), Access::ReadWrite).unwrap()).unwrap();
     let default_time = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
-    let report = v
+    let report = m
         .assemble(
-            &m,
+            &mut v,
             &mut source("esp"),
             &AssembleOptions {
                 default_time,
@@ -339,12 +404,12 @@ fn names_only_manifests_assemble_but_cannot_be_planned() {
 fn empty_manifest_is_an_empty_volume() {
     let m = load("empty", "Uapi16Manifest");
     let (img, mut v, skipped) = planned_volume(&m);
-    assert!(skipped.is_empty());
+    assert_eq!(skipped, 0);
     // Git keeps no empty directory, so the empty tree is made here; the
     // source is resolved once, before the assembly, like any other.
     let tree = Temp::dir();
-    let mut source = DirectorySource::new(host::open_dir(tree.path()).unwrap());
-    let report = v.assemble(&m, &mut source, &AssembleOptions::default()).unwrap();
+    let mut source = DirectorySource::new(PinnedDirectory::new(host::open_dir(tree.path()).unwrap()));
+    let report = m.assemble(&mut v, &mut source, &AssembleOptions::default()).unwrap();
     assert_eq!((report.files, report.directories, report.bytes), (0, 0, 0));
     assert!(v.read_dir("/").unwrap().is_empty());
     v.close().unwrap();
@@ -366,12 +431,12 @@ fn generator_agrees_with_systemd_manifest() {
     let src = tree("esp");
     let mut dirs: Vec<(PathBuf, u64)> = Vec::new();
     for e in &m.entries {
-        let name = e.name.as_deref().unwrap();
+        let name = e.name.as_str();
         let dest = copy.path().join(name);
         match e.inode_type {
             InodeType::Directory => {
                 std::fs::create_dir_all(&dest).unwrap();
-                dirs.push((dest, e.mtime_nsec.unwrap()));
+                dirs.push((dest, e.inode.mtime_nsec.unwrap()));
             }
             InodeType::Regular => {
                 std::fs::copy(src.join(name), &dest).unwrap();
@@ -379,14 +444,14 @@ fn generator_agrees_with_systemd_manifest() {
                     .write(true)
                     .open(&dest)
                     .unwrap()
-                    .set_modified(time(e.mtime_nsec.unwrap()))
+                    .set_modified(time(e.inode.mtime_nsec.unwrap()))
                     .unwrap();
             }
             other => panic!("unexpected {:?}", other),
         }
     }
     dirs.sort_by_key(|(p, _)| std::cmp::Reverse(p.components().count()));
-    dirs.push((copy.path().to_path_buf(), m.root.mtime_nsec.unwrap()));
+    dirs.push((copy.path().to_path_buf(), m.root.inode.mtime_nsec.unwrap()));
     for (dir, nsec) in dirs {
         std::fs::File::open(&dir).unwrap().set_modified(time(nsec)).unwrap();
     }
@@ -413,7 +478,8 @@ fn generator_agrees_with_systemd_manifest() {
 fn volume_manifest_agrees_with_systemd_manifest() {
     let m = load("esp", "size-hash-mtime.Uapi16Manifest");
     let (_img, mut v, _) = planned_volume(&m);
-    v.assemble(&m, &mut source("esp"), &AssembleOptions::default()).unwrap();
+    m.assemble(&mut v, &mut source("esp"), &AssembleOptions::default())
+        .unwrap();
     for (name, features, listed, listed_by_volume) in [
         (
             "none.Uapi16Manifest",
@@ -429,7 +495,7 @@ fn volume_manifest_agrees_with_systemd_manifest() {
         ),
     ] {
         let mut ours = Vec::new();
-        v.write_manifest(m.root.mtime(), features, &mut ours).unwrap();
+        v.write_manifest(m.root.inode.mtime(), features, &mut ours).unwrap();
         let theirs = std::fs::read_to_string(fixtures().join("esp").join(name)).unwrap();
         assert!(theirs.contains(listed), "{} does not list {}", name, listed);
         assert_eq!(
@@ -445,14 +511,14 @@ fn volume_manifest_agrees_with_systemd_manifest() {
 /// root file object, its file objects and its signature objects.
 #[derive(Debug, PartialEq)]
 struct ManifestObjects {
-    root: uapi16::RootObject,
-    files: Vec<uapi16::FileObject>,
+    root: RootObject,
+    files: Vec<FileObject>,
     signatures: Vec<uapi16::Signature>,
 }
 
 impl ManifestObjects {
     fn read(bytes: &[u8]) -> Result<ManifestObjects, uapi16::Error> {
-        let mut reader = uapi16::Reader::open(bytes)?;
+        let mut reader = Reader::open(bytes)?;
         let mut objects = ManifestObjects {
             root: reader.root().clone(),
             files: Vec::new(),
@@ -460,8 +526,8 @@ impl ManifestObjects {
         };
         for object in &mut reader {
             match object? {
-                uapi16::Object::File(file) => objects.files.push(*file),
-                uapi16::Object::Signature(signature) => objects.signatures.push(signature),
+                Object::File(file) => objects.files.push(*file),
+                Object::Signature(signature) => objects.signatures.push(signature),
                 other => panic!("{:?} is neither a file object nor a signature", other),
             }
         }

@@ -9,8 +9,11 @@
 //! FAT32 minimum demands.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::os::fd::BorrowedFd;
 use std::path::PathBuf;
+
+use uapi16::{Object, Order, Reader};
 
 use crate::dir::MAX_SLOTS;
 use crate::dirent::DIR_ENTRY_SIZE;
@@ -18,11 +21,12 @@ use crate::errno::*;
 use crate::format::{encode_label, FormatOptions};
 use crate::host::{walk_tree, HostEntry, UnnamableEntry};
 use crate::layout::{self, Layout, LayoutParams, MAX_CLUSTERS, MAX_CLUSTER_SIZE, MAX_SECTORS_PER_CLUSTER};
+use crate::manifest::{path_in_volume, AssembleFlags, EntryKind, ObjectAction, ObjectTriage, SizePurpose};
 use crate::name::{Alias, LongName};
 use crate::path::components;
 use crate::sys;
 use crate::volume::MAX_FILE_SIZE;
-use crate::{Context, Result};
+use crate::{Context, Error, Result};
 use crate::{Detail, NoSpaceReason};
 
 /// Parameters the size of a volume depends on.
@@ -301,6 +305,40 @@ impl Plan {
         Ok(skipped)
     }
 
+    /// Adds the files and directories of a manifest while `reader` reads
+    /// it to its end, the way an assembly with `flags` stores them: what
+    /// this crate cannot store fails the plan as it fails the assembly,
+    /// unless [`AssembleFlags::SKIP_UNSUPPORTED`] leaves it out. Returns how
+    /// many file objects are left out, see [`EntryKind`]. The manifest has to
+    /// declare the code point order, and its file objects have to be in it,
+    /// as for an assembly. Every regular file needs a size.
+    pub fn add_records<R: Read>(&mut self, reader: &mut Reader<R>, flags: AssembleFlags) -> Result<u64> {
+        reader.root().require_order(Order::CodePoint)?;
+        let mut triage = ObjectTriage::default();
+        let mut skipped = 0;
+        while let Some(object) = reader.next() {
+            let Object::File(object) = object? else {
+                continue;
+            };
+            let path = path_in_volume(&object.name);
+            match triage.decide(&object, flags)? {
+                ObjectAction::Skip(_) => skipped += 1,
+                ObjectAction::Store(EntryKind::Directory) => self.add_dir(&path)?,
+                ObjectAction::Store(EntryKind::File) => {
+                    let Some(size) = object.size else {
+                        return Err(Error::no_size(
+                            object.name.as_str(),
+                            Some(reader.record_number()),
+                            SizePurpose::Planning,
+                        ));
+                    };
+                    self.add_file(&path, size)?;
+                }
+            }
+        }
+        Ok(skipped)
+    }
+
     /// The smallest volume for the plan with a given cluster size.
     pub fn estimate_for(&self, cluster_size: u32) -> Result<Estimate> {
         let ss = self.options.sector_size;
@@ -392,6 +430,7 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ManifestProblem;
 
     fn options(ss: u32, cs: Option<u32>) -> PlanOptions {
         PlanOptions {
@@ -481,5 +520,99 @@ mod tests {
         let e = p.estimate().unwrap();
         assert!(e.layout.clusters >= layout::MIN_CLUSTERS);
         assert!(e.size() > 256 << 20);
+    }
+
+    #[test]
+    fn manifests_leave_out_what_an_assembly_leaves_out() {
+        let records = concat!(
+            "\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n",
+            "\x1e{\"name\":\"a\",\"size\":600}\n",
+            "\x1e{\"contents\":[{\"literal\":\"eA==\"}],\"name\":\"link\",\"type\":\"lnk\"}\n",
+            "\x1e{\"name\":\"sub\",\"sha256\":\"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\",\"size\":5,\"type\":\"dir\"}\n",
+            "\x1e{\"name\":\"sub/x\",\"size\":1}\n",
+            "\x1e{\"name\":\"sub/y\",\"type\":\"dir\"}\n",
+            "\x1e{\"name\":\"sub/y/z\",\"size\":1}\n",
+            "\x1e{\"name\":\"z\",\"size\":1}\n",
+            "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
+        );
+        let mut plan = Plan::new(options(512, Some(512)));
+        let mut reader = Reader::open(records.as_bytes()).unwrap();
+        assert_eq!(
+            plan.add_records(&mut reader, AssembleFlags::SKIP_UNSUPPORTED).unwrap(),
+            5
+        );
+        let e = plan.estimate().unwrap();
+        assert_eq!(
+            (e.files, e.directories, e.bytes, e.data_clusters),
+            (2, 0, 601, 1 + 2 + 1)
+        );
+        // Without SKIP_UNSUPPORTED the plan fails where the assembly fails.
+        let mut plan = Plan::new(options(512, Some(512)));
+        let mut reader = Reader::open(records.as_bytes()).unwrap();
+        let e = plan.add_records(&mut reader, AssembleFlags::NONE).unwrap_err();
+        assert_eq!(e.errno(), EOPNOTSUPP);
+        // A file FAT32 cannot hold and one without a size cannot be
+        // planned, and a manifest out of code point order not at all.
+        for (records, errno) in [
+            (
+                concat!(
+                    "\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n",
+                    "\x1e{\"name\":\"big\",\"size\":4294967296}\n",
+                    "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
+                ),
+                EFBIG,
+            ),
+            (
+                concat!(
+                    "\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n",
+                    "\x1e{\"name\":\"b\",\"size\":1}\n",
+                    "\x1e{\"name\":\"a\",\"size\":1}\n",
+                    "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
+                ),
+                EBADMSG,
+            ),
+            (
+                concat!(
+                    "\x1e{\"features\":[],\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n",
+                    "\x1e{\"name\":\"a\"}\n",
+                    "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
+                ),
+                EINVAL,
+            ),
+        ] {
+            let mut plan = Plan::new(options(512, None));
+            let mut reader = Reader::open(records.as_bytes()).unwrap();
+            assert_eq!(
+                plan.add_records(&mut reader, AssembleFlags::SKIP_UNSUPPORTED)
+                    .unwrap_err()
+                    .errno(),
+                errno,
+                "{}",
+                records
+            );
+        }
+        // Nor one that does not declare the order, even with its objects in
+        // it. Nothing of it is counted.
+        let undeclared = concat!(
+            "\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\"}\n",
+            "\x1e{\"name\":\"a\",\"size\":1}\n",
+            "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
+        );
+        let mut plan = Plan::new(options(512, None));
+        let mut reader = Reader::open(undeclared.as_bytes()).unwrap();
+        let e = plan
+            .add_records(&mut reader, AssembleFlags::SKIP_UNSUPPORTED)
+            .unwrap_err();
+        assert_eq!(e.errno(), EBADMSG);
+        assert_eq!(
+            e.detail(),
+            Some(&Detail::Manifest {
+                problem: ManifestProblem::Malformed(uapi16::Problem::NoOrder),
+                record: Some(0),
+                name: None,
+                field: Some("order".to_string()),
+            })
+        );
+        assert_eq!(plan.estimate().unwrap().files, 0);
     }
 }

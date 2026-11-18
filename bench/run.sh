@@ -167,7 +167,9 @@ small_file() { # small_file PATH SIZE SEED
 }
 
 make_inputs() {
-    local stamp=$IN/.ready-$WIDE
+    # The stamp names the order the manifests are written in: the inputs of
+    # a ufat from before manifests had to declare it are built again.
+    local stamp=$IN/.ready-$WIDE-codepoint
     [ -e "$stamp" ] && return
     say "building inputs under $IN (WIDE=$WIDE)"
     rm -rf "$IN"; mkdir -p "$IN"

@@ -117,7 +117,8 @@ The reply does not depend on the call. It is:
         "caseSensitive" : false,
         "nameLengthMax" : 255,
         "nameUnit" : "utf16Units",
-        "fileSizeMaxBytes" : 4294967295
+        "fileSizeMaxBytes" : 4294967295,
+        "manifest" : { "order" : "codepoint" }
       }
     }
 
@@ -147,6 +148,8 @@ What the fields mean for vfat:
   time does not. Times are stored as UTC.
 - Names are compared without regard to case and hold up to 255 UTF-16
   units. A file holds at most 4294967295 bytes.
+- `manifest` says that the root object of a manifest given as content has
+  to declare `"order": "codepoint"`, see "Content".
 
 ### Assemble
 
@@ -160,7 +163,8 @@ What the fields mean for vfat:
 
 Mode `assemble` creates the file system and copies the content into it,
 in one call. Mode `plan` computes the geometry and the size the content
-needs. It writes nothing.
+needs. It writes nothing. It reads a manifest once, from its start to
+its end, so the manifest can come through a pipe.
 
 Mode `assemble` does not format over what the image holds. It fails with
 `ImageNotEmpty` when the part of the image that it would format holds a
@@ -178,6 +182,8 @@ How the image is sized:
   exact size the content needs. It is never shrunk.
 - With a `size`, the file system gets that size. Content that does not
   fit fails with `TooSmall` before anything is written.
+- Content is planned first. A manifest is read twice then, so it has to
+  be a regular file.
 - Without content, a regular image file is grown to `size`. An empty
   image file without a `size` fails with `SizeRequired`.
 - A block device is never resized.
@@ -283,6 +289,11 @@ manifest names its paths from the root, so with a manifest `path` has to
 be `/`. Without content, `Populate` creates an empty directory at `path`.
 With `parents`, an existing directory at `path` is accepted.
 
+Content that fails to go in leaves the file system marked as not cleanly
+unmounted, as after a crash, with what was complete, unless nothing was
+written yet. A manifest that is refused at its first object leaves the
+file system as it was.
+
 The reply carries the counts `files`, `directories`, `bytes` and
 `skipped`, and with a `manifestSink` also `omitted`.
 
@@ -383,10 +394,45 @@ what the content is:
 | Directory | given | The tree the manifest describes. File references are resolved below the directory. |
 | none | given | Only for `Assemble` in mode `plan`, which needs no data. |
 
-Other combinations fail with `InvalidParameter`. When a manifest's
-contents come from a directory, every file the manifest names is checked
-first. A file that is missing, not a regular file or of the wrong size
-fails the call with `SourceMismatch` before the image is changed.
+Other combinations fail with `InvalidParameter`.
+
+A manifest is read one record at a time, and what a record describes is
+written when the record comes. So a manifest of any size can come through
+a pipe, unless it is planned before its content is written: `Assemble` in
+mode `assemble` plans its content first, so there it has to be a regular
+file. A pipe fails with `BadFileDescriptor` and reason `wrongType` then.
+Mode `plan` reads the manifest once and takes a pipe. A plan keeps the
+name of every file and directory of the manifest, so the memory
+`Assemble` uses grows with the manifest.
+
+When the file contents come from a stream, the manifest and the stream
+are read in lockstep: a record of the manifest, then the contents of the
+file it describes, then the next record. A client that passes both as
+pipes has to write them at the same time, from two threads or with
+`poll()`. A client that writes all of the manifest before the contents
+can deadlock: it waits for room in the manifest pipe while the service
+waits for contents.
+
+The root object of a manifest has to declare `"order": "codepoint"`, and
+its objects have to be in that order. The manifests ufat writes are. A
+manifest without the declaration fails with `InvalidManifest` and reason
+`noOrder`, also when its objects are sorted. `systemd-manifest make` sorts
+its output this way, and declares it since systemd commit 330fab5e90,
+which is not in a release yet. An object out of order fails with reason
+`outOfOrder` or `misplaced`. A name that comes twice fails with reason
+`duplicateName` when it comes right after itself or right after the
+objects below the directory it names, and with reason `outOfOrder`
+otherwise.
+
+When a manifest's contents come from a directory, each file is looked up
+when it is copied. The contents are the part of the file that starts at
+the offset the manifest gives and is as long as the manifest says,
+whatever else the file holds. A file that is missing or not a regular
+file fails the call with `SourceMismatch`. A file that is too short for
+the contents, or not of the `originalSize` the manifest gives for it,
+fails with `ContentMismatch` and reason `size`. `sizeBytes` is the size of
+the file and `expectedSizeBytes` the size it needs. A file that changes
+while it is read fails with `ContentMismatch` and reason `sourceChanged`.
 
 Symbolic links below a source directory are followed. They are resolved
 below that directory and never lead out of it.
@@ -397,14 +443,23 @@ The other fields of `Content`:
 |---|---|
 | `manifest` | A UAPI.16 manifest: `fileDescriptor` names it. `checkValidity`, true by default, rejects revoked entries and entries outside their validity window with `EntryNotValid`. |
 | `times` | `preserve` keeps modification times. This is the default. `fixed` sets every entry to the time stamp. `clamp` keeps times up to the time stamp and sets later ones to it. |
-| `unsupported` | `skip`, the default, leaves out what FAT cannot store and counts it in `skipped`. `fail` fails with `ContentNotSupported` before anything is written. |
+| `unsupported` | `skip`, the default, leaves out what FAT cannot store and counts it in `skipped`. `fail` fails with `ContentNotSupported`: for a tree before anything is written, for a manifest when the object's record comes. |
 | `replace` | Replaces existing files. True by default. With `false`, an existing file fails with `FileExists`. |
 | `extendedAttributes`, `uid`, `gid` | Accepted and ignored. FAT stores none of them. |
 | `manifestSink` | Writes a UAPI.16 manifest of the whole volume after the content is in. |
 
 What FAT cannot store: sockets, FIFOs and device nodes in a tree, and
-manifest entries that need a `url`, an `encoding` or an `offset`, that
-refer to a sub-manifest, or that have an inode type FAT does not have.
+manifest entries whose contents are only at a `url` or in an `encoding`,
+that refer to a sub-manifest, or that have an inode type FAT does not
+have. With `skip`, a directory that is left out takes everything below it
+along, and each entry counts in `skipped`. A file larger than 4294967295
+bytes fails with `TooLarge` whatever `unsupported` says.
+
+Contents that start at an `offset` in their file can only come from a
+directory. A stream has the contents of each file and nothing else of it.
+So with a stream, an entry with an `offset` fails with
+`ContentNotSupported` and `what` set to `offset` when its record comes,
+whatever `unsupported` says.
 
 The sizes and SHA-256 hashes in a manifest are verified while the
 contents are copied. A mismatch fails with `ContentMismatch`.
@@ -412,7 +467,9 @@ contents are copied. A mismatch fails with `ContentMismatch`.
 A stream has to end after the last file. A stream that ends early fails
 with `ContentMismatch` and reason `streamEnded`, for the file it ended
 in. A stream with more data after the last file fails with
-`ContentMismatch` and reason `size`, for the last file.
+`ContentMismatch` and reason `size`, for the last file. That is found
+when the manifest has ended, and the last file is in the file system
+then.
 
 The `name` of `SourceMismatch` and `ContentMismatch` is the name of the
 file's record in the manifest, such as `loader/loader.conf`.
@@ -489,7 +546,7 @@ Each parameter needs a descriptor of a certain kind:
 |---|---|
 | `image.fileDescriptor` | A regular file or a block device. Open read-write for `Assemble` in mode `assemble`, `Populate` and `Remove`. Read-only or read-write for `Describe`, `List` and `Check`. |
 | `content.sourceFileDescriptor` | A directory, a regular file or a pipe, open read-only. |
-| `content.manifest.fileDescriptor` | A regular file or a pipe, open read-only. A manifest of any size can be passed this way. |
+| `content.manifest.fileDescriptor` | A regular file or a pipe, open read-only. A manifest of any size can be passed this way. `Assemble` in mode `assemble` needs a regular file. |
 | `manifestSink.fileDescriptor` | A regular file or a pipe, open for writing. `O_APPEND` is allowed. |
 
 The service checks every descriptor before it uses it. The call fails
@@ -504,11 +561,13 @@ descriptor:
 - is not open read-write for a method that writes (`notReadWrite`),
 - is not open read-only for a source or a manifest (`notReadOnly`),
 - is not open for writing for a manifest sink (`notWritable`),
-- is not of the type the parameter needs (`wrongType`).
+- is not of the type the parameter needs (`wrongType`), also a manifest
+  on a pipe for `Assemble` in mode `assemble`.
 
-All descriptors are checked, and the manifest is read and verified,
-before the image is opened. A call that fails this way leaves the image
-unchanged.
+All descriptors are checked, and the first record of a manifest is read,
+before the image is opened. `Assemble` in mode `assemble` reads the
+whole manifest before the image is changed. A call that fails this way
+leaves the image unchanged.
 
 A pipe that is made non-blocking during the call fails it with
 `BadFileDescriptor` and the reason `flags` once the service has to wait
@@ -550,10 +609,10 @@ The service returns no text. Every error is a name with typed fields.
 | `InvalidName` | A name FAT cannot store. | `name`, `reason` (`empty`, `dotComponent`, `invalidCharacter`, `leadingSpace`, `trailingSpaceOrDot`, `tooLong`) |
 | `InvalidLabel` | A label that breaks the label rules. | `label`, `reason` (`tooLong`, `invalidCharacter`) |
 | `InvalidIdentifier` | A serial number that is not `XXXX-XXXX` or eight hex digits. | `identifier`, `reason` (`malformed`) |
-| `InvalidManifest` | The manifest cannot be parsed or is inconsistent. | `reason`, `record`, `name`, `field` |
-| `SourceMismatch` | A file the manifest names is missing from the source directory, not a regular file, or of the wrong size. | `name`, `reason` (`missing`, `notRegular`, `size`), `sizeBytes`, `expectedSizeBytes` |
-| `ContentMismatch` | Copied contents do not match the manifest. | `name`, `reason` (`size`, `hash`, `streamEnded`), `sizeBytes`, `expectedSizeBytes` |
-| `ContentNotSupported` | Content FAT cannot store, with `unsupported` set to `fail`. | `what` (`url`, `encoding`, `offset`, `transport`, `subManifest`, `inodeType`), `name`, `value` |
+| `InvalidManifest` | The manifest cannot be parsed or is inconsistent. A key twice in an object is reason `duplicateKey`. With reason `unlistedFeature`, `field` names the field of a feature the manifest does not list, such as `mTimeNSec`. | `reason`, `record`, `name`, `field` |
+| `SourceMismatch` | A file the manifest names is missing from the source directory, or not a regular file. | `name`, `reason` (`missing`, `notRegular`) |
+| `ContentMismatch` | Copied contents do not match the manifest, or a file of the source directory is too short for them or changed while it was read. | `name`, `reason` (`size`, `hash`, `streamEnded`, `sourceChanged`), `sizeBytes`, `expectedSizeBytes` |
+| `ContentNotSupported` | Content FAT cannot store, with `unsupported` set to `fail`. Contents at an `offset` that come from a stream. | `what` (`offset`, `subManifest`, `inodeType`, or `transport` for contents only at a URL or in an encoding, which `value` names), `name`, `value` |
 | `EntryNotValid` | A manifest entry is revoked or outside its validity window. | `name`, `reason` (`revoked`, `notYetValid`, `expired`) |
 | `NotReproducible` | `reproducible` without `identifier` or `timestampUSec`. | `reason` (`identifierRequired`, `timestampRequired`) |
 | `ImageBusy` | The block device is mounted or claimed by another process. | none |
@@ -628,8 +687,9 @@ Notes:
 - Files below a passed directory are opened with the service's
   credentials. This is why only root and the service's own user may
   connect.
-- Memory use does not grow with the volume. 512M leaves room for several
-  connections.
+- Memory use does not grow with the volume, and not with a manifest that
+  `Populate` writes. `Assemble` keeps the names of a manifest while it
+  plans it. 512M leaves room for several connections.
 - `DynamicUser=yes` works. Only root can then connect.
 - Do not set `LimitFSIZE=`. A write past the limit kills the process with
   SIGXFSZ.

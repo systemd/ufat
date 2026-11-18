@@ -37,8 +37,11 @@ use fat::fat::{Entry, Fat, BAD_CLUSTER, END_OF_CHAIN_MIN, ENTRY_MASK, ENTRY_SIZE
 use fat::format::{self, FormatOptions};
 use fat::fsck::{self, ProblemKind, Severity};
 use fat::layout::{Layout, FIRST_CLUSTER};
-use fat::name::{join_long_name, parse_long_name_entry, short_name_to_string, LongNameEntry};
-use fat::sha256;
+use fat::manifest::Sha256;
+use fat::name::{
+    join_long_name, parse_long_name_entry, short_name_to_string, LongNameEntry, LFN_MAX_ENTRIES, LFN_UNITS_PER_ENTRY,
+    MAX_LONG_NAME,
+};
 use fat::time::FatTimestamp;
 use fat::volume::Volume;
 
@@ -134,6 +137,12 @@ fn read_trace(path: &Path) -> Vec<Record> {
 enum Op {
     /// `create_dir_all`.
     Mkdir(String),
+    /// `create_dir`, and whether its parent grows a cluster for the entry,
+    /// which the harness checks.
+    CreateDir {
+        path: String,
+        grows: bool,
+    },
     /// A file written `chunk` bytes per write call, replacing an existing
     /// file of that name or not.
     Write {
@@ -151,6 +160,11 @@ impl Op {
     fn describe(&self) -> String {
         match self {
             Op::Mkdir(p) => format!("mkdir {}", p),
+            Op::CreateDir { path, grows } => format!(
+                "create_dir {}{}",
+                path,
+                if *grows { ", growing its parent" } else { "" }
+            ),
             Op::Write {
                 path,
                 data,
@@ -180,7 +194,8 @@ impl Op {
 
 /// A tree with long names, files replaced within one directory cluster and
 /// across two, a directory grown past its first cluster, a removed file
-/// whose slots are reused, nested directories. BOOTX64.EFI is written in
+/// whose slots are reused, nested directories, directories made with and
+/// without their parent growing for them. BOOTX64.EFI is written in
 /// small pieces so that its epoch holds many writes; the kernel names take
 /// four slots each.
 fn scenario(slots_per_cluster: usize) -> Vec<Op> {
@@ -226,6 +241,38 @@ fn scenario(slots_per_cluster: usize) -> Vec<Op> {
     // Now the only room is in the directory's second cluster: the old
     // entry's deletion and the new entry are two cluster writes.
     file(&mut ops, &kernel(2), 4000, true, whole);
+    // A directory made where its parent has room, and one made in /full
+    // after empty files with long names fill the first cluster of /full to
+    // its last slot, so that /full grows for the entry. The new cluster of
+    // /full is zeroed and synced before the new directory's cluster is
+    // allocated and written, and the entry comes last.
+    ops.push(Op::CreateDir {
+        path: "/loader/keys".into(),
+        grows: false,
+    });
+    ops.push(Op::Mkdir("/full".into()));
+    let mut free = slots_per_cluster - 2;
+    let mut n = 0;
+    while free > 0 {
+        // A name in k slots: k - 1 long name slots of LFN_UNITS_PER_ENTRY
+        // characters each, MAX_LONG_NAME characters at most, and the short
+        // entry. A name in one slot is a short name.
+        let k = free.min(LFN_MAX_ENTRIES + 1);
+        let name = if k == 1 {
+            format!("F{}", n)
+        } else {
+            let prefix = format!("fill-{}-", n);
+            let len = (LFN_UNITS_PER_ENTRY * (k - 1)).min(MAX_LONG_NAME);
+            format!("{}{}", prefix, "x".repeat(len - prefix.len()))
+        };
+        file(&mut ops, &format!("/full/{}", name), 0, false, whole);
+        free -= k;
+        n += 1;
+    }
+    ops.push(Op::CreateDir {
+        path: "/full/sub".into(),
+        grows: true,
+    });
     ops.push(Op::Close);
     ops
 }
@@ -270,8 +317,8 @@ fn join(dir: &str, name: &str) -> String {
     }
 }
 
-fn hash_of(data: &[u8]) -> [u8; 32] {
-    sha256::digest(data)
+fn hash_of(data: &[u8]) -> [u8; Sha256::SIZE] {
+    Sha256::digest(data).into()
 }
 
 /// The tree the scenario means to leave after `ops`.
@@ -286,6 +333,9 @@ fn simulate(ops: &[Op]) -> Tree {
                     cur.push_str(comp);
                     tree.insert(cur.clone(), Node::Dir);
                 }
+            }
+            Op::CreateDir { path, .. } => {
+                tree.insert(path.clone(), Node::Dir);
             }
             Op::Write { path, data, .. } => {
                 tree.insert(
@@ -309,7 +359,7 @@ fn show_node(node: Option<&Node>) -> String {
     match node {
         None => "absent".into(),
         Some(Node::Dir) => "directory".into(),
-        Some(Node::File { size, hash }) => format!("{} bytes {}", size, &sha256::to_hex(hash)[..12]),
+        Some(Node::File { size, hash }) => format!("{} bytes {}", size, &Sha256::from(*hash).to_string()[..12]),
     }
 }
 
@@ -616,6 +666,7 @@ impl Harness {
             v.device().trace_note(&op.describe()).unwrap();
             match op {
                 Op::Mkdir(path) => v.create_dir_all(path, fixed_time()).unwrap(),
+                Op::CreateDir { path, .. } => v.create_dir(path, fixed_time()).unwrap(),
                 Op::Write {
                     path,
                     data,
@@ -797,6 +848,22 @@ impl Harness {
                 if e.is_dir {
                     chains.insert(e.path.clone(), e.chain.clone());
                 }
+            }
+            if let Some(Op::CreateDir { path, grows }) = j.checked_sub(1).map(|k| &self.ops[k]) {
+                let parent = parent_of(path);
+                let clusters = |owners: &HashMap<u32, (String, bool)>| {
+                    owners.values().filter(|(p, dir)| *dir && p == parent).count()
+                };
+                let (before, after) = (clusters(&self.boundaries[j - 1].owners), clusters(&owners));
+                assert_eq!(
+                    after > before,
+                    *grows,
+                    "{}: {} has {} clusters before and {} after",
+                    self.boundary_name(j),
+                    parent,
+                    before,
+                    after
+                );
             }
             self.legit.extend(raw.referenced());
             self.boundaries.push(Boundary {

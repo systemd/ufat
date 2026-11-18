@@ -237,16 +237,15 @@ impl ManifestProblem {
 }
 
 /// How a file below the source directory fails to be what the manifest
-/// describes, found before anything is written.
+/// describes, found when it is opened to be copied. A file too short for
+/// the contents the manifest says it holds, or not of the size the manifest
+/// gives for it, is found while it is copied, see [`ContentProblem::Size`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceProblem {
     /// The file is not there.
     Missing,
     /// It is not a regular file.
     NotRegular,
-    /// Its size is not what the manifest says, or too short for the
-    /// offset and size asked for.
-    Size,
 }
 
 impl SourceProblem {
@@ -255,7 +254,6 @@ impl SourceProblem {
         match self {
             SourceProblem::Missing => "missing",
             SourceProblem::NotRegular => "notRegular",
-            SourceProblem::Size => "size",
         }
     }
 }
@@ -263,12 +261,16 @@ impl SourceProblem {
 /// How file contents fail to match the manifest while being copied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContentProblem {
-    /// Not as many bytes as the manifest says.
+    /// Not as many bytes as the manifest says, or in a file of the source
+    /// that is too short for them or not of the size the manifest gives for
+    /// it.
     Size,
     /// Not the SHA-256 hash the manifest says.
     Hash,
     /// The stream ended before the file was complete.
     StreamEnded,
+    /// The file of the source they are in changed while it was read.
+    SourceChanged,
 }
 
 impl ContentProblem {
@@ -278,6 +280,7 @@ impl ContentProblem {
             ContentProblem::Size => "size",
             ContentProblem::Hash => "hash",
             ContentProblem::StreamEnded => "streamEnded",
+            ContentProblem::SourceChanged => "sourceChanged",
         }
     }
 }
@@ -285,10 +288,6 @@ impl ContentProblem {
 /// What a manifest asks for that cannot be done.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnsupportedKind {
-    /// Contents to be fetched from a URL.
-    Url,
-    /// Contents in an encoding, named by `value`.
-    Encoding,
     /// Contents at an offset into a streamed source.
     Offset,
     /// Contents only available through a transport, named by `value`.
@@ -303,8 +302,6 @@ impl UnsupportedKind {
     /// The value as the Varlink interface spells it.
     pub fn as_str(self) -> &'static str {
         match self {
-            UnsupportedKind::Url => "url",
-            UnsupportedKind::Encoding => "encoding",
             UnsupportedKind::Offset => "offset",
             UnsupportedKind::Transport => "transport",
             UnsupportedKind::SubManifest => "subManifest",
@@ -414,6 +411,10 @@ pub enum Detail {
         problem: DescriptorProblem,
         /// The offending status flags, when that is the problem.
         flags: Option<i32>,
+        /// The parameter the descriptor was passed as, where its vetting or
+        /// a read or write of it knows that name, as host::passed_stream()
+        /// and the stream it returns do.
+        parameter: Option<&'static str>,
     },
     /// The manifest is malformed.
     Manifest {
@@ -427,18 +428,16 @@ pub enum Detail {
         field: Option<String>,
     },
     /// A file the manifest names is not below the source directory as the
-    /// manifest describes it, found before anything is written.
+    /// manifest describes it: missing, or not a regular file.
     Source {
         /// The entry's name, exactly as its record in the manifest has it.
         name: String,
         /// What is wrong.
         problem: SourceProblem,
-        /// The size found, when sizes are the problem.
-        size: Option<u64>,
-        /// The size the manifest says, when sizes are the problem.
-        expected: Option<u64>,
     },
-    /// File contents do not match the manifest.
+    /// File contents do not match the manifest, found while they are
+    /// copied: a file below the source directory that is too short for
+    /// them among them, or one that changed while it was read.
     Content {
         /// The entry's name, exactly as its record in the manifest has it.
         name: String,
@@ -446,7 +445,8 @@ pub enum Detail {
         problem: ContentProblem,
         /// The size found, when sizes are the problem.
         size: Option<u64>,
-        /// The size the manifest says, when sizes are the problem.
+        /// The size the manifest says, when sizes are the problem: for a
+        /// part of a file, the size the file needs to hold it.
         expected: Option<u64>,
     },
     /// The manifest asks for something that cannot be done.
@@ -540,21 +540,6 @@ impl Error {
         self
     }
 
-    /// Fills in the record index and the object's name of a manifest
-    /// error that lacks them.
-    #[must_use]
-    pub fn in_record(mut self, index: u64, object: Option<&str>) -> Self {
-        if let Some(Detail::Manifest { record, name, .. }) = &mut self.0.detail {
-            if record.is_none() {
-                *record = Some(index);
-            }
-            if name.is_none() {
-                *name = object.map(str::to_string);
-            }
-        }
-        self
-    }
-
     /// The message describing this error.
     pub fn message(&self) -> &str {
         &self.0.message
@@ -578,21 +563,45 @@ impl fmt::Debug for Error {
     }
 }
 
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        // An io::Error wrapping one of our own errors comes back unchanged.
-        if let Some(inner) = e.get_ref().and_then(|i| i.downcast_ref::<Error>()) {
-            return inner.clone();
+/// The errno of an [`std::io::Error`], and an error of ours it carries.
+pub(crate) trait IoErrorExt {
+    /// The error of ours the error carries, such as the one a passed
+    /// stream fails with when it was made non-blocking during the call
+    /// (host::PassedStream).
+    fn own_error(&self) -> Option<&Error>;
+
+    /// The errno the error stands for: that of an error of ours it
+    /// carries, the one the system gave, or the one that fits its kind.
+    fn errno(&self) -> i32;
+}
+
+impl IoErrorExt for std::io::Error {
+    fn own_error(&self) -> Option<&Error> {
+        self.get_ref().and_then(|inner| inner.downcast_ref::<Error>())
+    }
+
+    fn errno(&self) -> i32 {
+        if let Some(own) = self.own_error() {
+            return own.errno();
         }
-        let errno = match e.raw_os_error() {
+        match self.raw_os_error() {
             Some(n) => n,
-            None => match e.kind() {
+            None => match self.kind() {
                 std::io::ErrorKind::InvalidInput => EINVAL,
                 std::io::ErrorKind::OutOfMemory => ENOMEM,
                 _ => EIO,
             },
-        };
-        Error::new(errno, e.to_string())
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        // An io::Error wrapping one of our own errors comes back unchanged.
+        if let Some(inner) = e.own_error() {
+            return inner.clone();
+        }
+        Error::new(e.errno(), e.to_string())
     }
 }
 

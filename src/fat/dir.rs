@@ -35,7 +35,7 @@ use crate::name::{
     fold_str, join_long_name, parse_long_name_entry, short_name_to_string, valid_short_char, Alias, LongNameEntry,
     LFN_MAX_ENTRIES,
 };
-use crate::Result;
+use crate::{Detail, Error, NoSpaceReason, Result};
 
 /// Largest number of slots a directory may have: 2 MiB of entries. Linux
 /// refuses to create entries beyond that and EDK2 addresses slots with 16
@@ -714,6 +714,29 @@ impl Directory {
         self.index.first_fit(count)
     }
 
+    /// The free slots at the end of the directory, which a cluster appended
+    /// to it continues.
+    pub(crate) fn free_at_end(&self) -> usize {
+        self.index
+            .holes
+            .last_key_value()
+            .filter(|&(&start, &len)| start + len == self.slots())
+            .map_or(0, |(_, &len)| len)
+    }
+
+    /// The error for a directory that would grow past [`MAX_SLOTS`] slots.
+    pub(crate) fn full() -> Error {
+        err!(
+            ENOSPC,
+            Detail::NoSpace {
+                reason: NoSpaceReason::DirectoryEntries,
+                path: None,
+            },
+            "directory is full, it cannot hold more than {} entries",
+            MAX_SLOTS
+        )
+    }
+
     /// Chooses the short name for an alias that needs a numeric tail: the
     /// candidate with the smallest tail no entry answers to, as mtools and
     /// Windows choose it. Candidates below a remembered hint are known to be
@@ -1174,6 +1197,42 @@ mod tests {
         s.nt_flags = alias.case_flags;
         d.write_entry(start, &lfn, &s);
         short_name
+    }
+
+    /// The free slots at the end, which a cluster appended continues:
+    /// free slots before an entry do not count, nor do reserved ones.
+    #[test]
+    fn free_at_end() {
+        let name = |i: usize| {
+            let mut n = [b' '; SHORT_NAME_SIZE];
+            n[..3].copy_from_slice(format!("F{:02}", i).as_bytes());
+            n
+        };
+        let at = |d: &Directory, slot: usize| d.entries().into_iter().find(|e| e.slot == slot).unwrap();
+        let mut d = dir();
+        assert_eq!(d.free_at_end(), 16);
+        for i in 0..13 {
+            d.write_entry(i, &[], &short(&name(i), ATTR_ARCHIVE));
+        }
+        assert_eq!(d.free_at_end(), 3);
+        assert_eq!(d.find_free_run(3), Some(13));
+        assert_eq!(d.find_free_run(4), None);
+        let e = at(&d, 5);
+        d.delete(&e);
+        assert_eq!(d.free_at_end(), 3);
+        assert!(d.reserve(13, 3));
+        assert_eq!(d.free_at_end(), 0);
+        assert!(d.release_reservation(13));
+        assert_eq!(d.free_at_end(), 3);
+        d.append_cluster(3);
+        assert_eq!(d.free_at_end(), 19);
+        for i in 13..32 {
+            d.write_entry(i, &[], &short(&name(i), ATTR_ARCHIVE));
+        }
+        assert_eq!(d.free_at_end(), 0);
+        let e = at(&d, 31);
+        d.delete(&e);
+        assert_eq!(d.free_at_end(), 1);
     }
 
     #[test]

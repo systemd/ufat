@@ -168,16 +168,42 @@ manifest instead of a tree:
 With `--manifest`, the one SOURCE is the directory that the manifest's
 file references point into. `-` reads the file contents from standard
 input instead, back to back in manifest order. Standard input has to end
-after the last file. A manifest names its paths from the root of the
-file system, so `--path` does not apply.
+after the last file. It has the contents of each file and nothing else
+of it, so an entry whose contents start at an offset in their file fails
+the command with `-`, whatever `--unsupported` says. A manifest names its
+paths from the root of the file system, so `--path` does not apply.
 
 `--manifest -` reads the manifest from standard input. The file
 contents then have to come from a directory.
 
-When the contents come from a directory, ufat first checks that every
-file the manifest names is there with the size the manifest gives. This
-happens before the image is changed. While copying, ufat verifies the
-size and the SHA-256 hash of every file. A mismatch fails the command.
+ufat reads a manifest one record at a time, and writes each file and
+directory when its record comes. So `populate` takes a manifest of any
+size, also through a pipe, and its memory use does not grow with the
+manifest. To size the file system to fit, ufat reads the manifest once
+before it writes anything, and keeps the name of every file and
+directory while it does. So `assemble` with a SOURCE needs the manifest
+in a regular file, and the memory `assemble` and `assemble --plan` use
+grows with the manifest. `assemble --plan` and `assemble` without a
+SOURCE read the manifest only once, so they take one through a pipe as
+well.
+
+The objects of a manifest have to be in code point order: every
+directory before what is in it, and the names of a directory sorted by
+their bytes. The root object of the manifest has to declare that order
+with `"order": "codepoint"`. `ufat manifest` writes manifests that way.
+`systemd-manifest make` sorts its output that way, and declares the order
+since systemd commit 330fab5e90, which is not in a release yet. ufat
+refuses a manifest that does not declare the order, that is out of that
+order, or that names a file twice. Two names that FAT does not tell
+apart, such as `A.TXT` and `a.txt`, are taken as one name.
+
+While copying, ufat verifies the size and the SHA-256 hash of every file.
+The data of a file is the part of its file below the SOURCE that starts
+at the offset the manifest gives and is as long as the manifest says,
+whatever else that file holds. A file that is missing below the SOURCE,
+too short for the data, or does not match fails the command, and the file
+system is left marked as not cleanly unmounted, with the files that were
+complete.
 
 Signatures in a manifest are recognized but not verified. Verify a
 signed manifest before you hand it to ufat.
@@ -298,6 +324,11 @@ crash. It holds the files that were complete when the command failed.
 it mounts the file system read-write. Running `assemble --force` again
 formats the file system anew.
 
+When `populate` fails while it writes a tree or a manifest, ufat leaves
+the file system marked the same way, unless nothing was written yet. A
+manifest that is refused at its first object leaves the file system as
+it was.
+
 A crash can leave a state that readers resolve in different ways. A
 replaced file can briefly exist twice, and a long name can lose its long
 form. `ufat check` reports both. Every reader still finds a complete file.
@@ -331,8 +362,9 @@ The crate `fat` provides the same operations as the tool:
   files and directories.
 - `populate` copies directory trees from the host into a volume.
 - `plan` computes the size a set of files needs.
-- `manifest` reads UAPI.16 manifests, builds volumes from them and writes
-  manifests.
+- `manifest` builds volumes from UAPI.16 manifests while they are read,
+  and writes manifests. The manifests themselves are read and written by
+  the crate `uapi16` in the same tree, which knows nothing of FAT.
 - `fsck` checks a volume.
 
 A path on the host is resolved once. Everything below it is reached

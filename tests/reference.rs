@@ -482,7 +482,7 @@ fn matches_sha256sum() {
     assert_eq!(expected.len(), files.len());
     for (name, data) in &files {
         assert_eq!(
-            fat::sha256::to_hex(&fat::sha256::digest(data)),
+            fat::manifest::Sha256::digest(data).to_string(),
             expected[name],
             "{}",
             name
@@ -493,11 +493,14 @@ fn matches_sha256sum() {
     fat::manifest::HostTree::new(dir.as_fd())
         .write_manifest(&mut bytes)
         .unwrap();
-    let manifest = fat::manifest::parse(&bytes).unwrap();
     let mut hashed = 0;
-    for entry in &manifest.entries {
-        if let (Some(name), Some(hash)) = (&entry.name, &entry.sha256) {
-            assert_eq!(fat::sha256::to_hex(hash), expected[name], "{}", name);
+    for object in fat::manifest::Reader::open(&bytes[..]).unwrap() {
+        let fat::manifest::Object::File(entry) = object.unwrap() else {
+            continue;
+        };
+        if let Some(hash) = &entry.sha256 {
+            let name = entry.name.as_str();
+            assert_eq!(hash.to_string(), expected[name], "{}", name);
             hashed += 1;
         }
     }

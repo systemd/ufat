@@ -23,6 +23,9 @@
 # name with typed fields and every finding of Check is a kind with its facts;
 # the client renders them in its own language.
 #
+# Sizes and times are 64-bit integers. They can be larger than 2^53, which a
+# JSON parser that keeps numbers as doubles cannot hold exactly.
+#
 # An implementation serves one filesystem type and is found the way mkfs
 # tools are found today: the executable mkfs.<type> speaks this interface
 # when it is started with a socket passed as LISTEN_FDS, so that
@@ -215,8 +218,22 @@ type Capabilities(
 	nameUnit: LengthUnit,
 	fileSizeMaxBytes: int,
 	# Features that can be turned on or off, if any
-	features: ?[]Feature
+	features: ?[]Feature,
+	# What a UAPI.16 manifest given as content has to be; absent unless
+	# manifest is among operations
+	manifest: ?ManifestCapabilities
 )
+
+# What an implementation requires of a UAPI.16 manifest given as content.
+type ManifestCapabilities(
+	# The order the root file object has to declare in its order field, and
+	# its file objects have to be in; absent when any order is taken
+	order: ?ManifestOrder
+)
+
+# An order of the file objects of a manifest, as the order field of UAPI.16
+# names it: codepoint, the code point order of their complete names.
+type ManifestOrder(codepoint)
 
 # How copied files get their timestamps: the source's, the given time, or
 # the source's clamped to the given time (SOURCE_DATE_EPOCH semantics).
@@ -271,8 +288,19 @@ type ManifestFeature(
 )
 
 # A UAPI.16 manifest as content, read from a regular file or a pipe to its
-# end as a JSON text sequence. The files it names come from the source
-# directory, or back to back in manifest order from the source stream.
+# end as a JSON text sequence, record by record while its content is written.
+# Its root file object has to declare "order": "codepoint", which UAPI.16 asks
+# of a manifest made for creating a filesystem (uapi-group/specifications#255),
+# and its file objects are checked to be in that order while they are read. A
+# manifest that does not declare the order is InvalidManifest with reason
+# noOrder, also when its file objects are in it. The files it names come from
+# the source directory, or back to back in manifest order from the source
+# stream. A manifest and a source stream are read in lockstep, a record and
+# then the contents of the file it describes, so a client that passes both as
+# pipes writes to both at the same time. Assemble in mode assemble plans the
+# content first: it reads the whole manifest before it writes and needs it in
+# a regular file; a pipe is BadFileDescriptor with reason wrongType then. In
+# mode plan the manifest is read once, and a pipe will do.
 type Manifest(
 	# Index of the descriptor, open read-only
 	fileDescriptor: int,
@@ -303,11 +331,10 @@ type ManifestSink(
 # a manifest, the contents of its files back to back, a pipe is such a
 # stream. With a manifest the tree is what the manifest describes: every
 # file it names is resolved below the source directory, symbolic links
-# followed and never leaving it, checked to be present with the size the
-# manifest says before anything is written, and its contents verified
-# against the manifest's sizes and SHA-256 hashes while copying. The root
-# directory takes the source directory's owner, mode and time where the
-# filesystem keeps them.
+# followed and never leaving it, and its contents verified against the
+# manifest's sizes and SHA-256 hashes while copying. The root directory takes
+# the source directory's owner, mode and time where the filesystem keeps
+# them.
 type Content(
 	# Index of the descriptor of the source: a directory, a regular file or
 	# a pipe, open read-only
@@ -704,15 +731,23 @@ error InvalidIdentifier(identifier: string, reason: IdentifierProblem)
 type ManifestProblem(notJson, duplicateKey, invalidString, notObject, notUtf8, nulByte, recordSeparator, recordTooLarge, empty, noTrailer, dataAfterTrailer, fileAfterSignature, mediaType, firstHasName, firstNotDirectory, noOrder, noName, invalidName, duplicateName, misplaced, outOfOrder, unlistedFeature, noTarget, unknownType, fieldType, fieldRange, fieldNotPermitted, contradiction, contents, signature, extendedAttributes, noSize)
 error InvalidManifest(reason: ManifestProblem, record: ?int, name: ?string, field: ?string)
 
-# A file the manifest names is not below the source as described.
-type SourceProblem(missing, notRegular, size)
-error SourceMismatch(name: string, reason: SourceProblem, sizeBytes: ?int, expectedSizeBytes: ?int)
+# A file the manifest names is not below the source as described: it is
+# missing, or it is not a regular file.
+type SourceProblem(missing, notRegular)
+error SourceMismatch(name: string, reason: SourceProblem)
 
-# Contents do not match the manifest.
-type ContentProblem(size, hash, streamEnded)
+# Contents do not match the manifest, found while they are copied. A file of
+# the source that is too short for them, or not of the originalSize the
+# manifest gives for it, is reason size, with the size of the file in
+# sizeBytes and the size it needs in expectedSizeBytes. A file of the source
+# that changed while it was read is reason sourceChanged, without sizes.
+type ContentProblem(size, hash, streamEnded, sourceChanged)
 error ContentMismatch(name: string, reason: ContentProblem, sizeBytes: ?int, expectedSizeBytes: ?int)
 
-# Content the filesystem cannot hold, with UnsupportedPolicy fail.
+# Content the filesystem cannot hold, with UnsupportedPolicy fail. Also,
+# whatever the policy, contents that start at an offset in their file and
+# come from a stream: a stream has the contents of each file and nothing
+# else of it.
 type UnsupportedKind(url, encoding, offset, transport, subManifest, inodeType, ownership, extendedAttribute, hardlink, sparse, dosAttribute, inodeFlag, name, timestamp)
 error ContentNotSupported(name: ?string, what: UnsupportedKind, value: ?string)
 

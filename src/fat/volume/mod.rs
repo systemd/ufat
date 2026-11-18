@@ -87,6 +87,26 @@ enum Located {
     Entry { parent: u32, entry: DirEntry },
 }
 
+/// What a new entry is for, which decides the clusters allocated with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NewEntry {
+    /// A file. Its clusters come as its data is written.
+    File,
+    /// A directory. Its first cluster, which holds its "." and ".."
+    /// entries, comes with its entry.
+    Directory,
+}
+
+impl NewEntry {
+    /// The clusters allocated along with the entry.
+    fn clusters(self) -> u32 {
+        match self {
+            NewEntry::File => 0,
+            NewEntry::Directory => 1,
+        }
+    }
+}
+
 /// A placed, not yet written entry: its slot and its names.
 #[derive(Debug)]
 struct Placement {
@@ -318,6 +338,16 @@ impl Volume {
     /// Whether writes that publish new state are preceded by a flush.
     pub fn durable(&self) -> bool {
         self.durable
+    }
+
+    /// Whether the volume is being written: something was written to it
+    /// since open() or the last sync(), so that it carries the marks of a
+    /// volume that was not cleanly unmounted until sync() or close() puts
+    /// back what was there before. A caller that failed before anything was
+    /// written leaves the volume as it was by not closing it with
+    /// [`Volume::close_unfinished`].
+    pub fn is_writing(&self) -> bool {
+        self.writing
     }
 
     /// Marks the volume as being written, once per session. Linux and
@@ -764,15 +794,7 @@ impl Volume {
     fn grow_directory(&mut self, dir: &mut Directory) -> Result<()> {
         let per_cluster = self.layout.cluster_size() as usize / DIR_ENTRY_SIZE;
         if dir.slots() + per_cluster > MAX_SLOTS {
-            bail!(
-                ENOSPC,
-                Detail::NoSpace {
-                    reason: NoSpaceReason::DirectoryEntries,
-                    path: None,
-                },
-                "directory is full, it cannot hold more than {} entries",
-                MAX_SLOTS
-            );
+            return Err(Directory::full());
         }
         let cluster = self.allocate(1)?.first;
         let zeros = vec![0u8; self.layout.cluster_size() as usize];
@@ -808,11 +830,36 @@ impl Volume {
         }
     }
 
+    /// The clusters [`Volume::free_run`] adds to `dir` for a run of `count`
+    /// free slots where it has none. Fails where that takes the directory
+    /// past [`MAX_SLOTS`]. Nothing is written.
+    fn growth_for(&self, dir: &Directory, count: usize) -> Result<usize> {
+        // No run of `count` fits, so fewer slots are free at the end, and
+        // the clusters appended continue them.
+        let per_cluster = self.layout.cluster_size() as usize / DIR_ENTRY_SIZE;
+        let clusters = count.saturating_sub(dir.free_at_end()).div_ceil(per_cluster);
+        if dir.slots() + clusters * per_cluster > MAX_SLOTS {
+            return Err(Directory::full());
+        }
+        Ok(clusters)
+    }
+
     /// Picks the short name for `name`, builds its long name entries and
     /// finds room for them in `dir`, growing it as needed. `replacing` is an
-    /// entry about to be replaced, whose names do not count as taken.
-    /// Nothing is written yet.
-    fn place_entry(&mut self, dir: &mut Directory, name: &LongName, replacing: Option<&DirEntry>) -> Result<Placement> {
+    /// entry about to be replaced, whose names do not count as taken. The
+    /// clusters allocated with a `new` entry have to be free as well.
+    ///
+    /// What refuses the entry is checked before anything is written: a
+    /// damaged directory, a name that is taken, no short name left, a full
+    /// directory and too few free clusters. Only then does the volume begin
+    /// a write and grow the directory. The entry itself is not written.
+    fn place_entry(
+        &mut self,
+        dir: &mut Directory,
+        name: &LongName,
+        replacing: Option<&DirEntry>,
+        new: NewEntry,
+    ) -> Result<Placement> {
         writable(dir)?;
         if dir.name_taken(&name.folded(), replacing) {
             bail!(EEXIST, "'{}' exists", name.as_str());
@@ -838,7 +885,20 @@ impl Volume {
         } else {
             (alias.name, Vec::new())
         };
-        let start = self.free_run(dir, long.len() + 1)?;
+        let count = long.len() + 1;
+        let free = dir.find_free_run(count);
+        let growth = match free {
+            Some(_) => 0,
+            None => self.growth_for(dir, count)?,
+        };
+        if (self.free_clusters() as usize) < growth + new.clusters() as usize {
+            return Err(Fat::no_free_clusters());
+        }
+        self.begin_write()?;
+        let start = match free {
+            Some(start) => start,
+            None => self.free_run(dir, count)?,
+        };
         Ok(Placement {
             start,
             name: short,
@@ -874,9 +934,11 @@ impl Volume {
     /// an entry that was never written, which keeps it out of the cache.
     fn make_directory(&mut self, parent: &mut Directory, name: &LongName, time: SystemTime) -> Result<Directory> {
         let t = FatTimestamp::from_system_time(time);
-        // The new directory's cluster is allocated before anything else is
-        // touched, so that running out of space changes nothing.
-        let cluster = self.allocate(1)?.first;
+        // place_entry() checks the parent first, also that a cluster is
+        // free for the new directory, so a refusal writes nothing. The
+        // cluster is allocated once the parent made room.
+        let placement = self.place_entry(parent, name, None, NewEntry::Directory)?;
+        let cluster = self.allocate(NewEntry::Directory.clusters())?.first;
         let result = (|| {
             let cs = self.layout.cluster_size() as usize;
             let mut data = vec![0u8; cs];
@@ -899,7 +961,6 @@ impl Volume {
             data[..DIR_ENTRY_SIZE].copy_from_slice(&dot.to_bytes());
             data[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE].copy_from_slice(&dotdot.to_bytes());
             self.device.write_at(self.layout.cluster_offset(cluster)?, &data)?;
-            let placement = self.place_entry(parent, name, None)?;
             let mut entry = RawDirEntry {
                 attr: ATTR_DIRECTORY,
                 first_cluster: cluster,
@@ -922,9 +983,11 @@ impl Volume {
         result
     }
 
-    /// Creates a directory. Its parent must exist.
+    /// Creates a directory. Its parent must exist. Nothing is written for
+    /// a directory that is refused: a name FAT cannot store or one that is
+    /// too long, a parent that is missing, damaged or full, too few free
+    /// clusters, or a name the parent holds.
     pub fn create_dir(&mut self, path: &str, time: SystemTime) -> Result<()> {
-        self.begin_write()?;
         let (parent, name) = self.locate_parent(path)?;
         let child = self.with_directory_mut(parent, |vol, parent| {
             if Self::find(parent, name.as_str()).is_some() {
@@ -937,14 +1000,19 @@ impl Volume {
     }
 
     /// Creates a directory and any missing parents. Existing directories
-    /// along the way are fine.
+    /// along the way are fine, whatever their names. The path is walked to
+    /// the first directory that is missing without writing anything, and
+    /// the names of the directories to create are checked before the first
+    /// of them is, so a name FAT cannot store or one that is too long
+    /// writes nothing. Nothing is written either when every directory is
+    /// there.
     pub fn create_dir_all(&mut self, path: &str, time: SystemTime) -> Result<()> {
-        self.begin_write()?;
         let comps = components(path)?;
         let mut cluster = self.boot.root_cluster;
+        let mut there = 0;
         for (i, c) in comps.iter().enumerate() {
-            cluster = self.with_directory_mut(cluster, |vol, dir| match Self::find(dir, c) {
-                Some(e) if e.short.is_directory() => Ok(e.short.first_cluster),
+            match self.with_directory(cluster, |dir| Ok(Self::find(dir, c)))? {
+                Some(e) if e.short.is_directory() => cluster = e.short.first_cluster,
                 Some(_) => {
                     let p = format!("/{}", comps[..=i].join("/"));
                     bail!(
@@ -954,43 +1022,78 @@ impl Volume {
                         p
                     );
                 }
-                None => {
-                    let name = LongName::new(c)?;
-                    let child = vol
-                        .make_directory(dir, &name, time)
-                        .map_err(|e| e.at_path(&format!("/{}", comps[..=i].join("/"))))?;
-                    let first = child.first_cluster();
-                    vol.keep_directory(child);
-                    Ok(first)
-                }
+                None => break,
+            }
+            there = i + 1;
+        }
+        let names = comps[there..]
+            .iter()
+            .copied()
+            .map(LongName::new)
+            .collect::<Result<Vec<_>>>()?;
+        for (i, name) in (there..).zip(&names) {
+            cluster = self.with_directory_mut(cluster, |vol, dir| {
+                let child = vol
+                    .make_directory(dir, name, time)
+                    .map_err(|e| e.at_path(&format!("/{}", comps[..=i].join("/"))))?;
+                let first = child.first_cluster();
+                vol.keep_directory(child);
+                Ok(first)
             })?;
         }
         Ok(())
     }
 
     /// Sets the modification and creation time of a file or directory. A
-    /// directory's "." and ".." entries follow along.
+    /// directory's "." and ".." entries follow along. Only what changes is
+    /// written, so setting the time an entry has leaves the volume as it
+    /// was. A damaged directory where something would change is refused
+    /// before anything is written.
     pub fn set_times(&mut self, path: &str, time: SystemTime) -> Result<()> {
-        self.begin_write()?;
         let Located::Entry { parent, entry } = self.locate(path)? else {
             bail!(EINVAL, "the root directory has no timestamps");
         };
         let t = FatTimestamp::from_system_time(time);
         let mut raw = entry.short;
         raw.set_times(t);
-        self.with_directory(parent, |parent| {
-            writable(parent)?;
-            parent.set_slot(entry.slot, &raw.to_bytes());
-            self.save_directory(parent)
-        })?;
-        if raw.is_directory() {
+        let entry_changes = raw != entry.short;
+        if entry_changes {
+            self.with_directory(parent, |parent| writable(parent))?;
+        }
+        // The dot entries whose times change, with what they become.
+        let dots: Vec<(usize, RawDirEntry)> = if raw.is_directory() {
             self.with_directory(raw.first_cluster, |dir| {
-                writable(dir)?;
-                let dots: Vec<DirEntry> = dir.iter().filter(|e| e.is_dot()).cloned().collect();
-                for dot in dots {
-                    let mut d = dot.short;
-                    d.set_times(t);
-                    dir.set_slot(dot.slot, &d.to_bytes());
+                let dots: Vec<(usize, RawDirEntry)> = dir
+                    .iter()
+                    .filter(|e| e.is_dot())
+                    .filter_map(|dot| {
+                        let mut d = dot.short;
+                        d.set_times(t);
+                        (d != dot.short).then_some((dot.slot, d))
+                    })
+                    .collect();
+                if !dots.is_empty() {
+                    writable(dir)?;
+                }
+                Ok(dots)
+            })?
+        } else {
+            Vec::new()
+        };
+        if !entry_changes && dots.is_empty() {
+            return Ok(());
+        }
+        self.begin_write()?;
+        if entry_changes {
+            self.with_directory(parent, |parent| {
+                parent.set_slot(entry.slot, &raw.to_bytes());
+                self.save_directory(parent)
+            })?;
+        }
+        if !dots.is_empty() {
+            self.with_directory(raw.first_cluster, |dir| {
+                for &(slot, d) in &dots {
+                    dir.set_slot(slot, &d.to_bytes());
                 }
                 self.save_directory(dir)
             })?;

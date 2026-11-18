@@ -379,6 +379,25 @@ fn esp_tree() -> Temp {
     tree
 }
 
+/// A manifest read to its end, which a test can hold whole.
+struct Manifest {
+    root: fat::manifest::RootObject,
+    entries: Vec<fat::manifest::FileObject>,
+}
+
+/// Reads the manifest `bytes` to its end.
+fn read_manifest(bytes: &[u8]) -> Manifest {
+    let mut reader = fat::manifest::Reader::open(bytes).unwrap();
+    let root = reader.root().clone();
+    let mut entries = Vec::new();
+    for object in &mut reader {
+        if let fat::manifest::Object::File(object) = object.unwrap() {
+            entries.push(*object);
+        }
+    }
+    Manifest { root, entries }
+}
+
 /// A manifest of the tree and the contents of its streamed files in
 /// manifest order.
 fn manifest_and_blob(tree: &Path) -> (Vec<u8>, Vec<u8>) {
@@ -386,14 +405,64 @@ fn manifest_and_blob(tree: &Path) -> (Vec<u8>, Vec<u8>) {
     fat::manifest::HostTree::new(fat::host::open_dir(tree).unwrap().as_fd())
         .write_manifest(&mut bytes)
         .unwrap();
-    let m = fat::manifest::parse(&bytes).unwrap();
+    let m = read_manifest(&bytes);
     let mut blob = Vec::new();
     for e in &m.entries {
-        if e.is_streamed() {
-            blob.extend(std::fs::read(tree.join(e.name.as_ref().unwrap())).unwrap());
+        if e.has_external_data() {
+            blob.extend(std::fs::read(tree.join(e.name.as_str())).unwrap());
         }
     }
     (bytes, blob)
+}
+
+/// A pipe with `data` in it and its writing end closed, as a client passes
+/// a stream. `data` has to fit into the pipe.
+fn pipe_with(data: &[u8]) -> File {
+    let (reader, mut writer) = pipe();
+    writer.write_all(data).unwrap();
+    reader
+}
+
+/// Sets the file status flags of `file`, such as O_NONBLOCK.
+fn set_status_flags(file: &File, flags: c_int) {
+    // SAFETY: F_SETFL changes the flags of an open descriptor only.
+    assert_eq!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags) }, 0);
+}
+
+/// Writes `data` to the pipe `pipe`, which is set to O_NONBLOCK, until all
+/// of it is in or the pipe stays full for `patience`. Returns how much of
+/// `data` went in.
+fn write_until_full(pipe: &mut File, data: &[u8], patience: Duration) -> usize {
+    let timeout = c_int::try_from(patience.as_millis()).unwrap();
+    let mut written = 0;
+    while written < data.len() {
+        match pipe.write(&data[written..]) {
+            Ok(n) => written += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let mut ready = libc::pollfd {
+                    fd: pipe.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: one pollfd, which lives across the call.
+                let n = unsafe { libc::poll(&mut ready, 1, timeout) };
+                assert!(n >= 0, "{}", std::io::Error::last_os_error());
+                if n == 0 {
+                    break;
+                }
+            }
+            Err(e) => panic!("writing to the pipe: {}", e),
+        }
+    }
+    written
+}
+
+/// What is left in the pipe whose reading end `pipe` is, its writing end
+/// closed.
+fn left_in(mut pipe: File) -> Vec<u8> {
+    let mut left = Vec::new();
+    pipe.read_to_end(&mut left).unwrap();
+    left
 }
 
 /// Writes `data` to a fresh file and returns it open read-only.
@@ -404,7 +473,7 @@ fn file_with(dir: &Path, name: &str, data: &[u8]) -> File {
 }
 
 fn sha256_hex(data: &[u8]) -> String {
-    fat::sha256::to_hex(&fat::sha256::digest(data))
+    fat::manifest::Sha256::digest(data).to_string()
 }
 
 fn sha512_hex(data: &[u8]) -> String {
@@ -634,6 +703,8 @@ fn capabilities_describe_vfat() {
     assert_eq!(str_of(caps, "nameUnit"), "utf16Units");
     assert_eq!(u64_of(caps, "fileSizeMaxBytes"), 4_294_967_295);
     assert!(caps.get("features").is_none());
+    // A manifest has to declare the code point order.
+    assert_eq!(str_of(object_of(caps, "manifest"), "order"), "codepoint");
     // Any other type is not served, by any method.
     let e = error_of(&mut c, "GetCapabilities", r#"{"fileSystemType":"ext4"}"#, &[]);
     assert_eq!(e.name, format!("{}.FileSystemTypeNotSupported", IFACE));
@@ -763,18 +834,35 @@ fn assemble_plans_from_a_tree_and_a_manifest() {
     assert_eq!(u64_of(&b, "files"), 2);
     assert_eq!(u64_of(&b, "directories"), 3);
     assert_eq!(u64_of(&b, "bytes"), 5010);
-    // With the directory beside the manifest the source is verified first.
+    // A plan reads the manifest and nothing else: the directory beside it
+    // is not looked at.
     let manifest_file = ro(&scratch.path().join("manifest"));
     let empty = Temp::dir();
     let empty_dir = ro(empty.path());
-    let e = error_of(
+    let e = reply(call(
         &mut c,
         "Assemble",
         r#"{"mode":"plan","content":{"manifest":{"fileDescriptor":0},"sourceFileDescriptor":1}}"#,
         &[manifest_file.as_fd(), empty_dir.as_fd()],
+    ));
+    assert_eq!(
+        u64_of(object_of(&e, "description"), "sizeBytes"),
+        u64_of(d, "sizeBytes")
     );
-    assert_eq!(e.name, format!("{}.SourceMismatch", IFACE));
-    assert_eq!(str_of(&e.parameters, "reason"), "missing");
+    // It reads the manifest once, so it takes one that comes through a
+    // pipe, and reads all of it.
+    let piped = pipe_with(&manifest);
+    let e = reply(call(
+        &mut c,
+        "Assemble",
+        r#"{"mode":"plan","content":{"manifest":{"fileDescriptor":0}}}"#,
+        &[piped.as_fd()],
+    ));
+    assert_eq!(
+        u64_of(object_of(&e, "description"), "sizeBytes"),
+        u64_of(d, "sizeBytes")
+    );
+    assert!(left_in(piped).is_empty());
     // No content: the smallest volume there is, with 4 KiB sectors too.
     let m = reply(call(&mut c, "Assemble", r#"{"mode":"plan"}"#, &[]));
     let md = object_of(&m, "description");
@@ -1123,17 +1211,17 @@ fn assemble_with_a_manifest_and_a_directory() {
             .size,
         10
     );
-    // A directory that does not hold what the manifest names fails before
-    // the image is touched: the file the client created stays empty.
+    // A directory that does not hold what the manifest names fails when the
+    // file is copied, and leaves the file system unfinished.
     let manifest_file = ro(&base.path().join("manifest"));
     let empty = Temp::dir();
     let empty_dir = ro(empty.path());
-    let (fresh, fresh_img) = fresh_image();
+    let (missing, missing_img) = fresh_image();
     let e = error_of(
         &mut c,
         "Assemble",
         r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
-        &[fresh_img.as_fd(), manifest_file.as_fd(), empty_dir.as_fd()],
+        &[missing_img.as_fd(), manifest_file.as_fd(), empty_dir.as_fd()],
     );
     assert_eq!(
         e.name,
@@ -1144,30 +1232,81 @@ fn assemble_with_a_manifest_and_a_directory() {
     assert_eq!(str_of(&e.parameters, "reason"), "missing");
     // The file as the manifest names it, not as a path in the volume.
     assert_eq!(str_of(&e.parameters, "name"), "EFI/BOOT/BOOTX64.EFI");
-    assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
-    // So does a file that grew since the manifest was written. The manifest
-    // takes it whole, so it has to have the manifest's size.
+    assert_eq!(warnings(&mut c, missing.path()), ["dirtyFlag", "fatDirtyFlag"]);
+    // A file that grew since the manifest was written still holds the
+    // data the manifest describes at its start, and that is what is copied.
     std::fs::write(tree.join("loader/loader.conf"), b"timeout 5\nconsole-mode max\n").unwrap();
     let manifest_file = ro(&base.path().join("manifest"));
+    let (grown, grown_img) = fresh_image();
+    reply(call(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        &[grown_img.as_fd(), manifest_file.as_fd(), source.as_fd()],
+    ));
+    let mut data = Vec::new();
+    volume(grown.path(), Access::ReadOnly)
+        .open_file("/loader/loader.conf")
+        .unwrap()
+        .read_to_end(&mut data)
+        .unwrap();
+    assert_eq!(data, b"timeout 5\n");
+    // One that shrank is too short for the data, and fails when it is
+    // copied with the size of the file and the size it needs.
+    std::fs::write(tree.join("loader/loader.conf"), b"timeout\n").unwrap();
+    let manifest_file = ro(&base.path().join("manifest"));
+    let (_shrunk, shrunk_img) = fresh_image();
     let e = error_of(
         &mut c,
         "Assemble",
         r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
-        &[fresh_img.as_fd(), manifest_file.as_fd(), source.as_fd()],
+        &[shrunk_img.as_fd(), manifest_file.as_fd(), source.as_fd()],
     );
     assert_eq!(
         e.name,
-        format!("{}.SourceMismatch", IFACE),
+        format!("{}.ContentMismatch", IFACE),
         "{}",
         Value::Object(e.parameters.clone())
     );
     assert_eq!(str_of(&e.parameters, "reason"), "size");
     assert_eq!(str_of(&e.parameters, "name"), "loader/loader.conf");
-    assert_eq!(u64_of(&e.parameters, "sizeBytes"), 27);
+    assert_eq!(u64_of(&e.parameters, "sizeBytes"), 8);
     assert_eq!(u64_of(&e.parameters, "expectedSizeBytes"), 10);
-    assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
     std::fs::write(tree.join("loader/loader.conf"), b"timeout 5\n").unwrap();
-    // A broken manifest is InvalidManifest, with nothing written either.
+    // A file that changes while it is read is reason sourceChanged, without
+    // sizes. A file of procfs says it is empty when it is opened and has
+    // data when it is read, which is how a file that grew after it was
+    // opened looks to the source. Checked against a hash of all of it, it
+    // is read past its length.
+    let changing = file_with(
+        base.path(),
+        "changing",
+        format!(
+            "\x1e{{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}}\n\x1e{{\"contents\":[{{\"originalSha256\":\"{}\"}}],\"name\":\"version\",\"size\":0}}\n\x1e{{\"mediaType\":\"application/vnd.uapi.16.trailer\"}}\n",
+            sha256_hex(b"hello")
+        )
+        .as_bytes(),
+    );
+    let proc_dir = ro(Path::new("/proc"));
+    let (_changed, changed_img) = fresh_image();
+    let e = error_of(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        &[changed_img.as_fd(), changing.as_fd(), proc_dir.as_fd()],
+    );
+    assert_eq!(
+        e.name,
+        format!("{}.ContentMismatch", IFACE),
+        "{}",
+        Value::Object(e.parameters.clone())
+    );
+    assert_eq!(str_of(&e.parameters, "reason"), "sourceChanged");
+    assert_eq!(str_of(&e.parameters, "name"), "version");
+    assert!(e.parameters.get("sizeBytes").is_none());
+    assert!(e.parameters.get("expectedSizeBytes").is_none());
+    // A broken manifest is InvalidManifest, with nothing written.
+    let (fresh, fresh_img) = fresh_image();
     let garbage = file_with(base.path(), "garbage", b"garbage");
     let e = error_of(
         &mut c,
@@ -1178,7 +1317,7 @@ fn assemble_with_a_manifest_and_a_directory() {
     assert_eq!(e.name, format!("{}.InvalidManifest", IFACE));
     assert_eq!(str_of(&e.parameters, "reason"), "recordSeparator");
     let bad = file_with(base.path(), "bad",
-        b"\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\"}\n\x1e{\"name\":\"x\"}\n\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
+        b"\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n\x1e{\"name\":\"x\"}\n\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
     );
     let e = error_of(
         &mut c,
@@ -1188,8 +1327,24 @@ fn assemble_with_a_manifest_and_a_directory() {
     );
     assert_eq!(e.name, format!("{}.InvalidManifest", IFACE));
     assert_eq!(str_of(&e.parameters, "reason"), "noSize");
-    assert_eq!(str_of(&e.parameters, "name"), "/x");
+    assert_eq!(str_of(&e.parameters, "name"), "x");
+    assert_eq!(u64_of(&e.parameters, "record"), 1);
     assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
+    // A manifest that comes through a pipe can be read once, too little to
+    // size the file system to fit, which reads the manifest before its
+    // content is written.
+    let piped = pipe_with(&manifest);
+    let e = error_of(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        &[fresh_img.as_fd(), piped.as_fd(), source.as_fd()],
+    );
+    assert_eq!(e.name, format!("{}.BadFileDescriptor", IFACE));
+    assert_eq!(str_of(&e.parameters, "parameter"), "manifest");
+    assert_eq!(str_of(&e.parameters, "reason"), "wrongType");
+    assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
+    assert_eq!(left_in(piped), manifest);
     // A manifest needs a source, a stream needs a manifest, a file is no
     // content for Assemble.
     let manifest_file = ro(&base.path().join("manifest"));
@@ -1217,6 +1372,75 @@ fn assemble_with_a_manifest_and_a_directory() {
     );
     assert_eq!(str_of(&e.parameters, "parameter"), "content");
     assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
+}
+
+/// A manifest has to declare the code point order: one that does not is
+/// InvalidManifest with reason noOrder, also when its objects are sorted,
+/// before anything is written, from a file and from a pipe.
+#[test]
+fn manifests_have_to_declare_their_order() {
+    let _serial = common::serial();
+    let Some(ufat) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let tree = esp_tree();
+    let (manifest, _) = manifest_and_blob(tree.path());
+    let undeclared = String::from_utf8(manifest.clone())
+        .unwrap()
+        .replacen(r#","order":"codepoint""#, "", 1)
+        .into_bytes();
+    assert_ne!(undeclared, manifest);
+    let scratch = Temp::dir();
+    let mut c = connect_fd3(&ufat);
+    let source = ro(tree.path());
+    let no_order = |e: varlink::Error| {
+        assert_eq!(
+            e.name,
+            format!("{}.InvalidManifest", IFACE),
+            "{}",
+            Value::Object(e.parameters.clone())
+        );
+        assert_eq!(str_of(&e.parameters, "reason"), "noOrder");
+        assert_eq!(u64_of(&e.parameters, "record"), 0);
+        assert_eq!(str_of(&e.parameters, "field"), "order");
+    };
+    let file = file_with(scratch.path(), "undeclared", &undeclared);
+    no_order(error_of(
+        &mut c,
+        "Assemble",
+        r#"{"mode":"plan","content":{"manifest":{"fileDescriptor":0}}}"#,
+        &[file.as_fd()],
+    ));
+    let (fresh, img) = fresh_image();
+    let manifest_file = ro(&scratch.path().join("undeclared"));
+    no_order(error_of(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0,"size":41943040},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        &[img.as_fd(), manifest_file.as_fd(), source.as_fd()],
+    ));
+    assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
+    let image = Temp::image(40 << 20);
+    let img = rw(image.path());
+    reply(call(&mut c, "Assemble", IMG, &[img.as_fd()]));
+    let populate = r#"{"image":{"fileDescriptor":0},"path":"/","content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#;
+    for manifest in [ro(&scratch.path().join("undeclared")), pipe_with(&undeclared)] {
+        no_order(error_of(
+            &mut c,
+            "Populate",
+            populate,
+            &[img.as_fd(), manifest.as_fd(), source.as_fd()],
+        ));
+    }
+    assert!(volume(image.path(), Access::ReadOnly).read_dir("/").unwrap().is_empty());
+    let declared = file_with(scratch.path(), "declared", &manifest);
+    let r = reply(call(
+        &mut c,
+        "Populate",
+        populate,
+        &[img.as_fd(), declared.as_fd(), source.as_fd()],
+    ));
+    assert_eq!(u64_of(&r, "files"), 2);
 }
 
 /// Assemble with a manifest and the contents of its files in a stream.
@@ -1312,11 +1536,10 @@ fn assemble_with_a_manifest_and_a_stream() {
     assert_eq!(str_of(&e.parameters, "name"), "EFI/BOOT/BOOTX64.EFI");
     // So is a stream that goes on after the last file: that file got more
     // than the manifest says, by how much is not known.
-    let last = fat::manifest::parse(&manifest)
-        .unwrap()
+    let last = read_manifest(&manifest)
         .entries
         .into_iter()
-        .rfind(|e| e.is_streamed())
+        .rfind(|e| e.has_external_data())
         .unwrap();
     let (_image3, img3) = fresh_image();
     let long = file_with(scratch.path(), "long", &[&blob[..], b"more"].concat());
@@ -1334,9 +1557,89 @@ fn assemble_with_a_manifest_and_a_stream() {
         Value::Object(e.parameters.clone())
     );
     assert_eq!(str_of(&e.parameters, "reason"), "size");
-    assert_eq!(Some(str_of(&e.parameters, "name")), last.name.as_deref());
+    assert_eq!(str_of(&e.parameters, "name"), last.name.as_str());
     assert_eq!(u64_of(&e.parameters, "expectedSizeBytes"), last.size.unwrap());
     assert!(e.parameters.get("sizeBytes").is_none());
+}
+
+/// Populate with the manifest and the contents of its files in two pipes
+/// reads the two in lockstep: a record of the manifest, then the contents
+/// of the file it describes. So the client writes to both at the same time.
+/// Until contents come, the service takes no more of a manifest many times
+/// larger than a pipe holds than the first records: a client that wrote
+/// all of the manifest first would wait for the service forever, and the
+/// service for it.
+#[test]
+fn populate_reads_the_manifest_and_the_contents_in_lockstep() {
+    let _serial = common::serial();
+    let Some(ufat) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    // Some 100 bytes of manifest a file, in directories of a thousand.
+    const DIRECTORIES: usize = 5;
+    const FILES: usize = 1000;
+    // What a pipe holds on Linux by default, 16 pages of 4 KiB.
+    const PIPE_SIZE: c_int = 64 << 10;
+    // How long the manifest pipe has to stay full.
+    const PATIENCE: Duration = Duration::from_millis(500);
+    let mut manifest = b"\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n".to_vec();
+    let mut blob = Vec::new();
+    for d in 0..DIRECTORIES {
+        manifest.extend(format!("\x1e{{\"name\":\"d{}\",\"type\":\"dir\"}}\n", d).bytes());
+        for f in 0..FILES {
+            let data = format!("{:08}", d * FILES + f);
+            manifest.extend(
+                format!(
+                    "\x1e{{\"name\":\"d{}/f{:04}\",\"sha256\":\"{}\",\"size\":{}}}\n",
+                    d,
+                    f,
+                    sha256_hex(data.as_bytes()),
+                    data.len()
+                )
+                .bytes(),
+            );
+            blob.extend(data.bytes());
+        }
+    }
+    manifest.extend(b"\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n");
+    let image = Temp::image(40 << 20);
+    let img = rw(image.path());
+    let mut c = connect_fd3(&ufat);
+    reply(call(&mut c, "Assemble", IMG, &[img.as_fd()]));
+    let (manifest_reader, mut manifest_writer) = pipe();
+    let (contents_reader, mut contents_writer) = pipe();
+    c.send_with_fds(
+        &method("Populate"),
+        params(r#"{"image":{"fileDescriptor":0},"path":"/","content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#),
+        &[img.as_fd(), manifest_reader.as_fd(), contents_reader.as_fd()],
+    )
+    .unwrap();
+    drop((manifest_reader, contents_reader));
+    // The manifest alone fills its pipe, and the pipe stays full.
+    // SAFETY: F_SETPIPE_SZ changes the size of an open pipe only.
+    assert!(unsafe { libc::fcntl(manifest_writer.as_raw_fd(), libc::F_SETPIPE_SZ, PIPE_SIZE) } >= PIPE_SIZE);
+    set_status_flags(&manifest_writer, libc::O_NONBLOCK);
+    let written = write_until_full(&mut manifest_writer, &manifest, PATIENCE);
+    assert!(written < manifest.len() / 2, "{} of {} bytes", written, manifest.len());
+    // With the contents written at the same time, the rest goes in.
+    set_status_flags(&manifest_writer, 0);
+    let contents = std::thread::spawn(move || contents_writer.write_all(&blob).map(|_| blob.len()));
+    manifest_writer.write_all(&manifest[written..]).unwrap();
+    drop(manifest_writer);
+    let bytes = contents.join().unwrap().unwrap();
+    let r = c.receive().unwrap().unwrap();
+    conforms("Populate", &r);
+    let r = reply(r);
+    assert_eq!(u64_of(&r, "files"), (DIRECTORIES * FILES) as u64);
+    assert_eq!(u64_of(&r, "directories"), DIRECTORIES as u64);
+    assert_eq!(u64_of(&r, "bytes"), bytes as u64);
+    let mut data = Vec::new();
+    volume(image.path(), Access::ReadOnly)
+        .open_file(&format!("/d{}/f{:04}", DIRECTORIES - 1, FILES - 1))
+        .unwrap()
+        .read_to_end(&mut data)
+        .unwrap();
+    assert_eq!(data, format!("{:08}", DIRECTORIES * FILES - 1).as_bytes());
 }
 
 /// The kinds of the problems Check finds in `image`, which has no errors.
@@ -1359,7 +1662,9 @@ fn warnings(c: &mut Client, image: &Path) -> Vec<String> {
 /// An Assemble that fails after the format leaves the file system as after
 /// a crash: with the files that were complete, and marked as not cleanly
 /// unmounted, which Check reports. It is marked when it fails before the
-/// first file as well. Assembling again makes a clean file system.
+/// first file as well. Assembling again makes a clean file system, which a
+/// Populate refused before it writes anything leaves clean, and a Populate
+/// that fails partway leaves marked again.
 #[test]
 fn a_failed_assemble_leaves_the_file_system_unfinished() {
     let _serial = common::serial();
@@ -1378,8 +1683,8 @@ fn a_failed_assemble_leaves_the_file_system_unfinished() {
     let (manifest, _) = manifest_and_blob(&tree);
     let manifest_file = file_with(base.path(), "manifest", &manifest);
     // loader.conf keeps its size and changes its contents after the
-    // manifest was written: it passes the check of the source before the
-    // format and fails while it is copied, after BOOTX64.EFI.
+    // manifest was written: it fails while it is copied, after
+    // BOOTX64.EFI.
     std::fs::write(tree.join("loader/loader.conf"), b"timeout 9\n").unwrap();
     let mut c = connect_fd3(&ufat);
     let source = ro(&tree);
@@ -1409,7 +1714,7 @@ fn a_failed_assemble_leaves_the_file_system_unfinished() {
     let old = file_with(
         base.path(),
         "expired",
-        b"\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"validUntilUSec\":1}\n\x1e{\"name\":\"x\",\"size\":0}\n\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
+        b"\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\",\"validUntilUSec\":1}\n\x1e{\"name\":\"x\",\"size\":0}\n\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
     );
     let empty = file_with(base.path(), "empty", b"");
     let e = error_of(
@@ -1431,6 +1736,44 @@ fn a_failed_assemble_leaves_the_file_system_unfinished() {
         &[img.as_fd(), manifest_file.as_fd(), source.as_fd()],
     ));
     assert!(warnings(&mut c, image.path()).is_empty());
+    // A manifest that expired, one whose first object comes before its
+    // directory, and one whose first file the stream cannot have without a
+    // size are refused before anything is written, also with parents.
+    let misplaced = file_with(
+        base.path(),
+        "misplaced",
+        b"\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n\x1e{\"name\":\"d/x\",\"size\":0}\n\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
+    );
+    let sizeless = file_with(
+        base.path(),
+        "sizeless",
+        b"\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n\x1e{\"name\":\"x\"}\n\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
+    );
+    let old = ro(&base.path().join("expired"));
+    for (manifest, error) in [
+        (old, "EntryNotValid"),
+        (misplaced, "InvalidManifest"),
+        (sizeless, "InvalidManifest"),
+    ] {
+        let e = error_of(
+            &mut c,
+            "Populate",
+            r#"{"image":{"fileDescriptor":0},"path":"/","parents":true,"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+            &[img.as_fd(), manifest.as_fd(), empty.as_fd()],
+        );
+        assert_eq!(e.name, format!("{}.{}", IFACE, error));
+        assert!(warnings(&mut c, image.path()).is_empty());
+    }
+    std::fs::write(tree.join("loader/loader.conf"), b"timeout 9\n").unwrap();
+    let manifest_file = ro(&base.path().join("manifest"));
+    let e = error_of(
+        &mut c,
+        "Populate",
+        r#"{"image":{"fileDescriptor":0},"path":"/","content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2,"replace":true}}"#,
+        &[img.as_fd(), manifest_file.as_fd(), source.as_fd()],
+    );
+    assert_eq!(e.name, format!("{}.ContentMismatch", IFACE));
+    assert_eq!(warnings(&mut c, image.path()), ["dirtyFlag", "fatDirtyFlag"]);
 }
 
 /// imageHash: the hash of the whole image window as the call leaves it,
@@ -1504,8 +1847,8 @@ fn assemble_writes_a_manifest() {
     assert_eq!(u64_of(&r, "files"), 2);
     assert_eq!(u64_of(&r, "omitted"), 0);
     drop(out_file);
-    let m = fat::manifest::parse(&std::fs::read(&out).unwrap()).unwrap();
-    let mut listed: Vec<&str> = m.entries.iter().map(|e| e.name.as_deref().unwrap()).collect();
+    let m = read_manifest(&std::fs::read(&out).unwrap());
+    let mut listed: Vec<&str> = m.entries.iter().map(|e| e.name.as_str()).collect();
     listed.sort_unstable();
     assert_eq!(
         listed,
@@ -1517,13 +1860,13 @@ fn assemble_writes_a_manifest() {
             "loader/loader.conf"
         ]
     );
-    assert_eq!(m.root.mtime_nsec, Some(T0 * 1000));
+    assert_eq!(m.root.inode.mtime_nsec, Some(T0 * 1000));
     for e in &m.entries {
         if e.inode_type == fat::manifest::InodeType::Regular {
-            let data = std::fs::read(tree.path().join(e.name.as_deref().unwrap())).unwrap();
+            let data = std::fs::read(tree.path().join(e.name.as_str())).unwrap();
             assert_eq!(e.size, Some(data.len() as u64));
-            assert_eq!(e.sha256, Some(fat::sha256::digest(&data)), "{:?}", e.name);
-            assert!(e.mtime_nsec.is_some());
+            assert_eq!(e.sha256, Some(fat::manifest::Sha256::digest(&data)), "{:?}", e.name);
+            assert!(e.inode.mtime_nsec.is_some());
         }
     }
     // A sink that cannot be written to is refused before anything happens.
@@ -1562,7 +1905,9 @@ fn manifest_problems_are_those_of_uapi16() {
     assert_eq!(declared, spelled);
 }
 
-/// The manifest sink takes the features of UAPI.16, with "_" for "-".
+/// The manifest sink takes the features of UAPI.16, with "_" for "-". A
+/// refused manifest names the field of a feature it does not list, and a
+/// key it has twice is a reason of its own.
 #[test]
 fn manifests_record_and_apply_features() {
     let _serial = common::serial();
@@ -1649,6 +1994,39 @@ fn manifests_record_and_apply_features() {
     );
     assert_eq!(e.name, "org.varlink.service.InvalidParameter");
     assert_eq!(str_of(&e.parameters, "parameter"), "manifestSink");
+    // A field of a feature the manifest does not list is named, and a key
+    // twice in an object is duplicateKey.
+    let declared = "\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n";
+    let trailer = "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n";
+    for (record, reason, field) in [
+        (
+            "\x1e{\"mTimeNSec\":1,\"name\":\"a\",\"size\":0}\n",
+            "unlistedFeature",
+            Some("mTimeNSec"),
+        ),
+        (
+            "\x1e{\"flagHidden\":true,\"name\":\"a\",\"size\":0}\n",
+            "unlistedFeature",
+            Some("flagHidden"),
+        ),
+        ("\x1e{\"name\":\"a\",\"size\":0,\"size\":0}\n", "duplicateKey", None),
+    ] {
+        let bad = file_with(
+            scratch.path(),
+            "bad",
+            format!("{}{}{}", declared, record, trailer).as_bytes(),
+        );
+        let e = error_of(
+            &mut c,
+            "Assemble",
+            r#"{"mode":"plan","content":{"manifest":{"fileDescriptor":0}}}"#,
+            &[bad.as_fd()],
+        );
+        assert_eq!(e.name, format!("{}.InvalidManifest", IFACE), "{}", record);
+        assert_eq!(str_of(&e.parameters, "reason"), reason, "{}", record);
+        assert_eq!(u64_of(&e.parameters, "record"), 1, "{}", record);
+        assert_eq!(e.parameters.get("field").and_then(Value::as_str), field, "{}", record);
+    }
 }
 
 /// With the more flag Assemble tells which step it is in, in order.
@@ -1831,16 +2209,12 @@ fn describe_with_and_without_a_manifest() {
     assert_eq!(u64_of(last, "bytes"), 5010);
     assert_eq!(u64_of(last, "omitted"), 0);
     drop(out_file);
-    let m = fat::manifest::parse(&std::fs::read(&out).unwrap()).unwrap();
+    let m = read_manifest(&std::fs::read(&out).unwrap());
     assert_eq!(m.entries.len(), 5);
-    assert!(m.root.mtime_nsec.is_none());
-    assert!(m.entries.iter().all(|e| e.mtime_nsec.is_none()));
-    let conf = m
-        .entries
-        .iter()
-        .find(|e| e.name.as_deref() == Some("loader/loader.conf"))
-        .unwrap();
-    assert_eq!(conf.sha256, Some(fat::sha256::digest(b"timeout 5\n")));
+    assert!(m.root.inode.mtime_nsec.is_none());
+    assert!(m.entries.iter().all(|e| e.inode.mtime_nsec.is_none()));
+    let conf = m.entries.iter().find(|e| e.name == "loader/loader.conf").unwrap();
+    assert_eq!(conf.sha256, Some(fat::manifest::Sha256::digest(b"timeout 5\n")));
     // Images that hold no FAT32 volume say why.
     let blank = Temp::image(40 << 20);
     let blank_ro = ro(blank.path());
@@ -2073,12 +2447,9 @@ fn populate_puts_content_into_a_volume() {
     assert_eq!(u64_of(r, "files"), 2);
     assert_eq!(u64_of(r, "omitted"), 0);
     drop(out_file);
-    let m = fat::manifest::parse(&std::fs::read(&out).unwrap()).unwrap();
-    assert!(m
-        .entries
-        .iter()
-        .any(|e| e.name.as_deref() == Some("EFI/BOOT/BOOTX64.EFI")));
-    assert!(m.entries.iter().any(|e| e.name.as_deref() == Some("a/b/c.conf")));
+    let m = read_manifest(&std::fs::read(&out).unwrap());
+    assert!(m.entries.iter().any(|e| e.name == "EFI/BOOT/BOOTX64.EFI"));
+    assert!(m.entries.iter().any(|e| e.name == "a/b/c.conf"));
     assert_eq!(
         names(&call_more(
             &mut c,
@@ -2554,7 +2925,7 @@ fn passed_descriptors_are_vetted() {
 const DRAIN_POLL: Duration = Duration::from_millis(1);
 /// What the manifest of a volume carries for every file at least: the
 /// hash of its contents in hex.
-const MANIFEST_BYTES_PER_FILE: usize = 2 * fat::sha256::DIGEST_SIZE;
+const MANIFEST_BYTES_PER_FILE: usize = 2 * fat::manifest::Sha256::SIZE;
 /// How many times over the manifest of the sink test fills its pipe.
 const PIPEFULS: usize = 4;
 /// The size asked for a pipe that is to be as small as a pipe can be: the
@@ -2647,10 +3018,12 @@ fn receive(c: &mut Client, name: &str) -> Response {
 }
 
 /// A client keeps a copy of a pipe it passed and sets O_NONBLOCK on it
-/// during the call, once the service vetted it: the manifest, the contents
-/// of the files and the manifest sink. The read or write that then fails
-/// with EAGAIN fails the call with BadFileDescriptor and reason flags, as
-/// the vetting does when the flag is set before the call.
+/// during the call, once the service vetted it: the manifest, alone or read
+/// with the contents of its files, the contents of the files and the
+/// manifest sink. The read or write that then fails with EAGAIN fails the
+/// call with BadFileDescriptor and reason flags, as the vetting does when
+/// the flag is set before the call. The error names the parameter the pipe
+/// was passed as.
 #[test]
 fn pipes_made_non_blocking_during_the_call_are_refused() {
     let _serial = common::serial();
@@ -2701,6 +3074,30 @@ fn pipes_made_non_blocking_during_the_call_are_refused() {
     .unwrap();
     let client = feed_and_flip(&r, &w, &blob);
     refused(&mut c, "Assemble", "sourceFileDescriptor");
+    client.join().unwrap();
+    // The manifest, read with the contents of the files from a regular
+    // file into a volume made before: the manifest is named, not the
+    // contents it is read with.
+    let image = Temp::image(40 << 20);
+    let img = rw(image.path());
+    reply(call(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0}}"#,
+        &[img.as_fd()],
+    ));
+    let blob_file = file_with(scratch.path(), "blob", &blob);
+    let (r, w) = pipe();
+    c.send_with_fds(
+        &method("Populate"),
+        params(
+            r#"{"image":{"fileDescriptor":0},"path":"/","content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        ),
+        &[img.as_fd(), r.as_fd(), blob_file.as_fd()],
+    )
+    .unwrap();
+    let client = feed_and_flip(&r, &w, &manifest);
+    refused(&mut c, "Populate", "manifest");
     client.join().unwrap();
     // The manifest sink, a pipe as small as can be, and a volume whose
     // manifest fills it PIPEFULS times over.
@@ -2854,6 +3251,34 @@ fn errors_are_typed() {
         "Assemble",
         r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1,"unsupported":"fail"}}"#,
         &[fresh_img.as_fd(), source.as_fd()],
+    );
+    assert_eq!(e.name, format!("{}.ContentNotSupported", IFACE));
+    assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
+    // A plan refuses a manifest's fifo, and so does Assemble before the
+    // image is touched.
+    let scratch = Temp::dir();
+    let fifo = scratch.path().join("fifo.manifest");
+    std::fs::write(
+        &fifo,
+        concat!(
+            "\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n",
+            "\x1e{\"name\":\"f\",\"type\":\"fifo\"}\n",
+            "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
+        ),
+    )
+    .unwrap();
+    let e = error_of(
+        &mut c,
+        "Assemble",
+        r#"{"mode":"plan","content":{"manifest":{"fileDescriptor":0},"unsupported":"fail"}}"#,
+        &[ro(&fifo).as_fd()],
+    );
+    assert_eq!(e.name, format!("{}.ContentNotSupported", IFACE));
+    let e = error_of(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2,"unsupported":"fail"}}"#,
+        &[fresh_img.as_fd(), ro(&fifo).as_fd(), source.as_fd()],
     );
     assert_eq!(e.name, format!("{}.ContentNotSupported", IFACE));
     assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
@@ -3044,6 +3469,20 @@ fn too_small_images_are_reported() {
         Value::Object(e.parameters.clone())
     );
     assert_eq!(str_of(&e.parameters, "reason"), "blocks");
+    assert_eq!(str_of(&e.parameters, "path"), "/big.bin");
+    // So is the file of a manifest that does not fit.
+    let (manifest, _) = manifest_and_blob(&tree);
+    let manifest_file = file_with(base.path(), "manifest", &manifest);
+    let other = Temp::image(40 << 20);
+    let other_img = rw(other.path());
+    reply(call(&mut c, "Assemble", IMG, &[other_img.as_fd()]));
+    let e = error_of(
+        &mut c,
+        "Populate",
+        r#"{"image":{"fileDescriptor":0},"path":"/","content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        &[other_img.as_fd(), manifest_file.as_fd(), source.as_fd()],
+    );
+    assert_eq!(e.name, format!("{}.NoSpaceLeft", IFACE));
     assert_eq!(str_of(&e.parameters, "path"), "/big.bin");
     let ck = reply(call(&mut c, "Check", IMG, &[img.as_fd()]));
     assert_eq!(u64_of(&ck, "errors"), 0);

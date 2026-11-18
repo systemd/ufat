@@ -666,7 +666,7 @@ def dump_record(obj):
     return (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-ROOT_REC = b'{"mediaType":"application/vnd.uapi.16.manifest"}\n'
+ROOT_REC = b'{"mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}\n'
 TRAILER_REC = b'{"mediaType":"application/vnd.uapi.16.trailer"}\n'
 
 BIG_INTS = [0, 1, -1, 2 ** 31, 2 ** 32 - 1, 2 ** 32, 2 ** 63 - 1, 2 ** 63, 2 ** 64 - 1, 2 ** 64, 2 ** 127 - 1,
@@ -854,9 +854,14 @@ def mut_manifest_records(rng, records):
     elif how == "empty":
         recs = [rng.choice([b"", b"\n", b" ", b"\t\r\n"])] * rng.choice([1, 10, 1000])
     elif how == "many":
+        # In place of the seed's file objects, which could sort anywhere
+        # among them, and in code point order: the numbers zero padded, the
+        # deep names below their directories.
         n = rng.choice([200, 500, 1000, 2000, 10000])
-        body = rng.choice([b'{"name":"f%d","size":0}\n', b'{"name":"d%d","type":"dir"}\n', b'{"name":"f%d","size":1,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}\n', b'{"mediaType":"application/x-unknown","n":%d}\n', b'{"name":"a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/%d","size":0}\n'])
-        recs = [recs[0]] + [body % i for i in range(n)] + recs[1:]
+        deep = b"a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p"
+        body = rng.choice([b'{"name":"f%05d","size":0}\n', b'{"name":"d%05d","type":"dir"}\n', b'{"name":"f%05d","size":1,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}\n', b'{"mediaType":"application/x-unknown","n":%d}\n', b'{"name":"' + deep + b'/%05d","size":0}\n'])
+        dirs = [b'{"name":"%s","type":"dir"}\n' % deep[:i] for i in range(1, len(deep) + 1, 2)] if deep in body else []
+        recs = [recs[0]] + dirs + [body % i for i in range(n)] + [r for r in recs[1:] if b"trailer" in r]
     elif how == "sep":
         recs.insert(rng.randrange(len(recs) + 1), b'{"name":"s\x1ex","size":0}\n')
     elif how == "nul":

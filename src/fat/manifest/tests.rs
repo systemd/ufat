@@ -4,14 +4,21 @@ use crate::populate::CopyOptions;
 use crate::progress::Progress;
 use crate::test_util::{volume, TempDir, TempImage};
 use crate::volume::Volume;
-use crate::{ContentProblem, SourceProblem};
+use crate::{ContentProblem, Error, ManifestProblem, SourceProblem};
+use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::path::Path;
+use std::time::{Duration, UNIX_EPOCH};
+use uapi16::{Data, Digest, Mode, MAX_RECORD_SIZE, RECORD_SEPARATOR};
 
 /// A directory resolved once, the way the tool resolves the SOURCE of a
 /// manifest.
-fn dir_source(path: &Path) -> DirectorySource {
-    DirectorySource::new(crate::host::open_dir(path).unwrap())
+fn source_dir(path: &Path) -> PinnedDirectory {
+    PinnedDirectory::new(crate::host::open_dir(path).unwrap())
+}
+
+fn dir_source(path: &Path) -> DirectorySource<PinnedDirectory> {
+    DirectorySource::new(source_dir(path))
 }
 
 /// The manifest the generator writes for the tree at `path`.
@@ -21,6 +28,44 @@ fn generated(path: &Path) -> Vec<u8> {
         .write_manifest(&mut out)
         .unwrap();
     out
+}
+
+/// Reads the manifest `bytes` to its end with the reader of the `uapi16`
+/// crate, which requires the code point order, and returns its root file
+/// object and its file objects. A test can hold a manifest whole.
+fn read(bytes: &[u8]) -> Result<(RootObject, Vec<FileObject>)> {
+    let reader = Reader::open(bytes)?;
+    reader.root().require_order(Order::CodePoint)?;
+    let root = reader.root().clone();
+    let mut objects = Vec::new();
+    for object in reader {
+        if let Object::File(object) = object? {
+            objects.push(*object);
+        }
+    }
+    Ok((root, objects))
+}
+
+/// The file objects of the manifest `bytes`.
+fn objects(bytes: &[u8]) -> Vec<FileObject> {
+    read(bytes).unwrap().1
+}
+
+/// Assembles the manifest `bytes` into `v`.
+fn assemble(
+    v: &mut Volume,
+    bytes: &[u8],
+    source: &mut dyn ContentSource,
+    options: &AssembleOptions,
+) -> Result<AssembleReport> {
+    v.assemble(&mut Reader::open(bytes)?, source, options)
+}
+
+/// Assembles the manifest `bytes` into `v` with the contents of the files
+/// from `stream`.
+fn assemble_stream(v: &mut Volume, bytes: &[u8], stream: &[u8], options: &AssembleOptions) -> Result<AssembleReport> {
+    let mut stream = stream;
+    assemble(v, bytes, &mut StreamSource::new(&mut stream), options)
 }
 
 fn seq(records: &[&str]) -> Vec<u8> {
@@ -33,343 +78,265 @@ fn seq(records: &[&str]) -> Vec<u8> {
     out
 }
 
-const ROOT: &str = r#"{"mediaType":"application/vnd.uapi.16.manifest"}"#;
+const ROOT: &str = r#"{"mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}"#;
 const TRAILER: &str = r#"{"mediaType":"application/vnd.uapi.16.trailer"}"#;
+/// A root file object of a manifest that records modification times too.
+const ROOT_MTIME: &str = concat!(
+    r#"{"features":["device","gid","hardlink","mode","mtime","sha256","size","symlink","uid"],"#,
+    r#""mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}"#
+);
+
+/// The contents of a file read back from the volume.
+fn contents(v: &Volume, path: &str) -> Vec<u8> {
+    let mut back = Vec::new();
+    v.open_file(path).unwrap().read_to_end(&mut back).unwrap();
+    back
+}
+
+/// Records what an assembly reports to its observer.
+#[derive(Debug, Default)]
+struct Recorder {
+    progress: Vec<Progress>,
+    skipped: Vec<(String, SkipReason)>,
+}
+
+impl AssembleObserver for Recorder {
+    fn progress(&mut self, progress: &Progress) {
+        self.progress.push(*progress);
+    }
+
+    fn skipped(&mut self, name: &Name, reason: SkipReason) {
+        self.skipped.push((name.to_string(), reason));
+    }
+}
 
 #[test]
-fn parses_a_manifest() {
-    let hello = sha256::to_hex(&sha256::digest(b"hello"));
-    let m = parse(&seq(&[
-        ROOT,
+fn assembles_what_a_manifest_describes() {
+    let hello = Sha256::digest(b"hello").to_string();
+    let m = seq(&[
+        ROOT_MTIME,
         r#"{"mode":493,"name":"EFI","type":"dir","uid":0,"gid":0}"#,
         r#"{"name":"EFI/BOOT","type":"dir"}"#,
         &format!(
             r#"{{"mTimeNSec":1700000000000000000,"mode":420,"name":"EFI/BOOT/BOOTX64.EFI","sha256":"{}","size":5}}"#,
             hello
         ),
-        r#"{"name":"empty","size":"0"}"#,
-        r#"{"contents":[{"literal":"aGVs bG8="}],"name":"literal.txt","mode":"644"}"#,
+        r#"{"name":"empty","size":0}"#,
         r#"{"contents":[{"literal":"aGVsbG8="}],"name":"link","type":"lnk"}"#,
+        r#"{"contents":[{"literal":"aGVsbG8="}],"name":"literal.txt","mode":420}"#,
         r#"{"mediaType":"application/vnd.uapi.16.signature","mechanism":"pkcs7","data":"AAAA"}"#,
         r#"{"mediaType":"application/x-unknown","whatever":1}"#,
         TRAILER,
-    ]))
-    .unwrap();
-    assert_eq!(m.entries.len(), 6);
-    assert_eq!(m.entries[4].mode, Some(0o644));
-    assert_eq!(m.signatures, 1);
-    assert_eq!(m.root.inode_type, InodeType::Directory);
-    let boot = &m.entries[2];
-    assert_eq!(boot.name.as_deref(), Some("EFI/BOOT/BOOTX64.EFI"));
-    assert_eq!(boot.size, Some(5));
-    assert_eq!(boot.mtime(), Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)));
-    assert!(!boot.is_read_only());
-    assert!(boot.is_streamed());
-    let empty = &m.entries[3];
-    assert_eq!(empty.sha256, Some(sha256::EMPTY));
-    let literal = &m.entries[4];
-    assert_eq!(literal.contents[0].literal.as_deref(), Some(&b"hello"[..]));
-    assert_eq!(literal.size, Some(5));
-    assert!(!literal.is_streamed());
-    assert_eq!(m.streamed_bytes().unwrap(), 5);
-    assert_eq!(m.entries[5].inode_type, InodeType::Symlink);
+    ]);
+    let entries = objects(&m);
+    assert_eq!(entries.len(), 6);
+    assert_eq!(entries[5].inode.mode.map(Mode::bits), Some(0o644));
+    let boot = &entries[2];
+    assert_eq!(
+        boot.inode.mtime(),
+        Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+    );
+    assert!(!boot.inode.is_read_only() && boot.has_external_data());
+    assert_eq!(entries[3].sha256, Some(Sha256::EMPTY));
+    assert!(!entries[5].has_external_data());
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let options = AssembleOptions {
+        flags: AssembleFlags::SKIP_UNSUPPORTED,
+        ..AssembleOptions::default()
+    };
+    let r = assemble_stream(&mut v, &m, b"hello", &options).unwrap();
+    assert_eq!((r.files, r.directories, r.bytes, r.skipped), (3, 2, 10, 1));
+    assert_eq!(contents(&v, "/EFI/BOOT/BOOTX64.EFI"), b"hello");
+    assert_eq!(
+        v.metadata("/EFI/BOOT/BOOTX64.EFI").unwrap().modified,
+        UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    );
+    assert_eq!(contents(&v, "/literal.txt"), b"hello");
+    assert_eq!(v.metadata("/empty").unwrap().size, 0);
+    assert_eq!(v.metadata("/link").unwrap_err().errno(), ENOENT);
 }
 
+/// What the reader refuses is for the uapi16 crate to test, in its
+/// refused.jsonl. An assembly fails on it before it writes what the record
+/// describes, with the problem in the detail.
 #[test]
 fn rejects_broken_manifests() {
-    let cases: &[&[&str]] = &[
-        &[],
-        &[ROOT],
-        &[r#"{"name":"x"}"#, TRAILER],
-        &[ROOT, r#"{"name":"x"}"#],
-        &[ROOT, TRAILER, r#"{"name":"x"}"#],
-        &[
-            ROOT,
-            r#"{"mediaType":"application/vnd.uapi.16.signature","mechanism":"pkcs7","data":"AA=="}"#,
-            r#"{"name":"x"}"#,
-            TRAILER,
-        ],
-        &[ROOT, r#"{"name":"/abs"}"#, TRAILER],
-        &[ROOT, r#"{"name":"a/../b"}"#, TRAILER],
-        &[ROOT, r#"{"name":"Uapi16Manifest"}"#, TRAILER],
-        &[ROOT, r#"{"name":"x","type":"weird"}"#, TRAILER],
-        &[ROOT, r#"{"name":"x","type":"dir","size":1,"inodeToken":1}"#, TRAILER],
-        &[ROOT, r#"{"name":"x","type":"fifo","size":1}"#, TRAILER],
-        &[ROOT, r#"{"name":"x","mode":420,"readOnly":true}"#, TRAILER],
-        &[
-            ROOT,
-            r#"{"name":"x","size":3,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}"#,
-            TRAILER,
-        ],
-        &[
-            ROOT,
-            r#"{"name":"x","contents":[{"file":"a","literal":"AA=="}]}"#,
-            TRAILER,
-        ],
-        &[ROOT, r#"{"name":"x","contents":[{"encoding":"identity"}]}"#, TRAILER],
-        &[
-            ROOT,
-            r#"{"name":"x","size":5,"contents":[{"originalSize":4}]}"#,
-            TRAILER,
-        ],
-        &[ROOT, r#"{"name":"x"}"#, r#"{"name":"x"}"#, TRAILER],
-        &[ROOT, r#"{"name":"x","mode":5000}"#, TRAILER],
-        &[ROOT, r#"{"name":"x","mode":"9"}"#, TRAILER],
-        &[
-            r#"{"mediaType":"application/vnd.uapi.16.manifest","name":"x"}"#,
-            TRAILER,
-        ],
-        // The rules systemd's reader applies on top.
-        &[ROOT, r#"{"name":"x","uid":65535}"#, TRAILER],
-        &[ROOT, r#"{"name":"x","mediaType":null}"#, TRAILER],
-        &[ROOT, r#"{"name":"x","extendedAttributes":[]}"#, TRAILER],
-        &[ROOT, r#"{"name":"x","extendedAttributes":{"user":{"a":"b"}}}"#, TRAILER],
-        &[
-            ROOT,
-            r#"{"name":"x","extendedAttributes":{"user":{"":{"text":"b"}}}}"#,
-            TRAILER,
-        ],
-        &[
-            ROOT,
-            r#"{"name":"x","extendedAttributes":{"user":{"a":{"text":"b","base64":"Yg=="}}}}"#,
-            TRAILER,
-        ],
-        &[
-            ROOT,
-            r#"{"name":"x","extendedAttributes":{"user":{"a":{"base64":"!"}}}}"#,
-            TRAILER,
-        ],
-        &[
-            ROOT,
-            r#"{"name":"x","extendedAttributes":{"user":{"a":{"base64":"Yg"}}}}"#,
-            TRAILER,
-        ],
-        &[ROOT, r#"{"name":"x","contents":[{"literal":"aGVsbG8"}]}"#, TRAILER],
-        &[ROOT, r#"{"name":"x","userName":""}"#, TRAILER],
-        &[ROOT, r#"{"name":"x","userName":"123"}"#, TRAILER],
-        &[ROOT, r#"{"name":"x","userName":"a:b"}"#, TRAILER],
-        &[ROOT, r#"{"name":"x","groupName":" g"}"#, TRAILER],
-        &[ROOT, r#"{"name":"x","gptUuid":"not-a-uuid"}"#, TRAILER],
-        &[ROOT, r#"{"name":"x","gptUuid":"12345678\u00e9"}"#, TRAILER],
-        &[
-            ROOT,
-            r#"{"name":"x","gptTypeUuid":"\u00e9\u00e9\u00e9\u00e9\u00e9"}"#,
-            TRAILER,
-        ],
-        &[
-            ROOT,
-            r#"{"name":"x","gptLabel":"0123456789012345678901234567890123456"}"#,
-            TRAILER,
-        ],
-        &[ROOT, r#"{"name":"x","gptFlags":0,"gptFlagNoAuto":true}"#, TRAILER],
-        &[
-            ROOT,
-            r#"{"mediaType":"application/vnd.uapi.16.signature","data":"AAAA"}"#,
-            TRAILER,
-        ],
-        &[
-            ROOT,
-            r#"{"mediaType":"application/vnd.uapi.16.signature","mechanism":"pkcs7","key":"xyz"}"#,
-            TRAILER,
-        ],
-        &[
-            ROOT,
-            r#"{"mediaType":"application/vnd.uapi.16.signature","mechanism":"pkcs7","data":"!!"}"#,
-            TRAILER,
-        ],
-        &[
-            ROOT,
-            r#"{"mediaType":"application/vnd.uapi.16.signature","mechanism":"pkcs7","data":"AA="}"#,
-            TRAILER,
-        ],
-        &[
-            ROOT,
-            r#"{"name":"a.txt","size":0}"#,
-            r#"{"name":"A.TXT","size":0}"#,
-            TRAILER,
-        ],
-    ];
-    for records in cases {
-        assert!(parse(&seq(records)).is_err(), "{:?} accepted", records);
-    }
-    let long = "x".repeat(256);
-    assert!(parse(&seq(&[ROOT, &format!(r#"{{"name":"{}","size":0}}"#, long), TRAILER])).is_err());
-    let contents = format!("[{}]", vec![r#"{"literal":"AA=="}"#; 257].join(","));
-    assert!(parse(&seq(&[
-        ROOT,
-        &format!(r#"{{"name":"x","contents":{}}}"#, contents),
-        TRAILER
-    ]))
-    .is_err());
-    let contents = format!("[{}]", vec![r#"{"literal":"AA=="}"#; 256].join(","));
-    assert!(parse(&seq(&[
-        ROOT,
-        &format!(r#"{{"name":"x","contents":{}}}"#, contents),
-        TRAILER
-    ]))
-    .is_ok());
-    // Records beyond the cap.
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let m = seq(&[ROOT, r#"{"name":"x","size":1,"mode":5000}"#, TRAILER]);
+    let e = assemble_stream(&mut v, &m, b"x", &AssembleOptions::default()).unwrap_err();
+    assert_eq!(e.errno(), EBADMSG);
+    assert_eq!(
+        e.detail(),
+        Some(&Detail::Manifest {
+            problem: ManifestProblem::Malformed(Problem::FieldOutOfRange),
+            record: Some(1),
+            name: Some("x".to_string()),
+            field: Some("mode".to_string()),
+        })
+    );
+    assert!(v.read_dir("/").unwrap().is_empty());
+    // A record beyond the cap fails with E2BIG.
     let big = format!(r#"{{"name":"x","size":0,"pad":"{}"}}"#, "p".repeat(MAX_RECORD_SIZE));
-    assert_eq!(parse(&seq(&[ROOT, &big, TRAILER])).unwrap_err().errno(), E2BIG);
-    // No record separator at all.
-    assert!(parse(ROOT.as_bytes()).is_err());
-    // Whitespace-only records are fine, as long as it is ASCII whitespace.
-    let mut bytes = seq(&[ROOT]);
-    bytes.extend_from_slice(&[RECORD_SEPARATOR, b'\n', b' ']);
-    bytes.extend_from_slice(&seq(&[TRAILER]));
-    assert!(parse(&bytes).is_ok());
-    let mut bytes = seq(&[ROOT]);
-    bytes.push(RECORD_SEPARATOR);
-    bytes.extend_from_slice("\u{2028}".as_bytes());
-    bytes.extend_from_slice(&seq(&[TRAILER]));
-    assert!(parse(&bytes).is_err());
-    // The rules systemd relaxes are relaxed here too.
-    let m = parse(&seq(&[
-        ROOT,
-        r#"{"name":"x","size":"5","sha256":"2cf2 4dba 5fb0 a30e 26e8 3b2a c5b9 e29e 1b16 1e5c 1fa7 425e 7304 3362 938b 9824","validUntilUSec":"18446744073709551615"}"#,
-        r#"{"name":"y","size":0,"uid":4294967294,"userName":"Domain Users","gptUuid":"urn:uuid:4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709","gptLabel":"root","gptFlags":9223372036854775808,"gptFlagNoAuto":true,"extendedAttributes":{"user":{"a":{"text":"b"},"c":{"base64":"Yg=="}},"other":5}}"#,
-        TRAILER,
-    ]))
-    .unwrap();
-    assert_eq!(m.entries[0].size, Some(5));
-    assert_eq!(m.entries[0].sha256, Some(sha256::digest(b"hello")));
-    assert_eq!(m.entries[0].valid_until_usec, Some(u64::MAX));
-}
-
-/// The test vectors of systemd's unbase64mem() in
-/// src/test/test-hexdecoct.c: what it decodes and what it refuses.
-#[test]
-fn base64() {
-    for (text, data) in [
-        ("", ""),
-        ("Zg==", "f"),
-        ("Zm8=", "fo"),
-        ("Zm9v", "foo"),
-        ("Zm9vYg==", "foob"),
-        ("Zm9vYmE=", "fooba"),
-        ("Zm9vYmFy", "foobar"),
-        (" ", ""),
-        (" \n\r ", ""),
-        ("    Zg\n==       ", "f"),
-        (" Zm 8=\r", "fo"),
-        ("  Zm9\n\r\r\nv   ", "foo"),
-        (" Z m9vYg==\n\r", "foob"),
-        (" Zm 9vYmE=   ", "fooba"),
-        ("   Z m9v    YmFy   ", "foobar"),
-        ("aGVs\nbG8 =", "hello"),
+    let e = assemble_stream(&mut v, &seq(&[ROOT, &big, TRAILER]), b"", &AssembleOptions::default()).unwrap_err();
+    assert_eq!(e.errno(), E2BIG);
+    assert!(e.is_manifest(), "{:?}", e);
+    assert!(v.read_dir("/").unwrap().is_empty());
+    // A manifest that does not declare the code point order is refused
+    // before anything is written, also when its objects are in that order.
+    for root in [
+        r#"{"mediaType":"application/vnd.uapi.16.manifest"}"#,
+        r#"{"mediaType":"application/vnd.uapi.16.manifest","order":"bytes"}"#,
     ] {
-        assert_eq!(base64_decode(text).as_deref(), Some(data.as_bytes()), "{:?}", text);
+        let undeclared = seq(&[
+            root,
+            r#"{"name":"a","type":"dir"}"#,
+            r#"{"name":"b","size":0}"#,
+            TRAILER,
+        ]);
+        let (_img, mut v) = volume(8 << 20, 512, 512);
+        let e = assemble_stream(&mut v, &undeclared, b"", &AssembleOptions::default()).unwrap_err();
+        assert_eq!(e.errno(), EBADMSG);
+        assert_eq!(
+            e.detail(),
+            Some(&Detail::Manifest {
+                problem: ManifestProblem::Malformed(Problem::NoOrder),
+                record: Some(0),
+                name: None,
+                field: Some("order".to_string()),
+            }),
+            "{}",
+            root
+        );
+        assert!(v.read_dir("/").unwrap().is_empty());
     }
-    for text in ["A", "A====", "AAB==", " A A A B = ", " Z m 8 = q u u x "] {
-        assert_eq!(base64_decode(text), None, "{:?}", text);
-    }
+    // A manifest does not limit a component on its own. A name too long
+    // for FAT is refused when it would be written, and nothing is.
+    let long = format!(r#"{{"name":"{}","size":0}}"#, "x".repeat(256));
+    assert!(read(&seq(&[ROOT, &long, TRAILER])).is_ok());
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let e = assemble_stream(&mut v, &seq(&[ROOT, &long, TRAILER]), b"", &AssembleOptions::default()).unwrap_err();
+    assert_eq!(e.errno(), ENAMETOOLONG);
+    assert!(!v.is_writing());
 }
 
-/// Both alphabets, in any mix, with the values systemd's unbase64char()
-/// gives the digits, and its test of the two spellings of the same data.
+/// What the volume refuses at the first object of a manifest leaves it as
+/// it was, not even marked as being written: a file where it has a
+/// directory, a name FAT cannot store, as a file and as a directory, and a
+/// name it holds when nothing is replaced.
 #[test]
-fn base64_alphabets() {
-    assert_eq!(base64_decode("AZaz").unwrap(), [1, 150, 179]);
-    assert_eq!(base64_decode("09+/").unwrap(), [211, 223, 191]);
-    assert_eq!(base64_decode("09-_").unwrap(), [211, 223, 191]);
-    assert_eq!(base64_decode("_-8=").unwrap(), [0xff, 0xef]);
-    let plaintext: &[u8] = &[
-        0xcc, 0xa1, 0x72, 0x22, 0xae, 0xda, 0x66, 0x7e, 0x04, 0xa6, 0xe0, 0x82, 0x9a, 0x97, 0x05, 0xf6, 0x33, 0xe0,
-        0x0f, 0xc2, 0x45, 0x13, 0x58, 0x3f, 0xc5, 0xf4, 0xf4, 0x31, 0xab, 0x3c, 0x5f, 0x83, 0x34, 0x5b, 0x27, 0x32,
-        0x8a, 0x04, 0x6c, 0x43, 0x82, 0x07, 0xe3, 0x2c, 0xac, 0xb9, 0xfb, 0xac, 0xd0, 0x03, 0x91, 0x42, 0xcb, 0xa4,
-        0xde, 0x87, 0x86, 0x85, 0x10, 0xbb, 0xb7, 0x5b, 0x4b, 0xc8, 0xa0, 0xf4, 0x22, 0x1d, 0x15, 0x71, 0x87, 0x9d,
-        0xbf, 0x9f, 0xa9, 0xf1, 0xee, 0xa2, 0xb6, 0xaa, 0xc8, 0xc3, 0x37, 0x9c, 0xbb, 0xdf, 0x3e, 0xac, 0xdc, 0x94,
-        0x54, 0x38, 0x56, 0x07, 0x34, 0xb4, 0x3c, 0xcc, 0x31, 0x13,
-    ];
-    for text in [
-        "zKFyIq7aZn4EpuCCmpcF9jPgD8JFE1g/xfT0Mas8X4M0WycyigRsQ4IH4yysufus0AORQsuk3oeGhRC7t1tLyKD0Ih0VcYedv5+p8e6itqrIwzecu98+rNyUVDhWBzS0PMwxEw==",
-        "zKFyIq7aZn4EpuCCmpcF9jPgD8JFE1g_xfT0Mas8X4M0WycyigRsQ4IH4yysufus0AORQsuk3oeGhRC7t1tLyKD0Ih0VcYedv5-p8e6itqrIwzecu98-rNyUVDhWBzS0PMwxEw==",
+fn refusals_at_the_first_object_write_nothing() {
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+    v.create_dir("/d", t0).unwrap();
+    v.write_file("/f", &mut &b"old"[..], t0, false).unwrap();
+    v.sync().unwrap();
+    let keep = AssembleOptions {
+        flags: AssembleFlags::NONE,
+        ..AssembleOptions::default()
+    };
+    for (object, errno) in [
+        (r#"{"name":"d","size":0}"#, EISDIR),
+        (r#"{"name":"a:b","size":0}"#, EINVAL),
+        (r#"{"name":"a:b","type":"dir"}"#, EINVAL),
+        (r#"{"name":"f","size":3}"#, EEXIST),
     ] {
-        assert_eq!(base64_decode(text).as_deref(), Some(plaintext));
+        let e = assemble_stream(&mut v, &seq(&[ROOT, object, TRAILER]), b"new", &keep).unwrap_err();
+        assert_eq!(e.errno(), errno, "{}", object);
+        assert!(!v.is_writing(), "{}", object);
     }
+    assert_eq!(contents(&v, "/f"), b"old");
 }
 
-/// What systemd refuses: a last group without its padding, incomplete
-/// padding, padding with nothing to pad, padding that leaves bits set,
-/// anything after the padding, and any character that is not a digit,
-/// "=" or one of space, tab, newline and carriage return.
+/// A manifest that lists a file before the object of its directory, or
+/// its objects out of code point order, is refused when the object comes.
+/// What came before it is written.
 #[test]
-fn base64_refuses() {
-    for text in [
-        "Zg", "Zm8", "aGVsbG8", "Zg=", "Zm9v=", "Zm9v==", "=", "==", " = ", "Zh==", "Zm9=", "Zg==Zg==", "Zg== x",
-        "Z=g=", "====", "Zm9\x0cv", "Zm9\x0bv", "!!!!", "Zm9v\0",
+fn misplaced_and_unsorted_manifests_are_refused() {
+    for (records, problem, written) in [
+        (
+            &[
+                ROOT,
+                r#"{"name":"d/x","size":0}"#,
+                r#"{"name":"d","type":"dir","mTimeNSec":1700000000000000000}"#,
+                TRAILER,
+            ][..],
+            ManifestProblem::Malformed(Problem::Misplaced),
+            0,
+        ),
+        (
+            &[
+                ROOT,
+                r#"{"name":"a","type":"dir"}"#,
+                r#"{"name":"b","size":0}"#,
+                r#"{"name":"a/x","size":0}"#,
+                TRAILER,
+            ],
+            ManifestProblem::Malformed(Problem::Misplaced),
+            2,
+        ),
+        // In tree order, but the names of a directory are not sorted.
+        (
+            &[ROOT, r#"{"name":"b","size":0}"#, r#"{"name":"a","size":0}"#, TRAILER],
+            ManifestProblem::Malformed(Problem::OutOfOrder),
+            1,
+        ),
+        (
+            &[
+                ROOT,
+                r#"{"name":"a-b","size":0}"#,
+                r#"{"name":"a","type":"dir"}"#,
+                TRAILER,
+            ],
+            ManifestProblem::Malformed(Problem::OutOfOrder),
+            1,
+        ),
     ] {
-        assert_eq!(base64_decode(text), None, "{:?}", text);
+        let (_img, mut v) = volume(8 << 20, 512, 512);
+        let e = assemble_stream(&mut v, &seq(records), b"", &AssembleOptions::default()).unwrap_err();
+        assert_eq!(e.errno(), EBADMSG, "{:?}", records);
+        assert!(
+            matches!(e.detail(), Some(Detail::Manifest { problem: p, .. }) if *p == problem),
+            "{:?}: {:?}",
+            records,
+            e
+        );
+        assert_eq!(v.read_dir("/").unwrap().len(), written, "{:?}", records);
     }
 }
 
-/// Data of every length up to 300 bytes comes back from its padded
-/// encoding broken into lines of any width, the way systemd's
-/// base64mem_full() writes it.
-#[test]
-fn base64_round_trip() {
-    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut x = 1u32;
-    for len in 0..300usize {
-        let data: Vec<u8> = (0..len)
-            .map(|_| {
-                x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                (x >> 16) as u8
-            })
-            .collect();
-        let mut text = Vec::new();
-        for chunk in data.chunks(3) {
-            let n = chunk.iter().fold(0u32, |n, &b| (n << 8) | u32::from(b)) << (8 * (3 - chunk.len()));
-            for i in 0..4 {
-                let digit = DIGITS[((n >> (18 - 6 * i)) & 63) as usize];
-                text.push(if i <= chunk.len() { digit } else { b'=' });
-            }
-        }
-        let mut lines = Vec::new();
-        for line in text.chunks(1 + len % 77) {
-            lines.extend_from_slice(line);
-            lines.push(b'\n');
-        }
-        let decoded = base64_decode(std::str::from_utf8(&lines).unwrap());
-        assert_eq!(decoded.as_deref(), Some(&data[..]), "{} bytes", len);
-    }
-}
-
-fn manifest_with_tree() -> (Manifest, Vec<u8>) {
+/// The manifest of a tree, with the contents of its streamed files in
+/// manifest order.
+fn manifest_with_tree() -> (Vec<u8>, Vec<u8>) {
     let a = b"first file".to_vec();
     let b = vec![7u8; 5000];
-    let m = parse(&seq(&[
-        ROOT,
+    let m = seq(&[
+        ROOT_MTIME,
         r#"{"mTimeNSec":1700000000000000000,"name":"EFI","type":"dir"}"#,
-        &format!(
-            r#"{{"mTimeNSec":1700000001000000000,"name":"EFI/a.txt","sha256":"{}","size":{}}}"#,
-            sha256::to_hex(&sha256::digest(&a)),
-            a.len()
-        ),
+        r#"{"name":"EFI/Linux","type":"dir"}"#,
         &format!(
             r#"{{"mode":292,"name":"EFI/Linux/b.efi","sha256":"{}","size":{}}}"#,
-            sha256::to_hex(&sha256::digest(&b)),
+            Sha256::digest(&b),
             b.len()
+        ),
+        &format!(
+            r#"{{"mTimeNSec":1700000001000000000,"name":"EFI/a.txt","sha256":"{}","size":{}}}"#,
+            Sha256::digest(&a),
+            a.len()
         ),
         r#"{"contents":[{"literal":"aGVsbG8="}],"name":"literal.txt","size":5}"#,
         TRAILER,
-    ]))
-    .unwrap();
-    let mut blob = a;
-    blob.extend(b);
+    ]);
+    let mut blob = b;
+    blob.extend(a);
     (m, blob)
 }
 
 #[test]
 fn assembles_from_a_stream() {
     let (m, blob) = manifest_with_tree();
-    assert_eq!(m.streamed_bytes().unwrap(), blob.len() as u64);
     let (_img, mut v) = volume(8 << 20, 512, 512);
-    let mut reader: &[u8] = &blob;
-    let report = v
-        .assemble(&m, &mut StreamSource::new(&mut reader), &AssembleOptions::default())
-        .unwrap();
-    assert_eq!((report.files, report.directories, report.bytes), (3, 1, 5015));
+    let report = assemble_stream(&mut v, &m, &blob, &AssembleOptions::default()).unwrap();
+    assert_eq!((report.files, report.directories, report.bytes), (3, 2, 5015));
     assert_eq!(
         v.metadata("/EFI/a.txt").unwrap().modified,
         UNIX_EPOCH + Duration::from_secs(1_700_000_000)
@@ -380,45 +347,24 @@ fn assembles_from_a_stream() {
         b.attributes & crate::dirent::ATTR_READ_ONLY,
         crate::dirent::ATTR_READ_ONLY
     );
-    // Implicitly created directories get the default time, clamped to
-    // the FAT epoch.
+    // A directory without a time gets the default time, clamped to the FAT
+    // epoch.
     assert_eq!(
         v.metadata("/EFI/Linux").unwrap().modified,
         UNIX_EPOCH + Duration::from_secs(crate::time::FAT_EPOCH as u64)
     );
-    let mut back = String::new();
-    v.open_file("/literal.txt").unwrap().read_to_string(&mut back).unwrap();
-    assert_eq!(back, "hello");
+    assert_eq!(contents(&v, "/literal.txt"), b"hello");
 
-    // A short stream fails at the file it runs out in and leaves no
-    // trace of it. The files before it are complete.
+    // A short stream fails at the file it runs out in and leaves no trace
+    // of it. The directories before it are there.
     let (_img, mut v) = volume(8 << 20, 512, 512);
-    let mut short: &[u8] = &blob[..100];
-    assert_eq!(
-        v.assemble(&m, &mut StreamSource::new(&mut short), &AssembleOptions::default())
-            .unwrap_err()
-            .errno(),
-        EBADMSG
-    );
-    assert!(v.metadata("/EFI/Linux/b.efi").is_err());
-    assert_eq!(v.metadata("/EFI/a.txt").unwrap().size, 10);
-
-    // A stream that goes on after the last file fails at that file, which
-    // got more than the manifest says. It is not stored either.
-    let (_img, mut v) = volume(8 << 20, 512, 512);
-    let long_blob = [&blob[..], b"more"].concat();
-    let mut long: &[u8] = &long_blob;
-    let e = v
-        .assemble(&m, &mut StreamSource::new(&mut long), &AssembleOptions::default())
-        .unwrap_err();
+    let e = assemble_stream(&mut v, &m, &blob[..100], &AssembleOptions::default()).unwrap_err();
     assert_eq!(e.errno(), EBADMSG);
     assert!(
         matches!(
             e.detail(),
             Some(Detail::Content {
-                problem: ContentProblem::Size,
-                size: None,
-                expected: Some(5000),
+                problem: ContentProblem::StreamEnded,
                 ..
             })
         ),
@@ -426,28 +372,74 @@ fn assembles_from_a_stream() {
         e
     );
     assert!(v.metadata("/EFI/Linux/b.efi").is_err());
+    assert!(v.metadata("/EFI/Linux").unwrap().is_dir);
+
+    // A stream that goes on after the last file fails once the manifest
+    // ended, naming that file. The files are all there by then.
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let long_blob = [&blob[..], b"more"].concat();
+    let e = assemble_stream(&mut v, &m, &long_blob, &AssembleOptions::default()).unwrap_err();
+    assert_eq!(e.errno(), EBADMSG);
+    assert!(
+        matches!(
+            e.detail(),
+            Some(Detail::Content {
+                problem: ContentProblem::Size,
+                name,
+                size: None,
+                expected: Some(10),
+            }) if name == "EFI/a.txt"
+        ),
+        "{:?}",
+        e
+    );
     assert_eq!(v.metadata("/EFI/a.txt").unwrap().size, 10);
+    assert_eq!(contents(&v, "/literal.txt"), b"hello");
 
     // A corrupted stream fails the hash check. The file it was about to
     // replace survives untouched.
     let mut bad = blob.clone();
     bad[0] ^= 1;
-    let mut bad_reader: &[u8] = &bad;
-    let e = v
-        .assemble(&m, &mut StreamSource::new(&mut bad_reader), &AssembleOptions::default())
-        .unwrap_err();
+    let replace = AssembleOptions {
+        flags: AssembleFlags::REPLACE,
+        ..AssembleOptions::default()
+    };
+    let e = assemble_stream(&mut v, &m, &bad, &replace).unwrap_err();
     assert!(e.message().contains("hash"), "{}", e);
-    let mut back = String::new();
-    v.open_file("/EFI/a.txt").unwrap().read_to_string(&mut back).unwrap();
-    assert_eq!(back, "first file");
+    assert_eq!(contents(&v, "/EFI/Linux/b.efi"), vec![7u8; 5000]);
 
     // On a fresh volume the failed file leaves nothing behind.
     let (_img, mut v) = volume(8 << 20, 512, 512);
-    let mut bad_reader: &[u8] = &bad;
-    v.assemble(&m, &mut StreamSource::new(&mut bad_reader), &AssembleOptions::default())
-        .unwrap_err();
-    assert!(v.metadata("/EFI/a.txt").is_err());
-    assert!(v.metadata("/EFI").is_ok());
+    assemble_stream(&mut v, &m, &bad, &AssembleOptions::default()).unwrap_err();
+    assert!(v.metadata("/EFI/Linux/b.efi").is_err());
+    assert!(v.metadata("/EFI/Linux").is_ok());
+}
+
+/// A manifest is read once, from its start to its end: from a pipe as
+/// well as from a file.
+#[test]
+fn assembles_while_a_manifest_comes_through_a_pipe() {
+    let tmp = TempDir::new("manifest-pipe");
+    let dir = tmp.path().to_path_buf();
+    std::fs::create_dir_all(dir.join("EFI/Linux")).unwrap();
+    std::fs::write(dir.join("EFI/a.txt"), b"first file").unwrap();
+    std::fs::write(dir.join("EFI/Linux/b.efi"), vec![7u8; 5000]).unwrap();
+    let (m, _) = manifest_with_tree();
+    let (mut ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let writer = std::thread::spawn(move || {
+        // A record at a time, the way a producer writes them.
+        for record in m.split_inclusive(|&b| b == b'\n') {
+            theirs.write_all(record).unwrap();
+        }
+    });
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let mut reader = Reader::open(&mut ours).unwrap();
+    let report = v
+        .assemble(&mut reader, &mut dir_source(&dir), &AssembleOptions::default())
+        .unwrap();
+    writer.join().unwrap();
+    assert_eq!((report.files, report.directories, report.bytes), (3, 2, 5015));
+    assert_eq!(contents(&v, "/EFI/a.txt"), b"first file");
 }
 
 #[test]
@@ -459,17 +451,14 @@ fn assembles_from_a_directory() {
     std::fs::write(dir.join("EFI/Linux/b.efi"), vec![7u8; 5000]).unwrap();
     let (m, _) = manifest_with_tree();
     let (_img, mut v) = volume(8 << 20, 512, 512);
-    let report = v
-        .assemble(&m, &mut dir_source(&dir), &AssembleOptions::default())
-        .unwrap();
+    let report = assemble(&mut v, &m, &mut dir_source(&dir), &AssembleOptions::default()).unwrap();
     assert_eq!(report.files, 3);
 
     // The generator produces a manifest the reader accepts and the
     // planner and assembler agree on.
     let generated = generated(&dir);
-    let g = parse(&generated).unwrap();
     assert_eq!(
-        g.entries.iter().filter_map(|e| e.name.clone()).collect::<Vec<_>>(),
+        objects(&generated).iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
         vec!["EFI", "EFI/Linux", "EFI/Linux/b.efi", "EFI/a.txt"]
     );
     let mut plan = crate::plan::Plan::new(crate::plan::PlanOptions {
@@ -477,7 +466,11 @@ fn assembles_from_a_directory() {
         cluster_size: Some(512),
         ..crate::plan::PlanOptions::new(512)
     });
-    assert!(plan.add_manifest(&g).unwrap().is_empty());
+    let mut reader = Reader::open(&generated[..]).unwrap();
+    assert_eq!(
+        plan.add_records(&mut reader, AssembleFlags::SKIP_UNSUPPORTED).unwrap(),
+        0
+    );
     let est = plan.estimate().unwrap();
     let img = TempImage::new(est.size());
     let mut o = crate::format::FormatOptions {
@@ -487,147 +480,213 @@ fn assembles_from_a_directory() {
     est.apply(&mut o);
     crate::format::format(&img.device(), &o).unwrap();
     let mut v = Volume::open(img.device()).unwrap();
-    v.assemble(&g, &mut dir_source(&dir), &AssembleOptions::default())
-        .unwrap();
+    assemble(&mut v, &generated, &mut dir_source(&dir), &AssembleOptions::default()).unwrap();
     assert_eq!(v.free_clusters(), 0);
 }
 
+/// What FAT cannot store is refused, or left out with everything below it
+/// and counted. The contents of a file that is left out are read past in
+/// a stream, which ends with them all the same.
 #[test]
 fn unsupported_entries() {
-    let hello = sha256::to_hex(&sha256::digest(b"hello"));
-    let m = parse(&seq(&[
+    let hello = Sha256::digest(b"hello").to_string();
+    let m = seq(&[
         ROOT,
-        r#"{"name":"a/b/link","type":"lnk","contents":[{"literal":"eA=="}]}"#,
         r#"{"name":"encoded","size":5,"contents":[{"literal":"H4sIAAAAAAAAA8tIzcnJBwCGphA2BQAAAA==","encoding":"gzip"}]}"#,
+        r#"{"name":"link","type":"lnk","contents":[{"literal":"eA=="}]}"#,
+        r#"{"name":"ok","size":2}"#,
         r#"{"name":"remote","size":5,"contents":[{"url":"https://example.com/x"}]}"#,
         &format!(r#"{{"name":"sub","type":"dir","sha256":"{}","size":5}}"#, hello),
-        r#"{"name":"ok","size":0}"#,
+        r#"{"name":"sub/deeper","type":"dir"}"#,
+        r#"{"name":"sub/deeper/x","size":3}"#,
+        r#"{"name":"sub/inner","size":0}"#,
+        r#"{"name":"z","size":1}"#,
         TRAILER,
-    ]))
-    .unwrap();
-    let unsupported: Vec<String> = m
-        .entries
+    ]);
+    let unsupported: Vec<String> = objects(&m)
         .iter()
-        .filter(|e| e.check_supported().is_err())
-        .map(|e| e.name.clone().unwrap())
+        .filter(|e| EntryKind::try_from(*e).is_err())
+        .map(|e| e.name.to_string())
         .collect();
-    assert_eq!(unsupported, vec!["a/b/link", "encoded", "remote", "sub"]);
-    assert_eq!(m.check_supported().unwrap_err().errno(), EOPNOTSUPP);
-    assert_eq!(m.streamed_bytes().unwrap(), 0);
+    assert_eq!(unsupported, vec!["encoded", "link", "remote", "sub"]);
     let (_img, mut v) = volume(8 << 20, 512, 512);
-    let mut empty: &[u8] = &[];
-    let e = v
-        .assemble(&m, &mut StreamSource::new(&mut empty), &AssembleOptions::default())
-        .unwrap_err();
+    let e = assemble_stream(&mut v, &m, b"okxyzZ", &AssembleOptions::default()).unwrap_err();
     assert_eq!(e.errno(), EOPNOTSUPP);
-    // Nothing was created for the entry that failed, not even parents.
+    // Nothing was created for the entry that failed.
     assert_eq!(v.read_dir("/").unwrap().len(), 0);
+    let options = AssembleOptions {
+        flags: AssembleFlags::SKIP_UNSUPPORTED,
+        ..Default::default()
+    };
+    let mut recorder = Recorder::default();
+    let mut stream: &[u8] = b"okxyzZ";
     let r = v
-        .assemble(
-            &m,
-            &mut StreamSource::new(&mut empty),
-            &AssembleOptions {
-                skip_unsupported: true,
-                ..Default::default()
-            },
+        .assemble_with_observer(
+            &mut Reader::open(&m[..]).unwrap(),
+            &mut StreamSource::new(&mut stream),
+            &options,
+            &mut recorder,
         )
         .unwrap();
-    assert_eq!(r.skipped, unsupported);
-    assert_eq!((r.files, r.directories), (1, 0));
-    assert_eq!(v.metadata("/a").unwrap_err().errno(), ENOENT);
-    // The planner skips the same entries.
+    assert_eq!((r.files, r.directories, r.bytes, r.skipped), (2, 0, 3, 7));
+    use SkipReason::{BelowSkipped as Below, Unsupported as Cannot};
+    let skipped: Vec<(&str, SkipReason)> = recorder.skipped.iter().map(|(n, r)| (n.as_str(), *r)).collect();
+    assert_eq!(
+        skipped,
+        [
+            ("encoded", Cannot),
+            ("link", Cannot),
+            ("remote", Cannot),
+            ("sub", Cannot),
+            ("sub/deeper", Below),
+            ("sub/deeper/x", Below),
+            ("sub/inner", Below),
+        ]
+    );
+    assert_eq!(contents(&v, "/ok"), b"ok");
+    assert_eq!(contents(&v, "/z"), b"Z");
+    assert_eq!(v.metadata("/sub").unwrap_err().errno(), ENOENT);
+    // The stream had the contents of the file below the directory that
+    // was left out, and nothing else.
+    for stream in [&b"okxyz"[..], b"okxyzZmore"] {
+        let (_img, mut v) = volume(8 << 20, 512, 512);
+        assert_eq!(
+            assemble_stream(&mut v, &m, stream, &options).unwrap_err().errno(),
+            EBADMSG
+        );
+    }
+    // A file larger than a FAT32 file can be is no object to leave out.
+    let big = seq(&[ROOT, r#"{"name":"big","size":4294967296}"#, TRAILER]);
+    let e = assemble_stream(&mut v, &big, b"", &options).unwrap_err();
+    assert_eq!(e.errno(), EFBIG);
+    assert!(
+        matches!(
+            e.detail(),
+            Some(Detail::TooLarge {
+                path: Some(path),
+                size: 4294967296,
+                ..
+            }) if path == "/big"
+        ),
+        "{:?}",
+        e
+    );
+    // The planner leaves out the same objects.
     let mut plan = crate::plan::Plan::new(crate::plan::PlanOptions {
         allow_small: true,
         ..crate::plan::PlanOptions::new(512)
     });
-    assert_eq!(plan.add_manifest(&m).unwrap(), unsupported);
+    let mut reader = Reader::open(&m[..]).unwrap();
+    assert_eq!(
+        plan.add_records(&mut reader, AssembleFlags::SKIP_UNSUPPORTED).unwrap(),
+        7
+    );
+    assert_eq!((plan.estimate().unwrap().files, plan.estimate().unwrap().bytes), (2, 3));
 }
 
+/// Directories that are left out one after the other each take what is
+/// below them along, and nothing else: a name that only starts like the
+/// name of one is not below it. The stream has the contents of the files
+/// below them as well.
 #[test]
-fn contents_are_chosen_by_what_can_be_used() {
-    let hello = sha256::to_hex(&sha256::digest(b"hello"));
-    let m = parse(&seq(&[
+fn directories_left_out_one_after_the_other() {
+    let hello = Sha256::digest(b"hello").to_string();
+    let sub = |name: &str| format!(r#"{{"name":"{}","sha256":"{}","size":5,"type":"dir"}}"#, name, hello);
+    let m = seq(&[
         ROOT,
-        // A URL first, then an encoded literal, then plain data.
-        &format!(r#"{{"name":"x","size":5,"sha256":"{}","contents":[{{"url":"https://example.com/x"}},{{"literal":"AAAA","encoding":"gzip"}},{{"literal":"aGVsbG8="}}]}}"#, hello),
-        // A URL with a file as the alternative is read from the source.
-        &format!(r#"{{"name":"y","size":5,"sha256":"{}","contents":[{{"url":"https://example.com/y"}},{{"file":"data/y.bin"}}]}}"#, hello),
+        &sub("a"),
+        r#"{"name":"a/x","size":1}"#,
+        r#"{"name":"ab","size":1}"#,
+        &sub("b"),
+        r#"{"name":"b/y","size":1}"#,
+        &sub("c"),
+        r#"{"name":"d","size":1}"#,
         TRAILER,
-    ]))
-    .unwrap();
-    assert_eq!(
-        m.entries[0].fat_contents().unwrap().unwrap().literal.as_deref(),
-        Some(&b"hello"[..])
-    );
-    assert!(!m.entries[0].is_streamed());
-    assert_eq!(
-        m.entries[1].fat_contents().unwrap().unwrap().file.as_deref(),
-        Some("data/y.bin")
-    );
-    assert!(m.entries[1].is_streamed());
-    let tmp = TempDir::new("manifest-contents");
-    let dir = tmp.path().to_path_buf();
-    std::fs::create_dir_all(dir.join("data")).unwrap();
-    std::fs::write(dir.join("data/y.bin"), b"hello").unwrap();
+    ]);
+    let options = AssembleOptions {
+        flags: AssembleFlags::SKIP_UNSUPPORTED,
+        ..Default::default()
+    };
     let (_img, mut v) = volume(8 << 20, 512, 512);
+    let mut recorder = Recorder::default();
+    let mut stream: &[u8] = b"xAyD";
     let r = v
-        .assemble(&m, &mut dir_source(&dir), &AssembleOptions::default())
+        .assemble_with_observer(
+            &mut Reader::open(&m[..]).unwrap(),
+            &mut StreamSource::new(&mut stream),
+            &options,
+            &mut recorder,
+        )
         .unwrap();
-    assert_eq!((r.files, r.bytes), (2, 10));
-    for name in ["/x", "/y"] {
-        let mut back = String::new();
-        v.open_file(name).unwrap().read_to_string(&mut back).unwrap();
-        assert_eq!(back, "hello");
+    assert_eq!((r.files, r.skipped), (2, 5));
+    use SkipReason::{BelowSkipped as Below, Unsupported as Cannot};
+    let skipped: Vec<(&str, SkipReason)> = recorder.skipped.iter().map(|(n, r)| (n.as_str(), *r)).collect();
+    assert_eq!(
+        skipped,
+        [
+            ("a", Cannot),
+            ("a/x", Below),
+            ("b", Cannot),
+            ("b/y", Below),
+            ("c", Cannot),
+        ]
+    );
+    assert_eq!(contents(&v, "/ab"), b"A");
+    assert_eq!(contents(&v, "/d"), b"D");
+}
+
+/// A regular file without a size can be neither streamed nor planned, and
+/// both say so alike: by its name in the manifest, and the size field. The
+/// stream refuses it before anything is written.
+#[test]
+fn files_without_a_size() {
+    let m = seq(&[ROOT, r#"{"name":"x"}"#, TRAILER]);
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let streamed = assemble_stream(&mut v, &m, b"", &AssembleOptions::default()).unwrap_err();
+    assert!(!v.is_writing());
+    let mut plan = crate::plan::Plan::new(crate::plan::PlanOptions::new(512));
+    let mut reader = Reader::open(&m[..]).unwrap();
+    let planned = plan.add_records(&mut reader, AssembleFlags::NONE).unwrap_err();
+    for e in [streamed, planned] {
+        let Some(Detail::Manifest {
+            problem, name, field, ..
+        }) = e.detail()
+        else {
+            panic!("{:?}", e);
+        };
+        assert_eq!(*problem, ManifestProblem::NoSize);
+        assert_eq!((name.as_deref(), field.as_deref()), (Some("x"), Some("size")));
     }
 }
 
-/// A file the manifest takes whole has exactly the size the manifest gives.
-/// One that grew since the manifest was written fails like one that shrank,
-/// when the source is verified and again while it is copied. A part of a
-/// file, at an offset or out of a larger originalSize, only has to fit.
+/// A directory that refers to a sub-manifest is refused at its object,
+/// before the stream is asked for the sub-manifest, with or without a size.
+/// Left out instead, it takes its sub-manifest along: the stream has that
+/// too, and reads past it as far as the size says. Without a size it
+/// cannot.
 #[test]
-fn whole_files_have_the_size_of_the_manifest() {
-    let tmp = TempDir::new("manifest-sizes");
-    let dir = tmp.path().to_path_buf();
-    std::fs::write(dir.join("a"), b"hello world").unwrap();
-    let hello = sha256::to_hex(&sha256::digest(b"hello"));
-    let world = sha256::to_hex(&sha256::digest(b"world"));
-    // The manifest was written when `a` held "hello". The file is found by
-    // the entry's name or through a file reference.
-    for record in [
-        format!(r#"{{"name":"a","size":5,"sha256":"{}"}}"#, hello),
-        format!(
-            r#"{{"name":"b","size":5,"sha256":"{}","contents":[{{"file":"a"}}]}}"#,
-            hello
-        ),
-    ] {
-        let m = parse(&seq(&[ROOT, &record, TRAILER])).unwrap();
-        let e = dir_source(&dir).verify(&m).unwrap_err();
-        assert_eq!(e.errno(), EBADMSG);
-        assert!(
-            matches!(
-                e.detail(),
-                Some(Detail::Source {
-                    problem: SourceProblem::Size,
-                    size: Some(11),
-                    expected: Some(5),
-                    ..
-                })
+fn sub_manifests_and_a_stream() {
+    let hello = Sha256::digest(b"hello").to_string();
+    let m = |size: &str| {
+        seq(&[
+            ROOT,
+            &format!(
+                r#"{{"contents":[{{"file":"sub.manifest"}}],"name":"sub","sha256":"{}"{},"type":"dir"}}"#,
+                hello, size
             ),
-            "{:?}",
-            e
-        );
+            r#"{"name":"z","size":1}"#,
+            TRAILER,
+        ])
+    };
+    for size in ["", r#","size":5"#] {
         let (_img, mut v) = volume(8 << 20, 512, 512);
-        let e = v
-            .assemble(&m, &mut dir_source(&dir), &AssembleOptions::default())
-            .unwrap_err();
+        let e = assemble_stream(&mut v, &m(size), b"helloZ", &AssembleOptions::default()).unwrap_err();
+        assert_eq!(e.errno(), EOPNOTSUPP, "{:?}", e);
         assert!(
             matches!(
                 e.detail(),
-                Some(Detail::Content {
-                    problem: ContentProblem::Size,
-                    size: Some(11),
-                    expected: Some(5),
+                Some(Detail::Unsupported {
+                    what: UnsupportedKind::SubManifest,
                     ..
                 })
             ),
@@ -636,9 +695,298 @@ fn whole_files_have_the_size_of_the_manifest() {
         );
         assert!(v.read_dir("/").unwrap().is_empty());
     }
-    // Parts of `a`: the file may go on after them.
-    let m = parse(&seq(&[
+    let skip = AssembleOptions {
+        flags: AssembleFlags::SKIP_UNSUPPORTED,
+        ..AssembleOptions::default()
+    };
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let r = assemble_stream(&mut v, &m(r#","size":5"#), b"helloZ", &skip).unwrap();
+    assert_eq!((r.files, r.skipped), (1, 1));
+    assert_eq!(contents(&v, "/z"), b"Z");
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let e = assemble_stream(&mut v, &m(""), b"helloZ", &skip).unwrap_err();
+    assert!(
+        matches!(
+            e.detail(),
+            Some(Detail::Manifest {
+                problem: ManifestProblem::NoSize,
+                ..
+            })
+        ),
+        "{:?}",
+        e
+    );
+}
+
+/// Contents at an offset in their file come from a directory, and a stream,
+/// which has the contents of each file and nothing else of it, refuses
+/// them when the object comes, whether objects FAT cannot store are left
+/// out or not, before anything is written. So does a directory whose file
+/// is missing.
+#[test]
+fn offsets_and_a_stream() {
+    let tmp = TempDir::new("manifest-offset");
+    let dir = tmp.path().to_path_buf();
+    std::fs::write(dir.join("a"), b"hello world").unwrap();
+    let m = seq(&[
         ROOT,
+        r#"{"contents":[{"file":"a","offset":6}],"name":"w","size":5}"#,
+        TRAILER,
+    ]);
+    for flags in [AssembleFlags::NONE, AssembleFlags::SKIP_UNSUPPORTED] {
+        let options = AssembleOptions {
+            flags,
+            ..AssembleOptions::default()
+        };
+        let (_img, mut v) = volume(8 << 20, 512, 512);
+        let e = assemble_stream(&mut v, &m, b"world", &options).unwrap_err();
+        assert_eq!(e.errno(), EOPNOTSUPP, "{:?}", e);
+        assert!(
+            matches!(
+                e.detail(),
+                Some(Detail::Unsupported {
+                    what: UnsupportedKind::Offset,
+                    ..
+                })
+            ),
+            "{:?}",
+            e
+        );
+        assert!(v.read_dir("/").unwrap().is_empty());
+        assert!(!v.is_writing());
+        let empty = TempDir::new("manifest-offset-empty");
+        let e = assemble(&mut v, &m, &mut dir_source(empty.path()), &options).unwrap_err();
+        assert_eq!(e.errno(), ENOENT, "{:?}", e);
+        assert!(!v.is_writing());
+        let r = assemble(&mut v, &m, &mut dir_source(&dir), &options).unwrap();
+        assert_eq!((r.files, r.skipped), (1, 0));
+        assert_eq!(contents(&v, "/w"), b"world");
+    }
+}
+
+/// A file that changes while it is read fails with SourceChanged, without
+/// sizes. A file of procfs says it is empty when it is opened and has data
+/// when it is read, which is how a file that grew after it was opened looks
+/// to the source. Checked against a hash of all of it, it is read past its
+/// length.
+#[test]
+fn files_that_change_while_they_are_read() {
+    let hello = Sha256::digest(b"hello").to_string();
+    let m = seq(&[
+        ROOT,
+        &format!(
+            r#"{{"contents":[{{"originalSha256":"{}"}}],"name":"version","size":0}}"#,
+            hello
+        ),
+        TRAILER,
+    ]);
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let e = assemble(
+        &mut v,
+        &m,
+        &mut dir_source(Path::new("/proc")),
+        &AssembleOptions::default(),
+    )
+    .unwrap_err();
+    assert_eq!(e.errno(), EBADMSG);
+    assert_eq!(
+        e.detail(),
+        Some(&Detail::Content {
+            name: "version".to_string(),
+            problem: ContentProblem::SourceChanged,
+            size: None,
+            expected: None,
+        })
+    );
+    assert!(v.read_dir("/").unwrap().is_empty());
+}
+
+/// Names FAT does not tell apart, the second of which an assembly finds
+/// in the volume: taken as the same name.
+#[test]
+fn case_collisions_are_one_name() {
+    let m = seq(&[
+        ROOT,
+        r#"{"name":"A.TXT","size":1}"#,
+        r#"{"name":"EFI","type":"dir"}"#,
+        r#"{"name":"EFI/x","size":1}"#,
+        r#"{"name":"a.txt","size":2}"#,
+        r#"{"name":"efi","type":"dir"}"#,
+        r#"{"name":"efi/y","size":1}"#,
+        TRAILER,
+    ]);
+    // A file replaces the one it collides with, under its own name, and a
+    // directory takes the entries of the one it collides with.
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let r = assemble_stream(&mut v, &m, b"Axyyz", &AssembleOptions::default()).unwrap();
+    assert_eq!((r.files, r.directories, r.bytes), (4, 2, 5));
+    let names = |v: &Volume, path: &str| {
+        let mut names: Vec<String> = v.read_dir(path).unwrap().into_iter().map(|md| md.name).collect();
+        names.sort();
+        names
+    };
+    assert_eq!(names(&v, "/"), ["EFI", "a.txt"]);
+    assert_eq!(contents(&v, "/a.txt"), b"yy");
+    assert_eq!(names(&v, "/EFI"), ["x", "y"]);
+}
+
+/// Directories that the volume holds with the times the manifest gives
+/// are not written again. So a manifest refused at a file after them, or
+/// one of nothing but such directories, leaves the volume as it was.
+#[test]
+fn directories_that_are_there_with_their_times_write_nothing() {
+    let dirs = [
+        r#"{"mTimeNSec":1700000000000000000,"name":"EFI","type":"dir"}"#,
+        r#"{"mTimeNSec":1700000000000000000,"name":"EFI/BOOT","type":"dir"}"#,
+    ];
+    let m = seq(&[
+        ROOT_MTIME,
+        dirs[0],
+        dirs[1],
+        r#"{"name":"EFI/BOOT/x","size":1}"#,
+        TRAILER,
+    ]);
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    assemble_stream(&mut v, &m, b"x", &AssembleOptions::default()).unwrap();
+    v.sync().unwrap();
+    let keep = AssembleOptions {
+        flags: AssembleFlags::NONE,
+        ..AssembleOptions::default()
+    };
+    let e = assemble_stream(&mut v, &m, b"x", &keep).unwrap_err();
+    assert_eq!(e.errno(), EEXIST);
+    assert!(!v.is_writing());
+    let r = assemble_stream(&mut v, &seq(&[ROOT_MTIME, dirs[0], dirs[1], TRAILER]), b"", &keep).unwrap();
+    assert_eq!(r.directories, 2);
+    assert!(!v.is_writing());
+    // Another time is written.
+    let later = seq(&[
+        ROOT_MTIME,
+        r#"{"mTimeNSec":1800000000000000000,"name":"EFI","type":"dir"}"#,
+        TRAILER,
+    ]);
+    assemble_stream(&mut v, &later, b"", &keep).unwrap();
+    assert!(v.is_writing());
+    assert_eq!(
+        v.metadata("/EFI").unwrap().modified,
+        UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+    );
+}
+
+/// What a volume holds under the same name as an object was there before
+/// the assembly: a directory takes the entries, a file is replaced only
+/// with REPLACE.
+#[test]
+fn entries_of_the_same_name_that_are_there() {
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+    v.create_dir("/EFI", t0).unwrap();
+    v.write_file("/EFI/x", &mut &b"old"[..], t0, false).unwrap();
+    let m = seq(&[
+        ROOT_MTIME,
+        r#"{"mTimeNSec":1700000000000000000,"name":"EFI","type":"dir"}"#,
+        r#"{"name":"EFI/x","size":3}"#,
+        r#"{"name":"EFI/y","size":1}"#,
+        TRAILER,
+    ]);
+    let keep = AssembleOptions {
+        flags: AssembleFlags::NONE,
+        ..AssembleOptions::default()
+    };
+    let e = assemble_stream(&mut v, &m, b"newy", &keep).unwrap_err();
+    assert_eq!(e.errno(), EEXIST);
+    assert_eq!(e.detail(), Some(&Detail::Path("/EFI/x".into())));
+    assert_eq!(
+        v.metadata("/EFI").unwrap().modified,
+        UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+    );
+    assert_eq!(contents(&v, "/EFI/x"), b"old");
+    let replace = AssembleOptions {
+        flags: AssembleFlags::REPLACE,
+        ..AssembleOptions::default()
+    };
+    let r = assemble_stream(&mut v, &m, b"newy", &replace).unwrap();
+    assert_eq!((r.files, r.directories), (2, 1));
+    assert_eq!(contents(&v, "/EFI/x"), b"new");
+    // A file where the volume has a directory, and the other way round.
+    for (records, errno) in [
+        (&[ROOT, r#"{"name":"EFI","size":0}"#, TRAILER][..], EISDIR),
+        (
+            &[
+                ROOT,
+                r#"{"name":"EFI","type":"dir"}"#,
+                r#"{"name":"EFI/x","type":"dir"}"#,
+                TRAILER,
+            ],
+            ENOTDIR,
+        ),
+    ] {
+        assert_eq!(
+            assemble_stream(&mut v, &seq(records), b"", &replace)
+                .unwrap_err()
+                .errno(),
+            errno
+        );
+    }
+}
+
+#[test]
+fn contents_are_chosen_by_what_can_be_used() {
+    let hello = Sha256::digest(b"hello").to_string();
+    let m = seq(&[
+        ROOT,
+        // A URL first, then an encoded literal, then plain data.
+        &format!(
+            r#"{{"name":"x","size":5,"sha256":"{}","contents":[{{"url":"https://example.com/x"}},{{"literal":"AAAA","encoding":"gzip"}},{{"literal":"aGVsbG8="}}]}}"#,
+            hello
+        ),
+        // A URL with a file as the alternative is read from the source.
+        &format!(
+            r#"{{"name":"y","size":5,"sha256":"{}","contents":[{{"url":"https://example.com/y"}},{{"file":"data/y.bin"}}]}}"#,
+            hello
+        ),
+        TRAILER,
+    ]);
+    let entries = objects(&m);
+    assert_eq!(entries[0].data().unwrap(), Data::Literal(b"hello"));
+    assert!(!entries[0].has_external_data());
+    assert!(matches!(entries[1].data(), Ok(Data::External(reference)) if reference.file == "data/y.bin"));
+    assert!(entries[1].has_external_data());
+    let tmp = TempDir::new("manifest-contents");
+    let dir = tmp.path().to_path_buf();
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    std::fs::write(dir.join("data/y.bin"), b"hello").unwrap();
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let r = assemble(&mut v, &m, &mut dir_source(&dir), &AssembleOptions::default()).unwrap();
+    assert_eq!((r.files, r.bytes), (2, 10));
+    for name in ["/x", "/y"] {
+        assert_eq!(contents(&v, name), b"hello");
+    }
+}
+
+/// The data of an object is the part of its file that starts at the offset
+/// and is as long as the object says, whatever else the file holds, as the
+/// specification has it. A file that grew since the manifest was written is
+/// copied as far as the manifest says. The file has to be long enough for
+/// the data, and as long as the originalSize the manifest gives for it.
+#[test]
+fn files_hold_the_data_the_manifest_says() {
+    let tmp = TempDir::new("manifest-sizes");
+    let dir = tmp.path().to_path_buf();
+    std::fs::write(dir.join("a"), b"hello world").unwrap();
+    let hello = Sha256::digest(b"hello").to_string();
+    let world = Sha256::digest(b"world").to_string();
+    // The manifest was written when `a` held "hello". The file is found by
+    // the entry's name or through a file reference.
+    let m = seq(&[
+        ROOT,
+        &format!(r#"{{"name":"a","size":5,"sha256":"{}"}}"#, hello),
+        &format!(
+            r#"{{"name":"b","size":5,"sha256":"{}","contents":[{{"file":"a"}}]}}"#,
+            hello
+        ),
+        // Parts of `a`, at an offset and out of the originalSize the
+        // manifest gives.
         &format!(
             r#"{{"name":"c","size":5,"sha256":"{}","contents":[{{"file":"a","offset":6}}]}}"#,
             world
@@ -650,39 +998,49 @@ fn whole_files_have_the_size_of_the_manifest() {
         ),
         r#"{"name":"f","size":11,"contents":[{"file":"a","originalSize":11}]}"#,
         TRAILER,
-    ]))
-    .unwrap();
-    dir_source(&dir).verify(&m).unwrap();
+    ]);
     let (_img, mut v) = volume(8 << 20, 512, 512);
-    v.assemble(&m, &mut dir_source(&dir), &AssembleOptions::default())
-        .unwrap();
-    for (name, data) in [("/c", "world"), ("/d", "llo"), ("/e", "hello"), ("/f", "hello world")] {
-        let mut back = String::new();
-        v.open_file(name).unwrap().read_to_string(&mut back).unwrap();
-        assert_eq!(back, data, "{}", name);
-    }
-    // A part that runs past the end, and an originalSize that is not the
-    // file's.
-    for record in [
-        r#"{"name":"g","size":6,"contents":[{"file":"a","offset":6}]}"#,
-        r#"{"name":"h","size":5,"contents":[{"file":"a","originalSize":12}]}"#,
-        r#"{"name":"i","size":5,"contents":[{"file":"a","originalSize":5}]}"#,
+    assemble(&mut v, &m, &mut dir_source(&dir), &AssembleOptions::default()).unwrap();
+    for (name, data) in [
+        ("/a", "hello"),
+        ("/b", "hello"),
+        ("/c", "world"),
+        ("/d", "llo"),
+        ("/e", "hello"),
+        ("/f", "hello world"),
     ] {
-        let m = parse(&seq(&[ROOT, record, TRAILER])).unwrap();
-        let e = dir_source(&dir).verify(&m).unwrap_err();
+        assert_eq!(contents(&v, name), data.as_bytes(), "{}", name);
+    }
+    // A file too short for the data, at an offset and as a whole, and an
+    // originalSize that is not the file's, larger and smaller.
+    for (record, expected) in [
+        r#"{"name":"g","size":6,"contents":[{"file":"a","offset":6}]}"#,
+        r#"{"name":"h","size":12,"contents":[{"file":"a"}]}"#,
+        r#"{"name":"i","size":5,"contents":[{"file":"a","originalSize":12}]}"#,
+        r#"{"name":"j","size":5,"contents":[{"file":"a","originalSize":5}]}"#,
+    ]
+    .into_iter()
+    .zip([12, 12, 12, 5])
+    {
+        let m = seq(&[ROOT, record, TRAILER]);
+        let (_img, mut v) = volume(8 << 20, 512, 512);
+        let e = assemble(&mut v, &m, &mut dir_source(&dir), &AssembleOptions::default()).unwrap_err();
+        assert_eq!(e.errno(), EBADMSG);
         assert!(
             matches!(
                 e.detail(),
-                Some(Detail::Source {
-                    problem: SourceProblem::Size,
+                Some(Detail::Content {
+                    problem: ContentProblem::Size,
                     size: Some(11),
+                    expected: Some(n),
                     ..
-                })
+                }) if *n == expected
             ),
             "{}: {:?}",
             record,
             e
         );
+        assert!(v.read_dir("/").unwrap().is_empty());
     }
 }
 
@@ -694,10 +1052,10 @@ fn mismatches_name_the_record() {
     let dir = tmp.path().to_path_buf();
     std::fs::create_dir_all(dir.join("loader/entries")).unwrap();
     std::fs::write(dir.join("loader/loader.conf"), b"timeout 3\n").unwrap();
-    let conf = sha256::to_hex(&sha256::digest(b"timeout 3\n"));
-    let other = sha256::to_hex(&sha256::digest(b"timeout 5\n"));
+    let conf = Sha256::digest(b"timeout 3\n").to_string();
+    let other = Sha256::digest(b"timeout 5\n").to_string();
     // In the detail and in the message.
-    let named = |e: crate::Error, name: &str| {
+    let named = |e: Error, name: &str| {
         match e.detail() {
             Some(Detail::Source { name: n, .. } | Detail::Content { name: n, .. }) => assert_eq!(n, name, "{:?}", e),
             _ => panic!("{:?}", e),
@@ -705,50 +1063,78 @@ fn mismatches_name_the_record() {
         let text = e.to_string();
         assert!(text.contains(name) && !text.contains(&format!("/{}", name)), "{}", text);
     };
-    // Found before anything is written: missing, not a regular file, of
-    // another size.
-    for (record, name) in [
-        (r#"{"name":"loader/entries/a.conf","size":1}"#, "loader/entries/a.conf"),
+    const LOADER: &str = r#"{"name":"loader","type":"dir"}"#;
+    // Missing, not a regular file, too short, and the hash of the file and
+    // that of the whole source. The last record of each names the file.
+    let cases: [(&[&str], &str, String); 5] = [
         (
-            r#"{"name":"x/y","size":1,"contents":[{"file":"loader/entries"}]}"#,
+            &[LOADER, r#"{"name":"loader/entries","type":"dir"}"#],
+            "loader/entries/a.conf",
+            r#"{"name":"loader/entries/a.conf","size":1}"#.to_string(),
+        ),
+        (
+            &[LOADER, r#"{"name":"x","type":"dir"}"#],
             "x/y",
+            r#"{"name":"x/y","size":1,"contents":[{"file":"loader/entries"}]}"#.to_string(),
         ),
-        (r#"{"name":"loader/loader.conf","size":5}"#, "loader/loader.conf"),
-    ] {
-        let m = parse(&seq(&[ROOT, record, TRAILER])).unwrap();
-        named(dir_source(&dir).verify(&m).unwrap_err(), name);
-    }
-    // Found while copying: the hash of the file, and that of the whole
-    // source.
-    for record in [
-        format!(r#"{{"name":"loader/loader.conf","size":10,"sha256":"{}"}}"#, other),
-        format!(
-            r#"{{"name":"loader/loader.conf","size":5,"contents":[{{"originalSize":10,"originalSha256":"{}"}}]}}"#,
-            other
+        (
+            &[LOADER],
+            "loader/loader.conf",
+            r#"{"name":"loader/loader.conf","size":12}"#.to_string(),
         ),
-    ] {
-        let m = parse(&seq(&[ROOT, &record, TRAILER])).unwrap();
+        (
+            &[LOADER],
+            "loader/loader.conf",
+            format!(r#"{{"name":"loader/loader.conf","size":10,"sha256":"{}"}}"#, other),
+        ),
+        (
+            &[LOADER],
+            "loader/loader.conf",
+            format!(
+                r#"{{"name":"loader/loader.conf","size":5,"contents":[{{"originalSize":10,"originalSha256":"{}"}}]}}"#,
+                other
+            ),
+        ),
+    ];
+    for (directories, name, record) in &cases {
+        let records = [&[ROOT][..], directories, &[record.as_str(), TRAILER]].concat();
         let (_img, mut v) = volume(8 << 20, 512, 512);
-        let e = v
-            .assemble(&m, &mut dir_source(&dir), &AssembleOptions::default())
-            .unwrap_err();
-        named(e, "loader/loader.conf");
+        let e = assemble(
+            &mut v,
+            &seq(&records),
+            &mut dir_source(&dir),
+            &AssembleOptions::default(),
+        )
+        .unwrap_err();
+        named(e, name);
     }
     // From a stream that ends early or goes on after the last file.
-    let m = parse(&seq(&[
+    let m = seq(&[
         ROOT,
+        LOADER,
         &format!(r#"{{"name":"loader/loader.conf","size":10,"sha256":"{}"}}"#, conf),
         TRAILER,
-    ]))
-    .unwrap();
+    ]);
     for data in [&b"timeout"[..], &b"timeout 3\nmore"[..]] {
         let (_img, mut v) = volume(8 << 20, 512, 512);
-        let mut stream = data;
-        let e = v
-            .assemble(&m, &mut StreamSource::new(&mut stream), &AssembleOptions::default())
-            .unwrap_err();
+        let e = assemble_stream(&mut v, &m, data, &AssembleOptions::default()).unwrap_err();
         named(e, "loader/loader.conf");
     }
+    let missing = seq(&[ROOT, r#"{"name":"nowhere","size":1}"#, TRAILER]);
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let e = assemble(&mut v, &missing, &mut dir_source(&dir), &AssembleOptions::default()).unwrap_err();
+    assert_eq!(e.errno(), ENOENT);
+    assert!(
+        matches!(
+            e.detail(),
+            Some(Detail::Source {
+                problem: SourceProblem::Missing,
+                ..
+            })
+        ),
+        "{:?}",
+        e
+    );
 }
 
 #[test]
@@ -764,63 +1150,22 @@ fn source_files_stay_inside_the_source_directory() {
     let record =
         |name: &str, file: &str| format!(r#"{{"name":"{}","size":6,"contents":[{{"file":"{}"}}]}}"#, name, file);
     let base = dir.join("tree");
+    let options = AssembleOptions::default();
     let (_img, mut v) = volume(8 << 20, 512, 512);
     // Plain files work; a symlink does not until asked for.
-    let m = parse(&seq(&[ROOT, &record("a", "sub/inside.txt"), TRAILER])).unwrap();
-    v.assemble(&m, &mut dir_source(&base), &AssembleOptions::default())
-        .unwrap();
-    let m = parse(&seq(&[ROOT, &record("b", "in.lnk"), TRAILER])).unwrap();
-    assert!(v
-        .assemble(&m, &mut dir_source(&base), &AssembleOptions::default())
-        .is_err());
-    v.assemble(
-        &m,
-        &mut dir_source(&base).follow_symlinks(true),
-        &AssembleOptions::default(),
-    )
-    .unwrap();
+    let m = seq(&[ROOT, &record("a", "sub/inside.txt"), TRAILER]);
+    assemble(&mut v, &m, &mut dir_source(&base), &options).unwrap();
+    let m = seq(&[ROOT, &record("b", "in.lnk"), TRAILER]);
+    assert!(assemble(&mut v, &m, &mut dir_source(&base), &options).is_err());
+    let mut following = DirectorySource::new(source_dir(&base).follow_symlinks(true));
+    assemble(&mut v, &m, &mut following, &options).unwrap();
     // Nothing leads out of the tree, however it is spelled.
     for file in ["out.lnk", "abs.lnk"] {
-        let m = parse(&seq(&[ROOT, &record("c", file), TRAILER])).unwrap();
-        assert!(
-            v.assemble(
-                &m,
-                &mut dir_source(&base).follow_symlinks(true),
-                &AssembleOptions::default()
-            )
-            .is_err(),
-            "{}",
-            file
-        );
+        let m = seq(&[ROOT, &record("c", file), TRAILER]);
+        let mut following = DirectorySource::new(source_dir(&base).follow_symlinks(true));
+        assert!(assemble(&mut v, &m, &mut following, &options).is_err(), "{}", file);
     }
     assert_eq!(v.read_dir("/").unwrap().len(), 2);
-}
-
-#[test]
-fn directory_objects_after_their_children() {
-    let m = parse(&seq(&[
-        ROOT,
-        r#"{"name":"d/x","size":0}"#,
-        r#"{"name":"d","type":"dir","mTimeNSec":1700000000000000000}"#,
-        TRAILER,
-    ]))
-    .unwrap();
-    let (_img, mut v) = volume(8 << 20, 512, 512);
-    let mut empty: &[u8] = &[];
-    let opts = AssembleOptions {
-        default_time: UNIX_EPOCH + Duration::from_secs(1_000_000_000),
-        ..Default::default()
-    };
-    let r = v.assemble(&m, &mut StreamSource::new(&mut empty), &opts).unwrap();
-    assert_eq!((r.files, r.directories), (1, 1));
-    assert_eq!(
-        v.metadata("/d").unwrap().modified,
-        UNIX_EPOCH + Duration::from_secs(1_700_000_000)
-    );
-    assert_eq!(
-        v.metadata("/d/x").unwrap().modified,
-        UNIX_EPOCH + Duration::from_secs(1_000_000_000)
-    );
 }
 
 #[test]
@@ -832,48 +1177,76 @@ fn generator_leaves_the_manifest_out() {
     std::fs::write(dir.join("Uapi16Manifest.sig"), b"old").unwrap();
     std::fs::write(dir.join("Uapi16Manifest2"), b"kept").unwrap();
     std::fs::write(dir.join("sub/Uapi16Manifest"), b"kept").unwrap();
-    let m = parse(&generated(&dir)).unwrap();
-    let names: Vec<&str> = m.entries.iter().filter_map(|e| e.name.as_deref()).collect();
+    let entries = objects(&generated(&dir));
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, vec!["Uapi16Manifest2", "sub", "sub/Uapi16Manifest"]);
 }
 
 #[test]
 fn validity() {
-    let m = parse(&seq(&[ROOT, r#"{"name":"x","size":0,"validity":"revoked"}"#, TRAILER])).unwrap();
+    let revoked = seq(&[ROOT, r#"{"name":"x","size":0,"validity":"revoked"}"#, TRAILER]);
     let (_img, mut v) = volume(8 << 20, 512, 512);
-    let mut empty: &[u8] = &[];
-    let opts = AssembleOptions {
-        now_usec: Some(1),
+    let at = |now| AssembleOptions {
+        now_usec: Some(now),
         ..Default::default()
     };
     assert_eq!(
-        v.assemble(&m, &mut StreamSource::new(&mut empty), &opts)
-            .unwrap_err()
-            .errno(),
+        assemble_stream(&mut v, &revoked, b"", &at(1)).unwrap_err().errno(),
         EKEYREVOKED
     );
-    let m = parse(&seq(&[
+    let m = seq(&[
         ROOT,
         r#"{"name":"d","type":"dir","validUntilUSec":10}"#,
         r#"{"name":"d/x","size":0}"#,
         TRAILER,
-    ]))
-    .unwrap();
-    let opts = AssembleOptions {
-        now_usec: Some(20),
-        ..Default::default()
-    };
+    ]);
     assert_eq!(
-        v.assemble(&m, &mut StreamSource::new(&mut empty), &opts)
-            .unwrap_err()
-            .errno(),
+        assemble_stream(&mut v, &m, b"", &at(20)).unwrap_err().errno(),
         EKEYEXPIRED
     );
-    let opts = AssembleOptions {
-        now_usec: Some(5),
+    assert!(v.read_dir("/").unwrap().is_empty());
+    assert!(assemble_stream(&mut v, &m, b"", &at(5)).is_ok());
+    // So does the root file object, for the whole manifest.
+    let expired = seq(&[
+        r#"{"mediaType":"application/vnd.uapi.16.manifest","order":"codepoint","validUntilUSec":10}"#,
+        TRAILER,
+    ]);
+    assert_eq!(
+        assemble_stream(&mut v, &expired, b"", &at(20)).unwrap_err().errno(),
+        EKEYEXPIRED
+    );
+    // An object is checked before it is left out, also one below a
+    // directory that is left out. Without the check both are left out.
+    let skipping = |now_usec| AssembleOptions {
+        flags: AssembleFlags::SKIP_UNSUPPORTED,
+        now_usec,
         ..Default::default()
     };
-    assert!(v.assemble(&m, &mut StreamSource::new(&mut empty), &opts).is_ok());
+    let hello = Sha256::digest(b"hello").to_string();
+    let sub = format!(r#"{{"name":"sub","sha256":"{}","size":5,"type":"dir"}}"#, hello);
+    for (m, skipped) in [
+        (
+            seq(&[
+                ROOT,
+                r#"{"contents":[{"literal":"eA=="}],"name":"link","type":"lnk","validity":"revoked"}"#,
+                TRAILER,
+            ]),
+            1,
+        ),
+        (
+            seq(&[ROOT, &sub, r#"{"name":"sub/x","size":0,"validity":"revoked"}"#, TRAILER]),
+            2,
+        ),
+    ] {
+        let (_img, mut v) = volume(8 << 20, 512, 512);
+        let e = assemble_stream(&mut v, &m, b"", &skipping(Some(1))).unwrap_err();
+        assert_eq!(e.errno(), EKEYREVOKED);
+        assert!(v.read_dir("/").unwrap().is_empty());
+        assert_eq!(
+            assemble_stream(&mut v, &m, b"", &skipping(None)).unwrap().skipped,
+            skipped
+        );
+    }
 }
 
 /// Checks the progress a long operation reported: the counts only grow
@@ -931,14 +1304,14 @@ fn long_operations_report_progress() {
     );
 
     seen.clear();
-    let manifest = parse(&generated(&tree)).unwrap();
+    let manifest = generated(&tree);
     let (_img2, mut v2) = volume(64 << 20, 512, 4096);
     let a = v2
-        .assemble_with_progress(
-            &manifest,
+        .assemble_with_observer(
+            &mut Reader::open(&manifest[..]).unwrap(),
             &mut dir_source(&tree),
             &AssembleOptions::default(),
-            &mut |p| seen.push(*p),
+            &mut |p: &Progress| seen.push(*p),
         )
         .unwrap();
     assert!(seen.iter().any(|p| p.files == 0 && p.bytes > 0), "{:?}", seen);
@@ -962,4 +1335,32 @@ fn long_operations_report_progress() {
         },
     );
     assert_eq!((removed.files, removed.directories), (2, 2));
+}
+
+#[test]
+fn assemble_flags() {
+    let both = AssembleFlags::REPLACE | AssembleFlags::SKIP_UNSUPPORTED;
+    assert_eq!(AssembleFlags::default(), AssembleFlags::REPLACE);
+    assert_eq!(AssembleOptions::default().flags, AssembleFlags::REPLACE);
+    assert!(both.contains(AssembleFlags::REPLACE) && both.contains(AssembleFlags::SKIP_UNSUPPORTED));
+    assert!(both.contains(both) && both.contains(AssembleFlags::NONE));
+    assert!(!AssembleFlags::REPLACE.contains(AssembleFlags::SKIP_UNSUPPORTED));
+    assert!(!AssembleFlags::NONE.contains(AssembleFlags::REPLACE));
+    for (replace, skip) in [(false, false), (false, true), (true, false), (true, true)] {
+        let flags = AssembleFlags::NONE
+            .with(AssembleFlags::REPLACE, replace)
+            .with(AssembleFlags::SKIP_UNSUPPORTED, skip);
+        assert_eq!(flags.contains(AssembleFlags::REPLACE), replace);
+        assert_eq!(flags.contains(AssembleFlags::SKIP_UNSUPPORTED), skip);
+        assert_eq!(
+            both.with(AssembleFlags::REPLACE, replace)
+                .with(AssembleFlags::SKIP_UNSUPPORTED, skip),
+            flags
+        );
+    }
+    let mut flags = AssembleFlags::NONE;
+    flags |= AssembleFlags::SKIP_UNSUPPORTED;
+    assert_eq!(format!("{:?}", flags), "AssembleFlags(SKIP_UNSUPPORTED)");
+    assert_eq!(format!("{:?}", both), "AssembleFlags(REPLACE | SKIP_UNSUPPORTED)");
+    assert_eq!(format!("{:?}", AssembleFlags::NONE), "AssembleFlags()");
 }

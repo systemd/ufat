@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mutate  # noqa: E402
 
 RS = b"\x1e"
-ROOT = b'{"mediaType":"application/vnd.uapi.16.manifest"}\n'
+ROOT = b'{"mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}\n'
 TRAILER = b'{"mediaType":"application/vnd.uapi.16.trailer"}\n'
 
 
@@ -180,7 +180,7 @@ class Probes:
             "i128 overflow": [b'{"name":"x","size":170141183460469231731687303715884105728}\n'],
             "size u64 max": [b'{"name":"x","size":18446744073709551615}\n'],
             "size 2^32": [b'{"name":"x","size":4294967296}\n'],
-            "size 2^32-1 x 300": [b'{"name":"f%d","size":4294967295}\n' % i for i in range(300)],
+            "size 2^32-1 x 300": [b'{"name":"f%03d","size":4294967295}\n' % i for i in range(300)],
             "mtime u64 max": [b'{"name":"x","size":0,"mTimeNSec":18446744073709551615}\n'],
             "validSince u64 max": [b'{"name":"x","size":0,"validSinceUSec":18446744073709551615}\n'],
             "offset u64 max": [b'{"name":"x","size":0,"contents":[{"file":"x","offset":18446744073709551615}]}\n'],
@@ -238,7 +238,7 @@ class Probes:
         # Not a manifest at all.
         for name, data in [("empty", b""), ("rs only", RS), ("rs x 1M", RS * (1 << 20)), ("root only", RS + ROOT), ("4 MiB garbage", bytes(range(256)) * (16 * 1024)),
                            ("binary zeros", b"\0" * 100000), ("utf8 bom", b"\xef\xbb\xbf" + manifest([])), ("CRLF", manifest([]).replace(b"\n", b"\r\n")),
-                           ("nul in record", RS + b'{"name":"a\x00"}' + RS + TRAILER), ("huge valid", manifest([b'{"name":"f%d","size":0}\n' % i for i in range(60000)]))]:
+                           ("nul in record", RS + b'{"name":"a\x00"}' + RS + TRAILER), ("huge valid", manifest([b'{"name":"f%05d","size":0}\n' % i for i in range(60000)]))]:
             m = os.path.join(self.work, "probe.Uapi16Manifest")
             with open(m, "wb") as f:
                 f.write(data)

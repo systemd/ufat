@@ -34,7 +34,7 @@ use crate::bytes::le32;
 use crate::errno::*;
 use crate::layout::{Layout, FIRST_CLUSTER};
 use crate::Result;
-use crate::{CorruptPlace, Detail, NoSpaceReason};
+use crate::{CorruptPlace, Detail, Error, NoSpaceReason};
 
 /// The detail of a chain that is damaged at `cluster`.
 fn broken_chain(cluster: u32) -> Detail {
@@ -300,6 +300,18 @@ impl Fat {
         self.free
     }
 
+    /// The error for clusters that are needed and not free.
+    pub(crate) fn no_free_clusters() -> Error {
+        err!(
+            ENOSPC,
+            Detail::NoSpace {
+                reason: NoSpaceReason::Clusters,
+                path: None,
+            },
+            "no free clusters left"
+        )
+    }
+
     /// The last allocated cluster, stored in the FSInfo sector as the hint
     /// where to continue searching.
     pub fn cursor(&self) -> u32 {
@@ -558,14 +570,7 @@ impl Fat {
             bail!(EINVAL, "allocation of zero clusters");
         }
         if self.free == 0 {
-            bail!(
-                ENOSPC,
-                Detail::NoSpace {
-                    reason: NoSpaceReason::Clusters,
-                    path: None,
-                },
-                "no free clusters left"
-            );
+            return Err(Fat::no_free_clusters());
         }
         let max_cluster = self.layout.max_cluster();
         let first = match self.find_free(store, self.cursor + 1, max_cluster)? {
