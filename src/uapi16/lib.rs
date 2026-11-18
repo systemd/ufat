@@ -14,8 +14,11 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+mod digest;
+mod hex;
 mod name;
 
+pub use digest::{Digest, Finalize, InvalidDigest, Sha256, Sha256Context};
 pub use name::{InvalidName, Name};
 
 /// The name of a manifest that is stored in the tree it describes.
