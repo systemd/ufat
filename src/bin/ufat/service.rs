@@ -1094,7 +1094,7 @@ impl Content {
     fn plan(&self, plan: &mut Plan) -> fat::Result<()> {
         match &self.fill {
             Some(Fill::Tree(dir)) => {
-                let skipped = plan.add_tree(dir.as_fd(), "/", true)?;
+                let skipped = plan.add_tree(dir.as_fd(), "/", &self.copy_options())?;
                 if self.fail_unsupported {
                     refuse_skipped(&skipped)?;
                 }
@@ -1131,9 +1131,19 @@ impl Content {
     fn check_tree(&self, dest: &str) -> Outcome<()> {
         if let (true, Some(Fill::Tree(dir))) = (self.fail_unsupported, &self.fill) {
             let mut plan = Plan::new(PlanOptions::new(MIN_SECTOR_SIZE));
-            refuse_skipped(&plan.add_tree(dir.as_fd(), dest, true)?)?;
+            refuse_skipped(&plan.add_tree(dir.as_fd(), dest, &self.copy_options())?)?;
         }
         Ok(())
+    }
+
+    /// How a copy of the tree, and its plan, take it: following symbolic
+    /// links, and replacing what is there with replace.
+    fn copy_options(&self) -> CopyOptions {
+        CopyOptions {
+            times: self.times,
+            replace: self.replace,
+            follow_symlinks: true,
+        }
     }
 
     /// How an assembly of the manifest, and its plan, store its objects:
@@ -1148,11 +1158,7 @@ impl Content {
     /// Puts the content into the volume at `dest`: the directory a tree goes
     /// below, the path of one file. A manifest's tree goes below the root.
     fn write_into(&mut self, v: &mut Volume, dest: &str, progress: &mut dyn FnMut(&Progress)) -> Outcome<Counts> {
-        let copy = CopyOptions {
-            times: self.times,
-            replace: self.replace,
-            follow_symlinks: true,
-        };
+        let copy = self.copy_options();
         let assembly = AssembleOptions {
             default_time: self.time,
             flags: self.assemble_flags(),

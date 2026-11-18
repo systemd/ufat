@@ -128,7 +128,18 @@ What the fields mean for vfat:
   `features` and `discard` are missing. Asking for them fails with
   `OperationNotSupported`.
 - `sizeToFit` is `exact`. A plan gives the size the content needs, to the
-  sector.
+  sector. A plan does not compare names. Names that FAT does not tell
+  apart, such as `A.TXT` and `a.txt`, or `FOOBAR~1` and `FOO BAR`, whose
+  short name it is, are two names to it. Content with such names,
+  assembled with `replace`, leaves the clusters of every file that was
+  replaced free, and the plan of a directory close to the limit of 65536
+  entries can fail although the assembly would fit. The entries of a
+  directory under two such names go into one directory. A plan holds the
+  entries under each name to the limit on their own, and the assembly
+  fails with `NoSpaceLeft` and reason `directoryEntries` when they do not
+  fit together. A file and a directory under two such names pass a plan
+  and fail the assembly, with `replace` or without it, and so do names
+  that an assembly without `replace` refuses.
 - `minimalSizeBytes` is the smallest volume: 65525 clusters of 512 bytes
   plus the reserved sectors and two FATs. With 4096 byte sectors the
   minimum is 269045760 bytes. `maximalSizeBytes` is 2^32 - 1 sectors of
@@ -402,8 +413,8 @@ a pipe, unless it is planned before its content is written: `Assemble` in
 mode `assemble` plans its content first, so there it has to be a regular
 file. A pipe fails with `BadFileDescriptor` and reason `wrongType` then.
 Mode `plan` reads the manifest once and takes a pipe. A plan keeps the
-name of every file and directory of the manifest, so the memory
-`Assemble` uses grows with the manifest.
+path of the deepest open directory, and a count for each directory on
+that path, so the memory `Assemble` uses does not grow with the manifest.
 
 When the file contents come from a stream, the manifest and the stream
 are read in lockstep: a record of the manifest, then the contents of the
@@ -687,9 +698,8 @@ Notes:
 - Files below a passed directory are opened with the service's
   credentials. This is why only root and the service's own user may
   connect.
-- Memory use does not grow with the volume, and not with a manifest that
-  `Populate` writes. `Assemble` keeps the names of a manifest while it
-  plans it. 512M leaves room for several connections.
+- Memory use does not grow with the volume or with a manifest. 512M
+  leaves room for several connections.
 - `DynamicUser=yes` works. Only root can then connect.
 - Do not set `LimitFSIZE=`. A write past the limit kills the process with
   SIGXFSZ.

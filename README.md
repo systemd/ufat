@@ -178,14 +178,13 @@ contents then have to come from a directory.
 
 ufat reads a manifest one record at a time, and writes each file and
 directory when its record comes. So `populate` takes a manifest of any
-size, also through a pipe, and its memory use does not grow with the
-manifest. To size the file system to fit, ufat reads the manifest once
-before it writes anything, and keeps the name of every file and
-directory while it does. So `assemble` with a SOURCE needs the manifest
-in a regular file, and the memory `assemble` and `assemble --plan` use
-grows with the manifest. `assemble --plan` and `assemble` without a
-SOURCE read the manifest only once, so they take one through a pipe as
-well.
+size, also through a pipe. To size the file system to fit, ufat reads
+the manifest once before it writes anything. So `assemble` with a SOURCE
+needs the manifest in a regular file. `assemble --plan` and `assemble`
+without a SOURCE read the manifest only once, so they take one through a
+pipe as well. While it sizes, ufat keeps the path of the deepest open
+directory, and a count for each directory on that path. Memory use does
+not grow with the manifest.
 
 The objects of a manifest have to be in code point order: every
 directory before what is in it, and the names of a directory sorted by
@@ -265,6 +264,28 @@ smaller volumes. ufat never creates a volume below that limit:
 An existing image file is grown when needed and never shrunk. A smaller
 volume made by another tool can still be read, filled and checked.
 `ufat check` reports that it is below the minimum.
+
+A plan does not compare names. Two names that FAT does not tell apart
+are two names to the plan: names that differ in case only, such as
+`A.TXT` and `a.txt`, and a name and the short name FAT gives another
+one, such as `FOOBAR~1` for `FOO BAR`.
+
+When a file replaces another one under such a name, the plan counts
+both. The file system keeps the clusters of every replaced file free
+then. Both also count against the 65536 directory entries a FAT
+directory holds, so the plan of a directory close to that limit can
+fail although the write would fit. A long name takes up to 21 of these
+entries.
+
+The entries of a directory under two such names, such as `FOO BAR/a`
+and `FOOBAR~1/b`, go into one directory. The plan holds the entries
+under each name to the limit on their own, and only the write sees them
+all in one directory. When they do not fit, `assemble` fails with
+"directory is full".
+
+A file and a directory under two such names pass the plan, and
+`assemble` fails on the second one, with or without `--no-replace`.
+Names that `--no-replace` refuses pass the plan too.
 
 ## Sector size
 

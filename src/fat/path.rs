@@ -7,8 +7,8 @@
 //! stores them as entries of their own.
 
 use crate::errno::*;
-use crate::Result;
 use crate::{Detail, NameProblem};
+use crate::{Error, Result};
 
 /// What separates the names of a path.
 pub(crate) const SEPARATOR: char = '/';
@@ -20,35 +20,77 @@ pub(crate) const MAX_PATH: usize = 4095;
 
 /// Splits `path` into its names.
 pub(crate) fn components(path: &str) -> Result<Vec<&str>> {
-    let bad = |problem: NameProblem| Detail::Name {
-        name: path.to_string(),
-        problem,
-    };
-    if path.len() > MAX_PATH {
+    check_length(path)?;
+    let mut out = Vec::new();
+    for name in path.split(SEPARATOR).filter(|name| !name.is_empty()) {
+        if is_dot_name(name) {
+            return Err(dot_component(path, name));
+        }
+        out.push(name);
+    }
+    Ok(out)
+}
+
+/// The names of `path`, the first one first, checked as [`components`]
+/// checks them but not collected.
+pub(crate) fn names(path: &str) -> Result<impl DoubleEndedIterator<Item = &str> + Clone> {
+    check_length(path)?;
+    let names = path.split(SEPARATOR).filter(|name| !name.is_empty());
+    if let Some(name) = names.clone().find(|name| is_dot_name(name)) {
+        return Err(dot_component(path, name));
+    }
+    Ok(names)
+}
+
+/// The path of the directory `path` is in, as `path` spells it, and the
+/// last name of `path`, where that is all [`names`] has to check of it:
+/// `path` fits [`MAX_PATH`], and its last name is not empty, "." or "..".
+/// The names of `path` are then those of the directory and the last name,
+/// and [`names`] refuses `path` only where it refuses the directory. None
+/// for every other path.
+pub(crate) fn parent_and_name(path: &str) -> Option<(&str, &str)> {
+    let (parent, name) = path.rsplit_once(SEPARATOR)?;
+    (fits(path) && !name.is_empty() && !is_dot_name(name)).then_some((parent, name))
+}
+
+/// Whether `path` is not longer than [`MAX_PATH`].
+fn fits(path: &str) -> bool {
+    path.len() <= MAX_PATH
+}
+
+/// Refuses a path longer than [`MAX_PATH`].
+fn check_length(path: &str) -> Result<()> {
+    if !fits(path) {
         bail!(
             ENAMETOOLONG,
-            bad(NameProblem::TooLong),
+            Detail::Name {
+                name: path.to_string(),
+                problem: NameProblem::TooLong,
+            },
             "path is longer than {} bytes",
             MAX_PATH
         );
     }
-    let mut out = Vec::new();
-    for c in path.split(SEPARATOR) {
-        if c.is_empty() {
-            continue;
-        }
-        if c == "." || c == ".." {
-            bail!(
-                EINVAL,
-                bad(NameProblem::DotComponent),
-                "path '{}' contains a '{}' component",
-                path,
-                c
-            );
-        }
-        out.push(c);
-    }
-    Ok(out)
+    Ok(())
+}
+
+/// Whether `name` is "." or "..", which a path must not have.
+fn is_dot_name(name: &str) -> bool {
+    name == "." || name == ".."
+}
+
+/// The error of `path` for its name `name`, "." or "..".
+fn dot_component(path: &str, name: &str) -> Error {
+    err!(
+        EINVAL,
+        Detail::Name {
+            name: path.to_string(),
+            problem: NameProblem::DotComponent,
+        },
+        "path '{}' contains a '{}' component",
+        path,
+        name
+    )
 }
 
 /// Appends `name` to the directory path `dir`.
@@ -68,6 +110,31 @@ mod tests {
         assert_eq!(components("EFI/Linux").unwrap(), vec!["EFI", "Linux"]);
         assert_eq!(components("/EFI/./x").unwrap_err().errno(), EINVAL);
         assert_eq!(components("../x").unwrap_err().errno(), EINVAL);
+        assert_eq!(names("/EFI//Linux/").unwrap().next_back(), Some("Linux"));
+        assert_eq!(names("/EFI/..").err().map(|e| e.errno()), Some(EINVAL));
+        let longest = format!("/{}", "x".repeat(MAX_PATH - 1));
+        let too_long = format!("{}x", longest);
+        for (path, split) in [
+            ("/EFI/Linux", Some(("/EFI", "Linux"))),
+            ("/EFI", Some(("", "EFI"))),
+            ("EFI/Linux", Some(("EFI", "Linux"))),
+            ("/EFI//Linux", Some(("/EFI/", "Linux"))),
+            ("/./x", Some(("/.", "x"))),
+            (longest.as_str(), Some(("", &longest[1..]))),
+            ("EFI", None),
+            ("/EFI/", None),
+            ("/EFI/.", None),
+            ("/EFI/..", None),
+            (too_long.as_str(), None),
+        ] {
+            assert_eq!(parent_and_name(path), split, "{}", path);
+            if let Some((parent, name)) = split {
+                // names() agrees, also where it refuses the directory.
+                let parent_names = names(parent).map(|names| names.chain([name]).collect::<Vec<_>>());
+                let path_names = names(path).map(|names| names.collect::<Vec<_>>());
+                assert_eq!(path_names.ok(), parent_names.ok(), "{}", path);
+            }
+        }
         assert_eq!(join("/", "EFI"), "/EFI");
         assert_eq!(join("", "EFI"), "/EFI");
         assert_eq!(join("/EFI/", "Linux"), "/EFI/Linux");

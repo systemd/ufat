@@ -386,7 +386,11 @@ fn planner_is_exact() {
             ..FormatOptions::default()
         };
         let mut plan = fat::plan::Plan::new(fat::plan::PlanOptions::from_format_options(&options, None).unwrap());
-        plan.add_tree(source(tree.path()).as_fd(), "/", false).unwrap();
+        let no_links = CopyOptions {
+            follow_symlinks: false,
+            ..CopyOptions::default()
+        };
+        plan.add_tree(source(tree.path()).as_fd(), "/", &no_links).unwrap();
         let estimate = plan.estimate().unwrap();
         estimate.apply(&mut options);
 

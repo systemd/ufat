@@ -952,6 +952,53 @@ fn too_small_volumes_fail_cleanly() {
     assert_eq!(ok(&bin, &["cat", l, "/sub/c.txt"]), "last\n");
 }
 
+/// A plan does not compare names. The entries of a directory under two
+/// names that FAT does not tell apart go into one directory. The plan holds
+/// the entries under each name to the 65536 entries of a FAT directory on
+/// their own, and only the write sees them all in one directory. In two
+/// runs of 1600 names of 255 characters, which take 21 entries each, the
+/// plan passes and `assemble` fails. In one run the plan fails.
+#[test]
+fn directories_under_two_names_fill_up_when_written() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    let manifest = |runs: &[(&str, std::ops::Range<usize>)]| {
+        let mut text = String::from(
+            "\x1e{\"features\":[\"size\"],\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n",
+        );
+        for (name, files) in runs {
+            text.push_str(&format!("\x1e{{\"name\":\"{}\",\"type\":\"dir\"}}\n", name));
+            for i in files.clone() {
+                text.push_str(&format!("\x1e{{\"name\":\"{}/{:0>255}\",\"size\":0}}\n", name, i));
+            }
+        }
+        text.push_str("\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n");
+        text
+    };
+    let split = root.join("split.manifest");
+    fs::write(&split, manifest(&[("EFI", 0..1600), ("efi", 1600..3200)])).unwrap();
+    let s = split.to_str().unwrap();
+    ok(&bin, &["assemble", "--plan", "--manifest", s]);
+    let image = root.join("a.img");
+    let a = image.to_str().unwrap();
+    fails(
+        &bin,
+        &["assemble", "--create", "--manifest", s, a, "-"],
+        "directory is full",
+    );
+    let whole = root.join("whole.manifest");
+    fs::write(&whole, manifest(&[("EFI", 0..3200)])).unwrap();
+    fails(
+        &bin,
+        &["assemble", "--plan", "--manifest", whole.to_str().unwrap()],
+        "'/EFI' needs more than the 65536 entry slots a FAT32 directory holds",
+    );
+}
+
 /// Paths on the host are taken as the bytes they are, UTF-8 or not. Paths
 /// inside the volume are Unicode, and one that is not UTF-8 is refused.
 #[test]

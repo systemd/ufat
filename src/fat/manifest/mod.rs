@@ -9,11 +9,11 @@
 //! directories, no file of 4 GiB or more, and no two names that differ in
 //! case only.
 //!
-//! An assembly reads one record at a time and writes what it describes
-//! right away. It never holds a whole manifest, so a manifest of any size
-//! can come through a pipe. The planner in [`crate::plan`] takes the
-//! records as they come too, but it keeps the name of every file and
-//! directory it is given.
+//! Nothing here holds a whole manifest. An assembly reads one record at a
+//! time and writes what it describes right away, so a manifest of any size
+//! can come through a pipe. The planner in [`crate::plan`] counts what the
+//! records take as they come. It keeps the path of the deepest open
+//! directory, and a count for each directory on that path.
 //!
 //! Signatures are recognised but not verified: that needs an X.509 stack.
 //! Callers who need authenticated manifests must verify them before handing
@@ -50,8 +50,18 @@ pub(crate) use error::SizePurpose;
 
 /// The path inside a volume of the file object with the name `name`: the
 /// name below the root directory.
-pub(crate) fn path_in_volume(name: &str) -> String {
-    crate::path::join("/", name)
+fn path_in_volume(name: &str) -> String {
+    let mut path = String::with_capacity(SEPARATOR.len_utf8() + name.len());
+    path_in_volume_into(name, &mut path);
+    path
+}
+
+/// Puts [`path_in_volume`] of `name` into `path`, in place of what `path`
+/// held, so that the paths of all objects can share one buffer.
+pub(crate) fn path_in_volume_into(name: &str, path: &mut String) {
+    path.clear();
+    path.push(SEPARATOR);
+    path.push_str(name);
 }
 
 /// What a file object becomes in a FAT volume.

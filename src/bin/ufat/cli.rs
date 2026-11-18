@@ -583,7 +583,7 @@ impl Source {
         match self {
             Source::None => Ok(0),
             Source::Tree { path, dir } => {
-                let skipped = plan.add_tree(dir.as_fd(), dest(args), true)?;
+                let skipped = plan.add_tree(dir.as_fd(), dest(args), &copy_options(args)?)?;
                 if let (Some(skipped), true) = (skipped.first(), fail_unsupported(args)?) {
                     bail!(
                         errno::EINVAL,
@@ -615,11 +615,7 @@ impl Source {
     /// manifest assembled while it is read, which takes the contents of its
     /// files.
     fn fill(&mut self, volume: &mut Volume, args: &Args) -> Result<()> {
-        let copy = CopyOptions {
-            times: time_policy(args)?,
-            replace: !args.flag("no-replace"),
-            follow_symlinks: true,
-        };
+        let copy = copy_options(args)?;
         match self {
             Source::None => {}
             Source::Tree { path, dir } => {
@@ -680,6 +676,17 @@ impl AssembleObserver for SkipNotes {
             _ => eprintln!("ufat: skipped {}: the directory it is in was skipped", name),
         }
     }
+}
+
+/// How the command line asks a copy of a tree, and the plan of one, to
+/// take it: following symbolic links, and replacing what is there unless
+/// `--no-replace`.
+fn copy_options(args: &Args) -> Result<CopyOptions> {
+    Ok(CopyOptions {
+        times: time_policy(args)?,
+        replace: !args.flag("no-replace"),
+        follow_symlinks: true,
+    })
 }
 
 /// How the command line asks an assembly, and the plan of one, to store a
