@@ -33,6 +33,7 @@ use crate::dirent::{
 use crate::errno::*;
 use crate::name::{
     fold_str, join_long_name, parse_long_name_entry, short_name_to_string, valid_short_char, Alias, LongNameEntry,
+    LFN_MAX_ENTRIES,
 };
 use crate::Result;
 
@@ -54,12 +55,61 @@ type Map<K, V> = proofs::AssocMap<K, V>;
 pub(crate) struct DirEntry {
     /// The long name, if the entry has long name entries.
     pub(crate) long_name: Option<String>,
+    /// How `long_name` came out of the units the entry stores.
+    pub(crate) long_name_decoding: NameDecoding,
     /// The short entry.
     pub(crate) short: RawDirEntry,
     /// Slot index of the short entry.
     pub(crate) slot: usize,
-    /// Number of long name slots preceding the short entry.
-    pub(crate) long_slots: usize,
+    /// Number of long name slots preceding the short entry, at most
+    /// [`LFN_MAX_ENTRIES`]. A byte is enough, which leaves room for
+    /// `long_name_decoding` without making every entry the index keeps
+    /// larger.
+    pub(crate) long_slots: u8,
+}
+
+/// The long name slots of an entry fit into [`DirEntry::long_slots`].
+const _: () = assert!(
+    LFN_MAX_ENTRIES <= u8::MAX as usize,
+    "the long name slots of an entry do not fit into a byte"
+);
+
+/// How the text of a name came out of the units an entry stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NameDecoding {
+    /// The text is the name the entry stores.
+    Exact,
+    /// A unit of the long name is an unpaired surrogate, which no text
+    /// holds, and the text has U+FFFD in its place. It is not the name the
+    /// entry stores, and two such names can read the same.
+    Lossy,
+}
+
+/// The text of a long name and how it came out of the units of its long
+/// name slots.
+struct NameText {
+    text: String,
+    decoding: NameDecoding,
+}
+
+impl NameText {
+    /// Decodes the long name of the long name slots `units`, given in
+    /// sequence order. String::from_utf16() refuses exactly a name with an
+    /// unpaired surrogate, which then gets U+FFFD in place of the unit.
+    /// Every other name is decoded once.
+    fn decode(units: &[LongNameEntry]) -> NameText {
+        let name = join_long_name(units);
+        match String::from_utf16(&name) {
+            Ok(text) => NameText {
+                text,
+                decoding: NameDecoding::Exact,
+            },
+            Err(_) => NameText {
+                text: String::from_utf16_lossy(&name),
+                decoding: NameDecoding::Lossy,
+            },
+        }
+    }
 }
 
 impl DirEntry {
@@ -73,12 +123,12 @@ impl DirEntry {
 
     /// Index of the first slot the entry occupies.
     pub(crate) fn first_slot(&self) -> usize {
-        self.slot - self.long_slots
+        self.slot - usize::from(self.long_slots)
     }
 
     /// Number of slots the entry occupies.
     pub(crate) fn slot_count(&self) -> usize {
-        self.long_slots + 1
+        usize::from(self.long_slots) + 1
     }
 
     /// Whether this is the "." or ".." entry of a subdirectory.
@@ -543,18 +593,24 @@ impl Directory {
             }
             let short = RawDirEntry::from_bytes(raw);
             let mut long_name = None;
+            let mut long_name_decoding = NameDecoding::Exact;
             let mut long_slots = 0;
             if let Some((_, last)) = pending.last() {
                 if last.sequence == 1 && pending[0].1.checksum == short_name_checksum(&short.name) {
                     let units: Vec<LongNameEntry> = pending.iter().rev().map(|(_, l)| *l).collect();
-                    long_name = Some(String::from_utf16_lossy(&join_long_name(&units)));
-                    long_slots = pending.len();
+                    let NameText { text, decoding } = NameText::decode(&units);
+                    long_name = Some(text);
+                    long_name_decoding = decoding;
+                    // A set is complete with the slot of sequence number 1,
+                    // and numbers above LFN_MAX_ENTRIES do not parse.
+                    long_slots = pending.len() as u8;
                     pending.clear();
                 }
             }
             orphan(&mut pending, &mut free);
             entries.push(DirEntry {
                 long_name,
+                long_name_decoding,
                 short,
                 slot: i,
                 long_slots,
@@ -739,7 +795,12 @@ impl Directory {
             return;
         }
         units.reverse();
-        let long_name = (!long.is_empty()).then(|| String::from_utf16_lossy(&join_long_name(&units)));
+        let (long_name, long_name_decoding) = if long.is_empty() {
+            (None, NameDecoding::Exact)
+        } else {
+            let NameText { text, decoding } = NameText::decode(&units);
+            (Some(text), decoding)
+        };
         if let Some((shape, next)) = self.index.pending_tail.take() {
             if fold_str(&short_name_to_string(short)) == shape.candidate(next - 1) {
                 self.index.tails.insert(shape, next);
@@ -747,9 +808,12 @@ impl Directory {
         }
         self.index.insert(DirEntry {
             long_name,
+            long_name_decoding,
             short: *short,
             slot: start + long.len(),
-            long_slots: long.len(),
+            // Placed, the set is well formed: its first slot has the
+            // sequence number long.len(), at most LFN_MAX_ENTRIES.
+            long_slots: long.len() as u8,
         });
         #[cfg(any(test, kani))]
         self.check_index();
@@ -976,6 +1040,11 @@ mod proofs {
             .collect()
     }
 
+    /// `String::from_utf16` as [`narrow_lossy`]: every name decodes.
+    fn narrow(units: &[u16]) -> std::result::Result<String, std::string::FromUtf16Error> {
+        Ok(narrow_lossy(units))
+    }
+
     const SLOTS: usize = 4;
 
     /// A directory of four slots in one cluster, with concrete slot kinds
@@ -1026,6 +1095,7 @@ mod proofs {
     #[kani::unwind(20)]
     #[kani::stub(crate::name::fold_str, ascii_fold)]
     #[kani::stub(std::string::String::from_utf16_lossy, narrow_lossy)]
+    #[kani::stub(std::string::String::from_utf16, narrow)]
     fn index_follows_writes_and_deletes() {
         let mut d = shaped_directory();
         d.check_index();

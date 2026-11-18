@@ -418,15 +418,45 @@ The `name` of `SourceMismatch` and `ContentMismatch` is the name of the
 file's record in the manifest, such as `loader/loader.conf`.
 
 A `ManifestSink` has a `fileDescriptor` open for writing and optional
-`fields`, the per-file fields in the vocabulary of systemd-manifest:
-`mode`, `uid`, `gid`, `size`, `hash`, `symlink`, `device`, `hardlink`,
-`mtime`, `userXattr`, `userName`, `groupName`. Without `fields`, the
-default set of systemd-manifest is used. FAT has a notion of `size`,
-`hash` and `mtime` only. The other fields are left out. An entry with
-the read-only attribute carries `readOnly`. The manifest describes the
-whole volume, including files that were there before the call. Entries
-whose names a manifest cannot carry are left out and counted in
-`omitted`.
+`features`, what the manifest records. The values are the names of the
+`features` field of UAPI.16 with `_` in place of `-`: `mode`, `uid`,
+`gid`, `user_name`, `group_name`, `size`, `sha256`, `symlink`, `device`,
+`hardlink`, `mtime`, `user_xattr`, `flag_hidden`, `flag_system`,
+`flag_archive`, `flag_append_only`, `flag_immutable`, `flag_no_atime`,
+`flag_no_cow`, `flag_no_dump`, `read_only`, `fs_uuid`, `fs_label`,
+`fat_serial`, `gpt_label`, `gpt_uuid`, `gpt_type_uuid`, `gpt_disk_uuid`,
+`gpt_flags`, `gpt_flag_no_auto` and `gpt_flag_grow_file_system`. Without
+`features`, the default set of UAPI.16 is used: `device`, `gid`,
+`hardlink`, `mode`, `sha256`, `size`, `symlink` and `uid`.
+
+FAT records `size`, `sha256` and `mtime`. FAT has no symbolic links,
+device nodes, hard links or extended attributes. When asked for them,
+the manifest lists them in `features` and so says that there are none.
+The manifest records the read-only attribute whether it is asked for or
+not, and lists `read-only` in `features`. An entry with the attribute
+carries `readOnly`, and an entry without `readOnly` does not have the
+attribute. FAT has no notion of modes, owners and their names, and the
+manifest does not record them, nor any of the other features. The root
+object declares `"order": "codepoint"`, so the manifest can be given as
+content again.
+
+The manifest describes the whole volume, including files that were there
+before the call. Entries whose names a manifest cannot carry are left out
+and counted in `omitted`. Two entries whose names FAT takes for one, such
+as `README.TXT` and `readme.txt`, are both listed, each with what it
+holds.
+
+A damaged volume fails with `Corrupt`. `where` is `directory` when a
+directory shares a cluster with an entry read before, as in a loop of
+the tree or a cross-link, when the chain of a directory loops or is
+longer than a directory can be, when the entry of a subdirectory points
+at a cluster the volume does not have, or when a directory has two
+entries of the same name. `where` is `chain` when the chain of a
+directory or a file runs into a free, bad or invalid entry, when a file
+shares a cluster with an entry read before, when the chain of a file is
+shorter than the file, or when a file that is not empty starts at a
+cluster the volume does not have. Files are only read when the manifest
+records `sha256`.
 
 ## The more flag
 

@@ -24,6 +24,7 @@ use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use json::{Object, Value};
+use uapi16::Problem;
 
 use crate::errno::*;
 use crate::sha256::{self, DIGEST_SIZE};
@@ -31,15 +32,18 @@ use crate::volume::MAX_FILE_SIZE;
 use crate::{Detail, ManifestProblem, Result, UnsupportedKind, ValidityProblem};
 
 mod assemble;
+mod error;
 mod fields;
 mod generate;
 #[cfg(test)]
 mod tests;
-pub mod volume;
+mod volume;
 
 pub use assemble::{AssembleOptions, AssembleReport, ContentSource, DirectorySource, StreamSource};
 pub use fields::{base64_decode, valid_name};
-pub use generate::generate;
+pub use generate::HostTree;
+pub use uapi16::Features;
+pub use volume::WriteReport;
 
 use fields::{
     access_mode, boolean, check_extended_attributes, check_signature, fat_key, hash, string, uint, valid_gpt_label,
@@ -56,9 +60,9 @@ macro_rules! malformed {
 }
 
 /// The detail of a defect of the manifest itself.
-pub(super) fn malformed(problem: ManifestProblem) -> Detail {
+pub(super) fn malformed(problem: Problem) -> Detail {
     Detail::Manifest {
-        problem,
+        problem: ManifestProblem::Malformed(problem),
         record: None,
         name: None,
         field: None,
@@ -66,9 +70,9 @@ pub(super) fn malformed(problem: ManifestProblem) -> Detail {
 }
 
 /// [`malformed`] about one field.
-pub(super) fn malformed_field(problem: ManifestProblem, field: &str) -> Detail {
+pub(super) fn malformed_field(problem: Problem, field: &str) -> Detail {
     Detail::Manifest {
-        problem,
+        problem: ManifestProblem::Malformed(problem),
         record: None,
         name: None,
         field: Some(field.to_string()),
@@ -362,7 +366,7 @@ fn reconcile_hash_and_size(hash: &mut Option<[u8; DIGEST_SIZE]>, size: &mut Opti
         (Some(h), Some(s)) if h == sha256::EMPTY && s != 0 => {
             bail!(
                 EBADMSG,
-                malformed_field(ManifestProblem::Contradiction, "sha256"),
+                malformed_field(Problem::Contradiction, "sha256"),
                 "{}: a zero hash with a non-zero size",
                 what
             )
@@ -370,7 +374,7 @@ fn reconcile_hash_and_size(hash: &mut Option<[u8; DIGEST_SIZE]>, size: &mut Opti
         (Some(h), Some(0)) if h != sha256::EMPTY => {
             bail!(
                 EBADMSG,
-                malformed_field(ManifestProblem::Contradiction, "size"),
+                malformed_field(Problem::Contradiction, "size"),
                 "{}: a zero size with a non-zero hash",
                 what
             )
@@ -386,7 +390,7 @@ fn parse_contents(v: &Value, what: &str) -> Result<Contents> {
     let o = v.as_object().ok_or_else(|| {
         err!(
             EBADMSG,
-            malformed_field(ManifestProblem::Contents, "contents"),
+            malformed_field(Problem::InvalidContents, "contents"),
             "{}: contents entry is not an object",
             what
         )
@@ -402,7 +406,7 @@ fn parse_contents(v: &Value, what: &str) -> Result<Contents> {
                 if !valid_name(f) {
                     bail!(
                         EBADMSG,
-                        malformed_field(ManifestProblem::Contents, "file"),
+                        malformed_field(Problem::InvalidContents, "file"),
                         "{}: contents file reference '{}' is not a valid relative path",
                         what,
                         f
@@ -415,7 +419,7 @@ fn parse_contents(v: &Value, what: &str) -> Result<Contents> {
                 if !(u.starts_with("http://") || u.starts_with("https://")) {
                     bail!(
                         EBADMSG,
-                        malformed_field(ManifestProblem::Contents, "url"),
+                        malformed_field(Problem::InvalidContents, "url"),
                         "{}: contents URL '{}' is not http or https",
                         what,
                         u
@@ -427,7 +431,7 @@ fn parse_contents(v: &Value, what: &str) -> Result<Contents> {
                 c.literal = Some(base64_decode(string(value, "literal")?).ok_or_else(|| {
                     err!(
                         EBADMSG,
-                        malformed_field(ManifestProblem::Contents, "literal"),
+                        malformed_field(Problem::InvalidContents, "literal"),
                         "{}: literal contents are not Base64",
                         what
                     )
@@ -438,7 +442,7 @@ fn parse_contents(v: &Value, what: &str) -> Result<Contents> {
                 if e.is_empty() || e == "identity" {
                     bail!(
                         EBADMSG,
-                        malformed_field(ManifestProblem::Contents, "encoding"),
+                        malformed_field(Problem::InvalidContents, "encoding"),
                         "{}: encoding '{}' is not permitted",
                         what,
                         e
@@ -462,7 +466,7 @@ fn parse_contents(v: &Value, what: &str) -> Result<Contents> {
     {
         bail!(
             EBADMSG,
-            malformed(ManifestProblem::Contents),
+            malformed(Problem::InvalidContents),
             "{}: only one of file, url and literal may be set",
             what
         );
@@ -474,7 +478,7 @@ fn parse_contents(v: &Value, what: &str) -> Result<Contents> {
         match (c.encoded_size, c.original_size) {
             (Some(a), Some(b)) if a != b => bail!(
                 EBADMSG,
-                malformed_field(ManifestProblem::Contradiction, "encodedSize"),
+                malformed_field(Problem::Contradiction, "encodedSize"),
                 "{}: encoded and original size differ without an encoding",
                 what
             ),
@@ -485,7 +489,7 @@ fn parse_contents(v: &Value, what: &str) -> Result<Contents> {
         match (c.encoded_sha256, c.original_sha256) {
             (Some(a), Some(b)) if a != b => bail!(
                 EBADMSG,
-                malformed_field(ManifestProblem::Contradiction, "encodedSha256"),
+                malformed_field(Problem::Contradiction, "encodedSha256"),
                 "{}: encoded and original hash differ without an encoding",
                 what
             ),
@@ -499,7 +503,7 @@ fn parse_contents(v: &Value, what: &str) -> Result<Contents> {
             if s != literal.len() as u64 {
                 bail!(
                     EBADMSG,
-                    malformed_field(ManifestProblem::Contradiction, "literal"),
+                    malformed_field(Problem::Contradiction, "literal"),
                     "{}: literal contents are {} bytes, not {}",
                     what,
                     literal.len(),
@@ -516,7 +520,7 @@ fn parse_contents(v: &Value, what: &str) -> Result<Contents> {
         if c.offset > total {
             bail!(
                 EBADMSG,
-                malformed_field(ManifestProblem::Contents, "offset"),
+                malformed_field(Problem::InvalidContents, "offset"),
                 "{}: contents offset {} is beyond the data size {}",
                 what,
                 c.offset,
@@ -563,7 +567,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
                 if !valid_name(n) {
                     bail!(
                         EBADMSG,
-                        malformed_field(ManifestProblem::InvalidName, "name"),
+                        malformed_field(Problem::InvalidName, "name"),
                         "manifest object {}: name '{}' is not a valid relative path",
                         index,
                         n
@@ -577,7 +581,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
                 inode_type = Some(InodeType::parse(t).ok_or_else(|| {
                     err!(
                         EBADMSG,
-                        malformed_field(ManifestProblem::UnknownType, "type"),
+                        malformed_field(Problem::UnknownType, "type"),
                         "manifest object {}: unknown inode type '{}'",
                         index,
                         t
@@ -592,7 +596,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
                 if v >= 0xFFFF_FFFF || v == 0xFFFF {
                     bail!(
                         EBADMSG,
-                        malformed_field(ManifestProblem::FieldRange, key),
+                        malformed_field(Problem::FieldOutOfRange, key),
                         "manifest object {}: {} {} is out of range",
                         index,
                         key,
@@ -605,7 +609,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
                 if !valid_user_group_name(n) {
                     bail!(
                         EBADMSG,
-                        malformed_field(ManifestProblem::FieldType, key),
+                        malformed_field(Problem::WrongFieldType, key),
                         "manifest object {}: {} '{}' is not a valid name",
                         index,
                         key,
@@ -618,7 +622,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
                 if !valid_gpt_label(l) {
                     bail!(
                         EBADMSG,
-                        malformed_field(ManifestProblem::FieldType, "gptLabel"),
+                        malformed_field(Problem::WrongFieldType, "gptLabel"),
                         "manifest object {}: '{}' is not a valid GPT partition label",
                         index,
                         l
@@ -631,7 +635,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
                 if !valid_id128(id) {
                     bail!(
                         EBADMSG,
-                        malformed_field(ManifestProblem::FieldType, key),
+                        malformed_field(Problem::WrongFieldType, key),
                         "manifest object {}: {} '{}' is not a UUID",
                         index,
                         key,
@@ -668,14 +672,14 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
                 let items = value.as_array().ok_or_else(|| {
                     err!(
                         EBADMSG,
-                        malformed_field(ManifestProblem::FieldType, "contents"),
+                        malformed_field(Problem::WrongFieldType, "contents"),
                         "manifest field 'contents' is not an array"
                     )
                 })?;
                 if items.len() > MAX_CONTENTS {
                     bail!(
                         EBADMSG,
-                        malformed_field(ManifestProblem::Contents, "contents"),
+                        malformed_field(Problem::InvalidContents, "contents"),
                         "manifest object {}: more than {} contents entries",
                         index,
                         MAX_CONTENTS
@@ -700,7 +704,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
         if mt != MEDIA_TYPE {
             bail!(
                 EBADMSG,
-                malformed_field(ManifestProblem::MediaType, "mediaType"),
+                malformed_field(Problem::InvalidMediaType, "mediaType"),
                 "manifest object {} has unexpected media type '{}'",
                 index,
                 mt
@@ -711,21 +715,21 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
         if media_type.is_none() {
             bail!(
                 EBADMSG,
-                malformed_field(ManifestProblem::MediaType, "mediaType"),
+                malformed_field(Problem::InvalidMediaType, "mediaType"),
                 "the first manifest object does not carry the manifest media type"
             );
         }
         if e.name.is_some() {
             bail!(
                 EBADMSG,
-                malformed_field(ManifestProblem::FirstHasName, "name"),
+                malformed_field(Problem::RootHasName, "name"),
                 "the first manifest object has a name"
             );
         }
         if !matches!(inode_type, None | Some(InodeType::Directory)) {
             bail!(
                 EBADMSG,
-                malformed_field(ManifestProblem::FirstNotDirectory, "type"),
+                malformed_field(Problem::RootNotDirectory, "type"),
                 "the first manifest object is not a directory"
             );
         }
@@ -734,7 +738,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
         if e.name.is_none() {
             bail!(
                 EBADMSG,
-                malformed_field(ManifestProblem::NoName, "name"),
+                malformed_field(Problem::NoName, "name"),
                 "manifest object {} has no name",
                 index
             );
@@ -747,7 +751,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
     if e.size.is_some() && !matches!(t, InodeType::Regular | InodeType::Symlink | InodeType::Directory) {
         bail!(
             EBADMSG,
-            malformed_field(ManifestProblem::FieldNotPermitted, "size"),
+            malformed_field(Problem::FieldNotPermitted, "size"),
             "{}: 'size' is not permitted on a {}",
             w,
             t.as_str()
@@ -756,7 +760,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
     if major_minor && !matches!(t, InodeType::BlockDevice | InodeType::CharDevice) {
         bail!(
             EBADMSG,
-            malformed_field(ManifestProblem::FieldNotPermitted, "major"),
+            malformed_field(Problem::FieldNotPermitted, "major"),
             "{}: 'major' and 'minor' are not permitted on a {}",
             w,
             t.as_str()
@@ -765,7 +769,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
     if e.mode.is_some() && t == InodeType::Symlink {
         bail!(
             EBADMSG,
-            malformed_field(ManifestProblem::FieldNotPermitted, "mode"),
+            malformed_field(Problem::FieldNotPermitted, "mode"),
             "{}: 'mode' is not permitted on a symlink",
             w
         );
@@ -773,7 +777,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
     if matches!(e.inode_token, Some(tok) if tok != 0) && t == InodeType::Directory {
         bail!(
             EBADMSG,
-            malformed_field(ManifestProblem::FieldNotPermitted, "inodeToken"),
+            malformed_field(Problem::FieldNotPermitted, "inodeToken"),
             "{}: 'inodeToken' is not permitted on a directory",
             w
         );
@@ -783,7 +787,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
     {
         bail!(
             EBADMSG,
-            malformed_field(ManifestProblem::FieldNotPermitted, "contents"),
+            malformed_field(Problem::FieldNotPermitted, "contents"),
             "{}: 'contents' and 'sha256' are not permitted on a {}",
             w,
             t.as_str()
@@ -792,7 +796,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
     if gpt && t != InodeType::Regular {
         bail!(
             EBADMSG,
-            malformed(ManifestProblem::FieldNotPermitted),
+            malformed(Problem::FieldNotPermitted),
             "{}: GPT fields are only permitted on regular files",
             w
         );
@@ -800,7 +804,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
     if gpt_disk && index != 0 {
         bail!(
             EBADMSG,
-            malformed_field(ManifestProblem::FieldNotPermitted, "gptDiskUuid"),
+            malformed_field(Problem::FieldNotPermitted, "gptDiskUuid"),
             "{}: 'gptDiskUuid' is only permitted on the first object",
             w
         );
@@ -809,7 +813,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
         if ro == (mode & 0o222 != 0) {
             bail!(
                 EBADMSG,
-                malformed_field(ManifestProblem::Contradiction, "readOnly"),
+                malformed_field(Problem::Contradiction, "readOnly"),
                 "{}: 'readOnly' and 'mode' contradict each other",
                 w
             );
@@ -821,7 +825,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
         {
             bail!(
                 EBADMSG,
-                malformed_field(ManifestProblem::Contradiction, "gptFlags"),
+                malformed_field(Problem::Contradiction, "gptFlags"),
                 "{}: 'gptFlags' and the 'gptFlag*' fields contradict each other",
                 w
             );
@@ -835,7 +839,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
                 if c.offset.checked_add(size).is_none_or(|end| end > total) {
                     bail!(
                         EBADMSG,
-                        malformed_field(ManifestProblem::Contradiction, "offset"),
+                        malformed_field(Problem::Contradiction, "offset"),
                         "{}: offset {} plus size {} exceeds the contents size {}",
                         w,
                         c.offset,
@@ -852,7 +856,7 @@ pub fn parse_entry(object: &Object, index: usize) -> Result<Entry> {
                 (Some(a), Some(b)) if a != b => {
                     bail!(
                         EBADMSG,
-                        malformed_field(ManifestProblem::Contradiction, "sha256"),
+                        malformed_field(Problem::Contradiction, "sha256"),
                         "{}: object and contents hashes differ",
                         w
                     )
@@ -891,7 +895,7 @@ fn next_record(buffer: &[u8], eof: bool) -> Result<Option<(&str, usize)>> {
         if rest[0] != RECORD_SEPARATOR {
             bail!(
                 EBADMSG,
-                malformed(ManifestProblem::RecordSeparator),
+                malformed(Problem::NoRecordSeparator),
                 "manifest record does not start with a record separator but with byte 0x{:02x}",
                 rest[0]
             );
@@ -903,7 +907,7 @@ fn next_record(buffer: &[u8], eof: bool) -> Result<Option<(&str, usize)>> {
             None if body.len() > MAX_RECORD_SIZE => {
                 bail!(
                     E2BIG,
-                    malformed(ManifestProblem::RecordTooLarge),
+                    malformed(Problem::RecordTooLarge),
                     "manifest record exceeds {} bytes",
                     MAX_RECORD_SIZE
                 )
@@ -914,7 +918,7 @@ fn next_record(buffer: &[u8], eof: bool) -> Result<Option<(&str, usize)>> {
         if record.len() > MAX_RECORD_SIZE {
             bail!(
                 E2BIG,
-                malformed(ManifestProblem::RecordTooLarge),
+                malformed(Problem::RecordTooLarge),
                 "manifest record exceeds {} bytes",
                 MAX_RECORD_SIZE
             );
@@ -922,17 +926,12 @@ fn next_record(buffer: &[u8], eof: bool) -> Result<Option<(&str, usize)>> {
         if record.contains(&0) {
             bail!(
                 EBADMSG,
-                malformed(ManifestProblem::NulByte),
+                malformed(Problem::ContainsNulByte),
                 "manifest record contains a NUL byte"
             );
         }
-        let text = std::str::from_utf8(record).map_err(|_| {
-            err!(
-                EBADMSG,
-                malformed(ManifestProblem::NotUtf8),
-                "manifest record is not UTF-8"
-            )
-        })?;
+        let text = std::str::from_utf8(record)
+            .map_err(|_| err!(EBADMSG, malformed(Problem::NotUtf8), "manifest record is not UTF-8"))?;
         consumed += 1 + end;
         if text.bytes().all(|b| b.is_ascii_whitespace()) {
             // Empty records are skipped, as RFC 7464 suggests. Only ASCII
@@ -978,7 +977,7 @@ pub fn read(reader: &mut dyn Read) -> Result<Manifest> {
         start += consumed;
         if trailer {
             malformed!(
-                ManifestProblem::DataAfterTrailer,
+                Problem::DataAfterTrailer,
                 EBADMSG,
                 "manifest contains data after the trailer object"
             );
@@ -986,7 +985,7 @@ pub fn read(reader: &mut dyn Read) -> Result<Manifest> {
         let value = json::parse(&text).map_err(|e| {
             err!(
                 EBADMSG,
-                malformed(ManifestProblem::NotJson),
+                malformed(Problem::NotJson),
                 "manifest record {} is not valid JSON: {}",
                 index,
                 e
@@ -995,7 +994,7 @@ pub fn read(reader: &mut dyn Read) -> Result<Manifest> {
         })?;
         let Value::Object(object) = value else {
             malformed!(
-                ManifestProblem::NotObject,
+                Problem::NotObject,
                 EBADMSG,
                 "manifest record {} is not a JSON object",
                 index
@@ -1005,7 +1004,7 @@ pub fn read(reader: &mut dyn Read) -> Result<Manifest> {
             None => None,
             Some(Value::String(s)) => Some(s.as_str()),
             Some(_) => malformed!(
-                ManifestProblem::MediaType,
+                Problem::InvalidMediaType,
                 EBADMSG,
                 "manifest object {} has a mediaType that is not a string",
                 index
@@ -1014,7 +1013,7 @@ pub fn read(reader: &mut dyn Read) -> Result<Manifest> {
         if index == 0 {
             if media_type != Some(MEDIA_TYPE) {
                 malformed!(
-                    ManifestProblem::MediaType,
+                    Problem::InvalidMediaType,
                     EBADMSG,
                     "the first object of the manifest is not of the manifest media type"
                 );
@@ -1033,7 +1032,7 @@ pub fn read(reader: &mut dyn Read) -> Result<Manifest> {
         }
         if signatures > 0 {
             malformed!(
-                ManifestProblem::FileAfterSignature,
+                Problem::FileAfterSignature,
                 EBADMSG,
                 "manifest contains a file object after a signature object"
             );
@@ -1047,15 +1046,10 @@ pub fn read(reader: &mut dyn Read) -> Result<Manifest> {
             if let Some(&earlier) = names.get(&fat_key(name)) {
                 let other = entries[earlier].name.as_deref().unwrap_or_default();
                 if other == name {
-                    malformed!(
-                        ManifestProblem::DuplicateName,
-                        EBADMSG,
-                        "manifest lists '{}' twice",
-                        name
-                    );
+                    malformed!(Problem::DuplicateName, EBADMSG, "manifest lists '{}' twice", name);
                 }
                 malformed!(
-                    ManifestProblem::DuplicateName,
+                    Problem::DuplicateName,
                     EEXIST,
                     "manifest lists '{}' and '{}', which FAT cannot tell apart",
                     other,
@@ -1068,11 +1062,11 @@ pub fn read(reader: &mut dyn Read) -> Result<Manifest> {
         index += 1;
     }
     let Some(root) = root else {
-        malformed!(ManifestProblem::Empty, EBADMSG, "manifest contains no objects")
+        malformed!(Problem::NoObjects, EBADMSG, "manifest contains no objects")
     };
     if !trailer {
         malformed!(
-            ManifestProblem::NoTrailer,
+            Problem::NoTrailer,
             EBADMSG,
             "manifest lacks the trailer object, it is incomplete"
         );

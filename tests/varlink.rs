@@ -382,7 +382,10 @@ fn esp_tree() -> Temp {
 /// A manifest of the tree and the contents of its streamed files in
 /// manifest order.
 fn manifest_and_blob(tree: &Path) -> (Vec<u8>, Vec<u8>) {
-    let bytes = fat::manifest::generate(fat::host::open_dir(tree).unwrap().as_fd()).unwrap();
+    let mut bytes = Vec::new();
+    fat::manifest::HostTree::new(fat::host::open_dir(tree).unwrap().as_fd())
+        .write_manifest(&mut bytes)
+        .unwrap();
     let m = fat::manifest::parse(&bytes).unwrap();
     let mut blob = Vec::new();
     for e in &m.entries {
@@ -417,6 +420,37 @@ fn names(replies: &[Object]) -> Vec<&str> {
 /// service did.
 fn volume(image: &Path, access: Access) -> Volume {
     Volume::open(Device::open(image, access).unwrap()).unwrap()
+}
+
+/// Points the FAT entry of the first cluster of the directory `name`, an
+/// entry of the root directory of the FAT32 volume in `image` given by its
+/// 8.3 name, at that cluster itself, in every copy of the FAT: the chain of
+/// the directory loops. Returns the cluster.
+fn loop_root_directory(image: &Path, name: &[u8; 11]) -> u32 {
+    use fat::dirent::{self, ATTR_DIRECTORY, DIR_ENTRY_SIZE};
+
+    let f = rw(image);
+    let mut sector = [0u8; 512];
+    f.read_exact_at(&mut sector, 0).unwrap();
+    let boot = fat::boot::BootSector::parse(&sector).unwrap();
+    let layout = boot.layout().unwrap();
+    let mut buf = vec![0u8; layout.cluster_size() as usize];
+    f.read_exact_at(&mut buf, layout.cluster_offset(boot.root_cluster).unwrap())
+        .unwrap();
+    let slot = buf
+        .chunks(DIR_ENTRY_SIZE)
+        .find(|slot| &slot[dirent::field::NAME] == name && slot[dirent::field::ATTR] & ATTR_DIRECTORY != 0)
+        .unwrap();
+    let half = |field: std::ops::Range<usize>| u32::from(u16::from_le_bytes(slot[field].try_into().unwrap()));
+    let cluster = (half(dirent::field::FIRST_CLUSTER_HI) << u16::BITS) | half(dirent::field::FIRST_CLUSTER_LO);
+    for copy in 0..layout.fats {
+        f.write_all_at(
+            &cluster.to_le_bytes(),
+            layout.fat_offset(copy) + u64::from(cluster) * fat::fat::ENTRY_SIZE as u64,
+        )
+        .unwrap();
+    }
+    cluster
 }
 
 /// Damages the FAT32 volume in `image`: every file entry of the root
@@ -1462,7 +1496,7 @@ fn assemble_writes_a_manifest() {
         &mut c,
         "Assemble",
         &format!(
-            r#"{{"image":{{"fileDescriptor":0}},"options":{{"timestampUSec":{}}},"content":{{"sourceFileDescriptor":1,"manifestSink":{{"fileDescriptor":2,"fields":["size","hash","mtime"]}}}}}}"#,
+            r#"{{"image":{{"fileDescriptor":0}},"options":{{"timestampUSec":{}}},"content":{{"sourceFileDescriptor":1,"manifestSink":{{"fileDescriptor":2,"features":["size","sha256","mtime"]}}}}}}"#,
             T0
         ),
         &[img.as_fd(), source.as_fd(), out_file.as_fd()],
@@ -1505,6 +1539,116 @@ fn assemble_writes_a_manifest() {
     assert_eq!(str_of(&e.parameters, "parameter"), "manifestSink");
     assert_eq!(str_of(&e.parameters, "reason"), "notWritable");
     assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
+}
+
+/// The reasons of InvalidManifest are the names of the problems of the
+/// uapi16 crate and noSize, the way ManifestProblem spells them.
+#[test]
+fn manifest_problems_are_those_of_uapi16() {
+    use fat::ManifestProblem;
+    let Some(varlink::idl::Type::Enum(values)) = interface().types.get("ManifestProblem") else {
+        panic!("ManifestProblem is not an enumeration");
+    };
+    let mut spelled: Vec<&str> = uapi16::Problem::ALL
+        .iter()
+        .copied()
+        .map(ManifestProblem::Malformed)
+        .chain([ManifestProblem::NoSize])
+        .map(ManifestProblem::as_str)
+        .collect();
+    let mut declared: Vec<&str> = values.iter().map(String::as_str).collect();
+    spelled.sort_unstable();
+    declared.sort_unstable();
+    assert_eq!(declared, spelled);
+}
+
+/// The manifest sink takes the features of UAPI.16, with "_" for "-".
+#[test]
+fn manifests_record_and_apply_features() {
+    let _serial = common::serial();
+    let Some(ufat) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    // The values of ManifestFeature are the features of UAPI.16.
+    let Some(varlink::idl::Type::Enum(values)) = interface().types.get("ManifestFeature") else {
+        panic!("ManifestFeature is not an enumeration");
+    };
+    let mut spelled: Vec<String> = fat::manifest::Features::ALL
+        .names()
+        .map(|name| name.replace('-', "_"))
+        .collect();
+    let mut declared = values.clone();
+    spelled.sort_unstable();
+    declared.sort_unstable();
+    assert_eq!(declared, spelled);
+    let tree = esp_tree();
+    let scratch = Temp::dir();
+    let mut c = connect_fd3(&ufat);
+    let source = ro(tree.path());
+    let (image, img) = fresh_image();
+    reply(call(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1}}"#,
+        &[img.as_fd(), source.as_fd()],
+    ));
+    // The features a manifest lists in its root file object.
+    let listed = |path: &Path| {
+        let bytes = std::fs::read(path).unwrap();
+        let features = uapi16::Reader::open(&bytes[..]).unwrap().root().features;
+        features.unwrap().names().collect::<Vec<_>>()
+    };
+    // Every value is taken. What FAT has no notion of is not recorded, and
+    // the read-only attribute always is.
+    let img_ro = ro(image.path());
+    let out = scratch.path().join("all.manifest");
+    let out_file = sink(&out);
+    let all: Vec<String> = values.iter().map(|value| format!("\"{}\"", value)).collect();
+    reply(call(
+        &mut c,
+        "Describe",
+        &format!(
+            r#"{{"image":{{"fileDescriptor":0}},"manifestSink":{{"fileDescriptor":1,"features":[{}]}}}}"#,
+            all.join(",")
+        ),
+        &[img_ro.as_fd(), out_file.as_fd()],
+    ));
+    drop(out_file);
+    assert_eq!(
+        listed(&out),
+        [
+            "device",
+            "hardlink",
+            "mtime",
+            "read-only",
+            "sha256",
+            "size",
+            "symlink",
+            "user-xattr"
+        ]
+    );
+    let out_file = sink(&out);
+    reply(call(
+        &mut c,
+        "Describe",
+        r#"{"image":{"fileDescriptor":0},"manifestSink":{"fileDescriptor":1}}"#,
+        &[img_ro.as_fd(), out_file.as_fd()],
+    ));
+    drop(out_file);
+    assert_eq!(
+        listed(&out),
+        ["device", "hardlink", "read-only", "sha256", "size", "symlink"]
+    );
+    // systemd-manifest's name for sha256 is not one of them.
+    let out_file = sink(&out);
+    let e = error_of(
+        &mut c,
+        "Describe",
+        r#"{"image":{"fileDescriptor":0},"manifestSink":{"fileDescriptor":1,"features":["hash"]}}"#,
+        &[img_ro.as_fd(), out_file.as_fd()],
+    );
+    assert_eq!(e.name, "org.varlink.service.InvalidParameter");
+    assert_eq!(str_of(&e.parameters, "parameter"), "manifestSink");
 }
 
 /// With the more flag Assemble tells which step it is in, in order.
@@ -1777,6 +1921,41 @@ fn describe_with_and_without_a_manifest() {
     );
     assert_eq!(e.name, "org.varlink.service.InvalidParameter");
     assert_eq!(str_of(&e.parameters, "parameter"), "image");
+}
+
+/// Describe of a volume with a directory whose chain loops answers
+/// Corrupt for that directory.
+#[test]
+fn describe_of_a_directory_whose_chain_loops_is_corrupt() {
+    let _serial = common::serial();
+    let Some(ufat) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let tree = esp_tree();
+    let scratch = Temp::dir();
+    let (image, img) = fresh_image();
+    let mut c = connect_fd3(&ufat);
+    let source = ro(tree.path());
+    reply(call(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1}}"#,
+        &[img.as_fd(), source.as_fd()],
+    ));
+    drop(img);
+    let cluster = loop_root_directory(image.path(), b"LOADER     ");
+    let out_file = sink(&scratch.path().join("described.manifest"));
+    let img_ro = ro(image.path());
+    let e = error_of(
+        &mut c,
+        "Describe",
+        r#"{"image":{"fileDescriptor":0},"manifestSink":{"fileDescriptor":1}}"#,
+        &[img_ro.as_fd(), out_file.as_fd()],
+    );
+    assert_eq!(e.name, format!("{}.Corrupt", IFACE));
+    assert_eq!(str_of(&e.parameters, "where"), "directory");
+    assert_eq!(str_of(&e.parameters, "path"), "/loader");
+    assert_eq!(u64_of(&e.parameters, "block"), u64::from(cluster));
 }
 
 /// Populate: a tree, one file, a manifest's tree, and a directory alone;

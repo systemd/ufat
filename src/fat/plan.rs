@@ -16,7 +16,7 @@ use crate::dir::MAX_SLOTS;
 use crate::dirent::DIR_ENTRY_SIZE;
 use crate::errno::*;
 use crate::format::{encode_label, FormatOptions};
-use crate::host::walk_tree;
+use crate::host::{walk_tree, HostEntry, UnnamableEntry};
 use crate::layout::{self, Layout, LayoutParams, MAX_CLUSTERS, MAX_CLUSTER_SIZE, MAX_SECTORS_PER_CLUSTER};
 use crate::name::{Alias, LongName};
 use crate::path::components;
@@ -284,7 +284,7 @@ impl Plan {
         }
         self.add_dir(dest)?;
         let mut skipped = Vec::new();
-        walk_tree(source, dest, follow_symlinks, &mut |target, entry| {
+        let mut visit = |target: &str, entry: &HostEntry| -> Result<bool> {
             if entry.is_dir() {
                 self.add_dir(target)?;
                 Ok(true)
@@ -296,7 +296,8 @@ impl Plan {
                 skipped.push(entry.path.clone());
                 Ok(false)
             }
-        })?;
+        };
+        walk_tree(source, dest, follow_symlinks, UnnamableEntry::Fail, &mut visit)?;
         Ok(skipped)
     }
 

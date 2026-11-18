@@ -1,4 +1,4 @@
-{"extendedAttributes":{"user":{}},"gid":1000,"mTimeNSec":1699999000000000000,"mediaType":"application/vnd.uapi.16.manifest","mode":509,"uid":1000}
+{"extendedAttributes":{"user":{}},"features":["device","gid","hardlink","mode","mtime","sha256","size","symlink","uid","user-xattr"],"gid":1000,"mTimeNSec":1699999000000000000,"mediaType":"application/vnd.uapi.16.manifest","mode":509,"order":"codepoint","uid":1000}
 {"extendedAttributes":{"user":{}},"gid":1000,"mTimeNSec":1699999000000000000,"mode":509,"name":"EFI","type":"dir","uid":1000}
 {"extendedAttributes":{"user":{}},"gid":1000,"mTimeNSec":1699999000000000000,"mode":509,"name":"EFI/BOOT","type":"dir","uid":1000}
 {"extendedAttributes":{"user":{}},"gid":1000,"mTimeNSec":1700000000000000000,"mode":436,"name":"EFI/BOOT/BOOTX64.EFI","sha256":"608047e995ccddf55441b8ed783ac49c780b9a911aa655f47d3a4c174748f86b","size":4096,"uid":1000}

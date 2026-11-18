@@ -10,6 +10,8 @@
 
 use std::fmt;
 
+use uapi16::Problem;
+
 use crate::errno::{EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOMEM, ENOTDIR, ENOTEMPTY};
 
 /// What is wrong with a name inside a volume.
@@ -211,94 +213,24 @@ impl DescriptorProblem {
     }
 }
 
-/// What is wrong with a UAPI.16 manifest.
+/// What is wrong with a UAPI.16 manifest, the reason of an
+/// `InvalidManifest` error of the Varlink interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManifestProblem {
-    /// A record is not valid JSON.
-    NotJson,
-    /// A record is not a JSON object.
-    NotObject,
-    /// A record is not UTF-8.
-    NotUtf8,
-    /// A record contains a NUL byte.
-    NulByte,
-    /// A record does not start with the record separator.
-    RecordSeparator,
-    /// A record is larger than the parser accepts.
-    RecordTooLarge,
-    /// The manifest holds no object at all.
-    Empty,
-    /// The trailer object is missing.
-    NoTrailer,
-    /// Data follows the trailer object.
-    DataAfterTrailer,
-    /// A file object follows a signature object.
-    FileAfterSignature,
-    /// The media type is missing on the first object, is not a string, or
-    /// is not one the parser knows.
-    MediaType,
-    /// The first object has a name.
-    FirstHasName,
-    /// The first object is not a directory.
-    FirstNotDirectory,
-    /// An object after the first has no name.
-    NoName,
-    /// A name is not a normalized relative path.
-    InvalidName,
-    /// Two objects carry the same name, or names FAT folds together.
-    DuplicateName,
-    /// An inode type the parser does not know.
-    UnknownType,
-    /// A field is of the wrong JSON type or shape, named by `field`.
-    FieldType,
-    /// A field's value is out of range, named by `field`.
-    FieldRange,
-    /// A field that the object's inode type does not permit, named by
-    /// `field`.
-    FieldNotPermitted,
-    /// Two fields contradict each other, the first named by `field`.
-    Contradiction,
-    /// A contents entry: not an object, more than one of file, url and
-    /// literal, a URL that is not http or https, a literal that is not
-    /// Base64, an encoding that is not permitted, or too many entries.
-    Contents,
-    /// A malformed signature object.
-    Signature,
-    /// A malformed extendedAttributes object.
-    ExtendedAttributes,
-    /// A regular file without a size whose contents would have to be
-    /// streamed.
+    /// What the specification does not permit in a manifest, named by the
+    /// problem the [`uapi16`] crate has for it.
+    Malformed(Problem),
+    /// A regular file without a size, where the size has to be known: to
+    /// plan the size of a volume, or to take the contents from a stream.
     NoSize,
 }
 
 impl ManifestProblem {
-    /// The value as the Varlink interface spells it.
+    /// The value as the Varlink interface spells it, which is
+    /// [`Problem::as_str`] for a problem of the [`uapi16`] crate.
     pub fn as_str(self) -> &'static str {
         match self {
-            ManifestProblem::NotJson => "notJson",
-            ManifestProblem::NotObject => "notObject",
-            ManifestProblem::NotUtf8 => "notUtf8",
-            ManifestProblem::NulByte => "nulByte",
-            ManifestProblem::RecordSeparator => "recordSeparator",
-            ManifestProblem::RecordTooLarge => "recordTooLarge",
-            ManifestProblem::Empty => "empty",
-            ManifestProblem::NoTrailer => "noTrailer",
-            ManifestProblem::DataAfterTrailer => "dataAfterTrailer",
-            ManifestProblem::FileAfterSignature => "fileAfterSignature",
-            ManifestProblem::MediaType => "mediaType",
-            ManifestProblem::FirstHasName => "firstHasName",
-            ManifestProblem::FirstNotDirectory => "firstNotDirectory",
-            ManifestProblem::NoName => "noName",
-            ManifestProblem::InvalidName => "invalidName",
-            ManifestProblem::DuplicateName => "duplicateName",
-            ManifestProblem::UnknownType => "unknownType",
-            ManifestProblem::FieldType => "fieldType",
-            ManifestProblem::FieldRange => "fieldRange",
-            ManifestProblem::FieldNotPermitted => "fieldNotPermitted",
-            ManifestProblem::Contradiction => "contradiction",
-            ManifestProblem::Contents => "contents",
-            ManifestProblem::Signature => "signature",
-            ManifestProblem::ExtendedAttributes => "extendedAttributes",
+            ManifestProblem::Malformed(problem) => problem.as_str(),
             ManifestProblem::NoSize => "noSize",
         }
     }

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::errno::*;
-use crate::host::{walk_tree, FromStart};
+use crate::host::{walk_tree, FromStart, HostEntry, UnnamableEntry};
 use crate::progress::Progress;
 use crate::sys;
 use crate::volume::{Volume, MAX_FILE_SIZE};
@@ -241,7 +241,7 @@ impl Volume {
         }
         let mut report = CopyReport::default();
         self.create_dir_all(dest, options.times.resolve(source_mtime(&md)))?;
-        walk_tree(source, dest, options.follow_symlinks, &mut |target, entry| {
+        let mut visit = |target: &str, entry: &HostEntry| -> Result<bool> {
             if entry.is_dir() {
                 let time = options.times.resolve(source_mtime(&entry.metadata));
                 match self.metadata(target) {
@@ -265,7 +265,8 @@ impl Volume {
                 report.skipped.push(entry.path.clone());
                 Ok(false)
             }
-        })?;
+        };
+        walk_tree(source, dest, options.follow_symlinks, UnnamableEntry::Fail, &mut visit)?;
         Ok(report)
     }
 }

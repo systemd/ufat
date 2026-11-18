@@ -1,4 +1,4 @@
-{"mediaType":"application/vnd.uapi.16.manifest"}
+{"features":[],"mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}
 {"name":"EFI","type":"dir"}
 {"name":"EFI/BOOT","type":"dir"}
 {"name":"EFI/BOOT/BOOTX64.EFI"}

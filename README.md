@@ -126,9 +126,10 @@ The most common ones:
   and device nodes. By default they are left out with a message.
 - `--write-manifest PATH` writes a UAPI.16 manifest of what the file
   system holds after `assemble` or `populate`, or of what `describe`
-  finds. It has the size and the SHA-256 hash of every file, and no
-  times. With `-` as PATH the manifest goes to standard output, and
-  what the command prints there otherwise goes to standard error.
+  finds. It has the size and the SHA-256 hash of every file, says which
+  files and directories are read-only, and has no times. With `-` as
+  PATH the manifest goes to standard output, and what the command prints
+  there otherwise goes to standard error.
 - `--hash sha256` or `--hash sha512` prints the hash of the file system
   `assemble` wrote.
 - `--write-hash PATH` writes that hash to PATH instead, or with `-` to
@@ -181,9 +182,22 @@ size and the SHA-256 hash of every file. A mismatch fails the command.
 Signatures in a manifest are recognized but not verified. Verify a
 signed manifest before you hand it to ufat.
 
-`ufat manifest DIR` writes a manifest of a directory tree. For a tree of
-regular files and directories, the output is the same as that of
-`systemd-manifest make --field=size,hash,mtime`.
+`ufat manifest DIR` writes a manifest of a directory tree to standard
+output. It has the size and the SHA-256 hash of every regular file, and
+the modification time of every file and directory. Its root object lists
+these features and declares the code point order. Other kinds of files,
+such as symbolic links, are left out. So are entries whose names a
+manifest cannot carry, such as names that are not UTF-8, with everything
+below them, and ufat says how many it left out. A file that changes
+while ufat reads it gets the size and the hash of what ufat read, and
+ufat says how many files changed. When the command fails, the manifest
+it wrote so far has no trailer, and readers refuse it. For a tree of
+regular files and directories, `systemd-manifest make
+--field=size,hash,mtime` writes the same file objects. A
+systemd-manifest from before systemd commits 118717cfe2, 330fab5e90 and
+e83f7bce0c, which are not in a release yet, writes neither `features`
+nor `order` in the root file object. It also writes the hash of an empty
+file.
 
 ### Time stamps
 

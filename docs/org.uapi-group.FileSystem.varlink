@@ -231,24 +231,43 @@ type UnsupportedPolicy(
 	fail
 )
 
-# A per-file field of a manifest written back (ManifestSink.fields):
-# systemd-manifest's vocabulary, as its --field= and repart's
-# --manifest-fields= take it. The inode type is always written; the default
-# set is mode, uid, gid, size, hash, symlink, device, hardlink and
-# userXattr, mtime and the names are opt-in.
-type ManifestField(
+# A feature a manifest written through ManifestSink records: a value of the
+# features field of UAPI.16 with each "-" written as "_", the way systemd
+# writes the values of enumerations, so user-xattr is user_xattr. The inode
+# type is always written. The default set is UAPI.16's: device, gid,
+# hardlink, mode, sha256, size, symlink and uid.
+type ManifestFeature(
 	mode,
 	uid,
 	gid,
+	user_name,
+	group_name,
 	size,
-	hash,
+	sha256,
 	symlink,
 	device,
 	hardlink,
 	mtime,
-	userXattr,
-	userName,
-	groupName
+	user_xattr,
+	flag_hidden,
+	flag_system,
+	flag_archive,
+	flag_append_only,
+	flag_immutable,
+	flag_no_atime,
+	flag_no_cow,
+	flag_no_dump,
+	read_only,
+	fs_uuid,
+	fs_label,
+	fat_serial,
+	gpt_label,
+	gpt_uuid,
+	gpt_type_uuid,
+	gpt_disk_uuid,
+	gpt_flags,
+	gpt_flag_no_auto,
+	gpt_flag_grow_file_system
 )
 
 # A UAPI.16 manifest as content, read from a regular file or a pipe to its
@@ -263,15 +282,20 @@ type Manifest(
 )
 
 # Where a UAPI.16 manifest is written: of the whole filesystem as an Assemble
-# or Populate call leaves it, or as Describe finds it, in the stored form,
-# entries sorted by name with a directory's entries right after it. Only
-# where writeManifest is among Capabilities.operations.
+# or Populate call leaves it, or as Describe finds it, in the stored form. Its
+# root file object lists what the manifest records in features and declares
+# the code point order its file objects are in, so the manifest can be given
+# as content again. Only where writeManifest is among Capabilities.operations.
 type ManifestSink(
 	# Index of the descriptor open for writing that receives the manifest
 	fileDescriptor: int,
-	# The fields the manifest carries, the default set when absent. A field
-	# the filesystem has no notion of is left out and not counted as omitted.
-	fields: ?[]ManifestField
+	# What the manifest records, UAPI.16's default set when absent. What the
+	# filesystem has no notion of is not recorded and not counted as omitted.
+	# Where the filesystem has none of what a feature describes, the manifest
+	# records that there is none, as for symbolic links, device nodes, hard
+	# links and extended attributes on vfat. The manifest of vfat records the
+	# read-only attribute whether read_only is asked for or not.
+	features: ?[]ManifestFeature
 )
 
 # What goes into a filesystem. The source descriptor's type decides what it
@@ -673,8 +697,11 @@ error InvalidLabel(label: string, reason: LabelProblem)
 type IdentifierProblem(malformed, wrongKind, notSupported, reserved)
 error InvalidIdentifier(identifier: string, reason: IdentifierProblem)
 
-# The manifest cannot be parsed or is inconsistent.
-type ManifestProblem(notJson, notObject, notUtf8, nulByte, recordSeparator, recordTooLarge, empty, noTrailer, dataAfterTrailer, fileAfterSignature, mediaType, firstHasName, firstNotDirectory, noName, invalidName, duplicateName, unknownType, fieldType, fieldRange, fieldNotPermitted, contradiction, contents, signature, extendedAttributes, noSize)
+# The manifest cannot be parsed or is inconsistent. record is the number of
+# the record, counting from 0, name the name of the file object and field the
+# field the problem is with: for unlistedFeature the field of a feature the
+# manifest does not list, such as mTimeNSec.
+type ManifestProblem(notJson, duplicateKey, invalidString, notObject, notUtf8, nulByte, recordSeparator, recordTooLarge, empty, noTrailer, dataAfterTrailer, fileAfterSignature, mediaType, firstHasName, firstNotDirectory, noOrder, noName, invalidName, duplicateName, misplaced, outOfOrder, unlistedFeature, noTarget, unknownType, fieldType, fieldRange, fieldNotPermitted, contradiction, contents, signature, extendedAttributes, noSize)
 error InvalidManifest(reason: ManifestProblem, record: ?int, name: ?string, field: ?string)
 
 # A file the manifest names is not below the source as described.

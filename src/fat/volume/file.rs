@@ -128,6 +128,27 @@ impl Volume {
                 clusters
             );
         }
+        self.begin_read_at(first, size)
+    }
+
+    /// Opens the file of `size` bytes whose chain starts at `first` for
+    /// sequential reading, as [`Volume::begin_read`] opens the file at a
+    /// path, without looking up a path and without walking the chain
+    /// first. The reads follow the chain as far as the file goes. The read
+    /// that runs past the end of a chain shorter than the file fails with
+    /// EUCLEAN, and so does the read of the last cluster of the file when
+    /// the FAT entry of that cluster is free, bad or invalid. The rest of a
+    /// chain longer than the file is not followed.
+    pub(crate) fn begin_read_at(&self, first: u32, size: u64) -> Result<OpenRead> {
+        if size > 0 && !self.layout.valid_cluster(first) {
+            bail!(
+                EUCLEAN,
+                damaged(CorruptPlace::Chain, None, Some(first)),
+                "a file of {} bytes starts at cluster {}, which the volume does not have",
+                size,
+                first
+            );
+        }
         Ok(OpenRead {
             first,
             size,
@@ -148,6 +169,7 @@ impl Volume {
                 Entry::Next(next) => next,
                 other => bail!(
                     EUCLEAN,
+                    damaged(CorruptPlace::Chain, None, Some(cluster)),
                     "the chain of the file ends after {} clusters ({:?})",
                     at + 1,
                     other
@@ -168,7 +190,9 @@ impl Volume {
     }
 
     /// Reads from an open file into `buf`, up to the end of a cluster or of
-    /// the file. Returns the number of bytes read, 0 at the end.
+    /// the file. Returns the number of bytes read, 0 at the end. The read
+    /// that reaches the end of the file fails with EUCLEAN when the FAT
+    /// entry of its last cluster is free, bad or invalid.
     pub fn read_file_data(&self, file: &mut OpenRead, buf: &mut [u8]) -> Result<usize> {
         if file.pos >= file.size || buf.is_empty() {
             return Ok(0);
@@ -181,6 +205,21 @@ impl Volume {
         let off = self.layout.cluster_offset(cluster)? + within;
         self.device.read_at(off, &mut buf[..n])?;
         file.pos += n as u64;
+        if file.pos == file.size {
+            // The chain ends at the last cluster of the file or goes on.
+            // The steps to the clusters before looked at their entries,
+            // nothing looked at this one.
+            match self.fat_entry(cluster)? {
+                Entry::End | Entry::Next(_) => {}
+                other => bail!(
+                    EUCLEAN,
+                    damaged(CorruptPlace::Chain, None, Some(cluster)),
+                    "cluster {}, the last of the file, has the FAT entry {:?}",
+                    cluster,
+                    other
+                ),
+            }
+        }
         Ok(n)
     }
 
@@ -532,6 +571,12 @@ impl OpenRead {
     /// The file size.
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// The cluster the last read came from, the first cluster before the
+    /// first read.
+    pub(crate) fn cluster(&self) -> u32 {
+        self.current.map_or(self.first, |(cluster, _)| cluster)
     }
 }
 

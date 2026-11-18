@@ -420,6 +420,33 @@ impl HostEntry {
             .with_context(|| format!("failed to open {}", self.path.display()))?;
         Ok(File::from(fd))
     }
+
+    /// Whether the entry, a regular file open as `file`, is no longer what
+    /// the walk found: its size, its modification time or its change time
+    /// differs from the metadata. tar checks a file it read the same way.
+    pub(crate) fn has_changed(&self, file: &File) -> Result<bool> {
+        let now = sys::fstat(file.as_fd()).with_context(|| format!("failed to stat {}", self.path.display()))?;
+        let then = &self.metadata;
+        Ok(now.len() != then.len()
+            || (now.mtime(), now.mtime_nsec()) != (then.mtime(), then.mtime_nsec())
+            || (now.ctime(), now.ctime_nsec()) != (then.ctime(), then.ctime_nsec()))
+    }
+}
+
+/// What a walk does with an entry it cannot give a path inside the volume:
+/// one whose name is not UTF-8, which could not be stored as a long name
+/// anyway, or whose path inside the volume would be longer than
+/// [`crate::path::MAX_PATH`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnnamableEntry {
+    /// The walk fails, with EINVAL for the name and ENAMETOOLONG for the
+    /// path.
+    Fail,
+    /// The walk leaves the entry out, a directory with everything below
+    /// it, and counts it if it is a regular file or a directory, which a
+    /// user of the walk would have stored. Other files are left out
+    /// uncounted, as the users of the walk leave them out.
+    Omit,
 }
 
 /// How a directory path reads in a message: "." for the root.
@@ -472,15 +499,16 @@ struct Level {
 /// leaves it out: it is not there to copy. A directory that is already on
 /// the stack, reached through a followed link or a bind mount of a
 /// directory into itself, is ELOOP: the tree would otherwise go on until
-/// the path limit. A name that is not UTF-8 is an error since it could not
-/// be stored as a long name anyway, and so is a path inside the volume
-/// longer than [`crate::path::MAX_PATH`].
+/// the path limit. An entry the walk cannot give a path inside the volume
+/// fails the walk or is left out, as `unnamable` says. The walk returns how
+/// many entries it left out that way.
 pub(crate) fn walk_tree(
     root: BorrowedFd<'_>,
     dest: &str,
     follow_symlinks: bool,
+    unnamable: UnnamableEntry,
     visit: &mut dyn FnMut(&str, &HostEntry) -> Result<bool>,
-) -> Result<()> {
+) -> Result<u64> {
     let names = list_names(root, Path::new("")).with_context(|| "failed to list the source directory")?;
     let root_md = sys::fstat(root).with_context(|| "failed to stat the source directory")?;
     let mut stack = vec![Level {
@@ -491,25 +519,40 @@ pub(crate) fn walk_tree(
         path: PathBuf::new(),
         target: dest.to_string(),
     }];
+    let mut omitted = 0;
     loop {
-        let Some(level) = stack.last_mut() else { return Ok(()) };
+        let Some(level) = stack.last_mut() else {
+            return Ok(omitted);
+        };
         let Some(name) = level.names.next() else {
             stack.pop();
             continue;
         };
         let path = level.path.join(OsStr::from_bytes(&name));
-        let name = String::from_utf8(name).map_err(|_| err!(EINVAL, "{} is not valid UTF-8", path.display()))?;
-        let target = crate::path::join(&level.target, &name);
-        if target.len() > crate::path::MAX_PATH {
-            bail!(
-                ENAMETOOLONG,
-                "{}: its path inside the volume is longer than {} bytes",
-                path.display(),
-                crate::path::MAX_PATH
-            );
-        }
+        // The path inside the volume, or why the entry has none.
+        let target = match std::str::from_utf8(&name) {
+            Err(_) => Err(err!(EINVAL, "{} is not valid UTF-8", path.display())),
+            Ok(text) => {
+                let target = crate::path::join(&level.target, text);
+                if target.len() > crate::path::MAX_PATH {
+                    Err(err!(
+                        ENAMETOOLONG,
+                        "{}: its path inside the volume is longer than {} bytes",
+                        path.display(),
+                        crate::path::MAX_PATH
+                    ))
+                } else {
+                    Ok(target)
+                }
+            }
+        };
+        let target = match (target, unnamable) {
+            (Ok(target), _) => Some(target),
+            (Err(e), UnnamableEntry::Fail) => return Err(e),
+            (Err(_), UnnamableEntry::Omit) => None,
+        };
         let stat = || format!("failed to stat {}", path.display());
-        let mut fd = match sys::pin_entry(level.dir.as_fd(), name.as_bytes()) {
+        let mut fd = match sys::pin_entry(level.dir.as_fd(), &name) {
             Ok(fd) => fd,
             // Vanished since the listing: nothing to copy, as for
             // recurse_dir().
@@ -521,6 +564,12 @@ pub(crate) fn walk_tree(
             fd = sys::follow_link_at(root, level.dir.as_fd(), fd.as_fd()).with_context(stat)?;
             metadata = sys::fstat(fd.as_fd()).with_context(stat)?;
         }
+        let Some(target) = target else {
+            if metadata.is_dir() || metadata.is_file() {
+                omitted += 1;
+            }
+            continue;
+        };
         let entry = HostEntry { path, metadata, fd };
         if visit(&target, &entry)? && entry.is_dir() {
             let (dev, ino) = (entry.metadata.dev(), entry.metadata.ino());
@@ -589,7 +638,7 @@ mod tests {
     fn walk(root: &Path, follow: bool) -> Result<Vec<(String, char)>> {
         let fd = open_dir(root)?;
         let mut seen = Vec::new();
-        walk_tree(fd.as_fd(), "/", follow, &mut |target, entry| {
+        walk_tree(fd.as_fd(), "/", follow, UnnamableEntry::Fail, &mut |target, entry| {
             let kind = if entry.is_dir() {
                 'd'
             } else if entry.is_file() {
@@ -621,7 +670,7 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
-        top.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        top.sort_unstable();
         let mut expected = Vec::new();
         for name in top {
             match name.as_str() {
@@ -640,7 +689,7 @@ mod tests {
         assert_eq!(seen.last().unwrap().0, "/\u{e9}");
         // The entries themselves can be opened.
         let fd = open_dir(root).unwrap();
-        walk_tree(fd.as_fd(), "/", false, &mut |_, entry| {
+        walk_tree(fd.as_fd(), "/", false, UnnamableEntry::Fail, &mut |_, entry| {
             if entry.is_file() {
                 entry.open_file().unwrap();
             }
@@ -710,7 +759,7 @@ mod tests {
         let dest = format!("/{}", "d".repeat(3500));
         let fd = open_dir(root).unwrap();
         let mut seen = 0;
-        let err = walk_tree(fd.as_fd(), &dest, false, &mut |target, entry| {
+        let err = walk_tree(fd.as_fd(), &dest, false, UnnamableEntry::Fail, &mut |target, entry| {
             assert!(target.starts_with(&dest) && target.ends_with("/n"));
             assert!(entry.is_dir());
             seen += 1;
@@ -719,15 +768,50 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.errno(), ENAMETOOLONG);
         // Every level adds "/n" to `dest`.
-        assert_eq!(seen, (crate::path::MAX_PATH - dest.len()) / 2);
+        let levels = (crate::path::MAX_PATH - dest.len()) / 2;
+        assert_eq!(seen, levels);
+        // Left out instead, the level past the limit is one entry, with
+        // everything below it.
+        seen = 0;
+        let omitted = walk_tree(fd.as_fd(), &dest, false, UnnamableEntry::Omit, &mut |_, _| {
+            seen += 1;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!((seen, omitted), (levels, 1));
         // Not descending ends the walk after the first level.
         seen = 0;
-        walk_tree(fd.as_fd(), "/", false, &mut |_, _| {
+        walk_tree(fd.as_fd(), "/", false, UnnamableEntry::Fail, &mut |_, _| {
             seen += 1;
             Ok(false)
         })
         .unwrap();
         assert_eq!(seen, 1);
+    }
+
+    /// A name that is not UTF-8 fails the walk, or is left out with what is
+    /// below it and counted, if it is that of a regular file or a directory.
+    #[test]
+    fn names_that_are_not_utf8() {
+        let tmp = TempDir::new("walk-utf8");
+        let root = tmp.path();
+        fs::create_dir_all(root.join(OsStr::from_bytes(b"d\xff")).join("inside")).unwrap();
+        fs::write(root.join(OsStr::from_bytes(b"f\xfe")), b"x").unwrap();
+        fs::write(root.join("kept"), b"x").unwrap();
+        // A symbolic link is no file a user of the walk stores, so it is not
+        // counted, whatever its name.
+        symlink("kept", root.join(OsStr::from_bytes(b"l\xfd"))).unwrap();
+        let fd = open_dir(root).unwrap();
+        let err = walk_tree(fd.as_fd(), "/", false, UnnamableEntry::Fail, &mut |_, _| Ok(true)).unwrap_err();
+        assert_eq!(err.errno(), EINVAL);
+        assert!(err.message().contains("not valid UTF-8"), "{}", err);
+        let mut seen = Vec::new();
+        let omitted = walk_tree(fd.as_fd(), "/", false, UnnamableEntry::Omit, &mut |target, _| {
+            seen.push(target.to_string());
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!((seen, omitted), (vec!["/kept".to_string()], 2));
     }
 
     /// A directory that links to itself, and one that links to its parent:
@@ -740,7 +824,7 @@ mod tests {
         symlink(".", root.join("loop")).unwrap();
         let fd = open_dir(root).unwrap();
         let mut seen = 0;
-        let err = walk_tree(fd.as_fd(), "/", true, &mut |_, entry| {
+        let err = walk_tree(fd.as_fd(), "/", true, UnnamableEntry::Fail, &mut |_, entry| {
             assert!(entry.is_dir());
             seen += 1;
             Ok(true)
@@ -761,7 +845,7 @@ mod tests {
         fs::remove_dir_all(root.join("a")).unwrap();
         // Without following links the link is one entry, not a directory.
         seen = 0;
-        walk_tree(fd.as_fd(), "/", false, &mut |_, entry| {
+        walk_tree(fd.as_fd(), "/", false, UnnamableEntry::Fail, &mut |_, entry| {
             assert!(!entry.is_dir() && !entry.is_file());
             seen += 1;
             Ok(true)
@@ -844,7 +928,7 @@ mod tests {
         }
         let fd = open_dir(root).unwrap();
         let mut seen = Vec::new();
-        walk_tree(fd.as_fd(), "/", false, &mut |target, _| {
+        walk_tree(fd.as_fd(), "/", false, UnnamableEntry::Fail, &mut |target, _| {
             if target == "/a1" {
                 fs::remove_file(root.join("a2")).unwrap();
             }
@@ -870,7 +954,7 @@ mod tests {
         }
         let fd = open_dir(root).unwrap();
         let mut contents = Vec::new();
-        walk_tree(fd.as_fd(), "/", true, &mut |target, entry| {
+        walk_tree(fd.as_fd(), "/", true, UnnamableEntry::Fail, &mut |target, entry| {
             if target == "/d" {
                 // "d" is pinned; now root/d is what used to be root/c.
                 fs::rename(root.join("d"), root.join("e")).unwrap();

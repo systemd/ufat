@@ -501,8 +501,8 @@ def method_cases(rng, seeds, work, small_tree, img):
                          ({"sourceFileDescriptor": 0}, rw), ({"sourceFileDescriptor": 1}, [img, tree]),
                          ({"sourceFileDescriptor": 1, "unsupported": "fail"}, rw + [("/dev", "dir")]), ({"sourceFileDescriptor": 1, "uid": -1, "gid": 2 ** 40}, rw + [tree]),
                          ({"sourceFileDescriptor": 1, "manifestSink": {"fileDescriptor": 1}}, rw + [tree]),
-                         ({"sourceFileDescriptor": 1, "manifestSink": {"fileDescriptor": 2, "fields": ["bogus"]}}, rw + [tree, (sink_path, "wo")]),
-                         ({"sourceFileDescriptor": 1, "manifestSink": {"fileDescriptor": 2, "fields": ["size", "hash", "mtime"]}}, rw + [tree, (sink_path, "wo")]),
+                         ({"sourceFileDescriptor": 1, "manifestSink": {"fileDescriptor": 2, "features": ["bogus"]}}, rw + [tree, (sink_path, "wo")]),
+                         ({"sourceFileDescriptor": 1, "manifestSink": {"fileDescriptor": 2, "features": ["size", "sha256", "mtime"]}}, rw + [tree, (sink_path, "wo")]),
                          ({"sourceFileDescriptor": 1, "manifestSink": {"fileDescriptor": 2}}, rw + [tree, sink_path])]:
         content = dict(content)
         params = {"image": {"fileDescriptor": 0}, "path": content.pop("destination", "/"), "content": content}

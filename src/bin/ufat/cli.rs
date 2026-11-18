@@ -14,7 +14,7 @@ use fat::format::{self, FormatOptions, VolumeId};
 use fat::fsck;
 use fat::host;
 use fat::layout::MIN_SECTOR_SIZE;
-use fat::manifest::{self, AssembleOptions, DirectorySource, StreamSource};
+use fat::manifest::{self, AssembleOptions, DirectorySource, Features, HostTree, StreamSource, WriteReport};
 use fat::plan::{Plan, PlanOptions};
 use fat::populate::{CopyOptions, TimePolicy};
 use fat::probe::Prober;
@@ -667,17 +667,27 @@ fn manifest_to_stdout(args: &Args) -> bool {
 /// Writes the UAPI.16 manifest of everything `v` holds to the file `path`,
 /// or to standard output for "-", for `--write-manifest`.
 fn write_manifest(v: &Volume, path: &Path) -> Result<()> {
-    let fields = manifest::volume::Fields::default();
+    let features = Features::DEFAULT;
     let (report, shown) = if path == Path::new("-") {
-        let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-        let report = manifest::volume::write(v, v.root_time()?, fields, &mut out)?;
-        (report, "the manifest on standard output".to_string())
+        let out = std::io::BufWriter::new(std::io::stdout().lock());
+        let report = v.write_manifest(v.root_time()?, features, out)?;
+        (report, STDOUT_MANIFEST.to_string())
     } else {
         let file = std::fs::File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
-        let mut out = std::io::BufWriter::new(file);
-        let report = manifest::volume::write(v, v.root_time()?, fields, &mut out)?;
+        let report = v.write_manifest(v.root_time()?, features, std::io::BufWriter::new(file))?;
         (report, path.display().to_string())
     };
+    warn_about_manifest(&report, &shown);
+    Ok(())
+}
+
+/// How the messages name a manifest written to standard output.
+const STDOUT_MANIFEST: &str = "the manifest on standard output";
+
+/// Says how many entries the manifest `shown`, of which `report` is what
+/// it covers, leaves out, and how many files changed while they were read
+/// for it.
+fn warn_about_manifest(report: &WriteReport, shown: &str) {
     match report.omitted {
         0 => {}
         1 => eprintln!(
@@ -689,7 +699,17 @@ fn write_manifest(v: &Volume, path: &Path) -> Result<()> {
             n, shown
         ),
     }
-    Ok(())
+    match report.changed {
+        0 => {}
+        1 => eprintln!(
+            "ufat: 1 file changed while it was read: {} has the size and the hash of what was read",
+            shown
+        ),
+        n => eprintln!(
+            "ufat: {} files changed while they were read: {} has the sizes and the hashes of what was read",
+            n, shown
+        ),
+    }
 }
 
 /// Reports the geometry of a freshly made file system.
@@ -1240,8 +1260,12 @@ fn cmd_manifest(argv: &[OsString]) -> Result<()> {
         bail!(errno::EINVAL, "manifest takes exactly one DIR");
     };
     let dir = host::open_dir(Path::new(dir))?;
-    let bytes = manifest::generate(dir.as_fd())?;
-    std::io::stdout().write_all(&bytes)?;
+    // A manifest is complete with its trailer. What is printed of a tree
+    // that cannot be listed to its end has none, and the exit status says
+    // that it failed.
+    let out = std::io::BufWriter::new(std::io::stdout().lock());
+    let report = HostTree::new(dir.as_fd()).write_manifest(out)?;
+    warn_about_manifest(&report, STDOUT_MANIFEST);
     Ok(())
 }
 

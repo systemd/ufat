@@ -4,11 +4,12 @@
 //! follow systemd's reader (src/shared/uapi16-manifest.c) rule for rule.
 
 use json::{Object, Value};
+use uapi16::Problem;
 
 use super::{malformed_field, FILENAME, GPT_LABEL_MAX, NAME_MAX, PATH_MAX};
 use crate::errno::*;
 use crate::sha256::DIGEST_SIZE;
-use crate::{ManifestProblem, Result};
+use crate::Result;
 
 /// An unsigned integer. 64 bit values are a problem for many JSON
 /// implementations, so like systemd we also take them as decimal strings.
@@ -25,7 +26,7 @@ pub(super) fn uint(v: &Value, what: &str) -> Result<u64> {
     }
     bail!(
         EBADMSG,
-        malformed_field(ManifestProblem::FieldType, what),
+        malformed_field(Problem::WrongFieldType, what),
         "manifest field '{}' is not an unsigned integer",
         what
     )
@@ -40,7 +41,7 @@ pub(super) fn access_mode(v: &Value, what: &str) -> Result<u32> {
         Some(_) => {
             bail!(
                 EBADMSG,
-                malformed_field(ManifestProblem::FieldType, what),
+                malformed_field(Problem::WrongFieldType, what),
                 "manifest field '{}' is not an octal access mode",
                 what
             )
@@ -50,7 +51,7 @@ pub(super) fn access_mode(v: &Value, what: &str) -> Result<u32> {
     if m > 0o7777 {
         bail!(
             EBADMSG,
-            malformed_field(ManifestProblem::FieldRange, what),
+            malformed_field(Problem::FieldOutOfRange, what),
             "manifest field '{}' is out of range: {}",
             what,
             m
@@ -63,7 +64,7 @@ pub(super) fn string<'a>(v: &'a Value, what: &str) -> Result<&'a str> {
     v.as_str().ok_or_else(|| {
         err!(
             EBADMSG,
-            malformed_field(ManifestProblem::FieldType, what),
+            malformed_field(Problem::WrongFieldType, what),
             "manifest field '{}' is not a string",
             what
         )
@@ -74,7 +75,7 @@ pub(super) fn boolean(v: &Value, what: &str) -> Result<bool> {
     v.as_bool().ok_or_else(|| {
         err!(
             EBADMSG,
-            malformed_field(ManifestProblem::FieldType, what),
+            malformed_field(Problem::WrongFieldType, what),
             "manifest field '{}' is not a boolean",
             what
         )
@@ -104,7 +105,7 @@ pub(super) fn hash(v: &Value, what: &str) -> Result<[u8; DIGEST_SIZE]> {
         .ok_or_else(|| {
             err!(
                 EBADMSG,
-                malformed_field(ManifestProblem::FieldType, what),
+                malformed_field(Problem::WrongFieldType, what),
                 "manifest field '{}' is not a SHA-256 hash",
                 what
             )
@@ -170,7 +171,7 @@ pub(super) fn check_extended_attributes(v: &Value, what: &str) -> Result<()> {
     let namespaces = v.as_object().ok_or_else(|| {
         err!(
             EBADMSG,
-            malformed_field(ManifestProblem::ExtendedAttributes, "extendedAttributes"),
+            malformed_field(Problem::InvalidExtendedAttributes, "extendedAttributes"),
             "{}: 'extendedAttributes' is not an object",
             what
         )
@@ -182,7 +183,7 @@ pub(super) fn check_extended_attributes(v: &Value, what: &str) -> Result<()> {
         let attrs = attrs.as_object().ok_or_else(|| {
             err!(
                 EBADMSG,
-                malformed_field(ManifestProblem::ExtendedAttributes, "extendedAttributes"),
+                malformed_field(Problem::InvalidExtendedAttributes, "extendedAttributes"),
                 "{}: extended attribute namespace '{}' is not an object",
                 what,
                 ns
@@ -192,7 +193,7 @@ pub(super) fn check_extended_attributes(v: &Value, what: &str) -> Result<()> {
             if name.is_empty() || name.chars().any(|c| c.is_ascii_control()) {
                 bail!(
                     EBADMSG,
-                    malformed_field(ManifestProblem::ExtendedAttributes, "extendedAttributes"),
+                    malformed_field(Problem::InvalidExtendedAttributes, "extendedAttributes"),
                     "{}: invalid extended attribute name '{}'",
                     what,
                     name
@@ -201,7 +202,7 @@ pub(super) fn check_extended_attributes(v: &Value, what: &str) -> Result<()> {
             let value = value.as_object().ok_or_else(|| {
                 err!(
                     EBADMSG,
-                    malformed_field(ManifestProblem::ExtendedAttributes, "extendedAttributes"),
+                    malformed_field(Problem::InvalidExtendedAttributes, "extendedAttributes"),
                     "{}: value of extended attribute '{}' is not an object",
                     what,
                     name
@@ -217,7 +218,7 @@ pub(super) fn check_extended_attributes(v: &Value, what: &str) -> Result<()> {
                     if base64_decode(string(b, "base64")?).is_none() {
                         bail!(
                             EBADMSG,
-                            malformed_field(ManifestProblem::ExtendedAttributes, "extendedAttributes"),
+                            malformed_field(Problem::InvalidExtendedAttributes, "extendedAttributes"),
                             "{}: extended attribute '{}' is not valid Base64",
                             what,
                             name
@@ -226,7 +227,7 @@ pub(super) fn check_extended_attributes(v: &Value, what: &str) -> Result<()> {
                 }
                 _ => bail!(
                     EBADMSG,
-                    malformed_field(ManifestProblem::ExtendedAttributes, "extendedAttributes"),
+                    malformed_field(Problem::InvalidExtendedAttributes, "extendedAttributes"),
                     "{}: extended attribute '{}' needs exactly one of 'text' and 'base64'",
                     what,
                     name
@@ -247,7 +248,7 @@ pub(super) fn check_signature(object: &Object, index: usize) -> Result<()> {
         _ => {
             bail!(
                 EBADMSG,
-                malformed_field(ManifestProblem::Signature, "mechanism"),
+                malformed_field(Problem::InvalidSignature, "mechanism"),
                 "{} has no 'mechanism' string",
                 what
             )
@@ -257,7 +258,7 @@ pub(super) fn check_signature(object: &Object, index: usize) -> Result<()> {
         if hex_bytes(string(key, "key")?).is_none() {
             bail!(
                 EBADMSG,
-                malformed_field(ManifestProblem::Signature, "key"),
+                malformed_field(Problem::InvalidSignature, "key"),
                 "{}: 'key' is not hex",
                 what
             );
@@ -267,7 +268,7 @@ pub(super) fn check_signature(object: &Object, index: usize) -> Result<()> {
         if base64_decode(string(data, "data")?).is_none() {
             bail!(
                 EBADMSG,
-                malformed_field(ManifestProblem::Signature, "data"),
+                malformed_field(Problem::InvalidSignature, "data"),
                 "{}: 'data' is not Base64",
                 what
             );

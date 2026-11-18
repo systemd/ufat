@@ -27,8 +27,7 @@ use fat::format::{self, FormatOptions, VolumeId};
 use fat::fsck::{self, Problem};
 use fat::host;
 use fat::layout::{self, LayoutParams, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE, MIN_CLUSTERS, MIN_SECTOR_SIZE};
-use fat::manifest::volume::{Fields, WriteReport};
-use fat::manifest::{AssembleOptions, AssembleReport, DirectorySource, Manifest, StreamSource};
+use fat::manifest::{AssembleOptions, AssembleReport, DirectorySource, Features, Manifest, StreamSource, WriteReport};
 use fat::plan::{Plan, PlanOptions};
 use fat::populate::{CopyOptions, CopyReport, TimePolicy};
 use fat::probe::Prober;
@@ -825,29 +824,51 @@ impl Hash {
     }
 }
 
-/// The manifest sink: the descriptor and the fields the manifest carries.
+/// The manifest sink: the descriptor and what the manifest records.
 struct Sink {
     file: host::PassedStream,
-    fields: Fields,
+    features: Features,
 }
 
 impl Sink {
+    /// What separates the words in the name of a feature of UAPI.16, and
+    /// what stands for it in a value of the interface's ManifestFeature, as
+    /// systemd writes the values of enumerations: user-xattr is user_xattr.
+    const NAME_SEPARATOR: char = '-';
+    const VALUE_SEPARATOR: &'static str = "_";
+
+    /// The feature the value `value` of the interface's ManifestFeature
+    /// stands for.
+    fn feature(value: &str) -> Option<Features> {
+        Features::ALL
+            .names()
+            .find(|name| name.replace(Sink::NAME_SEPARATOR, Sink::VALUE_SEPARATOR) == value)
+            .and_then(|name| name.parse().ok())
+    }
+
     fn take(p: &Params<'_>, c: &mut Connection) -> Outcome<Sink> {
         let fd = required_fd(c, p, "fileDescriptor").map_err(|_| invalid("manifestSink"))?;
         let file = host::passed_sink(fd).map_err(bad("manifestSink"))?;
-        let fields = match p.0.get("fields") {
-            None | Some(Value::Null) => Fields::default(),
-            Some(_) => Fields::from_names(p.strings("fields")?).ok_or_else(|| invalid("manifestSink"))?,
+        let features = match p.0.get("features") {
+            None | Some(Value::Null) => Features::DEFAULT,
+            Some(_) => p
+                .strings("features")?
+                .into_iter()
+                .try_fold(Features::NONE, |features, value| {
+                    Sink::feature(value).map(|feature| features | feature)
+                })
+                .ok_or_else(|| invalid("manifestSink"))?,
         };
-        Ok(Sink { file, fields })
+        Ok(Sink { file, features })
     }
 
     /// Writes the manifest of everything `volume` holds, telling `progress`
     /// what it covered so far.
     fn write(self, volume: &Volume, progress: &mut dyn FnMut(&Progress)) -> Outcome<WriteReport> {
         let root_time = volume.root_time()?;
-        let mut out = BufWriter::new(self.file);
-        fat::manifest::volume::write_with_progress(volume, root_time, self.fields, &mut out, progress)
+        let out = BufWriter::new(self.file);
+        volume
+            .write_manifest_with_progress(root_time, self.features, out, progress)
             .map_err(bad("manifestSink"))
     }
 }

@@ -25,7 +25,7 @@ use crate::boot::{
     self, BootSector, FsInfo, BOOT_SECTOR_SIZE, FSINFO_SIZE, FSINFO_UNKNOWN, LABEL_SIZE, NO_NAME, NT_FLAG_DIRTY,
 };
 use crate::device::Device;
-use crate::dir::{DirEntry, Directory, MAX_SLOTS};
+use crate::dir::{DirEntry, Directory, NameDecoding, MAX_SLOTS};
 use crate::dirent::{
     short_name_checksum, RawDirEntry, ATTR_ARCHIVE, ATTR_DIRECTORY, ATTR_HIDDEN, ATTR_READ_ONLY, ATTR_SYSTEM,
     ATTR_VOLUME_ID, DIR_ENTRY_SIZE, DOTDOT_NAME, DOT_NAME, ENTRY_DELETED, ENTRY_E5_ESCAPE, ENTRY_END, SHORT_NAME_SIZE,
@@ -38,7 +38,7 @@ use crate::path::components;
 use crate::probe::Prober;
 use crate::time::FatTimestamp;
 use crate::Result;
-use crate::{Detail, NoSpaceReason, NotFat32Reason};
+use crate::{CorruptPlace, Detail, NoSpaceReason, NotFat32Reason};
 
 mod file;
 #[cfg(test)]
@@ -75,6 +75,9 @@ pub struct Metadata {
     pub attributes: u8,
     /// First cluster, 0 for empty files.
     pub(crate) first_cluster: u32,
+    /// How `name` came out of the units the entry stores. A short name
+    /// always comes out as the entry stores it.
+    pub(crate) name_decoding: NameDecoding,
 }
 
 /// Where a path led: the root, or an entry and the first cluster of the
@@ -529,7 +532,13 @@ impl Volume {
         let Some(chain) = self.fat.chain_bounded(&self.store(), first_cluster, max_clusters)? else {
             bail!(
                 EUCLEAN,
-                "directory at cluster {} spans more than the {} clusters a directory can have",
+                Detail::Corrupt {
+                    place: CorruptPlace::Directory,
+                    field: None,
+                    path: None,
+                    cluster: Some(first_cluster),
+                },
+                "the chain of the directory at cluster {} loops or is longer than the {} clusters a directory can have",
                 first_cluster,
                 max_clusters
             );
@@ -699,6 +708,7 @@ impl Volume {
             created: entry.short.create_timestamp().to_system_time(),
             attributes: entry.short.attr,
             first_cluster: entry.short.first_cluster,
+            name_decoding: entry.long_name_decoding,
         }
     }
 
@@ -714,6 +724,7 @@ impl Volume {
                 created: FatTimestamp::EPOCH.to_system_time(),
                 attributes: ATTR_DIRECTORY,
                 first_cluster: self.boot.root_cluster,
+                name_decoding: NameDecoding::Exact,
             }),
             Located::Entry { entry, .. } => Ok(Self::metadata_of(&entry)),
         }
@@ -722,7 +733,22 @@ impl Volume {
     /// Lists the directory at `path`, in on-disk order, without the dot
     /// entries and the volume label.
     pub fn read_dir(&self, path: &str) -> Result<Vec<Metadata>> {
-        self.with_directory(self.directory_at(path)?, |dir| {
+        self.read_dir_at(self.directory_at(path)?, |_| Ok(()))
+    }
+
+    /// Lists the directory whose chain starts at `first_cluster`, as
+    /// [`Volume::read_dir`] lists the one at a path. A walk of the tree
+    /// takes the cluster from the entry it found, where a lookup by name
+    /// could find another entry of the same name on a damaged volume.
+    /// `chain` is shown the clusters of the directory first, and an error
+    /// it returns is the listing's.
+    pub(crate) fn read_dir_at(
+        &self,
+        first_cluster: u32,
+        chain: impl FnOnce(&[u32]) -> Result<()>,
+    ) -> Result<Vec<Metadata>> {
+        self.with_directory(first_cluster, |dir| {
+            chain(dir.chain())?;
             Ok(dir
                 .iter()
                 .filter(|e| !e.is_dot() && !e.short.is_volume_label())

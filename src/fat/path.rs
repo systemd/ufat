@@ -10,6 +10,9 @@ use crate::errno::*;
 use crate::Result;
 use crate::{Detail, NameProblem};
 
+/// What separates the names of a path.
+pub(crate) const SEPARATOR: char = '/';
+
 /// Longest path accepted, in bytes: Linux's PATH_MAX without the NUL. A
 /// longer path could not be opened on the mounted volume in one go, and
 /// without a bound the paths a tree walk builds grow with the tree.
@@ -30,7 +33,7 @@ pub(crate) fn components(path: &str) -> Result<Vec<&str>> {
         );
     }
     let mut out = Vec::new();
-    for c in path.split('/') {
+    for c in path.split(SEPARATOR) {
         if c.is_empty() {
             continue;
         }
@@ -50,7 +53,7 @@ pub(crate) fn components(path: &str) -> Result<Vec<&str>> {
 
 /// Appends `name` to the directory path `dir`.
 pub(crate) fn join(dir: &str, name: &str) -> String {
-    format!("{}/{}", dir.trim_end_matches('/'), name)
+    format!("{}{}{}", dir.trim_end_matches(SEPARATOR), SEPARATOR, name)
 }
 
 #[cfg(test)]

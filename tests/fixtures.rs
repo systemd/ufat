@@ -16,8 +16,7 @@ use fat::dirent::ATTR_READ_ONLY;
 use fat::errno::{EINVAL, EOPNOTSUPP};
 use fat::format::{self, FormatOptions};
 use fat::host;
-use fat::manifest::volume::Fields;
-use fat::manifest::{self, AssembleOptions, DirectorySource, InodeType, Manifest, StreamSource};
+use fat::manifest::{self, AssembleOptions, DirectorySource, Features, HostTree, InodeType, Manifest, StreamSource};
 use fat::plan::{Plan, PlanOptions};
 use fat::volume::Volume;
 
@@ -353,7 +352,11 @@ fn empty_manifest_is_an_empty_volume() {
 }
 
 /// Our generator writes what `systemd-manifest make --field=size,hash,mtime`
-/// writes for the same tree, byte for byte.
+/// writes for the same tree, byte for byte, once make-fixtures.sh added
+/// `"features":["mtime","sha256","size"]` and `"order":"codepoint"` to the
+/// root object of systemd's manifest, see the README. The tree has no
+/// empty file, whose hash the generator leaves out and the systemd-manifest
+/// the fixtures come from writes.
 #[test]
 fn generator_agrees_with_systemd_manifest() {
     let m = load("esp", "size-hash-mtime.Uapi16Manifest");
@@ -387,7 +390,10 @@ fn generator_agrees_with_systemd_manifest() {
     for (dir, nsec) in dirs {
         std::fs::File::open(&dir).unwrap().set_modified(time(nsec)).unwrap();
     }
-    let ours = manifest::generate(host::open_dir(copy.path()).unwrap().as_fd()).unwrap();
+    let mut ours = Vec::new();
+    HostTree::new(host::open_dir(copy.path()).unwrap().as_fd())
+        .write_manifest(&mut ours)
+        .unwrap();
     let theirs = std::fs::read(fixtures().join("esp/size-hash-mtime.Uapi16Manifest")).unwrap();
     assert_eq!(
         String::from_utf8_lossy(&ours),
@@ -397,28 +403,111 @@ fn generator_agrees_with_systemd_manifest() {
 }
 
 /// The manifest of a volume is what `systemd-manifest make` writes for the
-/// tree the volume was filled from, byte for byte, for the fields FAT has
-/// a notion of: none at all, and size, hash and mtime.
+/// tree the volume was filled from, byte for byte, for the features FAT
+/// has a notion of: none at all, and size, sha256 and mtime. The manifests
+/// of systemd got their features and their order declared, see the README.
+/// A manifest of a volume records the read-only attribute as well, which
+/// systemd-manifest does not record. So it lists read-only next to the
+/// features systemd-manifest lists.
 #[test]
 fn volume_manifest_agrees_with_systemd_manifest() {
     let m = load("esp", "size-hash-mtime.Uapi16Manifest");
     let (_img, mut v, _) = planned_volume(&m);
     v.assemble(&m, &mut source("esp"), &AssembleOptions::default()).unwrap();
-    for (name, fields) in [
-        ("none.Uapi16Manifest", Fields::none()),
+    for (name, features, listed, listed_by_volume) in [
+        (
+            "none.Uapi16Manifest",
+            Features::NONE,
+            r#""features":[]"#,
+            r#""features":["read-only"]"#,
+        ),
         (
             "size-hash-mtime.Uapi16Manifest",
-            Fields::from_names(["size", "hash", "mtime"]).unwrap(),
+            Features::from_names(["size", "sha256", "mtime"]).unwrap(),
+            r#""features":["mtime","sha256","size"]"#,
+            r#""features":["mtime","read-only","sha256","size"]"#,
         ),
     ] {
         let mut ours = Vec::new();
-        manifest::volume::write(&v, m.root.mtime(), fields, &mut ours).unwrap();
-        let theirs = std::fs::read(fixtures().join("esp").join(name)).unwrap();
+        v.write_manifest(m.root.mtime(), features, &mut ours).unwrap();
+        let theirs = std::fs::read_to_string(fixtures().join("esp").join(name)).unwrap();
+        assert!(theirs.contains(listed), "{} does not list {}", name, listed);
         assert_eq!(
             String::from_utf8_lossy(&ours),
-            String::from_utf8_lossy(&theirs),
+            theirs.replacen(listed, listed_by_volume, 1),
             "the volume's manifest and systemd-manifest's {} disagree",
             name
         );
+    }
+}
+
+/// A manifest read to its end with the reader of the uapi16 crate: its
+/// root file object, its file objects and its signature objects.
+#[derive(Debug, PartialEq)]
+struct ManifestObjects {
+    root: uapi16::RootObject,
+    files: Vec<uapi16::FileObject>,
+    signatures: Vec<uapi16::Signature>,
+}
+
+impl ManifestObjects {
+    fn read(bytes: &[u8]) -> Result<ManifestObjects, uapi16::Error> {
+        let mut reader = uapi16::Reader::open(bytes)?;
+        let mut objects = ManifestObjects {
+            root: reader.root().clone(),
+            files: Vec::new(),
+            signatures: Vec::new(),
+        };
+        for object in &mut reader {
+            match object? {
+                uapi16::Object::File(file) => objects.files.push(*file),
+                uapi16::Object::Signature(signature) => objects.signatures.push(signature),
+                other => panic!("{:?} is neither a file object nor a signature", other),
+            }
+        }
+        Ok(objects)
+    }
+
+    /// The manifest the writer of the uapi16 crate writes for the objects.
+    fn write(&self) -> Result<Vec<u8>, uapi16::Error> {
+        let mut writer = uapi16::Writer::begin(Vec::new(), &self.root)?;
+        for file in &self.files {
+            writer.file(file)?;
+        }
+        for signature in &self.signatures {
+            writer.signature(signature)?;
+        }
+        writer.finish()
+    }
+}
+
+/// The uapi16 crate reads every manifest systemd-manifest wrote, and what
+/// it writes for one reads back as the same manifest. That holds since
+/// make-fixtures.sh took the hash of no data out of the empty file of the
+/// special case: the writer leaves out a hash given next to the size 0,
+/// and a reader marks the one it fills in as filled in, so the objects
+/// would differ in that mark.
+#[test]
+fn uapi16_reads_and_writes_back_every_fixture() {
+    for (case, name, files, signatures) in [
+        ("esp", "Uapi16Manifest", 13, 0),
+        ("esp", "signed.Uapi16Manifest", 13, 1),
+        ("esp", "size-hash-mtime.Uapi16Manifest", 13, 0),
+        ("esp", "none.Uapi16Manifest", 13, 0),
+        ("special", "Uapi16Manifest", 13, 0),
+        ("empty", "Uapi16Manifest", 0, 0),
+    ] {
+        let path = fixtures().join(case).join(name);
+        let bytes = std::fs::read(&path).unwrap();
+        let read = ManifestObjects::read(&bytes).unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
+        assert_eq!(
+            (read.files.len(), read.signatures.len()),
+            (files, signatures),
+            "{}",
+            path.display()
+        );
+        assert_eq!(read.root.order, Some(uapi16::Order::CodePoint), "{}", path.display());
+        let written = read.write().unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
+        assert_eq!(ManifestObjects::read(&written).unwrap(), read, "{}", path.display());
     }
 }

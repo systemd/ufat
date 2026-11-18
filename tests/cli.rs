@@ -1058,7 +1058,7 @@ fn counts_of_one() {
     assert!(summary.ends_with(" free, 0 lost; 1 error, 1 warning"), "{}", stdout);
 
     // An empty volume uses the one cluster of its root directory. A name
-    // of 100 three-byte characters fits FAT but no manifest.
+    // with the noncharacter U+FDD0 fits FAT but no manifest.
     let e = root.join("e.img");
     let e = e.to_str().unwrap();
     ok(&bin, &["assemble", "--create", "--size", "40M", e]);
@@ -1070,8 +1070,8 @@ fn counts_of_one() {
     );
     let device = fat::device::Device::open(Path::new(e), fat::device::Access::ReadWrite).unwrap();
     let mut v = fat::volume::Volume::open(device).unwrap();
-    let long: String = std::iter::repeat_n('\u{20ac}', 100).collect();
-    v.create_dir(&format!("/{}", long), std::time::SystemTime::now())
+    let odd = "a\u{fdd0}";
+    v.create_dir(&format!("/{}", odd), std::time::SystemTime::now())
         .unwrap();
     v.close().unwrap();
     let m = root.join("e.manifest");
@@ -1084,6 +1084,62 @@ fn counts_of_one() {
         stderr
     );
     assert!(stderr.starts_with("ufat: 1 entry is not in "), "{}", stderr);
+}
+
+/// `ufat manifest` prints the manifest while it walks the tree. It leaves
+/// out what a manifest cannot name and says how many entries it left out.
+/// What it printed of a tree it cannot walk to its end has no trailer.
+#[test]
+fn manifest_of_a_tree_as_far_as_it_goes() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let t = dir.path().join("tree");
+    // A noncharacter, a control character and a name that is not UTF-8, a
+    // directory with what is in it counting as one entry, and the name of
+    // the manifest, which is no omission.
+    fs::create_dir_all(t.join("d\u{fdd0}")).unwrap();
+    fs::write(t.join("d\u{fdd0}/inside"), b"x").unwrap();
+    fs::write(t.join("a.txt"), b"a").unwrap();
+    fs::write(t.join("b\u{1}.txt"), b"b").unwrap();
+    fs::write(t.join(OsStr::from_bytes(b"z\xff")), b"z").unwrap();
+    fs::write(t.join("Uapi16Manifest"), b"old").unwrap();
+    let records = |stdout: &[u8]| {
+        let text = String::from_utf8(stdout.to_vec()).unwrap();
+        text.split('\u{1e}').skip(1).map(str::to_string).collect::<Vec<_>>()
+    };
+    let out = run(&bin, &["manifest", t.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{}", stderr);
+    assert_eq!(
+        stderr,
+        "ufat: 3 entries are not in the manifest on standard output: their names cannot be written in a manifest\n"
+    );
+    let printed = records(&out.stdout);
+    assert_eq!(printed.len(), 3, "{:?}", printed);
+    assert!(printed[1].contains(r#""name":"a.txt""#), "{:?}", printed);
+    assert_eq!(printed[2], "{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n");
+
+    // A file that cannot be opened stops the walk where it comes. Where its
+    // mode keeps nobody out, as for root, there is nothing to try.
+    let locked = t.join("c.txt");
+    fs::write(&locked, b"c").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::File::open(&locked).is_ok() {
+        return eprintln!("skipping the file that cannot be opened: it opens");
+    }
+    let out = run(&bin, &["manifest", t.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr);
+    assert!(stderr.contains("failed to open"), "{}", stderr);
+    let printed = records(&out.stdout);
+    assert_eq!(printed.len(), 2, "{:?}", printed);
+    assert!(printed[1].contains(r#""name":"a.txt""#), "{:?}", printed);
 }
 
 /// assemble prints the hash of the file system it wrote on request, and
