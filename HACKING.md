@@ -225,12 +225,19 @@ bench/compare.sh compares two ufat binaries, BASE and HEAD:
     bench/compare.sh BASE HEAD
     bench/compare.py "$BENCH_DIR/out"
 
-It runs ten small workloads: assemble, populate, check and manifest with
-trees of 10000 files and with an ESP, and two Varlink calls. Every
-workload runs once under cachegrind, which counts the instructions, and
-once under strace, which counts the system calls. Then it runs nine
-times with each binary, alternating, for the wall time, the peak RSS and
-the bytes read and written. It needs valgrind and strace.
+It runs eleven small workloads: assemble, populate, check and manifest
+with trees of 10000 files and with an ESP, a plan from the manifest of
+such a tree, and two Varlink calls. Every workload runs once under
+cachegrind, which counts the instructions, and once under strace, which
+counts the system calls. Then it runs nine times with each binary,
+alternating, for the wall time, the peak RSS and the bytes read and
+written. It needs valgrind and strace.
+
+HEAD writes the manifests of the workloads that read a manifest,
+assemble/esp-stream, plan/wide-manifest and varlink/Assemble-esp-stream,
+and BASE reads them too. So BASE has to read what HEAD writes. That
+holds as long as both binaries have the same manifest reader. Against an
+older BASE those workloads can fail.
 
 bench/compare.py prints the results of HEAD and their change from BASE.
 It fails when HEAD exceeds BASE on a workload by more than a limit:
