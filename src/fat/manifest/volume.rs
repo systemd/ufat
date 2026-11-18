@@ -10,8 +10,8 @@
 //! asked for, and no mode, owner, device numbers, hardlinks, extended
 //! attributes or inode flags, since FAT has no notion of them. A feature
 //! the file system has no notion of is not recorded and not counted; what
-//! FAT keeps and the manifest could not record is counted in the report's
-//! `omitted`.
+//! FAT keeps and the manifest could not record goes into the report: the
+//! entries in `omitted`, the label in `omitted_label`.
 //!
 //! The order is the specification's code point order: the root object
 //! first, every directory's entries right after it, sorted by the bytes of
@@ -21,24 +21,28 @@
 //! regular files. So with the same features the manifest of a volume is
 //! the one the host tree generator writes for the tree the volume was
 //! filled from, apart from what FAT changes on the way: FAT keeps times at
-//! 2 s, the manifest always lists `read-only`, and a read-only file gets
-//! `readOnly`.
+//! 2 s, a read-only file gets `readOnly`, and the root object names the
+//! volume with `fatSerial` and `fsLabel`. The manifest always lists
+//! `read-only`, `fat-serial` and `fs-label`.
 
 use std::io::Write;
 use std::time::SystemTime;
 
-use uapi16::{Features, FileObject, Finalize, InodeType, Name, Order, RootObject, Sha256, Sha256Context, Writer};
+use uapi16::{
+    FatSerial, Features, FileObject, Finalize, InodeType, Name, Order, RootObject, Sha256, Sha256Context, Writer,
+};
 
 use super::DosAttributes;
 use crate::dir::NameDecoding;
 use crate::errno::*;
 use crate::fat::BitSet;
+use crate::format::{decode_label, encode_exact_label};
 use crate::progress::Progress;
 use crate::volume::{Metadata, Volume};
 use crate::{CorruptPlace, Detail, Result};
 
 /// What a written manifest covers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WriteReport {
     /// Regular files listed.
     pub files: u64,
@@ -46,13 +50,17 @@ pub struct WriteReport {
     pub directories: u64,
     /// Bytes of the regular files listed.
     pub bytes: u64,
-    /// What the tree or the volume holds that the manifest could not
+    /// The entries of the tree or the volume that the manifest could not
     /// record: entries whose names a manifest cannot carry, a directory
     /// with everything below it counting once. A feature the file system
     /// has no notion of is not an omission. A manifest with omissions does
     /// not describe all of it, and repart refuses such a manifest of a
     /// volume.
     pub omitted: u64,
+    /// The label of the volume where the manifest leaves it out: one that a
+    /// volume made from the manifest would not get, which only other tools
+    /// write. It is an omission as well, but not an entry.
+    pub omitted_label: Option<String>,
     /// Regular files of a host tree that changed while they were read for
     /// their hash. The manifest has the size and the hash of what was
     /// read, which need not be what the file holds now. A volume does not
@@ -61,6 +69,12 @@ pub struct WriteReport {
 }
 
 impl WriteReport {
+    /// Everything the manifest leaves out, as one count: the entries in
+    /// `omitted` and a label in `omitted_label`.
+    pub fn omissions(&self) -> u64 {
+        self.omitted + u64::from(self.omitted_label.is_some())
+    }
+
     /// What the manifest covers so far, as a progress callback hears it.
     fn progress(&self) -> Progress {
         Progress {
@@ -73,17 +87,23 @@ impl WriteReport {
 
 impl Volume {
     /// What the manifest of a FAT volume records whatever it is asked for:
-    /// the read-only attribute, which every entry has set or cleared.
-    const ALWAYS_RECORDED_FEATURES: Features = Features::READ_ONLY;
+    /// the read-only attribute, which every entry has set or cleared, and
+    /// the serial number and the label, which name the volume.
+    const ALWAYS_RECORDED_FEATURES: Features = Features::READ_ONLY
+        .union(Features::FAT_SERIAL)
+        .union(Features::FS_LABEL);
 
     /// What the manifest of a FAT volume can record: sizes, hashes, times,
     /// the read-only attribute and the hidden, system and archive
-    /// attributes, and that there are no symbolic links, device nodes,
-    /// hardlinks, extended attributes or inode flags.
+    /// attributes, the serial number and the label, and that there are no
+    /// symbolic links, device nodes, hardlinks, extended attributes or
+    /// inode flags.
     const MANIFEST_FEATURES: Features = Features::SIZE
         .union(Features::SHA256)
         .union(Features::MTIME)
         .union(Features::READ_ONLY)
+        .union(Features::FAT_SERIAL)
+        .union(Features::FS_LABEL)
         .union(Features::SYMLINK)
         .union(Features::DEVICE)
         .union(Features::HARDLINK)
@@ -120,15 +140,26 @@ impl Volume {
     /// not read-only. The manifest lists its features, and declares the
     /// code point ordering its objects are in.
     ///
+    /// The root object names the volume, whatever `features` asks for: its
+    /// serial number as `fatSerial`, and its label as `fsLabel` when it has
+    /// one. The manifest lists `fat-serial` and `fs-label`, and without
+    /// `fsLabel` it says that the volume has no label. A volume made from
+    /// the manifest gets the same serial number and label again, and the
+    /// content of the manifest goes into this volume and no other.
+    ///
     /// Names the manifest cannot carry are left out, with everything below
     /// them. The names the specification reserves in the top level for the
     /// manifest itself and its signatures (`Uapi16Manifest`,
     /// `Uapi16Manifest.*`) are left out silently, as `systemd-manifest`
     /// leaves them out; any other, one with a noncharacter or an unpaired
     /// surrogate for instance, which FAT stores but no manifest has, is
-    /// counted in the report's `omitted`. Names that FAT takes for one,
-    /// such as `README.TXT` and `readme.txt`, are two names to a manifest,
-    /// and each is listed with what its entry holds.
+    /// counted in the report's `omitted`. A label that a volume made from
+    /// the manifest would not have, see [`encode_exact_label`], which only
+    /// other tools write, is left out as well and named in the report's
+    /// `omitted_label`: the manifest does not list `fs-label` then.
+    /// Names that FAT takes for one, such as `README.TXT` and `readme.txt`,
+    /// are two names to a manifest, and each is listed with what its entry
+    /// holds.
     ///
     /// What only a damaged volume has fails with EUCLEAN: a cluster that
     /// belongs to two entries, or twice to one, as in a loop or a
@@ -164,7 +195,19 @@ impl Volume {
         progress: &mut dyn FnMut(&Progress),
     ) -> Result<WriteReport> {
         let top = self.metadata("/")?;
-        let features = (features | Volume::ALWAYS_RECORDED_FEATURES) & Volume::MANIFEST_FEATURES;
+        let mut features = (features | Volume::ALWAYS_RECORDED_FEATURES) & Volume::MANIFEST_FEATURES;
+        // The label goes in where a volume made from the manifest gets the
+        // same label field, so that the manifest goes into this volume
+        // again. Only other tools write one that it does not, and without
+        // fs-label listed the manifest says nothing about it.
+        let stored = self.label_bytes()?;
+        let label = stored.map(|raw| decode_label(&raw));
+        let carried = label
+            .as_deref()
+            .is_none_or(|label| encode_exact_label(label).ok() == stored);
+        if !carried {
+            features = features.without(Features::FS_LABEL);
+        }
         // The root object is a directory by definition and carries no type.
         let mut root = RootObject::default();
         root.features = Some(features);
@@ -172,11 +215,17 @@ impl Volume {
         if let Some(time) = root_time.filter(|_| features.contains(Features::MTIME)) {
             root.inode.set_mtime(time);
         }
+        root.file_system.fat_serial = Some(FatSerial(self.boot_sector().volume_id));
+        let (label, omitted_label) = if carried { (label, None) } else { (None, label) };
+        root.file_system.label = label;
         let mut listing = Listing {
             volume: self,
             features,
             writer: Writer::begin(out, &root)?,
-            report: WriteReport::default(),
+            report: WriteReport {
+                omitted_label,
+                ..WriteReport::default()
+            },
             buf: vec![0u8; self.layout().cluster_size() as usize],
             claimed: BitSet::new(self.layout().max_cluster() as usize + 1),
             progress,
@@ -541,6 +590,7 @@ mod tests {
                 directories: 4,
                 bytes: 7 + 5000 + 10 + 7,
                 omitted: 0,
+                omitted_label: None,
                 changed: 0,
             }
         );
@@ -589,8 +639,9 @@ mod tests {
         assert_eq!(
             recs[0].0,
             concat!(
-                r#"{"features":["device","hardlink","read-only","sha256","size","symlink"],"#,
-                r#""mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}"#
+                r#"{"fatSerial":"1234-ABCD","#,
+                r#""features":["device","fat-serial","fs-label","hardlink","read-only","sha256","size","symlink"],"#,
+                r#""fsLabel":"TEST","mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}"#
             )
         );
         assert_eq!(recs[2].0, r#"{"name":"EFI","type":"dir"}"#);
@@ -632,14 +683,18 @@ mod tests {
     #[test]
     fn features_govern_what_is_written() {
         let (_img, v) = populated();
-        // Nothing but names, the types of directories and the read-only
-        // attribute, which the manifest always records.
+        // Nothing but names, the types of directories, the read-only
+        // attribute and what names the volume, which the manifest always
+        // records.
         let (bytes, report) = written(&v, Some(t(1_600_000_000)), Features::NONE);
         assert_eq!((report.files, report.directories, report.bytes), (5, 4, 5024));
         let recs = records(&bytes);
         assert_eq!(
             recs[0].0,
-            r#"{"features":["read-only"],"mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}"#
+            concat!(
+                r#"{"fatSerial":"1234-ABCD","features":["fat-serial","fs-label","read-only"],"fsLabel":"TEST","#,
+                r#""mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}"#
+            )
         );
         assert_eq!(recs[1].0, r#"{"name":"B.txt"}"#);
         assert_eq!(recs[2].0, r#"{"name":"EFI","type":"dir"}"#);
@@ -695,7 +750,8 @@ mod tests {
         assert_eq!(
             records(&bytes)[0].0,
             concat!(
-                r#"{"features":["mtime","read-only"],"mTimeNSec":1600000000000000005,"#,
+                r#"{"fatSerial":"1234-ABCD","features":["fat-serial","fs-label","mtime","read-only"],"#,
+                r#""fsLabel":"TEST","mTimeNSec":1600000000000000005,"#,
                 r#""mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}"#
             )
         );
@@ -709,7 +765,8 @@ mod tests {
         let (_img, v) = populated();
         // Asked for everything, the manifest lists what FAT records:
         // sizes, hashes, times, the read-only attribute and the other DOS
-        // attributes, and that it has no symbolic links, device nodes,
+        // attributes, the serial number and the label of the volume, and
+        // that it has no symbolic links, device nodes,
         // hardlinks, extended attributes and inode flags. Modes, owners and
         // their names are not listed.
         let (bytes, _) = written(&v, None, Features::ALL);
@@ -718,6 +775,7 @@ mod tests {
             m.root.features.unwrap().names().collect::<Vec<_>>(),
             [
                 "device",
+                "fat-serial",
                 "flag-append-only",
                 "flag-archive",
                 "flag-hidden",
@@ -726,6 +784,7 @@ mod tests {
                 "flag-no-cow",
                 "flag-no-dump",
                 "flag-system",
+                "fs-label",
                 "hardlink",
                 "mtime",
                 "read-only",
@@ -793,14 +852,22 @@ mod tests {
         assert_eq!((copied.files, copied.directories), (5, 4));
         // The generator records sizes, hashes and times. With the tree's own
         // time for the root and times FAT keeps as they are, the two
-        // manifests are the same bytes, but for the read-only attribute,
-        // which the manifest of a volume always lists in its features.
+        // manifests are the same bytes, but for what the manifest of a
+        // volume always records: the read-only attribute, and the serial
+        // number and the label of the volume, which a tree does not have.
         let mut host = Vec::new();
         let host_report = HostTree::new(dir.as_fd()).write_manifest(&mut host).unwrap();
         let host = String::from_utf8(host).unwrap();
-        let listed = r#""features":["mtime","sha256","size"]"#;
+        let listed = r#"{"features":["mtime","sha256","size"],"#;
         assert!(host.contains(listed), "{}", host);
-        let host = host.replacen(listed, r#""features":["mtime","read-only","sha256","size"]"#, 1);
+        let host = host.replacen(
+            listed,
+            concat!(
+                r#"{"fatSerial":"1234-ABCD","#,
+                r#""features":["fat-serial","fs-label","mtime","read-only","sha256","size"],"fsLabel":"TEST","#
+            ),
+            1,
+        );
         let root_time = std::fs::metadata(tree.path()).unwrap().modified().unwrap();
         let features = Features::from_names(["size", "sha256", "mtime"]).unwrap();
         let (bytes, report) = written(&v, Some(root_time), features);
@@ -808,6 +875,105 @@ mod tests {
         assert_eq!(WrittenManifest::read(&bytes).names(), NAMES);
         assert_eq!((report.files, report.directories, report.bytes), (5, 4, copied.bytes));
         assert_eq!(report, host_report);
+    }
+
+    #[test]
+    fn names_the_volume() {
+        use crate::dirent::{self, ATTR_VOLUME_ID, DIR_ENTRY_SIZE};
+        use crate::format::{format, FormatOptions};
+        use crate::manifest::{ManifestLabel, VolumeIdentity};
+        use crate::test_util::format_options;
+        // The serial number and the label with their features, whatever the
+        // features asked for say, and no UUID, which FAT does not have. The
+        // manifest goes into the volume it names.
+        let (img, v) = populated();
+        let (bytes, report) = written(&v, None, Features::NONE);
+        let m = WrittenManifest::read(&bytes);
+        assert_eq!(m.root.file_system.fat_serial, Some(FatSerial(0x1234_abcd)));
+        assert_eq!(m.root.file_system.label.as_deref(), Some("TEST"));
+        assert_eq!(m.root.file_system.uuid, None);
+        assert!(m
+            .root
+            .features
+            .unwrap()
+            .contains(Features::FAT_SERIAL | Features::FS_LABEL));
+        assert_eq!(report.omitted, 0);
+        VolumeIdentity::from_root(&m.root).check(&v).unwrap();
+        // A label that a volume made from the manifest would not have, which
+        // ufat does not write but another tool may, is left out and counted,
+        // and the manifest does not list fs-label then: one with a control
+        // character, one beyond ASCII, one with a character mkfs.fat refuses
+        // or a space in front, and one whose last character the volume
+        // reads as padding.
+        let root = v.boot_sector().root_cluster;
+        let offset = v.layout().cluster_offset(root).unwrap();
+        let mut cluster = vec![0u8; v.layout().cluster_size() as usize];
+        v.close().unwrap();
+        img.device().read_at(offset, &mut cluster).unwrap();
+        let slot = cluster
+            .chunks(DIR_ENTRY_SIZE)
+            .position(|e| e[dirent::field::ATTR] == ATTR_VOLUME_ID)
+            .unwrap();
+        let name_at = offset + (slot * DIR_ENTRY_SIZE + dirent::field::NAME.start) as u64;
+        for (raw, label) in [
+            (b"\x01EST       ", "\u{1}EST"),
+            (b"\x85EST       ", "\u{85}EST"),
+            (b"\xe9TE        ", "\u{e9}TE"),
+            (b"A.B        ", "A.B"),
+            (b"A+B        ", "A+B"),
+            (b" X         ", " X"),
+            (b"ESP\xa0       ", "ESP"),
+        ] {
+            img.device().write_at(name_at, raw).unwrap();
+            let v = Volume::open(img.device()).unwrap();
+            assert_eq!(v.label().unwrap().as_deref(), Some(label));
+            let (bytes, report) = written(&v, None, Features::NONE);
+            let m = WrittenManifest::read(&bytes);
+            assert_eq!(m.root.file_system.fat_serial, Some(FatSerial(0x1234_abcd)));
+            assert_eq!(
+                (
+                    m.root.file_system.label.as_deref(),
+                    report.omitted,
+                    report.omitted_label.as_deref()
+                ),
+                (None, 0, Some(label)),
+                "{:?}",
+                label
+            );
+            assert_eq!(report.omissions(), 1);
+            assert!(!m.root.features.unwrap().contains(Features::FS_LABEL), "{:?}", label);
+            assert_eq!(VolumeIdentity::from_root(&m.root).label(), &ManifestLabel::Unrecorded);
+            v.close().unwrap();
+        }
+        // A volume without a label names none: the manifest lists fs-label
+        // and has no fsLabel.
+        let img = TempImage::new(8 << 20);
+        let options = FormatOptions {
+            label: None,
+            ..format_options(512, 512)
+        };
+        format(&img.device(), &options).unwrap();
+        let v = Volume::open(img.device()).unwrap();
+        let (bytes, _) = written(&v, None, Features::NONE);
+        let m = WrittenManifest::read(&bytes);
+        assert_eq!(m.root.file_system.label, None);
+        assert_eq!(VolumeIdentity::from_root(&m.root).label(), &ManifestLabel::Unlabeled);
+        VolumeIdentity::from_root(&m.root).check(&v).unwrap();
+        assert!(records(&bytes)[0]
+            .0
+            .starts_with(r#"{"fatSerial":"1234-ABCD","features":["fat-serial","fs-label","read-only"],"mediaType""#));
+        // Nor does one with a label in its boot sector only, which is no
+        // label to blkid, Windows and EDK2, who read the root directory.
+        drop(v);
+        img.device()
+            .write_at(crate::boot::field::VOLUME_LABEL.start as u64, b"ESP        ")
+            .unwrap();
+        let v = Volume::open(img.device()).unwrap();
+        let (bytes, report) = written(&v, None, Features::NONE);
+        let m = WrittenManifest::read(&bytes);
+        assert_eq!((m.root.file_system.label.as_deref(), report.omissions()), (None, 0));
+        assert_eq!(VolumeIdentity::from_root(&m.root).label(), &ManifestLabel::Unlabeled);
+        VolumeIdentity::from_root(&m.root).check(&v).unwrap();
     }
 
     #[test]
@@ -831,6 +997,7 @@ mod tests {
                 directories: 1,
                 bytes: 8,
                 omitted: 0,
+                omitted_label: None,
                 changed: 0,
             }
         );

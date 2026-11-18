@@ -56,9 +56,16 @@ pub enum LabelProblem {
     TooLong,
     /// A character a FAT label cannot hold: a non-printable or non-ASCII
     /// one, one of `* ? . , ; : / \ | + = < > [ ] "`, or a leading space.
+    /// A label that a volume has to report as it is, such as the one a
+    /// manifest names, cannot end with a space either, since FAT pads a
+    /// label with spaces.
     InvalidCharacter,
     /// The file system has no label at all; unused on FAT.
     NotSupported,
+    /// A label the file system stores for no label: on FAT the blank one
+    /// and `NO NAME`. Refused where a volume has to report the label as it
+    /// is, such as the one a manifest names.
+    Reserved,
 }
 
 impl LabelProblem {
@@ -68,6 +75,7 @@ impl LabelProblem {
             LabelProblem::TooLong => "tooLong",
             LabelProblem::InvalidCharacter => "invalidCharacter",
             LabelProblem::NotSupported => "notSupported",
+            LabelProblem::Reserved => "reserved",
         }
     }
 }
@@ -336,6 +344,30 @@ impl ValidityProblem {
     }
 }
 
+/// The field of the root file object of a manifest that names the volume
+/// the manifest is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileSystemField {
+    /// `fatSerial`: the volume serial number.
+    FatSerial,
+    /// `fsUUID`, whose first eight hex digits give the serial number of a
+    /// volume whose manifest has no `fatSerial`.
+    FsUuid,
+    /// `fsLabel`: the label.
+    FsLabel,
+}
+
+impl FileSystemField {
+    /// The field as a manifest and the Varlink interface spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileSystemField::FatSerial => "fatSerial",
+            FileSystemField::FsUuid => "fsUUID",
+            FileSystemField::FsLabel => "fsLabel",
+        }
+    }
+}
+
 /// What an error is about, for a program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Detail {
@@ -469,9 +501,39 @@ pub enum Detail {
         /// Why it is not valid.
         problem: ValidityProblem,
     },
+    /// What the root file object of a manifest says about the volume does
+    /// not match the volume the manifest's content goes into, or the serial
+    /// number or label given for a volume made from the manifest.
+    FileSystemMismatch {
+        /// The field of the root file object the expected value comes from.
+        field: FileSystemField,
+        /// What the manifest says, None for no label. A serial number is
+        /// written `XXXX-XXXX`, the one derived from `fsUUID` as well.
+        expected: Option<String>,
+        /// What the volume has or what was given, None for no label.
+        found: Option<String>,
+    },
     /// An option the caller gave is not valid, named as the Varlink
     /// interface spells it.
     InvalidOption(&'static str),
+}
+
+impl Detail {
+    /// The detail of a volume that is not the one a manifest names in
+    /// `field`: the manifest says `expected`, and the volume has `found`,
+    /// or `found` was given for a volume made from the manifest. None is
+    /// no label.
+    pub(crate) fn file_system_mismatch(
+        field: FileSystemField,
+        expected: Option<impl fmt::Display>,
+        found: Option<impl fmt::Display>,
+    ) -> Detail {
+        Detail::FileSystemMismatch {
+            field,
+            expected: expected.map(|value| value.to_string()),
+            found: found.map(|value| value.to_string()),
+        }
+    }
 }
 
 /// An error with an errno value, a description of what went wrong and the

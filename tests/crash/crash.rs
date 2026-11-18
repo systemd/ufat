@@ -34,7 +34,7 @@ use fat::boot::BootSector;
 use fat::device::{Access, Device};
 use fat::dirent::{self, short_name_checksum, RawDirEntry, ATTR_ARCHIVE, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_END};
 use fat::fat::{Entry, Fat, BAD_CLUSTER, END_OF_CHAIN_MIN, ENTRY_MASK, ENTRY_SIZE, FREE};
-use fat::format::{self, FormatOptions};
+use fat::format::{self, FormatOptions, VolumeId};
 use fat::fsck::{self, ProblemKind, Severity};
 use fat::layout::{Layout, FIRST_CLUSTER};
 use fat::manifest::Sha256;
@@ -55,6 +55,12 @@ const SEED: u64 = 20261107;
 const TIME: u64 = 1_700_000_000;
 /// Failures of one kind shown in the summary, at most.
 const SHOWN_PER_KIND: usize = 3;
+/// The serial number the volume is formatted with, the one the scenario
+/// sets first, before anything else is written, and the one it sets at its
+/// end, as an assembly from a manifest does.
+const FORMAT_SERIAL: u32 = 0x4352_5348;
+const FIRST_SERIAL: u32 = 0x4649_5253;
+const FINAL_SERIAL: u32 = 0x5345_5249;
 
 fn fixed_time() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(TIME)
@@ -152,6 +158,9 @@ enum Op {
         chunk: usize,
     },
     Remove(String),
+    /// `set_volume_id`: the serial number in the boot sector and its
+    /// backup.
+    Serial(u32),
     /// `close`: the marks go back, FSInfo gets its counts, fsync.
     Close,
 }
@@ -181,6 +190,7 @@ impl Op {
                 chunk
             ),
             Op::Remove(p) => format!("remove {}", p),
+            Op::Serial(id) => format!("serial {}", VolumeId(*id)),
             Op::Close => "close".to_string(),
         }
     }
@@ -200,9 +210,9 @@ impl Op {
 /// A tree with long names, files replaced within one directory cluster and
 /// across two, a directory grown past its first cluster, a removed file
 /// whose slots are reused, nested directories, directories made with and
-/// without their parent growing for them. BOOTX64.EFI is written in
-/// small pieces so that its epoch holds many writes; the kernel names take
-/// four slots each.
+/// without their parent growing for them, and a serial number set first
+/// and last. BOOTX64.EFI is written in small pieces so that its epoch
+/// holds many writes; the kernel names take four slots each.
 fn scenario(slots_per_cluster: usize) -> Vec<Op> {
     let mut rng = Rng(SEED);
     let mut ops: Vec<Op> = Vec::new();
@@ -216,6 +226,10 @@ fn scenario(slots_per_cluster: usize) -> Vec<Op> {
         });
     };
     let kernel = |n: usize| format!("/EFI/Linux/linux-6.12.{}-200.fc41.x86_64+3.efi", n);
+    // A serial number set before anything else is written. set_volume_id()
+    // begins the session itself, so the marks of the session go down before
+    // the serial number does.
+    ops.push(Op::Serial(FIRST_SERIAL));
     ops.push(Op::Mkdir("/EFI/BOOT".into()));
     file(&mut ops, "/EFI/BOOT/BOOTX64.EFI", 70_000, NameCollision::Fail, 4096);
     ops.push(Op::Mkdir("/EFI/Linux".into()));
@@ -284,6 +298,8 @@ fn scenario(slots_per_cluster: usize) -> Vec<Op> {
         path: "/full/sub".into(),
         grows: true,
     });
+    // The serial number an assembly from a manifest knows at its end.
+    ops.push(Op::Serial(FINAL_SERIAL));
     ops.push(Op::Close);
     ops
 }
@@ -360,7 +376,7 @@ fn simulate(ops: &[Op]) -> Tree {
             Op::Remove(path) => {
                 tree.remove(path);
             }
-            Op::Close => {}
+            Op::Serial(_) | Op::Close => {}
         }
     }
     tree
@@ -662,7 +678,7 @@ impl Harness {
         let options = FormatOptions {
             sector_size: Some(cfg.sector_size),
             cluster_size: Some(cfg.cluster_size),
-            volume_id: 0x4352_5348,
+            volume_id: FORMAT_SERIAL,
             label: Some("ESP".into()),
             timestamp: Some(fixed_time()),
             allow_small: true,
@@ -691,11 +707,17 @@ impl Harness {
                     w.finish().unwrap();
                 }
                 Op::Remove(path) => v.remove_file(path).unwrap(),
+                Op::Serial(id) => v.set_volume_id(VolumeId(*id)).unwrap(),
                 Op::Close => {}
             }
         }
         v.close().unwrap();
         let final_image = std::fs::read(img.path()).unwrap();
+        // Both boot sectors have the serial number the scenario set.
+        let boot = BootSector::parse(&final_image).unwrap();
+        let backup = usize::from(boot.backup_boot_sector) * usize::from(boot.bytes_per_sector);
+        let backup = BootSector::parse(&final_image[backup..]).unwrap();
+        assert_eq!((boot.volume_id, backup.volume_id), (FINAL_SERIAL, FINAL_SERIAL));
         let records = read_trace(trace.path());
 
         // The format is the pre-state: its records must turn the stale
@@ -925,7 +947,7 @@ impl Harness {
             format!(" ({} sectors)", sectors)
         };
         let region = if w.offset < l.fat_offset(0) {
-            if w.offset == 0 {
+            if w.offset < self.ss {
                 "boot sector".to_string()
             } else {
                 format!("reserved sector {}", w.offset / self.ss)
@@ -1065,6 +1087,7 @@ const ACCEPT_BEHIND_MARKER: &str = "a short entry behind the end marker of a par
 const ACCEPT_DUPLICATE: &str = "both versions of a replaced file in a partly written directory";
 const ACCEPT_ALIAS: &str = "a file listed under its alias in a partly written directory";
 const ACCEPT_REPLACED_ABSENT: &str = "a replaced file absent";
+const ACCEPT_BACKUP_SERIAL: &str = "the backup boot sector a serial number behind or ahead";
 
 struct Verdict {
     failure: Option<Failure>,
@@ -1352,6 +1375,10 @@ impl<'a> Worker<'a> {
         let partial_dirs = h.partial_directories(pieces);
         let torn_dir = |dir: &str| partial_dirs.iter().any(|d| d == dir);
         let replaced: BTreeSet<&str> = in_flight.iter().filter_map(|op| op.replaces()).collect();
+        // The serial number goes into the backup boot sector and the boot
+        // sector one after the other, while the boot sector says that the
+        // volume is being written.
+        let serial_in_flight = in_flight.iter().any(|op| matches!(op, Op::Serial(_)));
         let versions_of = |path: &str| -> BTreeSet<Option<Node>> {
             (lo..=hi).map(|j| h.boundaries[j].tree.get(path).cloned()).collect()
         };
@@ -1381,6 +1408,7 @@ impl<'a> Worker<'a> {
                 return (bad, accepted);
             }
         };
+        let marked = report.problems.iter().any(|p| p.kind == ProblemKind::DirtyFlag);
         for p in &report.problems {
             let msg = p.to_string();
             let path = p.path.as_deref().unwrap_or("");
@@ -1418,6 +1446,9 @@ impl<'a> Worker<'a> {
                 Severity::Warning if p.kind == ProblemKind::FatCopyDiffers => Some(ACCEPT_FAT_COPIES),
                 Severity::Warning if p.kind == ProblemKind::LostClusters => Some(ACCEPT_LOST),
                 Severity::Warning if p.kind == ProblemKind::FsinfoFreeCount => Some(ACCEPT_FSINFO),
+                Severity::Warning if p.kind == ProblemKind::BackupBootSectorDiffers && serial_in_flight && marked => {
+                    Some(ACCEPT_BACKUP_SERIAL)
+                }
                 Severity::Warning => None,
             };
             match rule {

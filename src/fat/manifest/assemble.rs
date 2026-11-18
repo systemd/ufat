@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use uapi16::{ContentSource, Directory, ErrorKind, FileObject, Name, Object, OpenError, Order, Reader};
 
-use super::{path_in_volume, DosAttributes, EntryKind, ObjectAction, ObjectTriage};
+use super::{path_in_volume, DosAttributes, EntryKind, ObjectAction, ObjectTriage, VolumeIdentity};
 use crate::errno::*;
 use crate::progress::Progress;
 use crate::sys;
@@ -478,6 +478,13 @@ impl Volume {
     /// those in the data, such as a hash that does not match. A directory
     /// the volume holds under the same name gets the directory object's
     /// time and attributes.
+    ///
+    /// A manifest whose root file object names the file system it is for
+    /// goes into that one only, see [`VolumeIdentity::check`]: any other
+    /// volume fails with EINVAL and [`Detail::FileSystemMismatch`] before
+    /// anything is written.
+    ///
+    /// [`Detail::FileSystemMismatch`]: crate::Detail::FileSystemMismatch
     pub fn assemble<R: Read>(
         &mut self,
         reader: &mut Reader<R>,
@@ -501,6 +508,7 @@ impl Volume {
         if let Some(now) = options.now_usec {
             reader.root().check_validity(now)?;
         }
+        VolumeIdentity::from_root(reader.root()).check(self)?;
         let mut assembly = Assembly {
             volume: self,
             source,

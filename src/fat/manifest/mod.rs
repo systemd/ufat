@@ -26,6 +26,14 @@
 //! device nodes, FIFOs, sockets) is refused unless the caller asks for it to
 //! be skipped. `readOnly` and the flags of the hidden, system and archive
 //! attributes set and clear those attributes of files and directories.
+//!
+//! The root file object can name the volume the manifest is for, see
+//! [`VolumeIdentity`]: a volume made from the manifest takes the serial
+//! number and the label, and a volume the content goes into has to have
+//! them. A manifest that names no serial number gives a volume the one
+//! derived from its bytes, see [`VolumeId::from_manifest_digest`].
+//!
+//! [`VolumeId::from_manifest_digest`]: crate::format::VolumeId::from_manifest_digest
 
 use crate::dirent::{ATTR_ARCHIVE, ATTR_HIDDEN, ATTR_READ_ONLY, ATTR_SYSTEM};
 use crate::errno::*;
@@ -36,12 +44,14 @@ use crate::{Detail, Result, UnsupportedKind};
 mod assemble;
 mod error;
 mod generate;
+mod identity;
 #[cfg(test)]
 mod tests;
 mod volume;
 
 pub use assemble::{AssembleFlags, AssembleObserver, AssembleOptions, AssembleReport, PinnedDirectory, SkipReason};
 pub use generate::HostTree;
+pub use identity::{ManifestLabel, SerialSource, VolumeIdentity};
 pub use uapi16::{
     ContentSource, Contents, DirectorySource, DosFlags, Features, FileObject, Finalize, FlagStates, InodeFlags,
     InodeType, Location, Name, Object, Order, Problem, Reader, RootObject, Sha256, Sha256Context, StreamSource,

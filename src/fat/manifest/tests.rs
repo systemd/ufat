@@ -656,6 +656,39 @@ fn files_without_a_size() {
     }
 }
 
+/// A manifest that names the file system it is for goes into that one
+/// only, also for a caller of the library, and nothing is written into
+/// another one. The test volume has the serial number 1234-ABCD and the
+/// label TEST.
+#[test]
+fn manifests_go_into_their_file_system() {
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    let named = |features: &str, fields: &str| {
+        let root = format!(
+            r#"{{"features":[{}],{}"mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}}"#,
+            features, fields
+        );
+        seq(&[&root, r#"{"name":"x","size":0}"#, TRAILER])
+    };
+    for (features, fields) in [
+        (r#""fat-serial","size""#, r#""fatSerial":"1234-ABCE","#),
+        (r#""fs-label","size""#, r#""fsLabel":"OTHER","#),
+        // fs-label listed without fsLabel: the file system has no label.
+        (r#""fs-label","size""#, ""),
+    ] {
+        let e = assemble_stream(&mut v, &named(features, fields), b"", &AssembleOptions::default()).unwrap_err();
+        assert!(matches!(e.detail(), Some(Detail::FileSystemMismatch { .. })), "{:?}", e);
+        assert!(v.read_dir("/").unwrap().is_empty());
+        assert!(!v.is_writing());
+    }
+    let fits = named(
+        r#""fat-serial","fs-label","size""#,
+        r#""fatSerial":"1234-abcd","fsLabel":"TEST","#,
+    );
+    assemble_stream(&mut v, &fits, b"", &AssembleOptions::default()).unwrap();
+    assert_eq!(v.read_dir("/").unwrap().len(), 1);
+}
+
 /// A directory that refers to a sub-manifest is refused at its object,
 /// before the stream is asked for the sub-manifest, with or without a size.
 /// Left out instead, it takes its sub-manifest along: the stream has that

@@ -138,9 +138,12 @@ The most common ones:
   system holds after `assemble` or `populate`, or of what `describe`
   finds. It has the size and the SHA-256 hash of every file, says which
   files and directories are read-only, and has no times. It records no
-  hidden, system or archive attributes either. With `-` as PATH the
-  manifest goes to standard output, and what the command prints there
-  otherwise goes to standard error.
+  hidden, system or archive attributes either. Its root object names the
+  serial number of the file system and its label, or says that it has no
+  label. A label that a file system made from the manifest would not get,
+  which only other tools write, is left out, and ufat says so. With `-`
+  as PATH the manifest goes to standard output, and what the command
+  prints there otherwise goes to standard error.
 - `--hash sha256` or `--hash sha512` prints the hash of the file system
   `assemble` wrote.
 - `--write-hash PATH` writes that hash to PATH instead, or with `-` to
@@ -165,7 +168,9 @@ files:
   This is the default when `SOURCE_DATE_EPOCH` is set.
 
 With `--timestamp` or `SOURCE_DATE_EPOCH`, the volume serial number is
-derived from the time stamp and the label instead of drawn at random.
+derived from the time stamp and the label instead of drawn at random. A
+file system made from a manifest gets its serial number from the
+manifest, see "Manifests".
 
 ### Manifests
 
@@ -227,6 +232,27 @@ leaves out clears its attribute. An object without `readOnly` is not
 read-only, unless the manifest does not list `read-only` and the object
 has a `mode` that gives nobody write permission. The inode flags such as
 `flagImmutable` are ignored, since FAT has none.
+
+The root object of a manifest can name the file system it is for, with
+`fatSerial`, or `fsUUID` whose first eight hex digits give a serial
+number, and `fsLabel`. A manifest that lists `fs-label` in `features`
+and has no `fsLabel` names a file system without a label, and so does
+an empty `fsLabel`. `assemble` gives the file system that serial number
+and label. `--identifier` and `--label` have to agree with them. Without
+a serial number from the manifest or from `--identifier`, the serial
+number is the first eight hex digits that `sha256sum` prints for the
+manifest. So a manifest gives the file system the same serial number
+whether it comes from a file or from standard input, with or without
+`--minimize`.
+`populate` checks that the file system has the serial number and the
+label the manifest names, and fails if it has not.
+
+The label is the one the file system reports, as `blkid` shows it. FAT
+pads a label with spaces, and stores the blank label and `NO NAME` for
+no label. So `assemble` and `populate` refuse a manifest whose label
+ends with a space, is blank or is `NO NAME`, as they refuse one whose
+label FAT cannot store. `--label` takes such a label as `mkfs.fat -n`
+does: it pads it with spaces, and a blank one or `NO NAME` is no label.
 
 Signatures in a manifest are recognized but not verified. Verify a
 signed manifest before you hand it to ufat.

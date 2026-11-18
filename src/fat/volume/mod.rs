@@ -32,6 +32,7 @@ use crate::dirent::{
 };
 use crate::errno::*;
 use crate::fat::{Entry, Extent, Fat, FatStore, CACHE_BYTES, ENTRY1_CLEAN_SHUTDOWN};
+use crate::format::VolumeId;
 use crate::layout::Layout;
 use crate::name::{fold_str, long_name_entries, short_name_to_string, Alias, LongName};
 use crate::path::{components, SEPARATOR};
@@ -284,8 +285,10 @@ fn check_attributes(attributes: u8) -> Result<()> {
     Ok(())
 }
 
-/// Whether a label field says the volume has no label: `NO NAME`, which
-/// mkfs.fat and Windows put there, or blanks.
+/// Whether the name of a label entry says that the volume has no label:
+/// blanks, or `NO NAME`, which the boot sector holds for no label, and
+/// which [`Volume::set_root_time`] copies from there into the entry it
+/// makes.
 fn is_no_name(label: &[u8; LABEL_SIZE]) -> bool {
     *label == NO_NAME || label.iter().all(|&b| b == b' ')
 }
@@ -496,23 +499,23 @@ impl Volume {
         u64::from(self.fat.free_count()) * u64::from(self.layout.cluster_size())
     }
 
-    /// The volume label, from the root directory entry or else from the
-    /// boot sector. None when the volume has no label: `NO NAME` and a
-    /// blank label mean none, to us as to blkid and mtools.
+    /// The volume label: the name of the root directory's label entry,
+    /// where Windows, EDK2, GRUB and blkid read it. The copy in the boot
+    /// sector counts for nothing, as it does for them. None when there is
+    /// no such entry, or when it is blank or says `NO NAME`. blkid shows a
+    /// blank entry as no label as well, but an entry `NO NAME` as the label
+    /// `NO NAME`.
     pub fn label(&self) -> Result<Option<String>> {
         Ok(self.label_bytes()?.map(|raw| crate::format::decode_label(&raw)))
     }
 
     /// The volume label as stored on disk, eleven space padded bytes in the
-    /// OEM code page: the root directory's label entry if there is one, else
-    /// the boot sector's. None when that says `NO NAME` or is blank, which
-    /// is how a volume without a label is written.
+    /// OEM code page: the name of the root directory's label entry. None
+    /// when there is no such entry, or when it is blank or says `NO NAME`,
+    /// see [`Volume::label`].
     pub fn label_bytes(&self) -> Result<Option<[u8; LABEL_SIZE]>> {
-        let label = match self.label_entry()? {
-            Some(e) => e.short.name,
-            None => self.boot.volume_label,
-        };
-        Ok(Some(label).filter(|l| !is_no_name(l)))
+        let label = self.label_entry()?.map(|e| e.short.name);
+        Ok(label.filter(|l| !is_no_name(l)))
     }
 
     /// The root directory's volume label entry, if there is one.
@@ -548,11 +551,13 @@ impl Volume {
 
     /// Sets the root directory's time on the volume label entry, creating
     /// the entry when there is none. A new entry carries the boot sector's
-    /// label, `NO NAME` when the volume has none, so the label the volume
-    /// reports stays what it was, see [`Volume::label`]. The time is stored
-    /// as on any entry: the modification time in two second steps, the
-    /// creation time in hundredths. The entry is one slot written in place,
-    /// so a crash leaves the old time or the new one.
+    /// label, `NO NAME` when that is blank or zeroed. So a volume without a
+    /// label keeps none, and a volume whose boot sector holds a label that
+    /// its root directory does not, as another tool can leave it, gets that
+    /// label, see [`Volume::label`]. The time is stored as on any entry: the
+    /// modification time in two second steps, the creation time in
+    /// hundredths. The entry is one slot written in place, so a crash
+    /// leaves the old time or the new one.
     pub fn set_root_time(&mut self, time: SystemTime) -> Result<()> {
         self.begin_write()?;
         let t = FatTimestamp::from_system_time(time);
@@ -581,6 +586,40 @@ impl Volume {
             }
             vol.save_directory(root)
         })
+    }
+
+    /// Sets the volume serial number to `id`, in the boot sector and in its
+    /// backup, for a serial number that is known only once the volume is
+    /// written, such as the one derived from a manifest.
+    ///
+    /// The two copies are written while the volume carries the marks of a
+    /// session, see [`Volume::begin_write`]: the backup first, then the
+    /// boot sector that readers go by. In durable mode a flush before them
+    /// makes the marks reach the device first, and one after them makes
+    /// both copies reach it before [`Volume::close`] takes the marks away.
+    /// So a crash in between leaves a volume marked as not cleanly
+    /// unmounted, with the old or the new serial number in each copy, as
+    /// nothing orders the two writes against each other on the device, and
+    /// fsck reports a backup that differs along with the marks. Each copy
+    /// is four bytes within one sector, written in place, so a crash
+    /// leaves the old serial number in it or the new one.
+    pub fn set_volume_id(&mut self, id: VolumeId) -> Result<()> {
+        self.begin_write()?;
+        self.commit_barrier()?;
+        let field = boot::field::VOLUME_ID;
+        let bytes = id.0.to_le_bytes();
+        let backup = u64::from(self.boot.backup_boot_sector);
+        if backup != 0 {
+            let offset = backup * u64::from(self.layout.sector_size) + field.start as u64;
+            self.device.write_at(offset, &bytes)?;
+        }
+        self.device.write_at(field.start as u64, &bytes)?;
+        self.commit_barrier()?;
+        // What close() puts back into the boot sector has the new serial
+        // number too.
+        self.boot_raw[field].copy_from_slice(&bytes);
+        self.boot.volume_id = id.0;
+        Ok(())
     }
 
     /// Reads a directory from disk, past the cache. Operations go through

@@ -979,6 +979,416 @@ fn manifests_have_to_declare_their_order() {
     assert_eq!(ok(&bin, &["list", a]), "EFI/\nloader/\n");
 }
 
+/// The serial number and the label `describe` shows for `image`.
+fn described_identity(bin: &Path, image: &str) -> (String, String) {
+    let described = ok(bin, &["describe", image]);
+    let field = |name: &str| {
+        described
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    (field("volume id:"), field("volume label:"))
+}
+
+/// The root object of a manifest names the file system: assemble gives it
+/// the serial number and the label, --identifier and --label have to agree,
+/// and populate checks them. Without a serial number from the manifest or
+/// --identifier, it is the one derived from the manifest's bytes, the same
+/// from a file, from standard input and with --minimize. A manifest that
+/// lists fs-label without fsLabel is for a file system without a label. A
+/// label that FAT cannot store, or would report as another one or as none,
+/// is refused. The manifests ufat writes of a file system name it, those of
+/// a tree do not.
+#[test]
+fn manifests_name_the_file_system() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    let t = root.join("tree");
+    let t = t.to_str().unwrap();
+    let image = |name: &str| root.join(name).to_str().unwrap().to_string();
+    let manifest = ok(&bin, &["manifest", t]);
+    // A tree describes no file system.
+    assert!(!manifest.contains("fatSerial") && !manifest.contains("fsLabel"));
+    let plain = root.join("plain.manifest");
+    fs::write(&plain, &manifest).unwrap();
+    let p = plain.to_str().unwrap();
+    // The serial number derived from the manifest, whichever way it comes:
+    // the first eight hex digits sha256sum prints for it.
+    let derived = common::derived_serial(manifest.as_bytes());
+    match common::find_program("sha256sum") {
+        Some(sha256sum) => {
+            let out = Command::new(sha256sum).arg(&plain).output().unwrap();
+            let printed = String::from_utf8(out.stdout).unwrap().to_uppercase();
+            assert_eq!(format!("{}-{}", &printed[..4], &printed[4..8]), derived);
+        }
+        None => eprintln!("not comparing with sha256sum: not found"),
+    }
+    let (a, b, c, d) = (image("a.img"), image("b.img"), image("c.img"), image("d.img"));
+    ok(&bin, &["assemble", "--create", "--size", "40M", "--manifest", p, &a, t]);
+    let out = run_in(
+        &bin,
+        &["assemble", "--create", "--size", "40M", "--manifest", "-", &b, t],
+        manifest.as_bytes(),
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    ok(&bin, &["assemble", "--create", "--minimize", "--manifest", p, &c, t]);
+    ok(&bin, &["assemble", "--create", "--manifest", p, &d]);
+    for img in [&a, &b, &c, &d] {
+        assert_eq!(
+            described_identity(&bin, img),
+            (derived.clone(), String::new()),
+            "{}",
+            img
+        );
+    }
+    // The image is the same whether the manifest came from a file and was
+    // read twice for --minimize, or from standard input with the size and
+    // the cluster size that --minimize chose.
+    let size = fs::metadata(&c).unwrap().len().to_string();
+    let cluster = ok(&bin, &["describe", &c])
+        .lines()
+        .find_map(|line| line.strip_prefix("cluster size:").map(|v| v.trim().to_string()))
+        .unwrap();
+    let e = image("e.img");
+    let out = run_in(
+        &bin,
+        &[
+            "assemble",
+            "--create",
+            "--size",
+            &size,
+            "--cluster-size",
+            &cluster,
+            "--manifest",
+            "-",
+            &e,
+            t,
+        ],
+        manifest.as_bytes(),
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(fs::read(&c).unwrap() == fs::read(&e).unwrap(), "the images differ");
+    // --identifier and --label are used where the manifest names nothing.
+    let f = image("f.img");
+    ok(
+        &bin,
+        &[
+            "assemble",
+            "--create",
+            "--size",
+            "40M",
+            "--identifier",
+            "1111-2222",
+            "--label",
+            "MINE",
+            "--manifest",
+            p,
+            &f,
+            t,
+        ],
+    );
+    assert_eq!(
+        described_identity(&bin, &f),
+        ("1111-2222".to_string(), "MINE".to_string())
+    );
+    // A manifest that names the file system gives it its serial number and
+    // label, from fatSerial, or else from the start of fsUUID.
+    let named = |name: &str, features: &[&str], fields: &str| {
+        let path = root.join(format!("{}.manifest", name));
+        fs::write(&path, common::with_root_fields(manifest.as_bytes(), features, fields)).unwrap();
+        path.to_str().unwrap().to_string()
+    };
+    let esp = named(
+        "esp",
+        &["fat-serial", "fs-label", "fs-uuid"],
+        r#""fatSerial":"1234-abcd","fsLabel":"ESP","fsUUID":"9999aaaa-0000-4000-8000-000000000000""#,
+    );
+    let uuid = named(
+        "uuid",
+        &["fs-uuid"],
+        r#""fsUUID":"5678abcd-0000-4000-8000-000000000000""#,
+    );
+    let g = image("g.img");
+    ok(&bin, &["assemble", "--create", "--manifest", &esp, &g]);
+    assert_eq!(
+        described_identity(&bin, &g),
+        ("1234-ABCD".to_string(), "ESP".to_string())
+    );
+    let h = image("h.img");
+    ok(
+        &bin,
+        &["assemble", "--create", "--size", "40M", "--manifest", &uuid, &h, t],
+    );
+    assert_eq!(described_identity(&bin, &h), ("5678-ABCD".to_string(), String::new()));
+    // The options have to agree with what the manifest names: the same
+    // values are fine, others are refused before an image is made.
+    let i = image("i.img");
+    ok(
+        &bin,
+        &[
+            "assemble",
+            "--create",
+            "--size",
+            "40M",
+            "--identifier",
+            "1234ABCD",
+            "--label",
+            "ESP",
+            "--manifest",
+            &esp,
+            &i,
+            t,
+        ],
+    );
+    let j = image("j.img");
+    for (option, value, message) in [
+        (
+            "--identifier",
+            "1234-0000",
+            "the identifier 1234-0000 differs from the serial number 1234-ABCD the manifest gives in fatSerial",
+        ),
+        (
+            "--label",
+            "esp",
+            "the label 'esp' differs from the label 'ESP' the manifest gives in fsLabel",
+        ),
+    ] {
+        fails(
+            &bin,
+            &[
+                "assemble",
+                "--create",
+                "--size",
+                "40M",
+                option,
+                value,
+                "--manifest",
+                &esp,
+                &j,
+                t,
+            ],
+            &format!("ufat: {}: {}", esp, message),
+        );
+        assert!(!Path::new(&j).exists());
+    }
+    fails(
+        &bin,
+        &[
+            "assemble",
+            "--create",
+            "--size",
+            "40M",
+            "--identifier",
+            "00000001",
+            "--manifest",
+            &uuid,
+            &j,
+            t,
+        ],
+        "the identifier 0000-0001 differs from the serial number 5678-ABCD the manifest gives in fsUUID",
+    );
+    // A manifest that lists fs-label without fsLabel is for a file system
+    // without a label, and a --label is one too many.
+    let unlabeled = named("unlabeled", &["fs-label"], "");
+    let k = image("k.img");
+    ok(
+        &bin,
+        &["assemble", "--create", "--size", "40M", "--manifest", &unlabeled, &k, t],
+    );
+    assert_eq!(described_identity(&bin, &k).1, "");
+    fails(
+        &bin,
+        &[
+            "assemble",
+            "--create",
+            "--size",
+            "40M",
+            "--label",
+            "MINE",
+            "--manifest",
+            &unlabeled,
+            &j,
+            t,
+        ],
+        "the label 'MINE' differs from the manifest, which gives the file system no label (fsLabel)",
+    );
+    assert!(!Path::new(&j).exists());
+    // A label FAT cannot store is refused, and so is one it would report
+    // as another label or as none: blkid shows a FAT label without the
+    // spaces at its end, and nothing for the blank label and NO NAME.
+    let mut refused = Vec::new();
+    for (name, label, message) in [
+        (
+            "long",
+            "much too long",
+            "label 'much too long' is longer than 11 characters",
+        ),
+        (
+            "trailing",
+            "ESP ",
+            "label 'ESP ' ends with a space, which FAT does not keep",
+        ),
+        ("blank", "   ", "label '   ' is what FAT stores for no label"),
+        ("no-name", "NO NAME", "label 'NO NAME' is what FAT stores for no label"),
+    ] {
+        let m = named(name, &["fs-label"], &format!(r#""fsLabel":"{}""#, label));
+        fails(
+            &bin,
+            &["assemble", "--create", "--size", "40M", "--manifest", &m, &j, t],
+            message,
+        );
+        fails(&bin, &["assemble", "--plan", "--manifest", &m], message);
+        assert!(!Path::new(&j).exists());
+        refused.push((m, message));
+    }
+    // populate checks the file system against what the manifest names, and
+    // writes nothing into another one. Its errors name the image, or the
+    // manifest for a label it refuses. A manifest that names nothing goes
+    // anywhere.
+    ok(&bin, &["populate", "--manifest", &esp, &g, t]);
+    ok(&bin, &["populate", "--replace", "--manifest", p, &g, t]);
+    ok(&bin, &["populate", "--replace", "--manifest", &unlabeled, &a, t]);
+    let other = named("other", &["fs-label"], r#""fsLabel":"OTHER""#);
+    let (before_a, before_g) = (fs::read(&a).unwrap(), fs::read(&g).unwrap());
+    for (img, m, message) in [
+        (
+            &a,
+            &esp,
+            format!(
+                "the file system has the serial number {}, the manifest is for 1234-ABCD (fatSerial)",
+                derived
+            ),
+        ),
+        (
+            &g,
+            &other,
+            "the file system has the label 'ESP', the manifest is for 'OTHER' (fsLabel)".to_string(),
+        ),
+        (
+            &a,
+            &other,
+            "the file system has no label, the manifest is for 'OTHER' (fsLabel)".to_string(),
+        ),
+        (
+            &g,
+            &unlabeled,
+            "the file system has the label 'ESP', the manifest is for one without a label (fsLabel)".to_string(),
+        ),
+    ] {
+        fails(
+            &bin,
+            &["populate", "--replace", "--manifest", m, img, t],
+            &format!("ufat: {}: {}", img, message),
+        );
+    }
+    for (m, message) in &refused {
+        fails(
+            &bin,
+            &["populate", "--replace", "--manifest", m, &g, t],
+            &format!("ufat: {}: {}", m, message),
+        );
+    }
+    assert!(fs::read(&a).unwrap() == before_a, "a.img changed");
+    assert!(fs::read(&g).unwrap() == before_g, "g.img changed");
+    // What ufat writes of a file system names it, so it makes the same
+    // serial number and label again and goes into that file system.
+    let written = root.join("written.manifest");
+    ok(&bin, &["describe", "--write-manifest", written.to_str().unwrap(), &g]);
+    let text = fs::read_to_string(&written).unwrap();
+    assert!(
+        text.starts_with(concat!(
+            "\u{1e}{\"fatSerial\":\"1234-ABCD\",",
+            "\"features\":[\"device\",\"fat-serial\",\"fs-label\",\"hardlink\",\"read-only\",\"sha256\",\"size\",\"symlink\"],",
+            "\"fsLabel\":\"ESP\","
+        )),
+        "{}",
+        text
+    );
+    let l = image("l.img");
+    ok(
+        &bin,
+        &[
+            "assemble",
+            "--create",
+            "--minimize",
+            "--manifest",
+            written.to_str().unwrap(),
+            &l,
+            t,
+        ],
+    );
+    assert_eq!(
+        described_identity(&bin, &l),
+        ("1234-ABCD".to_string(), "ESP".to_string())
+    );
+    ok(
+        &bin,
+        &["populate", "--replace", "--manifest", written.to_str().unwrap(), &g, t],
+    );
+    // So does what ufat writes of a file system without a label, which
+    // lists fs-label and has no fsLabel.
+    ok(&bin, &["describe", "--write-manifest", written.to_str().unwrap(), &a]);
+    let text = fs::read_to_string(&written).unwrap();
+    assert!(!text.contains("fsLabel") && text.contains("\"fs-label\""), "{}", text);
+    let m = image("m.img");
+    ok(
+        &bin,
+        &["assemble", "--create", "--manifest", written.to_str().unwrap(), &m],
+    );
+    assert_eq!(described_identity(&bin, &m), (derived.clone(), String::new()));
+    fails(
+        &bin,
+        &["populate", "--replace", "--manifest", written.to_str().unwrap(), &g, t],
+        &format!("ufat: {}: the file system has the serial number 1234-ABCD", g),
+    );
+    // The label a manifest names takes an entry in the root directory,
+    // which a plan counts: sixteen files fill a cluster of 512 bytes, the
+    // label entry is a seventeenth. A manifest that names no label takes
+    // none.
+    let mut sixteen =
+        String::from("\u{1e}{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n");
+    for i in 0..16 {
+        sixteen.push_str(&format!("\u{1e}{{\"name\":\"f{:02}\",\"size\":0}}\n", i));
+    }
+    sixteen.push_str("\u{1e}{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n");
+    for (fields, clusters) in [
+        ("", "1 cluster"),
+        (r#""features":["fs-label","size"],"fsLabel":"ESP","#, "2 clusters"),
+        (r#""features":["fs-label","size"],"#, "1 cluster"),
+    ] {
+        let path = root.join("sixteen.manifest");
+        fs::write(&path, sixteen.replacen("\u{1e}{", &format!("\u{1e}{{{}", fields), 1)).unwrap();
+        let out = run(
+            &bin,
+            &[
+                "assemble",
+                "--plan",
+                "--verbose",
+                "--cluster-size",
+                "512",
+                "--manifest",
+                path.to_str().unwrap(),
+            ],
+        );
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("16 files, 0 directories, 0 bytes: {} of 512 bytes", clusters)),
+            "{}: {}",
+            fields,
+            stderr
+        );
+    }
+}
+
 /// Names FAT does not tell apart are one name: assemble and populate refuse
 /// a second one, in a manifest as well as in a tree, a directory's as well
 /// as a file's, unless --replace says to take it as the first. A tree is
@@ -2789,6 +3199,50 @@ fn counts_of_one() {
         stderr
     );
     assert!(stderr.starts_with("ufat: 1 entry is not in "), "{}", stderr);
+}
+
+/// A label that a file system made from the manifest would not get, which
+/// only other tools write, is not in the manifest of a volume, and describe
+/// names it, apart from the entries it leaves out.
+#[test]
+fn a_label_the_manifest_leaves_out_is_named() {
+    use std::os::unix::fs::FileExt;
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let root = Temp::dir();
+    let img = root.path().join("l.img");
+    let img = img.to_str().unwrap();
+    ok(&bin, &["assemble", "--create", "--size", "40M", "--label", "ESP", img]);
+    // The label entry of the root directory as another tool writes it: A+B,
+    // which a file system made from the manifest would not get.
+    let device = fat::device::Device::open(Path::new(img), fat::device::Access::ReadOnly).unwrap();
+    let v = fat::volume::Volume::open(device).unwrap();
+    let offset = v.layout().cluster_offset(v.boot_sector().root_cluster).unwrap();
+    let mut cluster = vec![0u8; v.layout().cluster_size() as usize];
+    drop(v);
+    let file = fs::OpenOptions::new().read(true).write(true).open(img).unwrap();
+    file.read_exact_at(&mut cluster, offset).unwrap();
+    let slot = cluster
+        .chunks(fat::dirent::DIR_ENTRY_SIZE)
+        .position(|e| e[fat::dirent::field::ATTR] == fat::dirent::ATTR_VOLUME_ID)
+        .unwrap();
+    let name = slot * fat::dirent::DIR_ENTRY_SIZE + fat::dirent::field::NAME.start;
+    file.write_all_at(b"A+B        ", offset + name as u64).unwrap();
+    let m = root.path().join("l.manifest");
+    let out = run(&bin, &["describe", "--write-manifest", m.to_str().unwrap(), img]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{}", stderr);
+    assert_eq!(
+        stderr,
+        format!(
+            "ufat: the label 'A+B' is not in {}: a file system made from it would not get that label\n",
+            m.display()
+        )
+    );
+    let manifest = fs::read_to_string(&m).unwrap();
+    assert!(!manifest.contains("fsLabel"), "{}", manifest);
 }
 
 /// `ufat manifest` prints the manifest while it walks the tree. It leaves

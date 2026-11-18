@@ -2078,7 +2078,7 @@ fn manifests_record_and_apply_features() {
         features.unwrap().names().collect::<Vec<_>>()
     };
     // Every value is taken. What FAT has no notion of is not recorded, and
-    // the read-only attribute always is.
+    // the read-only attribute and what names the volume always are.
     let img_ro = ro(image.path());
     let out = scratch.path().join("all.manifest");
     let out_file = sink(&out);
@@ -2097,6 +2097,7 @@ fn manifests_record_and_apply_features() {
         listed(&out),
         [
             "device",
+            "fat-serial",
             "flag-append-only",
             "flag-archive",
             "flag-hidden",
@@ -2105,6 +2106,7 @@ fn manifests_record_and_apply_features() {
             "flag-no-cow",
             "flag-no-dump",
             "flag-system",
+            "fs-label",
             "hardlink",
             "mtime",
             "read-only",
@@ -2131,7 +2133,16 @@ fn manifests_record_and_apply_features() {
     drop(out_file);
     assert_eq!(
         listed(&out),
-        ["device", "hardlink", "read-only", "sha256", "size", "symlink"]
+        [
+            "device",
+            "fat-serial",
+            "fs-label",
+            "hardlink",
+            "read-only",
+            "sha256",
+            "size",
+            "symlink"
+        ]
     );
     // systemd-manifest's name for sha256 is not one of them.
     let out_file = sink(&out);
@@ -2220,6 +2231,254 @@ fn manifests_record_and_apply_features() {
         assert_eq!(u64_of(&e.parameters, "record"), 1, "{}", record);
         assert_eq!(e.parameters.get("field").and_then(Value::as_str), field, "{}", record);
     }
+}
+
+/// The root object of a manifest names the file system: Assemble gives it
+/// the serial number and the label, its identifier and label options have
+/// to agree, and Populate checks them. A manifest that names no serial
+/// number gives the one derived from its bytes, the same from a file, from
+/// a pipe, with minimize and in a plan. One that lists fs-label without
+/// fsLabel is for a file system without a label. A label that FAT cannot
+/// store, or would report as another one or as none, is refused. The sink
+/// names the file system.
+#[test]
+fn manifests_name_the_file_system() {
+    let _serial = common::serial();
+    let Some(ufat) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let tree = esp_tree();
+    let (manifest, _) = manifest_and_blob(tree.path());
+    let scratch = Temp::dir();
+    let mut c = connect_fd3(&ufat);
+    let source = ro(tree.path());
+    let mismatch = |e: varlink::Error, field: &str, expected: Option<&str>, found: Option<&str>| {
+        assert_eq!(
+            e.name,
+            format!("{}.FileSystemMismatch", IFACE),
+            "{}",
+            Value::Object(e.parameters.clone())
+        );
+        assert_eq!(str_of(&e.parameters, "field"), field);
+        assert_eq!(e.parameters.get("expected").and_then(Value::as_str), expected);
+        assert_eq!(e.parameters.get("found").and_then(Value::as_str), found);
+    };
+    // The serial number derived from the manifest: in a plan, from a file,
+    // with minimize, and from a pipe.
+    let derived = common::derived_serial(&manifest);
+    let plain = file_with(scratch.path(), "plain", &manifest);
+    let r = reply(call(
+        &mut c,
+        "Assemble",
+        r#"{"mode":"plan","content":{"manifest":{"fileDescriptor":0}}}"#,
+        &[plain.as_fd()],
+    ));
+    assert_eq!(str_of(object_of(&r, "description"), "identifier"), derived);
+    let sized = r#"{"image":{"fileDescriptor":0,"size":41943040},"options":{"timestampUSec":1700000000000000},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2,"manifestSink":{"fileDescriptor":3}},"imageHash":"sha256"}"#;
+    let minimized = r#"{"image":{"fileDescriptor":0},"options":{"minimize":true,"timestampUSec":1700000000000000},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2,"manifestSink":{"fileDescriptor":3}}}"#;
+    let mut images = Vec::new();
+    for (params, manifest_file) in [
+        (sized, ro(&scratch.path().join("plain"))),
+        (minimized, ro(&scratch.path().join("plain"))),
+        (sized, pipe_with(&manifest)),
+    ] {
+        let (image, img) = fresh_image();
+        let written = scratch.path().join("written.manifest");
+        let out_file = sink(&written);
+        let r = reply(call(
+            &mut c,
+            "Assemble",
+            params,
+            &[img.as_fd(), manifest_file.as_fd(), source.as_fd(), out_file.as_fd()],
+        ));
+        drop(out_file);
+        assert_eq!(str_of(object_of(&r, "description"), "identifier"), derived);
+        assert_eq!(serial_in(image.path()), derived);
+        // The hash is the one of the image with the serial number in it.
+        if let Some(hash) = r.get("imageHash").and_then(Value::as_str) {
+            assert_eq!(hash, sha256_hex(&std::fs::read(image.path()).unwrap()));
+        }
+        // So is the manifest written of it, which says that the file system
+        // has no label.
+        let m = read_manifest(&std::fs::read(&written).unwrap());
+        let identity = &m.root.file_system;
+        assert_eq!(
+            identity.fat_serial.map(|serial| serial.to_string()),
+            Some(derived.clone())
+        );
+        assert_eq!(identity.label, None);
+        assert!(m.root.recorded_features().contains(fat::manifest::Features::FS_LABEL));
+        images.push(image);
+    }
+    // A manifest that names the file system gives it its serial number and
+    // label, and the options have to agree with them.
+    let esp = common::with_root_fields(
+        &manifest,
+        &["fat-serial", "fs-label"],
+        r#""fatSerial":"1234-abcd","fsLabel":"ESP""#,
+    );
+    let esp_file = file_with(scratch.path(), "esp", &esp);
+    let r = reply(call(
+        &mut c,
+        "Assemble",
+        r#"{"mode":"plan","options":{"identifier":"1234ABCD","label":"ESP"},"content":{"manifest":{"fileDescriptor":0}}}"#,
+        &[esp_file.as_fd()],
+    ));
+    let d = object_of(&r, "description");
+    assert_eq!((str_of(d, "identifier"), str_of(d, "label")), ("1234-ABCD", "ESP"));
+    let (named, named_img) = fresh_image();
+    let esp_file = ro(&scratch.path().join("esp"));
+    let r = reply(call(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        &[named_img.as_fd(), esp_file.as_fd(), source.as_fd()],
+    ));
+    let d = object_of(&r, "description");
+    assert_eq!((str_of(d, "identifier"), str_of(d, "label")), ("1234-ABCD", "ESP"));
+    let unlabeled = common::with_root_fields(&manifest, &["fs-label"], "");
+    file_with(scratch.path(), "unlabeled", &unlabeled);
+    for (file, options, field, expected, found) in [
+        (
+            "esp",
+            r#"{"identifier":"1234-0000"}"#,
+            "fatSerial",
+            Some("1234-ABCD"),
+            "1234-0000",
+        ),
+        ("esp", r#"{"label":"BOOT"}"#, "fsLabel", Some("ESP"), "BOOT"),
+        // fs-label listed without fsLabel: no label, and a label given is
+        // one too many.
+        ("unlabeled", r#"{"label":"BOOT"}"#, "fsLabel", None, "BOOT"),
+    ] {
+        let manifest_file = ro(&scratch.path().join(file));
+        let e = error_of(
+            &mut c,
+            "Assemble",
+            &format!(
+                r#"{{"mode":"plan","options":{},"content":{{"manifest":{{"fileDescriptor":0}}}}}}"#,
+                options
+            ),
+            &[manifest_file.as_fd()],
+        );
+        mismatch(e, field, expected, Some(found));
+    }
+    let uuid = common::with_root_fields(
+        &manifest,
+        &["fs-uuid"],
+        r#""fsUUID":"5678abcd-0000-4000-8000-000000000000""#,
+    );
+    let uuid_file = file_with(scratch.path(), "uuid", &uuid);
+    let e = error_of(
+        &mut c,
+        "Assemble",
+        r#"{"mode":"plan","options":{"identifier":"00000001"},"content":{"manifest":{"fileDescriptor":0}}}"#,
+        &[uuid_file.as_fd()],
+    );
+    mismatch(e, "fsUUID", Some("5678-ABCD"), Some("0000-0001"));
+    // Populate puts the content of a manifest into the file system it
+    // names.
+    let populate = r#"{"image":{"fileDescriptor":0},"path":"/","content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2,"replace":true}}"#;
+    let esp_file = ro(&scratch.path().join("esp"));
+    let r = reply(call(
+        &mut c,
+        "Populate",
+        populate,
+        &[named_img.as_fd(), esp_file.as_fd(), source.as_fd()],
+    ));
+    assert_eq!(u64_of(&r, "files"), 2);
+    // From here on Populate refuses every manifest, and writes nothing.
+    let other = rw(images[0].path());
+    let (before_other, before_named) = (
+        std::fs::read(images[0].path()).unwrap(),
+        std::fs::read(named.path()).unwrap(),
+    );
+    // A label FAT cannot store is refused, and so is one it would report as
+    // another label or as none: blkid shows a FAT label without the spaces
+    // at its end, and nothing for the blank label and NO NAME. Populate
+    // refuses them as Assemble does.
+    for (label, reason) in [
+        ("much too long", "tooLong"),
+        ("ESP ", "invalidCharacter"),
+        ("   ", "reserved"),
+        ("NO NAME", "reserved"),
+    ] {
+        let refused = common::with_root_fields(&manifest, &["fs-label"], &format!(r#""fsLabel":"{}""#, label));
+        let refused_file = file_with(scratch.path(), "refused", &refused);
+        let e = error_of(
+            &mut c,
+            "Assemble",
+            r#"{"mode":"plan","content":{"manifest":{"fileDescriptor":0}}}"#,
+            &[refused_file.as_fd()],
+        );
+        assert_eq!(e.name, format!("{}.InvalidLabel", IFACE), "{:?}", label);
+        assert_eq!(str_of(&e.parameters, "reason"), reason, "{:?}", label);
+        assert_eq!(str_of(&e.parameters, "label"), label);
+        let refused_file = ro(&scratch.path().join("refused"));
+        let e = error_of(
+            &mut c,
+            "Populate",
+            populate,
+            &[named_img.as_fd(), refused_file.as_fd(), source.as_fd()],
+        );
+        assert_eq!(e.name, format!("{}.InvalidLabel", IFACE), "{:?}", label);
+        assert_eq!(str_of(&e.parameters, "reason"), reason, "{:?}", label);
+    }
+    // Populate checks the file system against what the manifest names.
+    let label = common::with_root_fields(&manifest, &["fs-label"], r#""fsLabel":"ESP""#);
+    file_with(scratch.path(), "label", &label);
+    for (img, file, field, expected, found) in [
+        (&other, "esp", "fatSerial", Some("1234-ABCD"), Some(derived.as_str())),
+        (&other, "label", "fsLabel", Some("ESP"), None),
+        (&named_img, "unlabeled", "fsLabel", None, Some("ESP")),
+    ] {
+        let manifest_file = ro(&scratch.path().join(file));
+        let e = error_of(
+            &mut c,
+            "Populate",
+            populate,
+            &[img.as_fd(), manifest_file.as_fd(), source.as_fd()],
+        );
+        mismatch(e, field, expected, found);
+    }
+    assert!(std::fs::read(images[0].path()).unwrap() == before_other);
+    assert!(std::fs::read(named.path()).unwrap() == before_named);
+    // A manifest that names no label goes into a file system without one.
+    let unlabeled_file = ro(&scratch.path().join("unlabeled"));
+    let r = reply(call(
+        &mut c,
+        "Populate",
+        populate,
+        &[other.as_fd(), unlabeled_file.as_fd(), source.as_fd()],
+    ));
+    assert_eq!(u64_of(&r, "files"), 2);
+    // The manifest of a file system names it.
+    let out = scratch.path().join("described.manifest");
+    let out_file = sink(&out);
+    let named_ro = ro(named.path());
+    reply(call(
+        &mut c,
+        "Describe",
+        r#"{"image":{"fileDescriptor":0},"manifestSink":{"fileDescriptor":1}}"#,
+        &[named_ro.as_fd(), out_file.as_fd()],
+    ));
+    drop(out_file);
+    let m = read_manifest(&std::fs::read(&out).unwrap());
+    let identity = &m.root.file_system;
+    assert_eq!(
+        identity.fat_serial.map(|serial| serial.to_string()).as_deref(),
+        Some("1234-ABCD")
+    );
+    assert_eq!(identity.label.as_deref(), Some("ESP"));
+    assert!(m
+        .root
+        .recorded_features()
+        .contains(fat::manifest::Features::FAT_SERIAL | fat::manifest::Features::FS_LABEL));
+}
+
+/// The serial number of the FAT volume in `image`, written XXXX-XXXX.
+fn serial_in(image: &Path) -> String {
+    fat::format::VolumeId(volume(image, Access::ReadOnly).boot_sector().volume_id).to_string()
 }
 
 /// With the more flag Assemble tells which step it is in, in order.
@@ -2352,6 +2611,28 @@ fn reproducible_images_are_identical() {
     let (b, b_img) = fresh_image();
     reply(call(&mut c, "Assemble", &options, &[a_img.as_fd(), source.as_fd()]));
     reply(call(&mut c, "Assemble", &options, &[b_img.as_fd(), source.as_fd()]));
+    assert!(std::fs::metadata(a.path()).unwrap().len() > 0);
+    assert_eq!(first_difference(a.path(), b.path()).unwrap(), None);
+    // A manifest names the serial number or has it derived from its bytes,
+    // so it needs no identifier.
+    let (manifest, _) = manifest_and_blob(tree.path());
+    let scratch = Temp::dir();
+    file_with(scratch.path(), "manifest", &manifest);
+    let options = format!(
+        r#"{{"image":{{"fileDescriptor":0}},"options":{{"minimize":true,"reproducible":true,"timestampUSec":{},"label":"ESP"}},"content":{{"manifest":{{"fileDescriptor":1}},"sourceFileDescriptor":2}}}}"#,
+        T0
+    );
+    let (a, a_img) = fresh_image();
+    let (b, b_img) = fresh_image();
+    for img in [&a_img, &b_img] {
+        let manifest_file = ro(&scratch.path().join("manifest"));
+        reply(call(
+            &mut c,
+            "Assemble",
+            &options,
+            &[img.as_fd(), manifest_file.as_fd(), source.as_fd()],
+        ));
+    }
     assert!(std::fs::metadata(a.path()).unwrap().len() > 0);
     assert_eq!(first_difference(a.path(), b.path()).unwrap(), None);
 }

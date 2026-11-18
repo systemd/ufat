@@ -13,7 +13,8 @@ use std::time::SystemTime;
 
 use crate::boot::{
     default_boot_code, field, valid_media, BootSector, FsInfo, BOOT_JUMP, BOOT_SIGNATURE, DRIVE_NUMBER_FIXED,
-    EXT_BOOT_SIGNATURE, FS_TYPE_FAT32, LABEL_SIZE, MEDIA_FIXED, NO_NAME, OEM_NAME_DEFAULT, OEM_NAME_SIZE,
+    EXT_BOOT_SIGNATURE, FS_TYPE_FAT32, LABEL_PADDING, LABEL_SIZE, MEDIA_FIXED, NO_NAME, OEM_NAME_DEFAULT,
+    OEM_NAME_SIZE,
 };
 use crate::bytes::size;
 use crate::device::Device;
@@ -117,7 +118,7 @@ pub fn encode_label(label: &str) -> Result<[u8; LABEL_SIZE]> {
             LABEL_SIZE
         );
     }
-    if bytes.iter().all(|&c| c == b' ') {
+    if bytes.iter().all(|&c| c == LABEL_PADDING) {
         return Ok(NO_NAME);
     }
     if bytes.first() == Some(&b' ') {
@@ -146,9 +147,39 @@ pub fn encode_label(label: &str) -> Result<[u8; LABEL_SIZE]> {
             );
         }
     }
-    let mut out = [b' '; LABEL_SIZE];
+    let mut out = [LABEL_PADDING; LABEL_SIZE];
     out[..bytes.len()].copy_from_slice(bytes);
     Ok(out)
+}
+
+/// Validates a label that a volume has to report as it is, such as the one
+/// a manifest names, and returns its space padded on-disk form. On top of
+/// what [`encode_label`] refuses, that is a label that ends with a space,
+/// which FAT reads as padding, and the blank label and `NO NAME`, which FAT
+/// stores for no label: they fail with EINVAL and [`Detail::Label`].
+pub fn encode_exact_label(label: &str) -> Result<[u8; LABEL_SIZE]> {
+    let raw = encode_label(label)?;
+    let invalid = |problem: LabelProblem| Detail::Label {
+        label: label.to_string(),
+        problem,
+    };
+    if raw == NO_NAME {
+        bail!(
+            EINVAL,
+            invalid(LabelProblem::Reserved),
+            "label '{}' is what FAT stores for no label",
+            label
+        );
+    }
+    if label.ends_with(char::from(LABEL_PADDING)) {
+        bail!(
+            EINVAL,
+            invalid(LabelProblem::InvalidCharacter),
+            "label '{}' ends with a space, which FAT does not keep",
+            label
+        );
+    }
+    Ok(raw)
 }
 
 /// The label `raw` as text, without its padding. The code page is
@@ -512,6 +543,39 @@ mod tests {
                 }),
                 "{:?}",
                 bad
+            );
+        }
+    }
+
+    /// A label a volume has to report as it is: what FAT reads back as
+    /// another label or as none is refused as well.
+    #[test]
+    fn exact_labels() {
+        for label in ["ESP", "A B", "no name"] {
+            let raw = encode_exact_label(label).unwrap();
+            assert_eq!(raw, encode_label(label).unwrap());
+            assert_eq!(decode_label(&raw), label);
+        }
+        for (label, problem) in [
+            ("ESP ", LabelProblem::InvalidCharacter),
+            ("A B  ", LabelProblem::InvalidCharacter),
+            (" ", LabelProblem::Reserved),
+            ("           ", LabelProblem::Reserved),
+            ("NO NAME", LabelProblem::Reserved),
+            ("NO NAME ", LabelProblem::Reserved),
+            ("TOOLONGLABEL", LabelProblem::TooLong),
+            (" X", LabelProblem::InvalidCharacter),
+        ] {
+            let e = encode_exact_label(label).unwrap_err();
+            assert_eq!(e.errno(), EINVAL, "{:?}", label);
+            assert_eq!(
+                e.detail(),
+                Some(&Detail::Label {
+                    label: label.into(),
+                    problem,
+                }),
+                "{:?}",
+                label
             );
         }
     }

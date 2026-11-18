@@ -303,6 +303,16 @@ type ManifestFeature(
 # plans the content first: it reads the whole manifest before it writes and
 # needs it in a regular file; a pipe is BadFileDescriptor with reason wrongType
 # then. In mode plan the manifest is read once, and a pipe will do.
+#
+# The root file object's fsUUID, fsLabel and fatSerial name the filesystem
+# the manifest is for. One that lists fs-label in its features without
+# fsLabel names a filesystem without a label. Assemble gives the filesystem
+# that UUID or serial number and that label, which FormatOptions.identifier
+# and label have to agree with; a manifest that names no UUID or serial number
+# gives the filesystem one derived from the manifest's bytes. Populate checks
+# them against the filesystem, and a difference is FileSystemMismatch. The
+# label is the one the filesystem reports: a label the filesystem cannot store,
+# or would report as another one or as none, is InvalidLabel for both.
 type Manifest(
 	# Index of the descriptor, open read-only
 	fileDescriptor: int,
@@ -324,7 +334,8 @@ type ManifestSink(
 	# Where the filesystem has none of what a feature describes, the manifest
 	# records that there is none, as for symbolic links, device nodes, hard
 	# links, extended attributes and inode flags on vfat. The manifest of vfat
-	# records the read-only attribute whether read_only is asked for or not.
+	# records the read-only attribute, the serial number and the label whether
+	# read_only, fat_serial and fs_label are asked for or not.
 	features: ?[]ManifestFeature
 )
 
@@ -385,9 +396,14 @@ type VfatOptions(
 # structs are honoured by their own implementation and refused by every
 # other.
 type FormatOptions(
-	# The volume label, within Capabilities.label
+	# The volume label, within Capabilities.label. With a manifest as content
+	# that names one, or names none, it has to agree, and it is the manifest's
+	# by default
 	label: ?string,
-	# The UUID or serial, as Capabilities.identifier says; random by default
+	# The UUID or serial, as Capabilities.identifier says; random by default.
+	# With a manifest as content that names one, it has to be that one, which
+	# it is by default. With a manifest that names none, it is derived from
+	# the manifest by default
 	identifier: ?string,
 	# The filesystem's time: stamped where the filesystem has one creation
 	# time or root time, and the fixed or clamping time for content; the
@@ -407,9 +423,10 @@ type FormatOptions(
 	# Make the filesystem the smallest that holds the content, false by
 	# default; Image.size is then the most it may take
 	minimize: ?bool,
-	# Make the bytes a function of the inputs alone: requires identifier and
-	# timestampUSec and pins everything else the implementation knows to
-	# vary (seeds, worker counts, walk order)
+	# Make the bytes a function of the inputs alone: requires timestampUSec,
+	# and identifier unless the content is a UAPI.16 manifest, which names
+	# the identifier or has one derived from it, and pins everything else
+	# the implementation knows to vary (seeds, worker counts, walk order)
 	reproducible: ?bool,
 	# Features to turn on or off, by the names Capabilities.features lists
 	enableFeatures: ?[]string,
@@ -726,8 +743,12 @@ error DirectoryNotEmpty(path: string)
 type NameProblem(empty, dotComponent, invalidCharacter, leadingSpace, trailingSpaceOrDot, tooLong, caseCollision)
 error InvalidName(name: string, reason: NameProblem)
 
-# The label does not fit the filesystem's rules.
-type LabelProblem(tooLong, invalidCharacter, notSupported)
+# The label does not fit the filesystem's rules. The label a manifest names is
+# the one the filesystem reports, so one the filesystem would report another
+# way is refused as well: on FAT one with a space at its end is
+# invalidCharacter, and the blank one and NO NAME, which FAT stores for no
+# label, are reserved.
+type LabelProblem(tooLong, invalidCharacter, notSupported, reserved)
 error InvalidLabel(label: string, reason: LabelProblem)
 
 # The identifier is not of the kind the filesystem carries or not well formed.
@@ -764,6 +785,17 @@ error ContentNotSupported(name: ?string, what: UnsupportedKind, value: ?string)
 # A manifest entry is revoked or outside its validity window.
 type ValidityProblem(revoked, notYetValid, expired)
 error EntryNotValid(name: string, reason: ValidityProblem)
+
+# What the root file object of a manifest says about the filesystem does not
+# match: the filesystem Populate puts the manifest's content into, or the
+# identifier or label given to Assemble. field is the manifest's field the
+# expected value comes from: fatSerial, fsUUID or fsLabel. expected is what the
+# manifest names, absent where it names no label, and found is the
+# filesystem's value or the one given, absent where the filesystem has no
+# label. A serial number is written XXXX-XXXX, also the one derived from
+# fsUUID.
+type FileSystemField(fatSerial, fsUUID, fsLabel)
+error FileSystemMismatch(field: FileSystemField, expected: ?string, found: ?string)
 
 # The image is in use: mounted, or claimed by another process.
 error ImageBusy()

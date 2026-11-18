@@ -398,3 +398,36 @@ pub fn bytes_at(path: &Path, offset: u64, len: usize) -> Vec<u8> {
     buf.truncate(n);
     buf
 }
+
+/// The serial number a manifest of the bytes `manifest` gives a file
+/// system that names none: the first eight hex digits of its SHA-256 hash,
+/// written as serial numbers are.
+pub fn derived_serial(manifest: &[u8]) -> String {
+    let hex = fat::manifest::Sha256::digest(manifest).to_string().to_uppercase();
+    format!("{}-{}", &hex[..4], &hex[4..8])
+}
+
+/// The manifest `manifest`, whose root object starts with its features,
+/// with `fields` added to its root object and the features they belong to,
+/// `features`, added to the ones it lists.
+pub fn with_root_fields(manifest: &[u8], features: &[&str], fields: &str) -> Vec<u8> {
+    const LISTED: &str = "\u{1e}{\"features\":[";
+    let text = String::from_utf8(manifest.to_vec()).unwrap();
+    let rest = text
+        .strip_prefix(LISTED)
+        .expect("the root object starts with its features");
+    let (listed, rest) = rest.split_once(']').unwrap();
+    let mut names: Vec<String> = listed
+        .split(',')
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    names.extend(features.iter().map(|feature| format!("\"{}\"", feature)));
+    names.sort_unstable();
+    let fields = if fields.is_empty() {
+        String::new()
+    } else {
+        format!("{},", fields)
+    };
+    format!("\u{1e}{{{}\"features\":[{}]{}", fields, names.join(","), rest).into_bytes()
+}

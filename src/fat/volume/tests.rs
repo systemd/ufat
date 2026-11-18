@@ -1506,6 +1506,33 @@ fn root_time() {
     assert_eq!(v.root_time().unwrap(), Some(t(1_650_000_000)));
 }
 
+/// The label is the root directory's label entry, as Windows, EDK2, GRUB
+/// and blkid read it. A label only in the boot sector, which Windows leaves
+/// there when it removes the label, is none. Stamping the root's time makes
+/// a label entry with the boot sector's label, which is the label then.
+#[test]
+fn the_label_is_the_one_of_the_root_directory() {
+    let img = TempImage::new(1 << 20);
+    let unlabelled = FormatOptions {
+        label: None,
+        ..format_options(512, 512)
+    };
+    format::format(&img.device(), &unlabelled).unwrap();
+    img.device()
+        .write_at(boot::field::VOLUME_LABEL.start as u64, b"ESP        ")
+        .unwrap();
+    let mut v = Volume::open(img.device()).unwrap();
+    assert_eq!(v.boot_sector().volume_label, *b"ESP        ");
+    assert_eq!(v.label().unwrap(), None);
+    assert_eq!(v.label_bytes().unwrap(), None);
+    v.set_root_time(t(1_700_000_000)).unwrap();
+    assert_eq!(v.label().unwrap().as_deref(), Some("ESP"));
+    let entries = v.load_directory(v.boot.root_cluster).unwrap();
+    let label = entries.iter().find(|e| e.short.is_volume_label()).unwrap();
+    assert_eq!(label.short.name, *b"ESP        ");
+    v.close().unwrap();
+}
+
 /// set_times() writes the dot entries of a directory where only they
 /// differ: its entry has the time already and its "." and ".." do not.
 #[test]
@@ -1644,4 +1671,85 @@ fn set_attributes() {
     );
     assert_eq!(v.metadata("/d/f").unwrap().attributes, 0);
     assert_eq!(v.metadata("/d/g").unwrap().attributes, ATTR_SYSTEM | ATTR_ARCHIVE);
+}
+
+/// The serial numbers in the boot sector and in its backup of the volume
+/// in `img`, and the NT flags of the boot sector, as they are on disk. The
+/// file is read past the volume, which holds the image open.
+fn serials_on_disk(img: &TempImage) -> (u32, u32, u8) {
+    let bytes = std::fs::read(img.path()).unwrap();
+    let boot = BootSector::parse(&bytes).unwrap();
+    let ss = usize::from(boot.bytes_per_sector);
+    let backup = BootSector::parse(&bytes[usize::from(boot.backup_boot_sector) * ss..]).unwrap();
+    (boot.volume_id, backup.volume_id, boot.nt_flags)
+}
+
+#[test]
+fn the_serial_number_is_set_in_both_boot_sectors() {
+    let (img, mut v) = volume(8 << 20, 512, 512);
+    assert_eq!(serials_on_disk(&img), (0x1234_abcd, 0x1234_abcd, 0));
+    let mut w = v.create_file("/a", t(1_500_000_000), NameCollision::Fail).unwrap();
+    w.write_all(b"data").unwrap();
+    w.finish().unwrap();
+    v.set_volume_id(VolumeId(0x5678_9abc)).unwrap();
+    assert_eq!(v.boot_sector().volume_id, 0x5678_9abc);
+    // Both copies have it while the volume is written, which it says.
+    assert_eq!(serials_on_disk(&img), (0x5678_9abc, 0x5678_9abc, NT_FLAG_DIRTY));
+    v.close().unwrap();
+    // Closing marks the volume clean and keeps the new serial number.
+    assert_eq!(serials_on_disk(&img), (0x5678_9abc, 0x5678_9abc, 0));
+    // The test volume is small, which is worth a warning of its own.
+    let report = fsck::check(&img.device()).unwrap();
+    assert!(
+        report
+            .problems
+            .iter()
+            .all(|p| p.kind == fsck::ProblemKind::BelowMinimumClusters),
+        "{:?}",
+        report.problems
+    );
+    let v = Volume::open(img.device()).unwrap();
+    assert_eq!(v.boot_sector().volume_id, 0x5678_9abc);
+    assert_eq!(v.label().unwrap().as_deref(), Some("TEST"));
+    drop(v);
+    // On its own it is a session of its own, with the marks of one, and on
+    // a volume left unfinished they stay.
+    let mut v = Volume::open(img.device()).unwrap();
+    v.set_volume_id(VolumeId(1)).unwrap();
+    v.close_unfinished().unwrap();
+    assert_eq!(serials_on_disk(&img), (1, 1, NT_FLAG_DIRTY));
+    // In durable mode too, which flushes around the two writes.
+    let mut v = Volume::open(img.device()).unwrap();
+    v.set_durable(true);
+    v.set_volume_id(VolumeId(2)).unwrap();
+    v.close().unwrap();
+    assert_eq!(serials_on_disk(&img), (2, 2, NT_FLAG_DIRTY));
+}
+
+#[test]
+fn a_volume_without_a_backup_boot_sector_gets_the_serial_number_once() {
+    let img = TempImage::new(8 << 20);
+    let options = FormatOptions {
+        reserved_sectors: 2,
+        ..format_options(512, 512)
+    };
+    format::format(&img.device(), &options).unwrap();
+    let mut v = Volume::open(img.device()).unwrap();
+    assert_eq!(v.boot_sector().backup_boot_sector, 0);
+    let mut before = std::fs::read(img.path()).unwrap();
+    v.set_volume_id(VolumeId(0x0bad_cafe)).unwrap();
+    v.close().unwrap();
+    let after = std::fs::read(img.path()).unwrap();
+    // The serial number changed, and nothing else of the boot sector.
+    before[boot::field::VOLUME_ID].copy_from_slice(&0x0bad_cafe_u32.to_le_bytes());
+    assert_eq!(after[..BOOT_SECTOR_SIZE], before[..BOOT_SECTOR_SIZE]);
+    let report = fsck::check(&img.device()).unwrap();
+    assert!(
+        report.problems.iter().all(|p| matches!(
+            p.kind,
+            fsck::ProblemKind::NoBackupBootSector | fsck::ProblemKind::BelowMinimumClusters
+        )),
+        "{:?}",
+        report.problems
+    );
 }

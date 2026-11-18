@@ -246,15 +246,15 @@ see "Passing file descriptors".
 
 | Option | Meaning |
 |---|---|
-| `label` | The volume label. Fails with `InvalidLabel` when it breaks the label rules. |
-| `identifier` | The volume serial number, as `XXXX-XXXX` or eight hex digits. Fails with `InvalidIdentifier` otherwise. Random by default. With `timestampUSec` it is derived from the time stamp and the label. |
+| `label` | The volume label. Fails with `InvalidLabel` when it breaks the label rules. With a manifest that names a label, or names none, it is the manifest's by default, and a different one fails with `FileSystemMismatch`. |
+| `identifier` | The volume serial number, as `XXXX-XXXX` or eight hex digits. Fails with `InvalidIdentifier` otherwise. Random by default. With `timestampUSec` it is derived from the time stamp and the label. With a manifest, it is the serial number the manifest names, and a different one fails with `FileSystemMismatch`. A manifest that names none gives one derived from its bytes. |
 | `timestampUSec` | The time stamp. It is the time of the root directory, the time `fixed` and `clamp` use, and the time of manifest entries without one. The current time by default. |
 | `sectorSize` | 512, 1024, 2048 or 4096. The logical block size of a block device by default, 512 for an image file. It must not be smaller than the device's logical block size. |
 | `blockSize` | The cluster size: a power of two from the sector size up to 32768, at most 128 sectors. Chosen from the volume size by default, like mkfs.fat does. |
 | `zero` | Overwrites the whole data area with zeros. Off by default. |
 | `force` | Formats the image whatever it holds. Off by default. |
 | `minimize` | Makes the file system as small as the content allows. Off by default. |
-| `reproducible` | Makes the image depend on the inputs only. Requires `identifier` and `timestampUSec`, and fails with `NotReproducible` without them. Set `times` to `fixed` or `clamp` to make the file times reproducible too. |
+| `reproducible` | Makes the image depend on the inputs only. Requires `timestampUSec`, and `identifier` unless the content is a manifest, and fails with `NotReproducible` without them. A manifest names the serial number or has it derived from its bytes. Set `times` to `fixed` or `clamp` to make the file times of a tree reproducible too. |
 | `discard` | `false` is accepted. `true` fails with `OperationNotSupported`. |
 | `enableFeatures`, `disableFeatures` | FAT has none. Setting them fails with `OperationNotSupported`. |
 | `vfat` | FAT32 options, see below. |
@@ -465,6 +465,37 @@ has a `mode` that gives nobody write permission. FAT has no inode flags,
 so `flagAppendOnly`, `flagImmutable`, `flagNoAtime`, `flagNoCow` and
 `flagNoDump` are ignored.
 
+The root object of a manifest can name the file system it is for:
+`fatSerial` its serial number, `fsUUID` a UUID whose first eight hex
+digits give the serial number when there is no `fatSerial`, and
+`fsLabel` its label. A manifest that lists `fs-label` in `features` and
+has no `fsLabel` names a file system without a label, and so does an
+empty `fsLabel`. `Assemble` gives the file system that serial number and
+that label. An `identifier` or a `label` in the options that differs
+from the manifest's fails with `FileSystemMismatch`, where `found` is the
+option's value, and `expected` is absent where the manifest names no
+label. When neither the manifest nor the options name a serial number,
+it is derived from the manifest: the first four bytes of the SHA-256 hash
+of the manifest's bytes. So its digits are the first eight that
+`sha256sum` prints for the manifest, and a manifest gives the same serial
+number from a regular file and from a pipe, with `minimize` and without.
+Mode `plan` reports that serial number too.
+`Populate` checks the file system's serial number and label against what
+the manifest names and fails with `FileSystemMismatch` when they differ,
+where `found` is the file system's value, absent when it has no label.
+What the manifest does not name is not checked. Serial numbers are
+written `XXXX-XXXX`, the one derived from `fsUUID` as well.
+
+The label is the one the file system reports, as `blkid` shows it. FAT
+pads a label with spaces, and stores the blank label and `NO NAME` for
+no label. So for `Assemble` and `Populate` alike a manifest whose label
+ends with a space fails with `InvalidLabel` and reason
+`invalidCharacter`, and one whose label is blank or `NO NAME` with
+reason `reserved`, as one whose label FAT cannot store fails with
+`InvalidLabel`. The `label` option takes such a label as `mkfs.fat -n`
+does: it is padded with spaces, and a blank one or `NO NAME` is no
+label.
+
 Symbolic links below a source directory are followed. They are resolved
 below that directory and never lead out of it.
 
@@ -527,12 +558,19 @@ entry with the attribute carries `readOnly`, and an entry without
 `readOnly` does not have the attribute. FAT has no notion of modes,
 owners and their names, and the manifest does not record them, nor any
 of the other features. The root object declares `"order": "codepoint"`,
-so the manifest can be given as content again.
+so the manifest can be given as content again. The manifest names the
+volume as well, whether it is asked for or not, and lists `fat-serial`
+and `fs-label` in `features`: the root object has its serial number as
+`fatSerial`, and its label as `fsLabel` when it has one. So the manifest
+given to `Assemble` makes a file system with the same serial number and
+label, and given to `Populate` it goes into this volume only.
 
 The manifest describes the whole volume, including files that were there
 before the call. Entries whose names a manifest cannot carry are left out
-and counted in `omitted`. Two entries whose names FAT takes for one, such
-as `README.TXT` and `readme.txt`, are both listed, each with what it
+and counted in `omitted`. So is a label that a file system made from the
+manifest would not get, which only other tools write, and the manifest
+does not list `fs-label` then. Two entries whose names FAT takes for one,
+such as `README.TXT` and `readme.txt`, are both listed, each with what it
 holds.
 
 A damaged volume fails with `Corrupt`. `where` is `directory` when a
@@ -639,14 +677,15 @@ The service returns no text. Every error is a name with typed fields.
 | `IsADirectory` | A file where the file system has a directory: under the same name, as for `Populate` of a single file at a path that is a directory, or with `replace` under a name FAT does not tell apart from the directory's. | `path` |
 | `DirectoryNotEmpty` | `Remove` of a directory with entries, without `recursive`. | `path` |
 | `InvalidName` | A name FAT cannot store, or with `replace` false a name FAT does not tell apart from one that exists. | `name`, `reason` (`empty`, `dotComponent`, `invalidCharacter`, `leadingSpace`, `trailingSpaceOrDot`, `tooLong`, `caseCollision`) |
-| `InvalidLabel` | A label that breaks the label rules. | `label`, `reason` (`tooLong`, `invalidCharacter`) |
+| `InvalidLabel` | A label that breaks the label rules, or the label of a manifest that FAT would report another way. | `label`, `reason` (`tooLong`, `invalidCharacter`, `reserved`) |
 | `InvalidIdentifier` | A serial number that is not `XXXX-XXXX` or eight hex digits. | `identifier`, `reason` (`malformed`) |
 | `InvalidManifest` | The manifest cannot be parsed or is inconsistent. A key twice in an object is reason `duplicateKey`. With reason `unlistedFeature`, `field` names the field of a feature the manifest does not list, such as `mTimeNSec`. | `reason`, `record`, `name`, `field` |
 | `SourceMismatch` | A file the manifest names is missing from the source directory, or not a regular file. | `name`, `reason` (`missing`, `notRegular`) |
 | `ContentMismatch` | Copied contents do not match the manifest, or a file of the source directory is too short for them or changed while it was read. | `name`, `reason` (`size`, `hash`, `streamEnded`, `sourceChanged`), `sizeBytes`, `expectedSizeBytes` |
 | `ContentNotSupported` | Content FAT cannot store, with `unsupported` set to `fail`. Contents at an `offset` that come from a stream. | `what` (`offset`, `subManifest`, `inodeType`, or `transport` for contents only at a URL or in an encoding, which `value` names), `name`, `value` |
 | `EntryNotValid` | A manifest entry is revoked or outside its validity window. | `name`, `reason` (`revoked`, `notYetValid`, `expired`) |
-| `NotReproducible` | `reproducible` without `identifier` or `timestampUSec`. | `reason` (`identifierRequired`, `timestampRequired`) |
+| `FileSystemMismatch` | The serial number or the label a manifest names is not the one of the file system `Populate` writes to, or not the `identifier` or `label` given to `Assemble`. | `field` (`fatSerial`, `fsUUID`, `fsLabel`), `expected`, `found` |
+| `NotReproducible` | `reproducible` without `timestampUSec`, or without `identifier` for content that is not a manifest. | `reason` (`identifierRequired`, `timestampRequired`) |
 | `ImageBusy` | The block device is mounted or claimed by another process. | none |
 | `io.systemd.System` | Any other failure, such as an I/O error. | `errno`, `errnoName` |
 

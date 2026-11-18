@@ -472,8 +472,10 @@ fn generator_agrees_with_systemd_manifest() {
 /// has a notion of: none at all, and size, sha256 and mtime. The manifests
 /// of systemd got their features and their order declared, see the README.
 /// A manifest of a volume records the read-only attribute as well, which
-/// systemd-manifest does not record. So it lists read-only next to the
-/// features systemd-manifest lists.
+/// systemd-manifest does not record, and it names the volume: its serial
+/// number, 0000-0000 here, and its label, which it has none of. So it lists
+/// read-only, fat-serial and fs-label next to the features systemd-manifest
+/// lists, and its root object has fatSerial.
 #[test]
 fn volume_manifest_agrees_with_systemd_manifest() {
     let m = load("esp", "size-hash-mtime.Uapi16Manifest");
@@ -485,13 +487,13 @@ fn volume_manifest_agrees_with_systemd_manifest() {
             "none.Uapi16Manifest",
             Features::NONE,
             r#""features":[]"#,
-            r#""features":["read-only"]"#,
+            r#""fatSerial":"0000-0000","features":["fat-serial","fs-label","read-only"]"#,
         ),
         (
             "size-hash-mtime.Uapi16Manifest",
             Features::from_names(["size", "sha256", "mtime"]).unwrap(),
             r#""features":["mtime","sha256","size"]"#,
-            r#""features":["mtime","read-only","sha256","size"]"#,
+            r#""fatSerial":"0000-0000","features":["fat-serial","fs-label","mtime","read-only","sha256","size"]"#,
         ),
     ] {
         let mut ours = Vec::new();

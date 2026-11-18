@@ -11,10 +11,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fat::device::{Access, Device};
 use fat::errno;
-use fat::format::FormatOptions;
+use fat::format::{FormatOptions, VolumeId};
 use fat::host::{LinkError, Linked, Naming, NewFile};
 use fat::layout::Layout;
-use fat::manifest::{Order, Reader, RootObject};
+use fat::manifest::{
+    AssembleFlags, Finalize, Order, Reader, RootObject, SerialSource, Sha256, Sha256Context, VolumeIdentity,
+};
 use fat::plan::{Estimate, Plan, PlanOptions};
 use fat::probe::Prober;
 use fat::volume::Volume;
@@ -25,8 +27,8 @@ pub(crate) fn now() -> SystemTime {
     SystemTime::now()
 }
 
-/// The bytes of a manifest, as its reader takes them.
-pub(crate) enum ManifestBytes {
+/// Where the bytes of a manifest come from.
+enum Origin {
     /// A regular file, read with positional reads from `offset` on. The
     /// manifest starts at `start` in it. Positional reads leave the
     /// position of the descriptor alone, so the file can be read once more
@@ -36,31 +38,130 @@ pub(crate) enum ManifestBytes {
     Stream(Box<dyn Read + Send>),
 }
 
+/// The SHA-256 hash of the bytes of a manifest, taken while they are read.
+enum ManifestHash {
+    /// Not wanted, and not taken.
+    Unwanted,
+    /// The hash of the bytes read so far.
+    Partial(Sha256Context),
+    /// The hash of all of them, once their end was read.
+    Complete(Sha256),
+}
+
+/// Whether the serial number of a file system may be derived from the
+/// bytes of a manifest, see [`SerialSource::Derived`]. The bytes are hashed
+/// for it, so a manifest is hashed only where that is possible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SerialDerivation {
+    /// A file system is made from the manifest and no serial number was
+    /// given for it: unless the manifest names one, it is derived.
+    Possible,
+    /// None is derived: the manifest goes into a file system that is there,
+    /// the serial number was given, or nobody asks for it.
+    Never,
+}
+
+/// What a command or a method of the Varlink service does with the
+/// manifest it reads, as far as the serial number of a file system goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManifestOperation {
+    /// It makes a file system from the manifest: `assemble`, Assemble.
+    Assemble,
+    /// It plans the file system the manifest makes and reports it with its
+    /// serial number: Assemble in mode plan.
+    Plan,
+    /// It plans the size the content needs and reports nothing else:
+    /// `assemble --plan`.
+    PlanSize,
+    /// It puts the content into a file system that is there: `populate`,
+    /// Populate.
+    Populate,
+}
+
+impl ManifestOperation {
+    /// Whether a serial number may be derived from the manifest where the
+    /// caller gave the serial number `identifier`, if any: only for a file
+    /// system the operation makes or reports, and only where none is given.
+    pub(crate) fn serial_derivation(self, identifier: Option<VolumeId>) -> SerialDerivation {
+        match (self, identifier) {
+            (ManifestOperation::Assemble | ManifestOperation::Plan, None) => SerialDerivation::Possible,
+            (ManifestOperation::Assemble | ManifestOperation::Plan, Some(_)) => SerialDerivation::Never,
+            (ManifestOperation::PlanSize | ManifestOperation::Populate, _) => SerialDerivation::Never,
+        }
+    }
+}
+
+/// The bytes of a manifest, as its reader takes them, and their SHA-256
+/// hash while it is wanted.
+pub(crate) struct ManifestBytes {
+    origin: Origin,
+    hash: ManifestHash,
+}
+
 impl ManifestBytes {
-    /// The bytes of the same manifest once more from its start. None for a
-    /// pipe, which can be read once only.
+    /// The bytes from `origin`, hashed where `derivation` says that a
+    /// serial number may be derived from them.
+    fn new(origin: Origin, derivation: SerialDerivation) -> ManifestBytes {
+        let hash = match derivation {
+            SerialDerivation::Possible => ManifestHash::Partial(Sha256Context::default()),
+            SerialDerivation::Never => ManifestHash::Unwanted,
+        };
+        ManifestBytes { origin, hash }
+    }
+
+    /// The bytes of the same manifest once more from its start, hashed if
+    /// these are. None for a pipe, which can be read once only.
     fn again(&self) -> io::Result<Option<ManifestBytes>> {
-        let ManifestBytes::At { file, start, .. } = self else {
+        let Origin::At { file, start, .. } = &self.origin else {
             return Ok(None);
         };
-        Ok(Some(ManifestBytes::At {
+        let derivation = match self.hash {
+            ManifestHash::Unwanted => SerialDerivation::Never,
+            ManifestHash::Partial(_) | ManifestHash::Complete(_) => SerialDerivation::Possible,
+        };
+        let origin = Origin::At {
             file: file.try_clone()?,
             start: *start,
             offset: *start,
-        }))
+        };
+        Ok(Some(ManifestBytes::new(origin, derivation)))
+    }
+
+    /// Stops hashing the bytes, and drops what was hashed.
+    fn stop_hashing(&mut self) {
+        self.hash = ManifestHash::Unwanted;
+    }
+
+    /// The hash of the whole manifest, once its end was read, where it is
+    /// wanted. The reader reads the end when it is asked for a record after
+    /// the last one.
+    fn digest(&self) -> Option<Sha256> {
+        match self.hash {
+            ManifestHash::Complete(digest) => Some(digest),
+            ManifestHash::Unwanted | ManifestHash::Partial(_) => None,
+        }
     }
 }
 
 impl Read for ManifestBytes {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            ManifestBytes::At { file, offset, .. } => {
+        let read = match &mut self.origin {
+            Origin::At { file, offset, .. } => {
                 let read = file.read_at(buf, *offset)?;
                 *offset += read as u64;
-                Ok(read)
+                read
             }
-            ManifestBytes::Stream(stream) => stream.read(buf),
+            Origin::Stream(stream) => stream.read(buf)?,
+        };
+        if let ManifestHash::Partial(context) = &mut self.hash {
+            if read > 0 {
+                context.update(&buf[..read]);
+            } else if !buf.is_empty() {
+                let context = std::mem::take(context);
+                self.hash = ManifestHash::Complete(context.finalize());
+            }
         }
+        Ok(read)
     }
 }
 
@@ -80,6 +181,14 @@ pub(crate) enum ManifestUse {
     Plan,
 }
 
+/// What a plan found when it read a manifest.
+pub(crate) struct PlanOutcome {
+    /// The file objects the plan leaves out, see [`Plan::add_records`].
+    pub skipped: u64,
+    /// The hash of the manifest's bytes, where it is wanted.
+    pub digest: Option<Sha256>,
+}
+
 /// A manifest the tool was handed, open for reading.
 ///
 /// Its first record, the root file object, is read when it is opened, so a
@@ -89,9 +198,16 @@ pub(crate) enum ManifestUse {
 /// from there. A manifest in a regular file can be read once more before
 /// the content is written, from its start, for a plan. Standard input and
 /// pipes can be read once only.
+///
+/// Where the serial number of a file system made from the manifest may be
+/// derived from its bytes, see [`SerialDerivation`], they are hashed as
+/// they are read, until [`ManifestInput::stop_hashing`] says that the hash
+/// is not wanted. The first pass that reads all of them gives it.
 pub(crate) struct ManifestInput {
     /// The reader the content is taken from.
     reader: Reader<ManifestBytes>,
+    /// The hash of the manifest a plan found, which reads it all once more.
+    digest: Option<Sha256>,
 }
 
 impl ManifestInput {
@@ -102,17 +218,18 @@ impl ManifestInput {
     /// is read through `stream`, such as a [`fat::host::PassedStream`],
     /// which fails a read when the pipe was made non-blocking during the
     /// call. The manifest has to declare the code point order, see
-    /// [`RootObject::require_order`].
-    pub(crate) fn open<S>(stream: S, manifest_use: ManifestUse) -> Result<ManifestInput>
+    /// [`RootObject::require_order`]. Its bytes are hashed where
+    /// `derivation` says that a serial number may be derived from them.
+    pub(crate) fn open<S>(stream: S, manifest_use: ManifestUse, derivation: SerialDerivation) -> Result<ManifestInput>
     where
         S: Read + AsFd + Send + 'static,
     {
         // A regular file is read with positional reads, through a
         // descriptor of its own.
         let mut file = File::from(stream.as_fd().try_clone_to_owned()?);
-        let bytes = if file.metadata()?.is_file() {
+        let origin = if file.metadata()?.is_file() {
             let start = file.stream_position()?;
-            ManifestBytes::At {
+            Origin::At {
                 file,
                 start,
                 offset: start,
@@ -120,16 +237,27 @@ impl ManifestInput {
         } else if manifest_use == ManifestUse::Plan {
             return Err(ManifestInput::not_plannable());
         } else {
-            ManifestBytes::Stream(Box::new(stream))
+            Origin::Stream(Box::new(stream))
         };
-        let reader = Reader::open(bytes)?;
+        let reader = Reader::open(ManifestBytes::new(origin, derivation))?;
         reader.root().require_order(Order::CodePoint)?;
-        Ok(ManifestInput { reader })
+        Ok(ManifestInput { reader, digest: None })
+    }
+
+    /// Stops hashing the manifest: no serial number is derived from it.
+    /// Hashing never starts again.
+    pub(crate) fn stop_hashing(&mut self) {
+        self.reader.get_mut().stop_hashing();
     }
 
     /// The root file object of the manifest.
     pub(crate) fn root(&self) -> &RootObject {
         self.reader.root()
+    }
+
+    /// The volume the manifest is for, as its root file object says.
+    pub(crate) fn identity(&self) -> VolumeIdentity {
+        VolumeIdentity::from_root(self.root())
     }
 
     /// The error for a manifest that cannot be read once more for a plan:
@@ -146,20 +274,51 @@ impl ManifestInput {
         )
     }
 
-    /// A reader of the whole manifest once more, for a plan before the
-    /// content is written. The reader the content is taken from is left as
-    /// it is.
-    pub(crate) fn plan_reader(&self) -> Result<Reader<ManifestBytes>> {
+    /// Reads the whole manifest once more, from its start, into `plan`,
+    /// for content written with `flags` after it. The reader the content
+    /// is taken from is left as it is. The hash of the manifest the plan
+    /// finds is the one of the content, which is not hashed again when it
+    /// is written. Returns how many file objects the plan leaves out.
+    pub(crate) fn plan(&mut self, plan: &mut Plan, flags: AssembleFlags) -> Result<u64> {
         let Some(bytes) = self.reader.get_ref().again()? else {
             return Err(ManifestInput::not_plannable());
         };
-        Ok(Reader::open(bytes)?)
+        let mut reader = Reader::open(bytes)?;
+        let skipped = plan.add_records(&mut reader, flags)?;
+        self.digest = reader.get_ref().digest();
+        if self.digest.is_some() {
+            self.stop_hashing();
+        }
+        Ok(skipped)
+    }
+
+    /// Reads the rest of the manifest into `plan` with the reader the
+    /// content would be taken from, for a plan alone of content written
+    /// with `flags`. So the manifest is read once.
+    pub(crate) fn plan_once(mut self, plan: &mut Plan, flags: AssembleFlags) -> Result<PlanOutcome> {
+        let skipped = plan.add_records(&mut self.reader, flags)?;
+        Ok(PlanOutcome {
+            skipped,
+            digest: self.reader.get_ref().digest(),
+        })
     }
 
     /// The reader the content is taken from, which goes on after the root
     /// file object.
     pub(crate) fn reader(&mut self) -> &mut Reader<ManifestBytes> {
         &mut self.reader
+    }
+
+    /// Gives `volume`, made from the manifest, the serial number derived
+    /// from the manifest's bytes where `serial` says that it takes that one.
+    /// A plan or the reader the content was taken from has read them all by
+    /// then.
+    pub(crate) fn stamp_serial(&self, volume: &mut Volume, serial: SerialSource) -> Result<()> {
+        let digest = self.digest.or_else(|| self.reader.get_ref().digest());
+        match serial.derived_serial(digest)? {
+            Some(id) => volume.set_volume_id(id),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1180,5 +1339,120 @@ mod tests {
         assert!(lines.len() == 1 && lines[0].starts_with(&unsynced), "{:?}", lines);
         assert!(path.exists());
         assert_eq!(std::fs::read(&written).unwrap(), b"old\n");
+    }
+
+    /// A manifest of a directory with a file in it.
+    const MANIFEST: &str = concat!(
+        "\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n",
+        "\x1e{\"name\":\"d\",\"type\":\"dir\"}\n",
+        "\x1e{\"name\":\"d/f\",\"size\":0}\n",
+        "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
+    );
+
+    /// A manifest is hashed only where a serial number may be derived from
+    /// it. populate opens its manifest so that none is, and reads it to its
+    /// end without hashing it. assemble without a serial number given gets
+    /// the hash of the whole manifest from the pass that reads all of it:
+    /// the content, or a plan that reads the manifest once more, after
+    /// which the content is not hashed again. A serial number that turns
+    /// out to be given stops the hashing.
+    #[test]
+    fn manifests_are_hashed_only_where_a_serial_number_may_be_derived() {
+        let dir = TempDir::new("hashed");
+        let path = dir.0.join("manifest");
+        std::fs::write(&path, MANIFEST).unwrap();
+        let open = |derivation| ManifestInput::open(File::open(&path).unwrap(), ManifestUse::Plan, derivation).unwrap();
+        let unwanted = |input: &ManifestInput| matches!(input.reader.get_ref().hash, ManifestHash::Unwanted);
+        let read_to_end = |input: &mut ManifestInput| {
+            for object in input.reader() {
+                object.unwrap();
+            }
+        };
+        let plan = || Plan::new(PlanOptions::new(fat::layout::MIN_SECTOR_SIZE));
+        let digest = Sha256::digest(MANIFEST.as_bytes());
+        // As populate opens it: never hashed.
+        let mut input = open(SerialDerivation::Never);
+        read_to_end(&mut input);
+        assert!(unwanted(&input));
+        assert_eq!(input.reader.get_ref().digest(), None);
+        // As assemble opens it: hashed, and the hash is there once the end
+        // of the manifest was read.
+        let mut input = open(SerialDerivation::Possible);
+        assert_eq!(input.reader.get_ref().digest(), None);
+        read_to_end(&mut input);
+        assert_eq!(input.reader.get_ref().digest(), Some(digest));
+        // A serial number given stops it.
+        let mut input = open(SerialDerivation::Possible);
+        input.stop_hashing();
+        read_to_end(&mut input);
+        assert!(unwanted(&input));
+        // A plan that reads the manifest once more takes the hash, and the
+        // content is not hashed again.
+        let mut input = open(SerialDerivation::Possible);
+        input.plan(&mut plan(), AssembleFlags::NONE).unwrap();
+        assert_eq!(input.digest, Some(digest));
+        assert!(unwanted(&input));
+        read_to_end(&mut input);
+        assert!(unwanted(&input));
+        let mut input = open(SerialDerivation::Never);
+        input.plan(&mut plan(), AssembleFlags::NONE).unwrap();
+        assert_eq!(input.digest, None);
+        // A plan alone reads the manifest once, hashed where it may be.
+        let planned = open(SerialDerivation::Possible).plan_once(&mut plan(), AssembleFlags::NONE);
+        assert_eq!(planned.unwrap().digest, Some(digest));
+        let planned = open(SerialDerivation::Never).plan_once(&mut plan(), AssembleFlags::NONE);
+        assert_eq!(planned.unwrap().digest, None);
+        // The serial number derived from the hash goes into a volume made
+        // from the manifest, and none does where it is given.
+        let image = dir.0.join("a.img");
+        File::create(&image).unwrap().set_len(IMAGE_SIZE).unwrap();
+        let target = Target {
+            path: &image,
+            offset: 0,
+            size: None,
+            flags: ImageFlags::FORCE,
+        };
+        let mut new = formatted(&target);
+        let formatted_id = new.volume().boot_sector().volume_id;
+        let mut input = open(SerialDerivation::Possible);
+        read_to_end(&mut input);
+        input.stamp_serial(new.volume_mut(), SerialSource::Given).unwrap();
+        assert_eq!(new.volume().boot_sector().volume_id, formatted_id);
+        input.stamp_serial(new.volume_mut(), SerialSource::Derived).unwrap();
+        let derived = VolumeId::from_manifest_digest(&digest);
+        assert_eq!(new.volume().boot_sector().volume_id, derived.0);
+    }
+
+    /// A serial number may be derived only by what makes a file system or
+    /// reports the one it would make, and only where none is given. So
+    /// populate and assemble --plan never hash their manifests.
+    #[test]
+    fn what_derives_a_serial_number() {
+        let given = Some(VolumeId(0x1234_abcd));
+        for (operation, without, with) in [
+            (
+                ManifestOperation::Assemble,
+                SerialDerivation::Possible,
+                SerialDerivation::Never,
+            ),
+            (
+                ManifestOperation::Plan,
+                SerialDerivation::Possible,
+                SerialDerivation::Never,
+            ),
+            (
+                ManifestOperation::PlanSize,
+                SerialDerivation::Never,
+                SerialDerivation::Never,
+            ),
+            (
+                ManifestOperation::Populate,
+                SerialDerivation::Never,
+                SerialDerivation::Never,
+            ),
+        ] {
+            assert_eq!(operation.serial_derivation(None), without, "{:?}", operation);
+            assert_eq!(operation.serial_derivation(given), with, "{:?}", operation);
+        }
     }
 }
