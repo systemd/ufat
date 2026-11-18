@@ -24,6 +24,11 @@
 //!   [`InodeFlags`], [`Sha256`] and [`Uuid`] what their fields hold. What
 //!   the root file object and a file object both have is in
 //!   [`InodeAttributes`] and [`ValidityWindow`].
+//! - [`ContentSource`] is where the contents of the files come from when a
+//!   manifest is applied: [`DirectorySource`] for the files next to the
+//!   manifest and [`StreamSource`] for one stream with all of them.
+//!   [`FileObject::copy_contents`] copies the contents of a file and checks
+//!   them against the manifest with a [`ContentCheck`].
 //!
 //! A manifest that does not come through a [`Read`], such as one from an
 //! async runtime, goes to a [`Decoder`] as it comes. [`Decoder::step`] says
@@ -43,6 +48,11 @@
 //! [`Encoder::signature`] and [`Encoder::finish`] append its records to a
 //! string, and the caller sends them on.
 //!
+//! Contents that do not go through a [`Write`] are checked with a
+//! [`ContentCheck`]: [`ContentCheck::update`] takes them as they come, and
+//! [`ContentCheck::finish`] says whether they have the size and the hash
+//! the manifest gives.
+//!
 //! A manifest is input from outside and can be very large. Reading one
 //! takes time in proportion to its size, and keeps one record without its
 //! separator and the name of the file object before it in memory: less
@@ -52,7 +62,8 @@
 //!
 //! Signature objects are read and not verified: that takes an OpenPGP or
 //! an X.509 implementation. [`Reader::signed_len`] says how much of the
-//! manifest they sign.
+//! manifest they sign. Contents that are stored in an encoding or that
+//! have to be fetched from a URL are not taken.
 //!
 //! The reader takes every field the specification has. A field it does
 //! not know is passed over, whatever its value is, as the specification
@@ -66,6 +77,7 @@
 #![warn(missing_docs)]
 
 mod base64;
+mod content;
 mod decode;
 mod digest;
 mod error;
@@ -77,8 +89,9 @@ mod reader;
 mod sequence;
 mod writer;
 
+pub use content::{ContentCheck, ContentSource, Data, Directory, DirectorySource, OpenError, Reference, StreamSource};
 pub use digest::{Digest, Finalize, InvalidDigest, Sha256, Sha256Context};
-pub use error::{Error, ErrorKind, Field, Invalid, Problem};
+pub use error::{ContentProblem, Error, ErrorKind, Field, Invalid, Problem, SourceProblem, UnsupportedContent};
 pub use features::{Features, Order, UnknownFeature};
 pub use name::{InvalidName, Name};
 pub use object::{

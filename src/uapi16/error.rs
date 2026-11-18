@@ -169,6 +169,61 @@ impl Problem {
     }
 }
 
+/// How the data of a file object cannot be had from where it is: a file
+/// the manifest refers to that is not there as the manifest describes it,
+/// or a file or a stream that cannot be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SourceProblem {
+    /// The file is not there.
+    Missing,
+    /// It is not a regular file.
+    NotRegular,
+    /// The file could not be opened, or it or the stream could not be
+    /// read, for the reason [`Error::io_error`] gives.
+    Unreadable,
+}
+
+/// How contents fail to be what the manifest describes, found while they
+/// are copied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ContentProblem {
+    /// They are not as many bytes as the manifest says, their file is too
+    /// short for them, or their file is not as long as the `originalSize`
+    /// the manifest gives, shorter or longer.
+    SizeMismatch,
+    /// They do not have the hash the manifest says, or their file does not
+    /// have the hash the manifest gives for it.
+    HashMismatch,
+    /// The stream they come from ended before they were complete.
+    StreamEnded,
+    /// The file they are in changed while it was read: it is not as long
+    /// as it was when it was opened, or longer.
+    SourceChanged,
+}
+
+/// Contents that a manifest gives in a way this crate cannot take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum UnsupportedContent {
+    /// They start at an offset in their file, and the source is a
+    /// [`StreamSource`](crate::StreamSource), which has them and nothing
+    /// else of the file.
+    OffsetInStream,
+    /// The object gives no size, and the source is a
+    /// [`StreamSource`](crate::StreamSource), which needs it to know where
+    /// they end.
+    NoSize,
+    /// Every contents object of the file has them at a URL or in an
+    /// encoding, and they would have to be fetched or decoded.
+    UrlOrEncoding,
+    /// There are none. The object has no contents objects, and only a
+    /// regular file has its contents in the file of its own name without
+    /// one.
+    Absent,
+}
+
 /// Why a file object must not be used now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Invalid {
@@ -186,6 +241,12 @@ pub enum Invalid {
 pub enum ErrorKind {
     /// The manifest is malformed.
     Manifest(Problem),
+    /// The data of a file object cannot be had from where it is.
+    Source(SourceProblem),
+    /// Contents are not what the manifest describes.
+    Content(ContentProblem),
+    /// The manifest gives contents in a way this crate cannot take.
+    Unsupported(UnsupportedContent),
     /// A file object is revoked or outside its validity window.
     NotValid(Invalid),
     /// Reading or writing failed.
@@ -403,6 +464,9 @@ struct Inner {
     record_number: Option<u64>,
     name: Option<String>,
     field: Option<Field>,
+    found_size: Option<u64>,
+    expected_size: Option<u64>,
+    value: Option<String>,
     cause: Option<Cause>,
 }
 
@@ -414,6 +478,9 @@ impl Error {
             record_number: None,
             name: None,
             field: None,
+            found_size: None,
+            expected_size: None,
+            value: None,
             cause: None,
         }))
     }
@@ -441,6 +508,22 @@ impl Error {
     #[must_use]
     pub(crate) fn at(mut self, field: Field) -> Error {
         self.0.field = Some(field);
+        self
+    }
+
+    /// Notes the size that was found and the one that was expected.
+    #[must_use]
+    pub(crate) fn sizes(mut self, found: Option<u64>, expected: Option<u64>) -> Error {
+        self.0.found_size = found;
+        self.0.expected_size = expected;
+        self
+    }
+
+    /// Notes what is not supported: the ways the contents are available
+    /// in.
+    #[must_use]
+    pub(crate) fn valued(mut self, value: impl Into<String>) -> Error {
+        self.0.value = Some(value.into());
         self
     }
 
@@ -573,6 +656,27 @@ impl Error {
         self.0.field
     }
 
+    /// The size that was found, when the error is about a size and it is
+    /// known: for a [`ContentProblem::SizeMismatch`] and a
+    /// [`ContentProblem::StreamEnded`].
+    pub fn found_size(&self) -> Option<u64> {
+        self.0.found_size
+    }
+
+    /// The size that was expected, when the error is about a size: the one
+    /// the manifest says, or the size a file needs at least to hold the
+    /// data the manifest says it holds.
+    pub fn expected_size(&self) -> Option<u64> {
+        self.0.expected_size
+    }
+
+    /// What is not supported, for [`UnsupportedContent::UrlOrEncoding`]:
+    /// the ways the contents are available in, such as `'gzip' encoding or
+    /// a URL`.
+    pub fn value(&self) -> Option<&str> {
+        self.0.value.as_deref()
+    }
+
     /// The I/O error behind this one, if there is one.
     pub fn io_error(&self) -> Option<&io::Error> {
         match &self.0.cause {
@@ -641,6 +745,39 @@ mod tests {
         let inner = io.get_ref().and_then(|e| e.downcast_ref::<Error>()).unwrap();
         assert_eq!(inner.kind(), ErrorKind::Manifest(Problem::NoTrailer));
         assert_eq!(io.to_string(), "incomplete");
+    }
+
+    #[test]
+    fn what_an_error_is_about() {
+        let e = Error::manifest(Problem::WrongFieldType, "message".to_string())
+            .at(Field::MTimeNSec)
+            .in_record(3)
+            .in_record(4)
+            .named("a/b");
+        assert_eq!(e.kind(), ErrorKind::Manifest(Problem::WrongFieldType));
+        assert_eq!(
+            (e.record_number(), e.name(), e.field()),
+            (Some(3), Some("a/b"), Some(Field::MTimeNSec))
+        );
+        assert_eq!(e.field().unwrap().to_string(), "mTimeNSec");
+        assert_eq!(e.to_string(), "message");
+        assert_eq!((e.found_size(), e.expected_size(), e.value()), (None, None, None));
+        assert!(e.io_error().is_none() && std::error::Error::source(&e).is_none());
+        let e = Error::new(ErrorKind::Content(ContentProblem::SizeMismatch), String::new())
+            .sizes(Some(1), Some(2))
+            .valued("gzip");
+        assert_eq!(
+            (e.found_size(), e.expected_size(), e.value()),
+            (Some(1), Some(2), Some("gzip"))
+        );
+        let e = Error::not_json(7, json::parse("{").unwrap_err());
+        assert_eq!(e.kind(), ErrorKind::Manifest(Problem::NotJson));
+        assert_eq!(e.record_number(), Some(7));
+        assert_eq!(
+            e.to_string(),
+            "manifest record 7 is not valid JSON: expected a string key at byte 1"
+        );
+        assert!(std::error::Error::source(&e).is_some());
     }
 
     /// The names of the problems the vectors of refused.jsonl do not hold:
