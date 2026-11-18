@@ -95,9 +95,9 @@ The commands are:
 
 | Command | What it does |
 |---|---|
-| `assemble IMAGE [SOURCE...]` | Create a file system sized to fit the sources and copy them into it. Without a SOURCE, create an empty file system. |
-| `assemble --plan [SOURCE...]` | Print the smallest file system size that holds the sources. |
-| `populate IMAGE [SOURCE...]` | Copy directory trees or one file into an existing file system. Without a SOURCE, create a directory. |
+| `assemble IMAGE [SOURCE]` | Create a file system sized to fit SOURCE or what `--manifest` describes, and fill it with that. Without a SOURCE, create an empty file system. |
+| `assemble --plan [SOURCE]` | Print the smallest file system size that holds SOURCE or what `--manifest` describes. |
+| `populate IMAGE [SOURCE]` | Copy a directory tree, one file, or what `--manifest` describes into an existing file system. Without a SOURCE, create a directory. |
 | `remove IMAGE PATH...` | Remove files and empty directories. `-r` removes directories with everything in them. |
 | `list IMAGE [PATH]` | List a directory. `-l` shows sizes and times. |
 | `describe IMAGE` | Show the geometry of a file system. |
@@ -118,7 +118,7 @@ The most common ones:
   serial number, as XXXX-XXXX or 8 hex digits.
 - `--sector-size BYTES` sets the logical sector size. See "Sector size"
   below.
-- `--path PATH` copies directory trees below PATH instead of the root.
+- `--path PATH` copies the directory tree below PATH instead of the root.
   For `populate` it is also the path of a single file, or the directory
   to create.
 - `--no-replace` fails instead of replacing files that exist.

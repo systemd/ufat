@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! The command line: assemble makes a file system and fills it, populate
-//! fills an existing one, both take directory trees, or with --manifest the
+//! fills an existing one, both take a directory tree, or with --manifest the
 //! tree a UAPI.16 manifest describes. The commands are the methods of the
 //! Varlink interface.
 
@@ -483,9 +483,20 @@ fn assemble_and_populate_take_trees_and_manifests() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("standard input is not a UAPI.16 manifest"));
     // A SOURCE is a directory, or for populate one file that needs --path;
-    // a manifest is named by --manifest.
+    // a manifest is named by --manifest. A manifest given as a SOURCE next
+    // to a tree fails on the count of trees, which says so too. Nothing is
+    // created then.
+    let untouched = root.join("untouched.img");
+    let untouched = untouched.to_str().unwrap();
     fails(&bin, &["populate", a, m], "needs --path");
-    fails(&bin, &["populate", a, m, tree_arg], "a SOURCE is a directory tree");
+    fails(&bin, &["assemble", "--plan", m], "a SOURCE is a directory tree");
+    fails(&bin, &["populate", a, m, tree_arg], "--manifest PATH names a manifest");
+    fails(
+        &bin,
+        &["assemble", "--create", untouched, m, tree_arg],
+        "--manifest PATH names a manifest",
+    );
+    assert!(!Path::new(untouched).exists());
     fs::write(root.join("garbage"), b"not a manifest").unwrap();
     fails(
         &bin,
@@ -499,15 +510,17 @@ fn assemble_and_populate_take_trees_and_manifests() {
         "is not a UAPI.16 manifest",
     );
     // A manifest takes exactly one SOURCE and no --path.
+    let nowhere = root.join("nowhere");
+    let nowhere = nowhere.to_str().unwrap();
     fails(
         &bin,
-        &["populate", "--manifest", m, a, tree_arg, tree_arg],
+        &["populate", "--manifest", nowhere, a, tree_arg, tree_arg],
         "exactly one SOURCE",
     );
-    fails(&bin, &["populate", "--manifest", m, a], "exactly one SOURCE");
+    fails(&bin, &["populate", "--manifest", nowhere, a], "exactly one SOURCE");
     fails(
         &bin,
-        &["populate", "--manifest", m, "--path", "/x", a, tree_arg],
+        &["populate", "--manifest", nowhere, "--path", "/x", a, tree_arg],
         "--path applies to directory trees",
     );
     // The switches and commands of the earlier command line are gone.
@@ -540,18 +553,7 @@ fn assemble_and_populate_take_trees_and_manifests() {
         "linux.efi",
     );
     assert!(!Path::new(d).exists());
-    fails(
-        &bin,
-        &[
-            "assemble",
-            "--create",
-            "--manifest",
-            m,
-            d,
-            root.join("nowhere").to_str().unwrap(),
-        ],
-        "nowhere",
-    );
+    fails(&bin, &["assemble", "--create", "--manifest", m, d, nowhere], "nowhere");
     assert!(!Path::new(d).exists());
     // A file that grew since the manifest was written is caught the same
     // way.
@@ -596,15 +598,74 @@ fn assemble_and_populate_take_trees_and_manifests() {
     assert!(run(&bin, &["check", c]).status.success());
     fails(
         &bin,
-        &["assemble", "--create", "--fit", tree_arg, "--manifest", m, c],
+        &["assemble", "--create", "--fit", tree_arg, "--manifest", nowhere, c],
         "carries the sizes",
     );
-    fails(&bin, &["assemble", "--plan"], "at least one SOURCE or --manifest");
+    fails(&bin, &["assemble", "--plan"], "a SOURCE or --manifest");
     fails(
         &bin,
         &["assemble", "--create", "--fit", tree_arg, c, tree_arg],
         "--fit sizes an empty file system",
     );
+    // One tree is taken, as by mkfs tools. The trees are counted before
+    // anything is opened, so a tree that is not there is not what fails.
+    // The same goes for a manifest: the checks above of its SOURCE, --path
+    // and --fit come before it is read.
+    for args in [
+        &["assemble", "--create", c, nowhere, tree_arg][..],
+        &["assemble", "--plan", nowhere, tree_arg],
+        &["populate", a, nowhere, tree_arg],
+        &["assemble", "--create", "--fit", nowhere, "--fit", tree_arg, c],
+    ] {
+        fails(&bin, args, "only one directory tree can be given");
+    }
+    // Bad values of --unsupported and --times fail right after the command
+    // line is parsed, whatever the command does: before a tree, a file or a
+    // manifest is opened, an image is created, or anything is put into one.
+    let unsupported = "unknown policy 'bogus' for --unsupported";
+    let times = "unknown time policy 'bogus'";
+    fails(&bin, &["populate", "--unsupported", "bogus", a, nowhere], unsupported);
+    fails(
+        &bin,
+        &["populate", "--manifest", nowhere, "--unsupported", "bogus", a, tree_arg],
+        unsupported,
+    );
+    fails(
+        &bin,
+        &["assemble", "--create", "--times", "bogus", untouched, tree_arg],
+        times,
+    );
+    fails(
+        &bin,
+        &[
+            "assemble",
+            "--create",
+            "--size",
+            "34M",
+            "--unsupported",
+            "bogus",
+            untouched,
+        ],
+        unsupported,
+    );
+    assert!(!Path::new(untouched).exists());
+    let file = root.join("tree/loader/entries/x.conf");
+    let file = file.to_str().unwrap();
+    fails(
+        &bin,
+        &["populate", "--times", "bogus", "--path", "/new", a, tree_arg],
+        times,
+    );
+    fails(&bin, &["populate", "--times", "bogus", "--path", "/newdir", a], times);
+    fails(
+        &bin,
+        &["populate", "--unsupported", "bogus", "--path", "/new.txt", a, file],
+        unsupported,
+    );
+    let listed = ok(&bin, &["list", a, "/"]);
+    for name in ["new/", "newdir/", "new.txt"] {
+        assert!(!listed.lines().any(|l| l == name), "{}", listed);
+    }
 }
 
 /// A volume too small for what goes into it. A copy that runs out of
@@ -655,7 +716,7 @@ fn too_small_volumes_fail_cleanly() {
     assert_eq!(fs::metadata(&existing).unwrap().len(), 0);
 
     let size: u64 = ok(&bin, &["assemble", "--plan", t]).trim().parse().unwrap();
-    // A plan against a size says whether the sources fit it.
+    // A plan against a size says whether the tree fits it.
     fails(&bin, &["assemble", "--plan", "--size", "1M", t], "more than --size");
     assert_eq!(
         ok(&bin, &["assemble", "--plan", "--size", "64M", t]),
