@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use json::StringRules;
 
-use crate::{FILENAME, STRING_RULES};
+use crate::{InodeType, FILENAME, STRING_RULES};
 
 /// What separates the components of a name.
 const SEPARATOR: char = '/';
@@ -257,8 +257,9 @@ impl Ord for Name {
 /// The names are the same in all bytes before that one, so the bytes from
 /// there on settle both how the names are ordered and whether the second
 /// one may follow the first in a manifest. That is why one pass over the
-/// bytes the names share answers all of it. The root's empty name is a
-/// name here, too.
+/// bytes the names share answers all the questions
+/// [`SequenceCheck`](crate::sequence::SequenceCheck) asks of a file object
+/// and the one before it. The root's empty name is a name here, too.
 pub(crate) struct NamePair<'a> {
     /// The bytes of the first name from the first byte in which the names
     /// differ on, and those of the second one.
@@ -296,6 +297,31 @@ impl<'a> NamePair<'a> {
     pub(crate) fn ordering(&self) -> Ordering {
         let rank = |rest: &[u8]| rest.first().map(|&b| (b != SEPARATOR_BYTE, b));
         rank(self.first).cmp(&rank(self.second))
+    }
+
+    /// Whether the second name is that of a file in a directory that can
+    /// still have entries after the first file, the last one so far: the
+    /// root, a directory the first file is in, or the first file itself if
+    /// its type, `first_type`, is a directory.
+    ///
+    /// The directory of the second file is the root or one the first file
+    /// is in if every separator of the second name comes before the first
+    /// byte in which the names differ, where the first name has the same
+    /// separators. It is the first file itself if the first name ends there
+    /// and the second name has its last separator right there.
+    pub(crate) fn second_is_in_open_directory(&self, first_type: InodeType) -> bool {
+        let first_is_directory = first_type == InodeType::Directory;
+        let rest = match self.second.split_first() {
+            Some((&SEPARATOR_BYTE, inside)) if first_is_directory && self.first.is_empty() => inside,
+            _ => self.second,
+        };
+        !rest.contains(&SEPARATOR_BYTE)
+    }
+
+    /// Whether the second name is the first one, or that of a directory
+    /// the first file is in.
+    pub(crate) fn second_is_first_or_above(&self) -> bool {
+        self.second.is_empty() && self.first.first().is_none_or(|&b| b == SEPARATOR_BYTE)
     }
 }
 

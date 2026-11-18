@@ -303,6 +303,12 @@ impl Order {
             Order::CodePoint => "codepoint",
         }
     }
+
+    /// The order a value of `order` declares. A value the specification
+    /// does not have declares none, as it asks.
+    pub(crate) fn declared(value: &str) -> Option<Order> {
+        (value == Order::CodePoint.as_str()).then_some(Order::CodePoint)
+    }
 }
 
 impl fmt::Display for Order {
@@ -372,5 +378,14 @@ mod tests {
         more |= Features::MODE;
         assert_eq!(more, some | Features::MODE);
         assert_eq!(format!("{:?}", some), "Features(mtime | sha256 | size)");
+    }
+
+    #[test]
+    fn orders() {
+        assert_eq!(Order::declared("codepoint"), Some(Order::CodePoint));
+        for value in ["", "CodePoint", "alphabetical", "bytes", "codepoint "] {
+            assert_eq!(Order::declared(value), None, "{:?}", value);
+        }
+        assert_eq!(Order::CodePoint.to_string(), "codepoint");
     }
 }

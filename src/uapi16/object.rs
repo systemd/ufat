@@ -8,7 +8,8 @@ use std::ops::{BitAnd, BitOr, Not};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::error::{Error, ErrorKind, Field, Invalid};
+use crate::decode::ROOT_RECORD;
+use crate::error::{Error, ErrorKind, Field, Invalid, Problem};
 use crate::hex::Hex;
 use crate::{Features, Name, Order, Sha256, STRING_RULES};
 
@@ -334,6 +335,14 @@ impl FromStr for Uuid {
 
 /// The `gpt` fields of a file object that describe a regular file as a
 /// partition of a GPT partition table: those of its entry in the table.
+///
+/// `gptFlags` holds all attribute flags of the entry. `gptFlagNoAuto`,
+/// `gptFlagGrowFileSystem` and `readOnly` give one of them each, and where
+/// a flag is given both ways the two agree. Where the manifest lists the
+/// feature of one of these fields, a regular file without the field has the
+/// flags it gives cleared. A reader checks the fields against each other
+/// that way and leaves them as the manifest has them: a regular file
+/// without any `gpt` field has no `GptPartition`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct GptPartition {
@@ -389,11 +398,38 @@ impl GptPartition {
 /// The crate does not export it, so no other crate can name or implement
 /// it.
 pub trait FlagSet:
-    Copy + PartialEq + BitAnd<Output = Self> + BitOr<Output = Self> + Not<Output = Self> + 'static
+    Copy + Default + PartialEq + BitAnd<Output = Self> + BitOr<Output = Self> + Not<Output = Self> + 'static
 {
     /// Every single flag with its field and the feature that records it, in
     /// the order of the names of the fields.
     const FIELDS: &'static [(Self, Field, Features)];
+
+    /// The flag `field` is the field of.
+    fn from_field(field: Field) -> Option<Self> {
+        Self::FIELDS
+            .iter()
+            .find(|&&(_, of, _)| of == field)
+            .map(|&(flag, _, _)| flag)
+    }
+
+    /// The flags an object of the type `inode_type` may have: every one on
+    /// a regular file or a directory, none on any other file.
+    fn permitted(inode_type: InodeType) -> Self {
+        // The default is no flag, so its complement is every flag.
+        let none = Self::default();
+        match inode_type {
+            InodeType::Regular | InodeType::Directory => !none,
+            _ => none,
+        }
+    }
+
+    /// The flags `features` records.
+    fn recorded_by(features: Features) -> Self {
+        Self::FIELDS
+            .iter()
+            .filter(|&&(_, _, feature)| features.contains(feature))
+            .fold(Self::default(), |flags, &(flag, _, _)| flags | flag)
+    }
 }
 
 /// What [`DosFlags`] and [`InodeFlags`] both have besides their flags:
@@ -586,26 +622,52 @@ impl<F: FlagSet> FlagStates<F> {
             .filter(move |(flag, _, _)| (self.stated & *flag) == *flag)
             .map(|&(_, field, feature)| (field, feature))
     }
+
+    /// The field of the first flag stated that an object of the type
+    /// `inode_type` cannot have. The flags stated are held against those
+    /// the type permits all at once, and the fields are only looked through
+    /// to name the first flag that is not permitted.
+    pub(crate) fn unpermitted_field(&self, inode_type: InodeType) -> Option<Field> {
+        let unpermitted = self.stated & !F::permitted(inode_type);
+        if unpermitted == F::default() {
+            return None;
+        }
+        F::FIELDS
+            .iter()
+            .find(|&&(flag, _, _)| (unpermitted & flag) == flag)
+            .map(|&(_, field, _)| field)
+    }
+
+    /// Fills in what `features`, which a manifest records, say about the
+    /// flags an object of the type `inode_type` does not state: a flag the
+    /// manifest records is cleared.
+    pub(crate) fn fill_in(&mut self, features: Features, inode_type: InodeType) {
+        self.stated = self.stated | (F::recorded_by(features) & F::permitted(inode_type));
+    }
 }
 
-/// The fields of an object of a manifest that a reader filled in: the
-/// sizes and hashes that follow from other fields, which the record of the
-/// object does not have. A writer leaves them out.
+/// The fields of an object of a manifest that a reader filled in, which
+/// the record of the object does not have: the sizes and hashes that
+/// follow from other fields, and `readOnly`, which is false where the
+/// manifest lists `read-only`. A writer leaves them out, and the checks of
+/// an object take a filled-in `readOnly` for one that is not there.
 ///
-/// What is filled in is a size or a hash: the `size` and the `sha256` of a
-/// [`FileObject`], and the sizes and hashes of a [`Contents`].
+/// The `size` and the `sha256` of a [`FileObject`], the sizes and hashes
+/// of a [`Contents`] and the `readOnly` of [`InodeAttributes`] can be
+/// filled in. Each of them notes it in its own `filled_in`.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct FilledIn(u8);
 
 impl FilledIn {
     /// The fields that can be filled in, in the order of their bits.
-    const FIELDS: [Field; 6] = [
+    const FIELDS: [Field; 7] = [
         Field::Size,
         Field::Sha256,
         Field::EncodedSize,
         Field::EncodedSha256,
         Field::OriginalSize,
         Field::OriginalSha256,
+        Field::ReadOnly,
     ];
 
     /// The bit of `field`, none for one that cannot be filled in.
@@ -902,6 +964,9 @@ pub struct InodeAttributes {
     /// `flagAppendOnly` and the other fields of the inode flags: the
     /// flags the object states.
     pub flags: FlagStates<InodeFlags>,
+    /// `readOnly`, if a reader filled it in. Whoever sets another value
+    /// takes the field out.
+    pub filled_in: FilledIn,
 }
 
 impl InodeAttributes {
@@ -928,7 +993,7 @@ impl InodeAttributes {
             Field::GroupName => self.group_name.is_some(),
             Field::MTimeNSec => self.mtime_nsec.is_some(),
             Field::Mode => self.mode.is_some(),
-            Field::ReadOnly => self.read_only.is_some(),
+            Field::ReadOnly => self.stated_read_only().is_some(),
             Field::Uid => self.uid.is_some(),
             Field::UserName => self.user_name.is_some(),
             _ => false,
@@ -942,6 +1007,28 @@ impl InodeAttributes {
             .into_iter()
             .filter(|(field, _)| self.has_feature_field(*field))
             .chain(self.flags.feature_fields())
+    }
+
+    /// `readOnly` as the record of the object has it: None where a reader
+    /// filled it in.
+    pub(crate) fn stated_read_only(&self) -> Option<bool> {
+        self.read_only.filter(|_| !self.filled_in.contains(Field::ReadOnly))
+    }
+
+    /// Fills in what `features`, which the manifest records, say about the
+    /// attributes a file of the type `inode_type` does not have: an inode
+    /// flag the manifest records is cleared, the file is not read-only if
+    /// the manifest records `readOnly`, which is noted in `filled_in`, and
+    /// it has no extended attributes if the manifest records them.
+    fn fill_in(&mut self, features: Features, inode_type: InodeType) {
+        self.flags.fill_in(features, inode_type);
+        if features.contains(Features::READ_ONLY) && self.read_only.is_none() {
+            self.read_only = Some(false);
+            self.filled_in.insert(Field::ReadOnly);
+        }
+        if features.contains(Features::USER_XATTR) && self.user_xattrs.is_none() {
+            self.user_xattrs = Some(Box::default());
+        }
     }
 
     /// The modification time, if the attributes have one.
@@ -1103,10 +1190,29 @@ impl FileObject {
 
     /// The features whose fields the object has, see [`Features`]. A
     /// manifest records them all or the object is not one of its file
-    /// objects. The fields a reader filled in do not count.
+    /// objects. What a reader filled in, see [`FilledIn`], does not count.
     pub fn stated_features(&self) -> Features {
         self.feature_fields()
             .fold(Features::NONE, |features, (_, feature)| features | feature)
+    }
+
+    /// Fills in what `features`, which its manifest records, say about the
+    /// fields the object does not have: a flag the manifest records is
+    /// cleared, the file is not read-only if the manifest records
+    /// `readOnly`, and it has no extended attributes if the manifest
+    /// records them. The `gpt` fields are not filled in, see
+    /// [`GptPartition`].
+    pub(crate) fn fill_in(&mut self, features: Features) {
+        self.dos_flags.fill_in(features, self.inode_type);
+        self.inode.fill_in(features, self.inode_type);
+    }
+
+    /// The field of the first flag the object states that it cannot have:
+    /// only regular files and directories have flags.
+    pub(crate) fn unpermitted_flag(&self) -> Option<Field> {
+        self.dos_flags
+            .unpermitted_field(self.inode_type)
+            .or_else(|| self.inode.flags.unpermitted_field(self.inode_type))
     }
 
     /// Checks that the object may be used at the time `now_usec`, in
@@ -1186,10 +1292,45 @@ impl RootObject {
     }
 
     /// The features whose fields the object has, see [`Features`]. A
-    /// manifest records them all or this is not its root file object.
+    /// manifest records them all or this is not its root file object. A
+    /// `readOnly` a reader filled in, see [`FilledIn`], does not count.
     pub fn stated_features(&self) -> Features {
         self.feature_fields()
             .fold(Features::NONE, |features, (_, feature)| features | feature)
+    }
+
+    /// What the manifest records: the features the root file object lists
+    /// in `features`, or [`Features::DEFAULT`] if it lists none.
+    pub fn recorded_features(&self) -> Features {
+        self.features.unwrap_or(Features::DEFAULT)
+    }
+
+    /// Requires the manifest to declare `order` in its root file object, as
+    /// a consumer does that relies on the order: a manifest that does not is
+    /// [`Problem::NoOrder`], even if its file objects are in that order. A
+    /// reader checks the file objects against the order the manifest
+    /// declares while it reads them.
+    pub fn require_order(&self, order: Order) -> Result<(), Error> {
+        if self.order == Some(order) {
+            return Ok(());
+        }
+        Err(Error::manifest(
+            Problem::NoOrder,
+            format!(
+                "the manifest does not declare \"{}\": \"{}\" in its root file object",
+                Field::Order,
+                order
+            ),
+        )
+        .at(Field::Order)
+        .in_record(ROOT_RECORD))
+    }
+
+    /// Fills in what `features`, which the manifest records, say about the
+    /// fields of the root directory the object does not have, as
+    /// [`FileObject::fill_in`] does for a file object.
+    pub(crate) fn fill_in(&mut self, features: Features) {
+        self.inode.fill_in(features, InodeType::Directory);
     }
 
     /// Checks that the manifest may be used at the time `now_usec`, in
