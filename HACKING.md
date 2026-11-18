@@ -48,8 +48,8 @@ With rustup, `cargo +1.85.0` selects rustc 1.85:
 
 `cargo test` runs:
 
-- the unit tests of the library and of the json, varlink, dlopen,
-  dlopen-note and blkid crates,
+- the unit tests of the library and of the json, uapi16, varlink,
+  dlopen, dlopen-note and blkid crates,
 - the integration tests in tests/,
 - the crash consistency harness.
 

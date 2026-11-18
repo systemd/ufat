@@ -8,6 +8,7 @@ members = [
     "src/dlopen-note",
     "src/fat",
     "src/json",
+    "src/uapi16",
     "src/varlink",
     "tools",
     "tests/crash",
@@ -23,6 +24,7 @@ default-members = [
     "src/dlopen-note",
     "src/fat",
     "src/json",
+    "src/uapi16",
     "src/varlink",
     "tests/crash",
 ]
