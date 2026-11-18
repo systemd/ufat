@@ -20,13 +20,12 @@ use fat::manifest::{
 };
 use fat::plan::{Plan, PlanOptions};
 use fat::populate::{CopyOptions, TimePolicy};
-use fat::probe::Prober;
 use fat::time::civil_from_days;
 use fat::volume::Volume;
 use fat::{bail, err, Context, DescriptorProblem, Detail, Error, ManifestProblem, Result};
 
 use crate::service;
-use crate::util::{self, ImageFlags, ManifestInput, ManifestUse};
+use crate::util::{self, GivenSize, ImageFlags, ManifestInput, ManifestUse, SizeMode, SizeRequest};
 
 const USAGE: &str = "\
 Usage: ufat COMMAND [OPTIONS...] ARGS...
@@ -34,9 +33,9 @@ Usage: ufat COMMAND [OPTIONS...] ARGS...
        ufat --version
 
 Commands:
-  assemble [OPTIONS] IMAGE [SOURCE]      Create a FAT32 file system sized to fit
-                                         SOURCE or what --manifest describes,
-                                         and fill it with that
+  assemble [OPTIONS] IMAGE [SOURCE]      Create a FAT32 file system and fill it
+                                         with SOURCE or what --manifest
+                                         describes
   assemble --plan [OPTIONS] [SOURCE]     Print the smallest file system size for
                                          SOURCE or what --manifest describes
   populate [OPTIONS] IMAGE [SOURCE]      Fill an existing FAT32 file system
@@ -52,8 +51,11 @@ Commands:
 The commands are the methods of the org.uapi-group.FileSystem Varlink
 interface that ufat serves; cat and manifest have no method.
 
-assemble without a SOURCE creates an empty file system of the size of IMAGE or
---size, or sized to hold the --fit directory or what --manifest describes.
+assemble makes the file system as large as --size, or else as large as the
+part of IMAGE behind --offset. --minimize makes it the smallest that holds the
+content, and --size is then the most it may take. Without a SOURCE it is
+empty. The --fit directory or what --manifest describes then has to fit
+--size, and without --size the file system is the smallest that holds it.
 assemble refuses an IMAGE that holds a file system, a partition table or other
 data libblkid recognizes, or without libblkid anything that is not blank.
 --force formats it anyway.
@@ -64,9 +66,9 @@ A SOURCE is a directory tree, or for populate one file. With --manifest the
 one SOURCE is the tree the manifest describes, where its file contents are
 read, or - for the contents on standard input, back to back in manifest order.
 The manifest has to declare \"order\": \"codepoint\" and be in that order.
-assemble with a SOURCE reads the manifest twice, to plan the file system and
-to fill it, and needs it in a regular file. populate, assemble --plan and
-assemble without a SOURCE read it once and take a pipe:
+assemble --minimize with a SOURCE reads the manifest twice, to plan the file
+system and to fill it, and needs it in a regular file. Everything else reads
+it once and takes a pipe:
   --manifest PATH       Build what the UAPI.16 manifest at PATH, or on standard
                         input for -, describes
   --no-check-validity   Accept revoked and expired manifest entries
@@ -75,12 +77,15 @@ assemble without a SOURCE read it once and take a pipe:
 
 Options common to commands taking IMAGE:
   --offset BYTES        Byte offset of the file system inside IMAGE
-  --size BYTES          Size of the file system inside IMAGE (assemble: instead
-                        of the size that fits the content; assemble --plan:
-                        fail when the content does not fit this size)
+  --size BYTES          Size of the file system inside IMAGE, or with
+                        --minimize the most it may take (--minimize, --plan,
+                        --fit and --manifest without a SOURCE fail when the
+                        content does not fit this size)
 
 Options for assemble:
   --plan                Print the size the content needs and write nothing
+  --minimize            Make the file system the smallest that holds the
+                        content
   --sector-size BYTES   Logical sector size, 512 or 4096 (1024 and 2048 work)
   --cluster-size BYTES  Cluster size
   --identifier ID       Volume serial number, XXXX-XXXX or 8 hex digits
@@ -93,11 +98,12 @@ Options for assemble:
   --fats N              FAT copies (default 2)
   --mkfs-fat-compat     Reproduce mkfs.fat's layout quirks exactly
   --zero                Zero the whole data area
-  --create              Create IMAGE if it does not exist (without a SOURCE it
-                        needs --size, --fit or --manifest for that)
+  --create              Create IMAGE if it does not exist (it then needs --size,
+                        --minimize, --fit, or --manifest without a SOURCE)
   --force, -f           Format IMAGE whatever it holds
-  --fit DIR             Size IMAGE to the smallest file system holding DIR
-                        and leave it empty (no SOURCE)
+  --fit DIR             Size IMAGE for DIR and leave it empty (no SOURCE):
+                        --size, which DIR has to fit, or else the smallest
+                        file system holding DIR
   --hash ALGORITHM      Print the sha256 or sha512 hash of the file system
                         written
   --write-hash PATH     Write that hash to PATH instead, or to standard output
@@ -336,7 +342,15 @@ const FILL_VALUES: &[&str] = &[
     "write-manifest",
 ];
 const FILL_FLAGS: &[&str] = &["no-replace", "no-check-validity", "verbose"];
-const FORMAT_FLAGS: &[&str] = &["no-align", "mkfs-fat-compat", "zero", "create", "force", "verbose"];
+const FORMAT_FLAGS: &[&str] = &[
+    "no-align",
+    "mkfs-fat-compat",
+    "zero",
+    "create",
+    "force",
+    "minimize",
+    "verbose",
+];
 
 fn with(a: &[&'static str], b: &[&'static str]) -> Vec<&'static str> {
     a.iter().chain(b).copied().collect()
@@ -484,7 +498,7 @@ fn read_manifest(path: &Path, manifest_use: ManifestUse) -> Result<(ManifestInpu
             ..
         }) => err!(
             errno::EINVAL,
-            "{} is not a regular file: assemble with a SOURCE needs the manifest in one",
+            "{} is not a regular file: --minimize with a SOURCE needs the manifest in one",
             name
         ),
         _ if e.is_manifest() => e.context(format_args!("{} is not a UAPI.16 manifest", name)),
@@ -814,13 +828,27 @@ fn image_arg<'a>(args: &'a Args, command: &str) -> Result<&'a Path> {
     }
 }
 
-/// `assemble --plan`: the size the content needs, with nothing written.
+/// `assemble --plan`: the size the content needs, with nothing written. It
+/// answers for `assemble` with the same options. With `--size` and without
+/// `--minimize` that makes a file system of that size, so the content is
+/// planned with the cluster size the formatter picks for it and has to fit
+/// its clusters. Otherwise the plan is of the smallest file system, which
+/// with `--minimize` has to fit in `--size`.
 fn plan(args: &Args) -> Result<()> {
     if args.positional.is_empty() && args.path("manifest").is_none() {
         bail!(errno::EINVAL, "assemble --plan needs a SOURCE or --manifest");
     }
     let options = format_options(args)?;
-    let mut plan = Plan::new(PlanOptions::from_format_options(&options, None)?);
+    let mut plan_options = PlanOptions::from_format_options(&options, None)?;
+    let size = args.size("size")?;
+    let given = match size {
+        Some(size) if !args.flag("minimize") => Some(GivenSize::new(&options, size, None)?),
+        _ => None,
+    };
+    if let Some(given) = &given {
+        plan_options.cluster_size = Some(given.layout.cluster_size());
+    }
+    let mut plan = Plan::new(plan_options);
     // Nothing is written after a plan, so it reads the manifest on from its
     // root file object, and the manifest is read once. A pipe will do.
     let source = Source::open(args, &args.positional_paths(), Sourcing::Size)?;
@@ -832,15 +860,17 @@ fn plan(args: &Args) -> Result<()> {
         );
     }
     let e = plan.estimate()?;
-    if let Some(size) = args.size("size")? {
-        if e.size() > size {
-            bail!(
-                errno::ENOSPC,
-                "the content needs a {} byte file system, more than --size {}",
-                e.size(),
-                size
-            );
-        }
+    match (&given, size) {
+        (Some(given), _) => given
+            .check(&e)
+            .map_err(|shortfall| err!(errno::ENOSPC, "{}", shortfall))?,
+        (None, Some(size)) if e.size() > size => bail!(
+            errno::ENOSPC,
+            "the content needs a {} byte file system, more than --size {}",
+            e.size(),
+            size
+        ),
+        _ => {}
     }
     println!("{}", e.size());
     if args.flag("verbose") {
@@ -855,60 +885,64 @@ fn plan(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// `assemble` without a SOURCE: an empty file system, of the size of the
-/// image or `--size`, or sized for the `--fit` directory or what
-/// `--manifest` describes.
+/// `assemble` without a SOURCE: an empty file system of the size of
+/// `--size` or of the image, or with `--minimize` the smallest one. The
+/// `--fit` directory or what `--manifest` describes has to fit a size
+/// given, and without one the file system is the smallest that holds it.
 fn assemble_empty(args: &Args, path: &Path) -> Result<Volume> {
     let mut options = format_options(args)?;
-    let offset = args.size("offset")?.unwrap_or(0);
-    let size = args.size("size")?;
     let fit = args.paths("fit");
     let target = util::Target {
         path,
-        offset,
-        size,
+        offset: args.size("offset")?.unwrap_or(0),
+        size: args.size("size")?,
         flags: args.image_flags(),
     };
-    if fit.is_empty() && args.path("manifest").is_none() {
-        let mut device = util::open_target(&target)?;
-        if !target.flags.contains(ImageFlags::FORCE) {
-            Prober::new().ensure_empty(&device, offset, size)?;
-        }
-        if target.flags.contains(ImageFlags::CREATE) {
-            let size = size.ok_or_else(|| err!(errno::EINVAL, "--create needs --size, --fit or --manifest"))?;
-            util::size_image(&mut device, offset, size)?;
-        }
-        let device = device.window(offset, size)?;
-        format::format(&device, &options)?;
-        return Volume::open(device);
-    }
     // Nothing of the content is written, so a manifest is planned on from
     // its root file object, through the reader that read it, and is read
-    // once: a pipe will do. fit_and_format() plans the content once.
-    let mut source = Some(Source::open(args, &fit, Sourcing::Size)?);
+    // once: a pipe will do. fit_and_format() plans the content at most once.
+    let source = Source::open(args, &fit, Sourcing::Size)?;
+    let mode = if args.flag("minimize") {
+        SizeMode::Minimize
+    } else if matches!(source, Source::None) {
+        SizeMode::Given
+    } else {
+        SizeMode::Fit
+    };
+    let mut source = Some(source);
     let mut add = |plan: &mut Plan| match source.take() {
         Some(source) => source.into_plan(plan, args).map(drop),
         None => bail!(errno::EINVAL, "the content is planned once"),
     };
-    let (volume, estimate) = util::fit_and_format(&target, &mut options, &mut add).map_err(|e| e.into_error(path))?;
-    report_estimate(args, path, &estimate);
+    let (volume, estimate) = util::fit_and_format(&target, &mut options, SizeRequest::new(mode, &mut add))
+        .map_err(|e| e.into_error(path))?;
+    if let Some(estimate) = estimate {
+        report_estimate(args, path, &estimate);
+    }
     Ok(volume)
 }
 
-/// `assemble` with a SOURCE: the file system sized to fit it, unless
-/// `--size` says otherwise, and filled with it.
+/// `assemble` with a SOURCE: the file system of the size of `--size` or of
+/// the image, or with `--minimize` the smallest that holds it, filled with
+/// it.
 fn assemble_filled(args: &Args, path: &Path, paths: &[&Path]) -> Result<Volume> {
     if !args.paths("fit").is_empty() {
         bail!(
             errno::EINVAL,
-            "--fit sizes an empty file system; with a SOURCE the file system is sized for it"
+            "--fit sizes an empty file system; with a SOURCE --minimize sizes it for the SOURCE"
         );
     }
-    // The manifest is planned before its content is written.
-    let mut source = Source::open(args, paths, Sourcing::Write(ManifestUse::Plan))?;
+    let mode = if args.flag("minimize") {
+        SizeMode::Minimize
+    } else {
+        SizeMode::Given
+    };
+    let mut source = Source::open(args, paths, Sourcing::Write(mode.manifest_use()))?;
     // Better to learn about a tree FAT cannot hold before an image is sized
-    // and formatted.
-    source.check(args)?;
+    // and formatted. With --minimize the plan finds it.
+    if mode == SizeMode::Given {
+        source.check(args)?;
+    }
     let mut options = format_options(args)?;
     let target = util::Target {
         path,
@@ -916,10 +950,12 @@ fn assemble_filled(args: &Args, path: &Path, paths: &[&Path]) -> Result<Volume> 
         size: args.size("size")?,
         flags: args.image_flags(),
     };
-    let (mut v, estimate) =
-        util::fit_and_format(&target, &mut options, &mut |plan| source.add_to(plan, args).map(drop))
-            .map_err(|e| e.into_error(path))?;
-    report_estimate(args, path, &estimate);
+    let mut add = |plan: &mut Plan| source.add_to(plan, args).map(drop);
+    let (mut v, estimate) = util::fit_and_format(&target, &mut options, SizeRequest::new(mode, &mut add))
+        .map_err(|e| e.into_error(path))?;
+    if let Some(estimate) = estimate {
+        report_estimate(args, path, &estimate);
+    }
     match source.fill(&mut v, args) {
         Ok(()) => Ok(v),
         Err(e) => Err(unfinished(v, e)),
@@ -1008,10 +1044,15 @@ fn cmd_assemble(argv: &[OsString]) -> Result<()> {
         }
     }
     let layout = *v.layout();
+    // The hash is of the file system's own bytes, which with --minimize can
+    // end before --size does.
+    let window = v.device().len();
     v.close()?;
     report_layout(path, &layout, args.flag("verbose"));
     if let Some(hash) = hash {
-        let digest = hash.of(&open_image(&args, path, Access::ReadOnly)?, &mut |_| {})?;
+        let offset = args.size("offset")?.unwrap_or(0);
+        let image = util::open_image(path, offset, Some(window), Access::ReadOnly)?;
+        let digest = hash.of(&image, &mut |_| {})?;
         match hash_path {
             Some(p) if p != Path::new("-") => {
                 std::fs::write(p, format!("{}\n", digest)).with_context(|| format!("cannot write {}", p.display()))?

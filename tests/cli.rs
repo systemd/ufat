@@ -412,7 +412,7 @@ fn assemble_refuses_to_format_over_what_is_there() {
     let t = t.to_str().unwrap();
     let a = root.join("a.img");
     let a = a.to_str().unwrap();
-    ok(&bin, &["assemble", "--create", a, t]);
+    ok(&bin, &["assemble", "--create", "--minimize", a, t]);
     let refused = "the image holds a FAT file system, use --force to format it anyway";
     fails(&bin, &["assemble", a, t], refused);
     fails(&bin, &["assemble", "--create", "--size", "40M", a], refused);
@@ -424,7 +424,7 @@ fn assemble_refuses_to_format_over_what_is_there() {
     // Empty and zeros.
     let empty = root.join("empty.img");
     fs::File::create(&empty).unwrap();
-    ok(&bin, &["assemble", empty.to_str().unwrap(), t]);
+    ok(&bin, &["assemble", "--minimize", empty.to_str().unwrap(), t]);
     let zeros = root.join("zeros.img");
     fs::File::create(&zeros).unwrap().set_len(40 << 20).unwrap();
     ok(&bin, &["assemble", zeros.to_str().unwrap()]);
@@ -437,6 +437,16 @@ fn assemble_refuses_to_format_over_what_is_there() {
     ok(&bin, &["assemble", "--size", "40M", d]);
     fails(&bin, &["assemble", "--offset", "60M", d], refused);
     fails(&bin, &["assemble", "--offset", "60M", "--size", "40M", d, t], refused);
+    // An offset beyond the end of the image leaves no size to take. One at
+    // its end leaves 0 bytes, too few for any file system, like a size of 0.
+    fails(
+        &bin,
+        &["assemble", "--offset", "200M", d],
+        "offset 209715200 is beyond the end of the device (104857600 bytes)",
+    );
+    let no_room = "0 sectors are not enough for the 32 reserved sectors";
+    fails(&bin, &["assemble", "--offset", "100M", d], no_room);
+    fails(&bin, &["assemble", "--size", "0", d], no_room);
     // Another file system, which libblkid names.
     let ext4 = root.join("ext4.img");
     let mkfs_ext4 = common::Maker::of("ext4");
@@ -479,13 +489,16 @@ fn assemble_and_populate_take_trees_and_manifests() {
     assert!(run(&bin, &["check", a]).status.success());
     let tree_size = ok(&bin, &["assemble", "--plan", tree_arg]);
     // A manifest of the tree, kept outside it, builds the same content; the
-    // one SOURCE says where the files are. assemble reads it twice.
+    // one SOURCE says where the files are. --minimize reads it twice.
     let manifest = root.join("tree.manifest");
     fs::write(&manifest, ok(&bin, &["manifest", tree_arg])).unwrap();
     let m = manifest.to_str().unwrap();
     let b = image("b.img");
     let b = b.as_str();
-    ok(&bin, &["assemble", "--create", "--manifest", m, b, tree_arg]);
+    ok(
+        &bin,
+        &["assemble", "--create", "--minimize", "--manifest", m, b, tree_arg],
+    );
     assert_eq!(ok(&bin, &["list", b, "/loader/entries"]), "x.conf\n");
     assert_eq!(ok(&bin, &["cat", b, "/EFI/Linux/linux.efi"]), "kernel");
     assert_eq!(fs::metadata(b).unwrap().len().to_string() + "\n", tree_size);
@@ -584,17 +597,40 @@ fn assemble_and_populate_take_trees_and_manifests() {
     assert!(ok(&bin, &["check", clean]).contains("not cleanly unmounted"));
     // --manifest - reads the manifest from standard input, which then
     // cannot carry the file contents as well. A pipe is read once.
-    // assemble with a SOURCE plans the content before it writes it, so it
-    // refuses one before it reads anything of it: all of it is left in the
-    // pipe. assemble --plan and assemble without a SOURCE read the
-    // manifest once and take one. assemble --plan takes standard input
-    // that is the file itself as well.
+    // assemble --minimize with a SOURCE plans the content before it writes
+    // it, so it refuses one before it reads anything of it: all of it is
+    // left in the pipe. assemble --plan, assemble without a SOURCE and
+    // assemble with a size given read the manifest once and take one.
+    // assemble --plan takes standard input that is the file itself as well.
     let manifest_bytes = fs::read(&manifest).unwrap();
-    let not_a_file = "standard input is not a regular file: assemble with a SOURCE needs the manifest in one";
+    let not_a_file = "standard input is not a regular file: --minimize with a SOURCE needs the manifest in one";
     let piped = image("piped.img");
     let piped = piped.as_str();
-    for args in [
-        &["assemble", "--create", "--manifest", "-", piped, tree_arg][..],
+    let minimized = ["assemble", "--create", "--minimize", "--manifest", "-", piped, tree_arg];
+    let (out, left) = run_from_pipe(&bin, &minimized, &manifest_bytes);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(not_a_file));
+    assert_eq!(left, manifest_bytes);
+    assert!(!Path::new(piped).exists());
+    let (out, left) = run_from_pipe(
+        &bin,
+        &["assemble", "--create", "--manifest", "-", piped],
+        &manifest_bytes,
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(left.is_empty(), "{} bytes left", left.len());
+    assert_eq!(fs::metadata(piped).unwrap().len().to_string() + "\n", tree_size);
+    assert!(run(&bin, &["check", piped]).status.success());
+    fs::remove_file(piped).unwrap();
+    let (out, left) = run_from_pipe(&bin, &["assemble", "--plan", "--manifest", "-"], &manifest_bytes);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), tree_size);
+    assert!(left.is_empty(), "{} bytes left", left.len());
+    let out = run_from(&bin, &["assemble", "--plan", "--manifest", "-"], &manifest);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), tree_size);
+    let out = run_in(
+        &bin,
         &[
             "assemble",
             "--create",
@@ -605,29 +641,10 @@ fn assemble_and_populate_take_trees_and_manifests() {
             piped,
             tree_arg,
         ],
-    ] {
-        let (out, left) = run_from_pipe(&bin, args, &manifest_bytes);
-        assert_eq!(out.status.code(), Some(1), "{:?}", args);
-        assert!(String::from_utf8_lossy(&out.stderr).contains(not_a_file), "{:?}", args);
-        assert_eq!(left, manifest_bytes, "{:?}", args);
-        assert!(!Path::new(piped).exists());
-    }
-    let (out, left) = run_from_pipe(
-        &bin,
-        &["assemble", "--create", "--manifest", "-", piped],
         &manifest_bytes,
     );
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(left.is_empty(), "{} bytes left", left.len());
-    assert_eq!(fs::metadata(piped).unwrap().len().to_string() + "\n", tree_size);
-    assert!(run(&bin, &["check", piped]).status.success());
-    let (out, left) = run_from_pipe(&bin, &["assemble", "--plan", "--manifest", "-"], &manifest_bytes);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), tree_size);
-    assert!(left.is_empty(), "{} bytes left", left.len());
-    let out = run_from(&bin, &["assemble", "--plan", "--manifest", "-"], &manifest);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), tree_size);
+    assert_eq!(ok(&bin, &["cat", piped, "/loader/entries/x.conf"]), "title x\n");
     let out = run_in(&bin, &["populate", "--manifest", "-", a, tree_arg], &manifest_bytes);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let out = run_in(&bin, &["populate", "--manifest", "-", a, "-"], b"");
@@ -719,14 +736,18 @@ fn assemble_and_populate_take_trees_and_manifests() {
     // the manifest describes at its start, and that is what is copied.
     let d = image("d.img");
     let d = d.as_str();
-    fails(&bin, &["assemble", "--create", "--manifest", m, d, nowhere], "nowhere");
+    fails(
+        &bin,
+        &["assemble", "--create", "--minimize", "--manifest", m, d, nowhere],
+        "nowhere",
+    );
     assert!(!Path::new(d).exists());
     let empty = root.join("empty");
     let empty = empty.to_str().unwrap();
     fs::create_dir(empty).unwrap();
     fails(
         &bin,
-        &["assemble", "--create", "--manifest", m, d, empty],
+        &["assemble", "--create", "--minimize", "--manifest", m, d, empty],
         &format!(
             "ufat: {}: EFI/Linux/linux.efi: failed to open EFI/Linux/linux.efi",
             empty
@@ -765,6 +786,25 @@ fn assemble_and_populate_take_trees_and_manifests() {
     assert_eq!(fs::metadata(c).unwrap().len().to_string() + "\n", tree_size);
     ok(&bin, &["populate", "--manifest", m, c, tree_arg]);
     assert!(run(&bin, &["check", c]).status.success());
+    // With --size it takes that size, which the --fit directory or what the
+    // manifest describes has to fit. A size no file system fits in is
+    // refused as it is without them.
+    let e = image("e.img");
+    let e = e.as_str();
+    for sized in [["--fit", tree_arg], ["--manifest", m]] {
+        ok(
+            &bin,
+            &[&["assemble", "--create", "--size", "64M", e][..], &sized].concat(),
+        );
+        assert_eq!(fs::metadata(e).unwrap().len(), 64 << 20);
+        fs::remove_file(e).unwrap();
+        fails(
+            &bin,
+            &[&["assemble", "--create", "--size", "1M", e][..], &sized].concat(),
+            "FAT32 needs at least 65525",
+        );
+        assert!(!Path::new(e).exists());
+    }
     fails(
         &bin,
         &["assemble", "--create", "--fit", tree_arg, "--manifest", nowhere, c],
@@ -866,18 +906,23 @@ fn manifests_have_to_declare_their_order() {
         &format!("ufat: {}: {}", m, refused),
     );
     assert!(!image.exists());
-    fails(&bin, &["assemble", "--plan", "--manifest", m], refused);
-    fails(&bin, &["assemble", "--create", "--manifest", m, a], refused);
-    assert!(!image.exists());
-    ok(&bin, &["assemble", "--create", "--size", "40M", a]);
-    fails(&bin, &["populate", "--manifest", m, a, t], refused);
-    let out = run_in(&bin, &["populate", "--manifest", "-", a, t], undeclared.as_bytes());
+    let out = run_in(
+        &bin,
+        &["assemble", "--create", "--size", "40M", "--manifest", "-", a, t],
+        undeclared.as_bytes(),
+    );
     assert_eq!(out.status.code(), Some(1));
     assert!(
         String::from_utf8_lossy(&out.stderr).contains(&format!("ufat: standard input: {}", refused)),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(!image.exists());
+    fails(&bin, &["assemble", "--plan", "--manifest", m], refused);
+    fails(&bin, &["assemble", "--create", "--manifest", m, a], refused);
+    assert!(!image.exists());
+    ok(&bin, &["assemble", "--create", "--size", "40M", a]);
+    fails(&bin, &["populate", "--manifest", m, a, t], refused);
     assert_eq!(ok(&bin, &["list", a]), "");
     // With the declaration it is taken.
     fs::write(&manifest, &declared).unwrap();
@@ -887,10 +932,13 @@ fn manifests_have_to_declare_their_order() {
 
 /// A volume too small for what goes into it. A copy that runs out of
 /// clusters says which file did not fit and leaves what came before it in
-/// a consistent file system. `assemble` with a `--size` the content does
-/// not fit says so before it sizes or formats anything: a file `--create`
-/// made is gone again and an existing file is as it was. Without a size an
-/// existing file is grown to the fit and never shrunk.
+/// a consistent file system. `assemble --minimize` with a `--size` the
+/// content does not fit says so before it sizes or formats anything: a
+/// file `--create` made is gone again and an existing file is as it was.
+/// So do `--fit` and `--manifest` without a SOURCE, and a size of 0, which
+/// no file system fits in. With `--minimize` and without a size an
+/// existing file is grown to the fit and never shrunk. Without
+/// `--minimize` the file system takes the size given or the whole file.
 #[test]
 fn too_small_volumes_fail_cleanly() {
     let _serial = common::serial();
@@ -918,38 +966,256 @@ fn too_small_volumes_fail_cleanly() {
     let n = new.to_str().unwrap();
     fails(
         &bin,
-        &["assemble", "--create", "--size", "1M", n, t],
+        &["assemble", "--create", "--minimize", "--size", "1M", n, t],
         "holds 1048576 bytes but the content needs",
     );
     assert!(!new.exists(), "a failed assemble left its image behind");
+    fails(
+        &bin,
+        &["assemble", "--create", n, t],
+        "is empty: give --size, or --minimize",
+    );
+    assert!(!new.exists(), "a failed assemble left its image behind");
+    fails(
+        &bin,
+        &["assemble", "--create", "--size", "1M", n, t],
+        "FAT32 needs at least 65525",
+    );
+    assert!(!new.exists(), "a failed assemble left its image behind");
+    fails(
+        &bin,
+        &["assemble", "--create", "--size", "0", n, t],
+        "0 sectors are not enough for the 32 reserved sectors",
+    );
+    assert!(!new.exists(), "a failed assemble left its image behind");
+    // An empty file system that the tree or its manifest has to fit is
+    // refused the same way, in the clusters --size 34M gets.
+    let manifest = root.join("tree.manifest");
+    fs::write(&manifest, ok(&bin, &["manifest", t])).unwrap();
+    let m = manifest.to_str().unwrap();
+    for content in [["--fit", t], ["--manifest", m]] {
+        fails(
+            &bin,
+            &[&["assemble", "--create", "--size", "34M", n][..], &content].concat(),
+            "a file system of 35651584 bytes holds 68528 clusters of 512 bytes, the content needs 73732",
+        );
+        assert!(!new.exists(), "a failed assemble left its image behind");
+    }
     let existing = root.join("existing.img");
     let e = existing.to_str().unwrap();
     fs::write(&existing, b"").unwrap();
     fails(
         &bin,
-        &["assemble", "--size", "1M", e, t],
+        &["assemble", "--minimize", "--size", "1M", e, t],
         "holds 1048576 bytes but the content needs",
     );
     assert_eq!(fs::metadata(&existing).unwrap().len(), 0);
 
     let size: u64 = ok(&bin, &["assemble", "--plan", t]).trim().parse().unwrap();
-    // A plan against a size says whether the tree fits it.
-    fails(&bin, &["assemble", "--plan", "--size", "1M", t], "more than --size");
+    // A plan against a size says whether the tree fits it, the way
+    // assemble with the same options would: 1M is too small for any file
+    // system, and too small for the smallest one --minimize makes.
+    fails(
+        &bin,
+        &["assemble", "--plan", "--size", "1M", t],
+        "FAT32 needs at least 65525",
+    );
+    fails(
+        &bin,
+        &["assemble", "--plan", "--minimize", "--size", "1M", t],
+        "more than --size",
+    );
     assert_eq!(
         ok(&bin, &["assemble", "--plan", "--size", "64M", t]),
         format!("{}\n", size)
     );
     fs::File::create(&existing).unwrap().set_len(4096).unwrap();
-    ok(&bin, &["assemble", e, t]);
+    ok(&bin, &["assemble", "--minimize", e, t]);
     assert_eq!(fs::metadata(&existing).unwrap().len(), size);
     assert_eq!(ok(&bin, &["cat", e, "/sub/c.txt"]), "last\n");
     let large = root.join("large.img");
     let l = large.to_str().unwrap();
     fs::File::create(&large).unwrap().set_len(64 << 20).unwrap();
-    ok(&bin, &["assemble", l, t]);
+    ok(&bin, &["assemble", "--minimize", l, t]);
     assert_eq!(fs::metadata(&large).unwrap().len(), 64 << 20);
+    assert!(ok(&bin, &["describe", l]).contains(&format!("size:             {}\n", size)));
     assert!(run(&bin, &["check", l]).status.success());
     assert_eq!(ok(&bin, &["cat", l, "/sub/c.txt"]), "last\n");
+    ok(&bin, &["assemble", "--force", l, t]);
+    assert!(ok(&bin, &["describe", l]).contains(&format!("size:             {}\n", 64 << 20)));
+    assert_eq!(ok(&bin, &["cat", l, "/sub/c.txt"]), "last\n");
+    // Without --minimize nothing is planned: what does not fit fails while
+    // it is written, and leaves the file system unfinished.
+    fs::File::create(&large).unwrap().set_len(36 << 20).unwrap();
+    fails(&bin, &["assemble", l, t], "copying big.bin: no free clusters left");
+    assert!(ok(&bin, &["check", l]).contains("marked dirty"));
+}
+
+/// A file system of the size given gets the cluster size that size gets,
+/// also where `--fit` or `--manifest` without a SOURCE plans what it has to
+/// hold. A plan of a small tree picks 512 byte clusters, and 200 GiB of
+/// them are more than FAT32 can count. The images are sparse.
+#[test]
+fn a_size_given_keeps_its_cluster_size() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    tree(&root.join("tree"));
+    let t = root.join("tree");
+    let t = t.to_str().unwrap();
+    let manifest = root.join("tree.manifest");
+    fs::write(&manifest, ok(&bin, &["manifest", t])).unwrap();
+    let m = manifest.to_str().unwrap();
+    let sized = ["assemble", "--create", "--size", "200G", "--identifier", "1234abcd"];
+    let alone = root.join("alone.img");
+    let alone = alone.to_str().unwrap();
+    ok(&bin, &[&sized[..], &[alone]].concat());
+    let geometry = ok(&bin, &["describe", alone]);
+    assert!(geometry.contains("cluster size:     32768\n"), "{}", geometry);
+    let image = root.join("sized.img");
+    let i = image.to_str().unwrap();
+    for content in [["--fit", t], ["--manifest", m]] {
+        ok(&bin, &[&sized[..], &content, &[i]].concat());
+        assert_eq!(fs::metadata(&image).unwrap().len(), 200 << 30);
+        assert_eq!(ok(&bin, &["describe", i]), geometry);
+        assert!(run(&bin, &["check", i]).status.success());
+        fs::remove_file(&image).unwrap();
+    }
+}
+
+/// Whether the content fits a size given is counted in clusters. One
+/// sector more can take one more sector for each FAT and hold one cluster
+/// less: with 512 byte clusters a file system of 66590 sectors holds 65534
+/// clusters, one of 66591 sectors 65533. A tree that takes 65534 clusters
+/// fills the smaller one to the last cluster. Its plan, the smallest file
+/// system for it, has 66590 sectors, fewer than 66591, so comparing sizes
+/// would let `--fit` and `--manifest` pass there and the copy run out of
+/// clusters. The images are sparse.
+#[test]
+fn one_sector_more_can_hold_one_cluster_less() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    // A cluster for the root directory and 65533 for the file.
+    let tree = root.join("tree");
+    fs::create_dir(&tree).unwrap();
+    fs::File::create(tree.join("big"))
+        .unwrap()
+        .set_len(65533 * 512)
+        .unwrap();
+    let t = tree.to_str().unwrap();
+    let manifest = root.join("tree.manifest");
+    fs::write(&manifest, ok(&bin, &["manifest", t])).unwrap();
+    let m = manifest.to_str().unwrap();
+    let sectors = |n: u64| (n * 512).to_string();
+    let clusters = |free: u64, clusters: u64| format!("clusters:         {} ({} free)", clusters, free);
+    assert_eq!(ok(&bin, &["assemble", "--plan", t]), sectors(66590) + "\n");
+    let image = root.join("a.img");
+    let a = image.to_str().unwrap();
+    for (n, held) in [(66590, 65534), (66591, 65533), (66592, 65534)] {
+        ok(&bin, &["assemble", "--create", "--size", &sectors(n), a]);
+        assert!(ok(&bin, &["describe", a]).contains(&clusters(held - 1, held)));
+        fs::remove_file(&image).unwrap();
+    }
+    for content in [["--fit", t], ["--manifest", m]] {
+        for n in [66590, 66592] {
+            ok(
+                &bin,
+                &[&["assemble", "--create", "--size", &sectors(n), a][..], &content].concat(),
+            );
+            fs::remove_file(&image).unwrap();
+        }
+        fails(
+            &bin,
+            &[&["assemble", "--create", "--size", &sectors(66591), a][..], &content].concat(),
+            "a file system of 34094592 bytes holds 65533 clusters of 512 bytes, the content needs 65534",
+        );
+        assert!(!image.exists(), "a failed assemble left its image behind");
+    }
+    // The copy agrees: the tree fills 66590 sectors to the last cluster and
+    // does not go into 66591.
+    ok(
+        &bin,
+        &["assemble", "--create", "--size", &sectors(66590), "--fit", t, a],
+    );
+    ok(&bin, &["populate", a, t]);
+    assert!(ok(&bin, &["describe", a]).contains(&clusters(0, 65534)));
+    fs::remove_file(&image).unwrap();
+    ok(&bin, &["assemble", "--create", "--size", &sectors(66591), a]);
+    fails(&bin, &["populate", a, t], "copying big: no free clusters left");
+}
+
+/// `assemble --plan --size` answers for `assemble` with the same options.
+/// Without `--minimize` that is a file system of the size given, with the
+/// cluster size the formatter picks for it: 80000 files of one byte fit 512
+/// byte clusters in about 44 MB, but take 80000 of the 4 KiB clusters that
+/// 300 MiB gets, and it has fewer. With `--minimize` the smallest file
+/// system, with 512 byte clusters, has to fit in `--size`. The files come
+/// from standard input, after a manifest.
+#[test]
+fn a_plan_against_a_size_answers_for_assemble() {
+    let _serial = common::serial();
+    let Some(bin) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let dir = Temp::dir();
+    let root = dir.path();
+    // 100 directories of 800 files, which keeps every directory below the
+    // 65536 entries FAT allows.
+    let mut text = String::from(
+        "\x1e{\"features\":[\"size\"],\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n",
+    );
+    for d in 0..100 {
+        text.push_str(&format!("\x1e{{\"name\":\"d{:02}\",\"type\":\"dir\"}}\n", d));
+        for f in 0..800 {
+            text.push_str(&format!("\x1e{{\"name\":\"d{:02}/f{:03}\",\"size\":1}}\n", d, f));
+        }
+    }
+    text.push_str("\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n");
+    let manifest = root.join("small.manifest");
+    fs::write(&manifest, text).unwrap();
+    let m = manifest.to_str().unwrap();
+    let contents = vec![b'x'; 80_000];
+    let smallest: u64 = ok(&bin, &["assemble", "--plan", "--manifest", m])
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(smallest < 300 << 20, "{}", smallest);
+    ok(
+        &bin,
+        &["assemble", "--plan", "--minimize", "--size", "300M", "--manifest", m],
+    );
+    fails(
+        &bin,
+        &["assemble", "--plan", "--size", "300M", "--manifest", m],
+        "a file system of 314572800 bytes holds 76646 clusters of 4096 bytes, the content needs 80701",
+    );
+    let image = root.join("a.img");
+    let a = image.to_str().unwrap();
+    let out = run_in(
+        &bin,
+        &["assemble", "--create", "--size", "300M", "--manifest", m, a, "-"],
+        &contents,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr);
+    assert!(stderr.contains("no free clusters left"), "{}", stderr);
+    fs::remove_file(&image).unwrap();
+    // 400 MiB holds them, and the plan says so.
+    ok(&bin, &["assemble", "--plan", "--size", "400M", "--manifest", m]);
+    let out = run_in(
+        &bin,
+        &["assemble", "--create", "--size", "400M", "--manifest", m, a, "-"],
+        &contents,
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(ok(&bin, &["cat", a, "/d99/f799"]), "x");
 }
 
 /// A plan does not compare names. The entries of a directory under two
@@ -987,7 +1253,7 @@ fn directories_under_two_names_fill_up_when_written() {
     let a = image.to_str().unwrap();
     fails(
         &bin,
-        &["assemble", "--create", "--manifest", s, a, "-"],
+        &["assemble", "--create", "--minimize", "--manifest", s, a, "-"],
         "directory is full",
     );
     let whole = root.join("whole.manifest");
@@ -1024,6 +1290,7 @@ fn host_paths_need_not_be_utf8() {
     let out = ufat(&[
         "assemble".as_ref(),
         "--create".as_ref(),
+        "--minimize".as_ref(),
         image.as_ref(),
         tree_dir.as_ref(),
     ]);
@@ -1126,7 +1393,7 @@ fn populate_and_remove_work_on_paths() {
     assert!(!ok(&bin, &["list", a, "/"]).contains("fifo-fail"));
     fails(&bin, &["populate", "--unsupported", "maybe", a, t], "skip or fail");
     // A plan refuses it too, from a tree or a manifest, and so does
-    // assemble, which plans first, before the image is touched.
+    // --minimize before the image is touched.
     fails(
         &bin,
         &["assemble", "--plan", "--unsupported", "fail", t],
@@ -1156,6 +1423,7 @@ fn populate_and_remove_work_on_paths() {
         &bin,
         &[
             "assemble",
+            "--minimize",
             "--unsupported",
             "fail",
             "--manifest",
@@ -1193,7 +1461,10 @@ fn manifests_of_what_was_written() {
     let a = a.to_str().unwrap();
     let written = root.join("written.manifest");
     let w = written.to_str().unwrap();
-    ok(&bin, &["assemble", "--create", "--write-manifest", w, a, t]);
+    ok(
+        &bin,
+        &["assemble", "--create", "--minimize", "--write-manifest", w, a, t],
+    );
     let described = root.join("described.manifest");
     let d = described.to_str().unwrap();
     ok(&bin, &["describe", "--write-manifest", d, a]);
@@ -1203,7 +1474,7 @@ fn manifests_of_what_was_written() {
     // The manifest builds the same files from the tree.
     let b = root.join("b.img");
     let b = b.to_str().unwrap();
-    ok(&bin, &["assemble", "--create", "--manifest", w, b, t]);
+    ok(&bin, &["assemble", "--create", "--minimize", "--manifest", w, b, t]);
     assert_eq!(ok(&bin, &["cat", b, "/EFI/Linux/linux.efi"]), "kernel");
     let populated = root.join("populated.manifest");
     let p = populated.to_str().unwrap();
@@ -1232,6 +1503,7 @@ fn manifests_of_what_was_written() {
     let (stdout, stderr) = run_here(&[
         "assemble",
         "--create",
+        "--minimize",
         "--hash",
         "sha256",
         "--write-manifest",
@@ -1251,6 +1523,7 @@ fn manifests_of_what_was_written() {
     let (stdout, stderr) = run_here(&[
         "assemble",
         "--create",
+        "--minimize",
         "--hash",
         "sha256",
         "--write-hash",
@@ -1265,7 +1538,17 @@ fn manifests_of_what_was_written() {
     assert_eq!(fs::read_to_string(&hash_file).unwrap(), sha256_line(e));
     let f = root.join("f.img");
     let f = f.to_str().unwrap();
-    let (stdout, _) = run_here(&["assemble", "--create", "--hash", "sha256", "--write-hash", "-", f, t]);
+    let (stdout, _) = run_here(&[
+        "assemble",
+        "--create",
+        "--minimize",
+        "--hash",
+        "sha256",
+        "--write-hash",
+        "-",
+        f,
+        t,
+    ]);
     assert_eq!(String::from_utf8_lossy(&stdout), sha256_line(f));
     fails(
         &bin,
@@ -1311,7 +1594,10 @@ fn counts_of_one() {
     let t = t.to_str().unwrap();
     let a = root.join("a.img");
     let a = a.to_str().unwrap();
-    let out = run(&bin, &["assemble", "--create", "--verbose", "--fats", "1", a, t]);
+    let out = run(
+        &bin,
+        &["assemble", "--create", "--minimize", "--verbose", "--fats", "1", a, t],
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{}", stderr);
     assert!(
@@ -1340,7 +1626,7 @@ fn counts_of_one() {
     // FAT entry 0 without the media byte in the first of two FATs is one
     // error, and the one byte the second FAT differs in is one warning.
     let b = root.join("b.img");
-    ok(&bin, &["assemble", "--create", b.to_str().unwrap(), t]);
+    ok(&bin, &["assemble", "--create", "--minimize", b.to_str().unwrap(), t]);
     let image = fs::OpenOptions::new().read(true).write(true).open(&b).unwrap();
     let mut sector = [0u8; 512];
     image.read_exact_at(&mut sector, 0).unwrap();
@@ -1458,13 +1744,35 @@ fn hashes_and_capabilities() {
     let t = t.to_str().unwrap();
     let a = root.join("a.img");
     let a = a.to_str().unwrap();
-    let hash = ok(&bin, &["assemble", "--create", "--hash", "sha256", a, t]);
+    let hash = ok(&bin, &["assemble", "--create", "--minimize", "--hash", "sha256", a, t]);
     assert_eq!(
         hash,
         format!("{}\n", fat::manifest::Sha256::digest(&fs::read(a).unwrap()))
     );
     let hash = ok(&bin, &["assemble", "--force", "--hash", "sha512", a, t]);
     assert_eq!(hash.trim().len(), 128);
+    // The hash is of the file system written, also where --size is only
+    // the most --minimize may take, and when the image is larger.
+    let size: usize = ok(&bin, &["assemble", "--plan", t]).trim().parse().unwrap();
+    let b = root.join("b.img");
+    let b = b.to_str().unwrap();
+    let minimized = ["assemble", "--minimize", "--size", "50M", "--hash", "sha256"];
+    let hash = ok(&bin, &[&minimized[..], &["--create", b, t]].concat());
+    assert_eq!(
+        hash,
+        format!("{}\n", fat::manifest::Sha256::digest(&fs::read(b).unwrap()))
+    );
+    fs::File::options()
+        .write(true)
+        .open(b)
+        .unwrap()
+        .set_len(100 << 20)
+        .unwrap();
+    let hash = ok(&bin, &[&minimized[..], &["--force", b, t]].concat());
+    assert_eq!(
+        hash,
+        format!("{}\n", fat::manifest::Sha256::digest(&fs::read(b).unwrap()[..size]))
+    );
     fails(&bin, &["assemble", "--hash", "md5", a, t], "sha256 or sha512");
     let caps = ok(&bin, &["capabilities"]);
     assert!(

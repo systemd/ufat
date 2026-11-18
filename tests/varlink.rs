@@ -662,7 +662,7 @@ fn capabilities_describe_vfat() {
             "writeManifest"
         ]
     );
-    assert_eq!(str_of(caps, "sizeToFit"), "exact");
+    assert_eq!(str_of(caps, "sizeToFit"), "best");
     // The smallest volume: 65525 clusters of one 512 byte sector, two
     // FATs of 512 sectors and 32 reserved sectors.
     let mut params = fat::layout::LayoutParams::new(512);
@@ -730,7 +730,7 @@ fn methods_on_an_image_take_the_file_system_type() {
     reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"sourceFileDescriptor":1}}"#,
         &[img.as_fd(), source.as_fd()],
     ));
     // Each method with what it needs besides the type and the image.
@@ -807,7 +807,6 @@ fn assemble_plans_from_a_tree_and_a_manifest() {
         r#"{"mode":"plan","options":{"label":"esp","identifier":"1234-abcd"},"content":{"sourceFileDescriptor":0}}"#,
         &[source.as_fd()],
     ));
-    assert!(bool_of(&a, "exact"));
     assert_eq!(u64_of(&a, "files"), 2);
     assert_eq!(u64_of(&a, "directories"), 3);
     assert_eq!(u64_of(&a, "bytes"), 5010);
@@ -880,7 +879,7 @@ fn assemble_plans_from_a_tree_and_a_manifest() {
     let r = reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"options":{"label":"esp","identifier":"1234-abcd"},"content":{"sourceFileDescriptor":1}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true,"label":"esp","identifier":"1234-abcd"},"content":{"sourceFileDescriptor":1}}"#,
         &[img.as_fd(), source.as_fd()],
     ));
     let rd = object_of(&r, "description");
@@ -895,7 +894,6 @@ fn assemble_plans_from_a_tree_and_a_manifest() {
         &[source.as_fd()],
     );
     assert_eq!(phases(&replies), vec!["planning"]);
-    assert!(bool_of(replies.last().unwrap(), "exact"));
 }
 
 /// Assemble with a tree: the image sized to fit, the root stamped with the
@@ -915,12 +913,11 @@ fn assemble_with_a_tree() {
         &mut c,
         "Assemble",
         &format!(
-            r#"{{"image":{{"fileDescriptor":0}},"options":{{"label":"ESP","identifier":"1234-ABCD","timestampUSec":{}}},"content":{{"sourceFileDescriptor":1,"times":"clamp"}}}}"#,
+            r#"{{"image":{{"fileDescriptor":0}},"options":{{"minimize":true,"label":"ESP","identifier":"1234-ABCD","timestampUSec":{}}},"content":{{"sourceFileDescriptor":1,"times":"clamp"}}}}"#,
             T0
         ),
         &[img.as_fd(), source.as_fd()],
     ));
-    assert!(bool_of(&r, "exact"));
     assert_eq!(u64_of(&r, "files"), 2);
     assert_eq!(u64_of(&r, "directories"), 3);
     assert_eq!(u64_of(&r, "bytes"), 5010);
@@ -957,13 +954,23 @@ fn assemble_with_a_tree() {
     assert_eq!(data, vec![1u8; 5000]);
     assert_eq!(v.root_time().unwrap(), Some(UNIX_EPOCH + Duration::from_micros(T0)));
     drop(v);
+    // Without minimize the file system takes the size of the image, and
+    // an empty one has none.
+    let (_unsized, unsized_img) = fresh_image();
+    let e = error_of(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1}}"#,
+        &[unsized_img.as_fd(), source.as_fd()],
+    );
+    assert_eq!(e.name, format!("{}.SizeRequired", IFACE));
     // Without a timestamp the root takes the source directory's time,
     // which build_tree fixed.
     let (image2, img2) = fresh_image();
     reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"sourceFileDescriptor":1}}"#,
         &[img2.as_fd(), source.as_fd()],
     ));
     let v = volume(image2.path(), Access::ReadOnly);
@@ -1002,7 +1009,6 @@ fn assemble_without_content() {
         r#"{"image":{"fileDescriptor":0},"options":{"label":"ESP","blockSize":4096,"vfat":{"oemName":"ufat","fats":1}}}"#,
         &[img.as_fd()],
     ));
-    assert!(!bool_of(&r, "exact"));
     assert!(r.get("files").is_none());
     let d = object_of(&r, "description");
     assert_eq!(u64_of(d, "sizeBytes"), 320 << 20);
@@ -1039,9 +1045,20 @@ fn assemble_without_content() {
     ));
     assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 40 << 20);
     // An empty file without a size and without content has no size to take.
-    let (_fresh2, fresh_img2) = fresh_image();
+    let (fresh2, fresh_img2) = fresh_image();
     let e = error_of(&mut c, "Assemble", IMG, &[fresh_img2.as_fd()]);
     assert_eq!(e.name, format!("{}.SizeRequired", IFACE));
+    // A size of 0 is too small for any file system, and so are the 0 bytes
+    // an offset at the end of an image that holds something leaves.
+    for (params, image) in [
+        (r#"{"image":{"fileDescriptor":0,"size":0}}"#, &fresh_img2),
+        (r#"{"image":{"fileDescriptor":0,"offset":335544320}}"#, &img),
+    ] {
+        let e = error_of(&mut c, "Assemble", params, &[image.as_fd()]);
+        assert_eq!(e.name, format!("{}.NoSpaceLeft", IFACE), "{}", params);
+        assert_eq!(str_of(&e.parameters, "reason"), "volume");
+    }
+    assert_eq!(std::fs::metadata(fresh2.path()).unwrap().len(), 0);
     // Options the library refuses are named as the interface spells them,
     // with force set, since the image holds a file system by now.
     let e = error_of(
@@ -1051,6 +1068,13 @@ fn assemble_without_content() {
         &[img.as_fd()],
     );
     assert_eq!(e.name, "org.varlink.service.InvalidParameter");
+    assert_eq!(str_of(&e.parameters, "parameter"), "blockSize");
+    let e = error_of(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"options":{"blockSize":512,"sectorSize":4096,"force":true}}"#,
+        &[img.as_fd()],
+    );
     assert_eq!(str_of(&e.parameters, "parameter"), "blockSize");
     let e = error_of(
         &mut c,
@@ -1130,7 +1154,7 @@ fn assemble_refuses_what_is_there_without_force() {
     let r = reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"options":{"force":true},"content":{"sourceFileDescriptor":1}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true,"force":true},"content":{"sourceFileDescriptor":1}}"#,
         &[img.as_fd(), source.as_fd()],
     ));
     assert_eq!(u64_of(&r, "files"), 2);
@@ -1185,7 +1209,7 @@ fn assemble_with_a_manifest_and_a_directory() {
     let r = reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"options":{"label":"ESP"},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true,"label":"ESP"},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
         &[img.as_fd(), manifest_file.as_fd(), source.as_fd()],
     ));
     assert_eq!(u64_of(&r, "files"), 2);
@@ -1200,7 +1224,7 @@ fn assemble_with_a_manifest_and_a_directory() {
     let r = reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"sourceFileDescriptor":1}}"#,
         &[img2.as_fd(), source.as_fd()],
     ));
     assert_eq!(u64_of(&r, "files"), 3);
@@ -1213,6 +1237,7 @@ fn assemble_with_a_manifest_and_a_directory() {
     );
     // A directory that does not hold what the manifest names fails when the
     // file is copied, and leaves the file system unfinished.
+    let minimized = r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#;
     let manifest_file = ro(&base.path().join("manifest"));
     let empty = Temp::dir();
     let empty_dir = ro(empty.path());
@@ -1220,7 +1245,7 @@ fn assemble_with_a_manifest_and_a_directory() {
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        minimized,
         &[missing_img.as_fd(), manifest_file.as_fd(), empty_dir.as_fd()],
     );
     assert_eq!(
@@ -1241,7 +1266,7 @@ fn assemble_with_a_manifest_and_a_directory() {
     reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        minimized,
         &[grown_img.as_fd(), manifest_file.as_fd(), source.as_fd()],
     ));
     let mut data = Vec::new();
@@ -1259,7 +1284,7 @@ fn assemble_with_a_manifest_and_a_directory() {
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        minimized,
         &[shrunk_img.as_fd(), manifest_file.as_fd(), source.as_fd()],
     );
     assert_eq!(
@@ -1292,7 +1317,7 @@ fn assemble_with_a_manifest_and_a_directory() {
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        minimized,
         &[changed_img.as_fd(), changing.as_fd(), proc_dir.as_fd()],
     );
     assert_eq!(
@@ -1311,7 +1336,7 @@ fn assemble_with_a_manifest_and_a_directory() {
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        minimized,
         &[fresh_img.as_fd(), garbage.as_fd(), source.as_fd()],
     );
     assert_eq!(e.name, format!("{}.InvalidManifest", IFACE));
@@ -1330,14 +1355,14 @@ fn assemble_with_a_manifest_and_a_directory() {
     assert_eq!(str_of(&e.parameters, "name"), "x");
     assert_eq!(u64_of(&e.parameters, "record"), 1);
     assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
-    // A manifest that comes through a pipe can be read once, too little to
-    // size the file system to fit, which reads the manifest before its
-    // content is written.
+    // A manifest that comes through a pipe can be read once. That is
+    // enough when the image has its size, and too little to size it to
+    // fit, which reads the manifest before its content is written.
     let piped = pipe_with(&manifest);
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        minimized,
         &[fresh_img.as_fd(), piped.as_fd(), source.as_fd()],
     );
     assert_eq!(e.name, format!("{}.BadFileDescriptor", IFACE));
@@ -1351,7 +1376,7 @@ fn assemble_with_a_manifest_and_a_directory() {
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1}}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"manifest":{"fileDescriptor":1}}}"#,
         &[fresh_img.as_fd(), manifest_file.as_fd()],
     );
     assert_eq!(e.name, "org.varlink.service.InvalidParameter");
@@ -1360,18 +1385,27 @@ fn assemble_with_a_manifest_and_a_directory() {
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"sourceFileDescriptor":1}}"#,
         &[fresh_img.as_fd(), conf.as_fd()],
     );
     assert_eq!(str_of(&e.parameters, "parameter"), "content");
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{}}"#,
         &[fresh_img.as_fd()],
     );
     assert_eq!(str_of(&e.parameters, "parameter"), "content");
     assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
+    let piped = pipe_with(&manifest);
+    let r = reply(call(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0,"size":41943040},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        &[fresh_img.as_fd(), piped.as_fd(), source.as_fd()],
+    ));
+    assert_eq!((u64_of(&r, "files"), u64_of(&r, "directories")), (2, 3));
+    assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 40 << 20);
 }
 
 /// A manifest has to declare the code point order: one that does not is
@@ -1412,26 +1446,27 @@ fn manifests_have_to_declare_their_order() {
         &[file.as_fd()],
     ));
     let (fresh, img) = fresh_image();
-    let manifest_file = ro(&scratch.path().join("undeclared"));
-    no_order(error_of(
-        &mut c,
-        "Assemble",
-        r#"{"image":{"fileDescriptor":0,"size":41943040},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
-        &[img.as_fd(), manifest_file.as_fd(), source.as_fd()],
-    ));
-    assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
+    let sized = r#"{"image":{"fileDescriptor":0,"size":41943040},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#;
+    for manifest in [ro(&scratch.path().join("undeclared")), pipe_with(&undeclared)] {
+        no_order(error_of(
+            &mut c,
+            "Assemble",
+            sized,
+            &[img.as_fd(), manifest.as_fd(), source.as_fd()],
+        ));
+        assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
+    }
     let image = Temp::image(40 << 20);
     let img = rw(image.path());
     reply(call(&mut c, "Assemble", IMG, &[img.as_fd()]));
     let populate = r#"{"image":{"fileDescriptor":0},"path":"/","content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#;
-    for manifest in [ro(&scratch.path().join("undeclared")), pipe_with(&undeclared)] {
-        no_order(error_of(
-            &mut c,
-            "Populate",
-            populate,
-            &[img.as_fd(), manifest.as_fd(), source.as_fd()],
-        ));
-    }
+    let manifest_file = ro(&scratch.path().join("undeclared"));
+    no_order(error_of(
+        &mut c,
+        "Populate",
+        populate,
+        &[img.as_fd(), manifest_file.as_fd(), source.as_fd()],
+    ));
     assert!(volume(image.path(), Access::ReadOnly).read_dir("/").unwrap().is_empty());
     let declared = file_with(scratch.path(), "declared", &manifest);
     let r = reply(call(
@@ -1484,7 +1519,7 @@ fn assemble_with_a_manifest_and_a_stream() {
         &mut c,
         "Assemble",
         &format!(
-            r#"{{"image":{{"fileDescriptor":0}},"options":{{"label":"ESP","identifier":"00000001","timestampUSec":{}}},"content":{{"manifest":{{"fileDescriptor":1}},"sourceFileDescriptor":2}}}}"#,
+            r#"{{"image":{{"fileDescriptor":0}},"options":{{"minimize":true,"label":"ESP","identifier":"00000001","timestampUSec":{}}},"content":{{"manifest":{{"fileDescriptor":1}},"sourceFileDescriptor":2}}}}"#,
             T0
         ),
         &[img.as_fd(), manifest_file.as_fd(), reader.as_fd()],
@@ -1523,7 +1558,7 @@ fn assemble_with_a_manifest_and_a_stream() {
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
         &[img2.as_fd(), manifest_file.as_fd(), short.as_fd()],
     );
     assert_eq!(
@@ -1547,7 +1582,7 @@ fn assemble_with_a_manifest_and_a_stream() {
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
         &[img3.as_fd(), manifest_file.as_fd(), long.as_fd()],
     );
     assert_eq!(
@@ -1689,8 +1724,7 @@ fn a_failed_assemble_leaves_the_file_system_unfinished() {
     let mut c = connect_fd3(&ufat);
     let source = ro(&tree);
     let (image, img) = fresh_image();
-    let assemble =
-        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#;
+    let assemble = r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#;
     let e = error_of(
         &mut c,
         "Assemble",
@@ -1732,7 +1766,7 @@ fn a_failed_assemble_leaves_the_file_system_unfinished() {
     reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"options":{"force":true},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true,"force":true},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
         &[img.as_fd(), manifest_file.as_fd(), source.as_fd()],
     ));
     assert!(warnings(&mut c, image.path()).is_empty());
@@ -1796,7 +1830,7 @@ fn assemble_hashes_the_image() {
             &mut c,
             "Assemble",
             &format!(
-                r#"{{"image":{{"fileDescriptor":0}},"content":{{"sourceFileDescriptor":1}},"imageHash":"{}"}}"#,
+                r#"{{"image":{{"fileDescriptor":0}},"options":{{"minimize":true}},"content":{{"sourceFileDescriptor":1}},"imageHash":"{}"}}"#,
                 algorithm
             ),
             &[img.as_fd(), source.as_fd()],
@@ -1839,7 +1873,7 @@ fn assemble_writes_a_manifest() {
         &mut c,
         "Assemble",
         &format!(
-            r#"{{"image":{{"fileDescriptor":0}},"options":{{"timestampUSec":{}}},"content":{{"sourceFileDescriptor":1,"manifestSink":{{"fileDescriptor":2,"features":["size","sha256","mtime"]}}}}}}"#,
+            r#"{{"image":{{"fileDescriptor":0}},"options":{{"minimize":true,"timestampUSec":{}}},"content":{{"sourceFileDescriptor":1,"manifestSink":{{"fileDescriptor":2,"features":["size","sha256","mtime"]}}}}}}"#,
             T0
         ),
         &[img.as_fd(), source.as_fd(), out_file.as_fd()],
@@ -1875,7 +1909,7 @@ fn assemble_writes_a_manifest() {
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1,"manifestSink":{"fileDescriptor":2}}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"sourceFileDescriptor":1,"manifestSink":{"fileDescriptor":2}}}"#,
         &[fresh_img.as_fd(), source.as_fd(), readable.as_fd()],
     );
     assert_eq!(e.name, format!("{}.BadFileDescriptor", IFACE));
@@ -1934,7 +1968,7 @@ fn manifests_record_and_apply_features() {
     reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"sourceFileDescriptor":1}}"#,
         &[img.as_fd(), source.as_fd()],
     ));
     // The features a manifest lists in its root file object.
@@ -2045,7 +2079,7 @@ fn assemble_reports_its_phases() {
     let replies = call_more(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1,"manifestSink":{"fileDescriptor":2}},"imageHash":"sha256"}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"sourceFileDescriptor":1,"manifestSink":{"fileDescriptor":2}},"imageHash":"sha256"}"#,
         &[img.as_fd(), source.as_fd(), out_file.as_fd()],
     );
     // A phase that lasts repeats itself; the order is what counts, and the
@@ -2105,7 +2139,7 @@ fn long_phases_report_progress() {
     let replies = call_more(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
         &[img.as_fd(), manifest_file.as_fd(), reader.as_fd()],
     );
     writer.join().unwrap();
@@ -2136,7 +2170,7 @@ fn reproducible_images_are_identical() {
         &mut c,
         "Assemble",
         &format!(
-            r#"{{"image":{{"fileDescriptor":0}},"options":{{"reproducible":true,"timestampUSec":{}}},"content":{{"sourceFileDescriptor":1}}}}"#,
+            r#"{{"image":{{"fileDescriptor":0}},"options":{{"minimize":true,"reproducible":true,"timestampUSec":{}}},"content":{{"sourceFileDescriptor":1}}}}"#,
             T0
         ),
         &[img.as_fd(), source.as_fd()],
@@ -2146,13 +2180,13 @@ fn reproducible_images_are_identical() {
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"options":{"reproducible":true,"identifier":"1234-ABCD"},"content":{"sourceFileDescriptor":1}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true,"reproducible":true,"identifier":"1234-ABCD"},"content":{"sourceFileDescriptor":1}}"#,
         &[img.as_fd(), source.as_fd()],
     );
     assert_eq!(e.name, format!("{}.NotReproducible", IFACE));
     assert_eq!(str_of(&e.parameters, "reason"), "timestampRequired");
     let options = format!(
-        r#"{{"image":{{"fileDescriptor":0}},"options":{{"reproducible":true,"identifier":"1234-ABCD","timestampUSec":{},"label":"ESP"}},"content":{{"sourceFileDescriptor":1,"times":"clamp"}}}}"#,
+        r#"{{"image":{{"fileDescriptor":0}},"options":{{"minimize":true,"reproducible":true,"identifier":"1234-ABCD","timestampUSec":{},"label":"ESP"}},"content":{{"sourceFileDescriptor":1,"times":"clamp"}}}}"#,
         T0
     );
     let (a, a_img) = fresh_image();
@@ -2179,7 +2213,7 @@ fn describe_with_and_without_a_manifest() {
         &mut c,
         "Assemble",
         &format!(
-            r#"{{"image":{{"fileDescriptor":0}},"options":{{"label":"ESP","identifier":"1234-ABCD","timestampUSec":{}}},"content":{{"sourceFileDescriptor":1}}}}"#,
+            r#"{{"image":{{"fileDescriptor":0}},"options":{{"minimize":true,"label":"ESP","identifier":"1234-ABCD","timestampUSec":{}}},"content":{{"sourceFileDescriptor":1}}}}"#,
             T0
         ),
         &[img.as_fd(), source.as_fd()],
@@ -2313,7 +2347,7 @@ fn describe_of_a_directory_whose_chain_loops_is_corrupt() {
     reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"sourceFileDescriptor":1}}"#,
         &[img.as_fd(), source.as_fd()],
     ));
     drop(img);
@@ -2542,7 +2576,7 @@ fn remove_files_and_directories() {
     reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"sourceFileDescriptor":1}}"#,
         &[img.as_fd(), source.as_fd()],
     ));
     reply(call(
@@ -2622,7 +2656,7 @@ fn list_streams_entries() {
     reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"sourceFileDescriptor":1}}"#,
         &[img.as_fd(), source.as_fd()],
     ));
     reply(call(
@@ -2728,7 +2762,7 @@ fn check_finds_damage() {
     reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"sourceFileDescriptor":1}}"#,
         &[img.as_fd(), source.as_fd()],
     ));
     let img_ro = ro(image.path());
@@ -3067,7 +3101,7 @@ fn pipes_made_non_blocking_during_the_call_are_refused() {
     c.send_with_fds(
         &method("Assemble"),
         params(
-            r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+            r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
         ),
         &[img.as_fd(), manifest_file.as_fd(), r.as_fd()],
     )
@@ -3117,7 +3151,7 @@ fn pipes_made_non_blocking_during_the_call_are_refused() {
     reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"sourceFileDescriptor":1}}"#,
         &[img.as_fd(), source.as_fd()],
     ));
     let img_ro = ro(image.path());
@@ -3245,17 +3279,18 @@ fn errors_are_typed() {
     assert_eq!(e.name, format!("{}.ContentNotSupported", IFACE));
     assert_eq!(str_of(&e.parameters, "what"), "inodeType");
     assert_eq!(str_of(&e.parameters, "name"), "sock");
+    // Assemble refuses it before the image is touched, with the size given
+    // and with the size planned. A plan refuses a manifest's fifo, and so
+    // does Assemble with minimize before the image is touched.
     let (fresh, fresh_img) = fresh_image();
-    let e = error_of(
-        &mut c,
-        "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1,"unsupported":"fail"}}"#,
-        &[fresh_img.as_fd(), source.as_fd()],
-    );
-    assert_eq!(e.name, format!("{}.ContentNotSupported", IFACE));
-    assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
-    // A plan refuses a manifest's fifo, and so does Assemble before the
-    // image is touched.
+    for parameters in [
+        r#"{"image":{"fileDescriptor":0,"size":40000000},"content":{"sourceFileDescriptor":1,"unsupported":"fail"}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"sourceFileDescriptor":1,"unsupported":"fail"}}"#,
+    ] {
+        let e = error_of(&mut c, "Assemble", parameters, &[fresh_img.as_fd(), source.as_fd()]);
+        assert_eq!(e.name, format!("{}.ContentNotSupported", IFACE));
+        assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
+    }
     let scratch = Temp::dir();
     let fifo = scratch.path().join("fifo.manifest");
     std::fs::write(
@@ -3277,7 +3312,7 @@ fn errors_are_typed() {
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2,"unsupported":"fail"}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2,"unsupported":"fail"}}"#,
         &[fresh_img.as_fd(), ro(&fifo).as_fd(), source.as_fd()],
     );
     assert_eq!(e.name, format!("{}.ContentNotSupported", IFACE));
@@ -3494,15 +3529,15 @@ fn too_small_images_are_reported() {
         "{:?}",
         listed
     );
-    // Sized into a window of 1 MiB the content does not fit: TooSmall, and
-    // the fresh file the client made is still empty.
+    // Sized to fit into a window of 1 MiB the content does not fit:
+    // TooSmall, and the fresh file the client made is still empty.
     let (manifest, _) = manifest_and_blob(&tree);
     let manifest_file = file_with(base.path(), "manifest", &manifest);
     let (fresh, fresh_img) = fresh_image();
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0,"size":1048576},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        r#"{"image":{"fileDescriptor":0,"size":1048576},"options":{"minimize":true},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
         &[fresh_img.as_fd(), manifest_file.as_fd(), source.as_fd()],
     );
     assert_eq!(
@@ -3517,22 +3552,21 @@ fn too_small_images_are_reported() {
     let e = error_of(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0,"size":1048576},"content":{"sourceFileDescriptor":1}}"#,
+        r#"{"image":{"fileDescriptor":0,"size":1048576},"options":{"minimize":true},"content":{"sourceFileDescriptor":1}}"#,
         &[fresh_img.as_fd(), source.as_fd()],
     );
     assert_eq!(e.name, format!("{}.TooSmall", IFACE));
     assert_eq!(std::fs::metadata(fresh.path()).unwrap().len(), 0);
     // Without a size the file is grown to the fit and the same call
-    // succeeds; the size was not the exact minimum when it was given.
+    // succeeds. Without minimize the file system takes the size given.
     let manifest_file = ro(&base.path().join("manifest"));
     let r = reply(call(
         &mut c,
         "Assemble",
-        r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        r#"{"image":{"fileDescriptor":0},"options":{"minimize":true},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
         &[fresh_img.as_fd(), manifest_file.as_fd(), source.as_fd()],
     ));
     assert_eq!((u64_of(&r, "files"), u64_of(&r, "directories")), (3, 1));
-    assert!(bool_of(&r, "exact"));
     assert!(std::fs::metadata(fresh.path()).unwrap().len() > 48 << 20);
     let (big_image, big_img) = fresh_image();
     let r = reply(call(
@@ -3541,7 +3575,6 @@ fn too_small_images_are_reported() {
         r#"{"image":{"fileDescriptor":0,"size":67108864},"content":{"sourceFileDescriptor":1}}"#,
         &[big_img.as_fd(), source.as_fd()],
     ));
-    assert!(!bool_of(&r, "exact"));
     assert_eq!(u64_of(object_of(&r, "description"), "sizeBytes"), 64 << 20);
     assert_eq!(std::fs::metadata(big_image.path()).unwrap().len(), 64 << 20);
 }

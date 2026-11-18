@@ -9,7 +9,7 @@ the same manifest below 0.1 s. Fixed by the directory cache and index:
 way.
 
     tests/fuzz/repro/quadratic-directory.py 16000 dir > many.Uapi16Manifest
-    time ufat assemble --create --manifest many.Uapi16Manifest img - < /dev/null
+    time ufat assemble --create --minimize --manifest many.Uapi16Manifest img - < /dev/null
 
 With `dir` every entry is a directory (no contents needed); with `file`
 every entry is an empty file whose contents come from the stream or from a

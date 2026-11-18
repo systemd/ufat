@@ -66,7 +66,7 @@ Every method except `GetCapabilities` works on an `Image`:
 |---|---|
 | `fileDescriptor` | Index of the passed image file or block device. |
 | `offset` | Byte offset of the file system in the image. 0 by default. |
-| `size` | Size of the file system in bytes. The rest of the image by default. |
+| `size` | Size of the file system in bytes. The rest of the image by default. With `minimize`, the most the file system may take. |
 
 Paths inside the file system are absolute. `/` is the root. Times are
 microseconds since the UNIX epoch, in UTC.
@@ -96,7 +96,7 @@ The reply does not depend on the call. It is:
         "operations" : [ "plan", "assembleWithContent", "populate", "remove",
                          "list", "check", "label", "identifier", "reproducible",
                          "manifest", "writeManifest" ],
-        "sizeToFit" : "exact",
+        "sizeToFit" : "best",
         "minimalSizeBytes" : 34089472,
         "maximalSizeBytes" : 2199023255040,
         "sizeGranularityBytes" : 512,
@@ -127,7 +127,7 @@ What the fields mean for vfat:
 - `operations` lists what the implementation can do. `repair`,
   `features` and `discard` are missing. Asking for them fails with
   `OperationNotSupported`.
-- `sizeToFit` is `exact`. A plan gives the size the content needs, to the
+- `sizeToFit` is `best`. A plan gives the size the content needs, to the
   sector. A plan does not compare names. Names that FAT does not tell
   apart, such as `A.TXT` and `a.txt`, or `FOOBAR~1` and `FOO BAR`, whose
   short name it is, are two names to it. Content with such names,
@@ -189,21 +189,25 @@ formats any image.
 
 How the image is sized:
 
-- With content and without `size`, a regular image file is grown to the
-  exact size the content needs. It is never shrunk.
-- With a `size`, the file system gets that size. Content that does not
-  fit fails with `TooSmall` before anything is written.
-- Content is planned first. A manifest is read twice then, so it has to
-  be a regular file.
-- Without content, a regular image file is grown to `size`. An empty
-  image file without a `size` fails with `SizeRequired`.
-- A block device is never resized.
+- Without `minimize`, the file system gets `size`, or the rest of the
+  image behind `offset`, as mkfs.fat does. A regular image file is grown
+  to `size`. An empty image file without a `size` fails with
+  `SizeRequired`. A size too small for a FAT32 file system fails with
+  `NoSpaceLeft` and reason `volume` before anything is written, also a
+  `size` of 0 and an `offset` at the end of the image. The content is
+  written right away. Content that does not fit fails with `NoSpaceLeft`
+  while it is written.
+- With `minimize`, the file system is as small as the content allows. A
+  regular image file is grown to that size. Content that does not fit
+  `size` or the block device fails with `TooSmall` before anything is
+  written. The content is planned first. A manifest is read twice then,
+  so it has to be a regular file.
+- An image file is never shrunk, and a block device is never resized.
 
 The reply carries a `description` with the label and the serial number
 as stored, the sector size, the cluster size (`blockSize`), the size and
 the free space. With content, the counts `files`, `directories`, `bytes`
-and `skipped` follow, and with a `manifestSink` also `omitted`. `exact`
-is true when the size was computed to fit the content.
+and `skipped` follow, and with a `manifestSink` also `omitted`.
 
 Mode `plan` answers with `minimalSizeBytes` in place of `freeBytes`:
 
@@ -220,7 +224,6 @@ Mode `plan` answers with `minimalSizeBytes` in place of `freeBytes`:
         "minimalSizeBytes" : 34089472,
         "label" : "ESP"
       },
-      "exact" : true,
       "files" : 2,
       "directories" : 3,
       "bytes" : 5010
@@ -250,6 +253,7 @@ see "Passing file descriptors".
 | `blockSize` | The cluster size: a power of two from the sector size up to 32768, at most 128 sectors. Chosen from the volume size by default, like mkfs.fat does. |
 | `zero` | Overwrites the whole data area with zeros. Off by default. |
 | `force` | Formats the image whatever it holds. Off by default. |
+| `minimize` | Makes the file system as small as the content allows. Off by default. |
 | `reproducible` | Makes the image depend on the inputs only. Requires `identifier` and `timestampUSec`, and fails with `NotReproducible` without them. Set `times` to `fixed` or `clamp` to make the file times reproducible too. |
 | `discard` | `false` is accepted. `true` fails with `OperationNotSupported`. |
 | `enableFeatures`, `disableFeatures` | FAT has none. Setting them fails with `OperationNotSupported`. |
@@ -410,11 +414,12 @@ Other combinations fail with `InvalidParameter`.
 A manifest is read one record at a time, and what a record describes is
 written when the record comes. So a manifest of any size can come through
 a pipe, unless it is planned before its content is written: `Assemble` in
-mode `assemble` plans its content first, so there it has to be a regular
-file. A pipe fails with `BadFileDescriptor` and reason `wrongType` then.
-Mode `plan` reads the manifest once and takes a pipe. A plan keeps the
-path of the deepest open directory, and a count for each directory on
-that path, so the memory `Assemble` uses does not grow with the manifest.
+mode `assemble` with `minimize` plans its content first, so there it has
+to be a regular file. A pipe fails with `BadFileDescriptor` and reason
+`wrongType` then. Mode `plan` reads the manifest once and takes a pipe.
+A plan keeps the path of the deepest open directory, and a count for
+each directory on that path, so the memory `Assemble` uses does not grow
+with the manifest.
 
 When the file contents come from a stream, the manifest and the stream
 are read in lockstep: a record of the manifest, then the contents of the
@@ -534,7 +539,7 @@ reply. Without it, only the final reply is sent.
 
 | Method | Phases |
 |---|---|
-| `Assemble` | `planning` (with content), `formatting`, `populating` (with content), `reading` (with a `manifestSink`, and again with `imageHash`). Mode `plan` sends `planning` only. |
+| `Assemble` | `planning` (with `minimize`), `formatting`, `populating` (with content), `reading` (with a `manifestSink`, and again with `imageHash`). Mode `plan` sends `planning` only. |
 | `Describe` | `reading`, with a `manifestSink` only. |
 | `Populate` | `populating`, then `reading` with a `manifestSink`. |
 | `Remove` | `removing`, for a recursive removal only. |
@@ -557,7 +562,7 @@ Each parameter needs a descriptor of a certain kind:
 |---|---|
 | `image.fileDescriptor` | A regular file or a block device. Open read-write for `Assemble` in mode `assemble`, `Populate` and `Remove`. Read-only or read-write for `Describe`, `List` and `Check`. |
 | `content.sourceFileDescriptor` | A directory, a regular file or a pipe, open read-only. |
-| `content.manifest.fileDescriptor` | A regular file or a pipe, open read-only. A manifest of any size can be passed this way. `Assemble` in mode `assemble` needs a regular file. |
+| `content.manifest.fileDescriptor` | A regular file or a pipe, open read-only. A manifest of any size can be passed this way. `Assemble` with `minimize` needs a regular file. |
 | `manifestSink.fileDescriptor` | A regular file or a pipe, open for writing. `O_APPEND` is allowed. |
 
 The service checks every descriptor before it uses it. The call fails
@@ -573,12 +578,12 @@ descriptor:
 - is not open read-only for a source or a manifest (`notReadOnly`),
 - is not open for writing for a manifest sink (`notWritable`),
 - is not of the type the parameter needs (`wrongType`), also a manifest
-  on a pipe for `Assemble` in mode `assemble`.
+  on a pipe for `Assemble` with `minimize`.
 
 All descriptors are checked, and the first record of a manifest is read,
-before the image is opened. `Assemble` in mode `assemble` reads the
-whole manifest before the image is changed. A call that fails this way
-leaves the image unchanged.
+before the image is opened. With `minimize` the whole manifest is read
+before the image is changed. A call that fails this way leaves the image
+unchanged.
 
 A pipe that is made non-blocking during the call fails it with
 `BadFileDescriptor` and the reason `flags` once the service has to wait
@@ -605,12 +610,12 @@ The service returns no text. Every error is a name with typed fields.
 | `BadFileDescriptor` | A passed descriptor does not meet the requirements. | `parameter`, `reason`, `flags` |
 | `FileSystemTypeNotSupported` | A `fileSystemType` other than `vfat`. | `fileSystemType` |
 | `OperationNotSupported` | `discard`, features or `repair` were requested. | `operation` |
-| `SizeRequired` | `Assemble` without content into an empty file without a `size`. | none |
+| `SizeRequired` | `Assemble` without `minimize` into an empty file without a `size`. | none |
 | `NotFileSystem` | The image holds no FAT32 file system. | `reason` (`blank`, `foreignImageType`, `sectorSize`, `tooSmall`, `unknown`), `found`, `sectorSize` |
 | `ImageNotEmpty` | `Assemble` without `force` into an image that holds a file system, a partition table or other data. | `found` |
 | `Corrupt` | The file system is damaged where the operation needs it. | `where` (`superblock`, `allocation`, `chain`, `directory`), `field`, `path`, `block` |
-| `NoSpaceLeft` | The file system is full, or the cluster size leaves fewer than 65525 clusters. | `reason` (`blocks`, `directoryEntries`, `names`, `volume`), `path` |
-| `TooSmall` | The content does not fit the `size` given to `Assemble`. | `minimalSizeBytes`, `sizeBytes` |
+| `NoSpaceLeft` | The file system is full, or the size or the cluster size leaves fewer than 65525 clusters. | `reason` (`blocks`, `directoryEntries`, `names`, `volume`), `path` |
+| `TooSmall` | With `minimize`, the content does not fit the `size` given to `Assemble` or the block device. `minimalSizeBytes` is the smallest file system that holds it, `sizeBytes` that `size` or what the block device has behind `offset`. | `minimalSizeBytes`, `sizeBytes` |
 | `TooLarge` | A file is larger than FAT allows, or a volume has more clusters than FAT32 can address. | `path`, `sizeBytes`, `sizeMaxBytes` |
 | `NoSuchFile` | A path does not exist. | `path` |
 | `FileExists` | A file exists and `replace` is false, or a directory exists and `parents` is false. | `path` |

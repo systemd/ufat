@@ -36,16 +36,16 @@ interface org.uapi-group.FileSystem
 # Where a filesystem lives: an image file or block device and the byte range
 # inside it. A block device written to is claimed exclusively while the call
 # runs, the way a mount claims it; a mounted device is refused with ImageBusy. A
-# regular file is grown to the size the filesystem needs when the call makes
-# one and no size is given; it is never shrunk.
+# regular file is grown to the size of a filesystem the call makes; it is never
+# shrunk.
 type Image(
 	# Index of the descriptor of the image file or block device
 	fileDescriptor: int,
 	# Byte offset of the filesystem inside the image, 0 by default
 	offset: ?int,
-	# Size of the filesystem in bytes, the rest of the image by default; with
-	# content and no size the filesystem is sized to fit when the
-	# implementation can (Capabilities.sizeToFit), else SizeRequired
+	# Size of the filesystem in bytes, the rest of the image by default; an
+	# empty image without a size is SizeRequired, unless FormatOptions.minimize
+	# is set. With FormatOptions.minimize the most the filesystem may take.
 	size: ?int
 )
 
@@ -79,13 +79,14 @@ type LabelRules(
 	charset: LabelCharset
 )
 
-# How well plan finds the smallest filesystem for given content.
+# How well plan finds the smallest filesystem for given content, in the
+# words of systemd-repart's Minimize=.
 type SizeToFit(
-	# An estimate that holds the content with room to spare (ext4, xfs)
-	estimate,
-	# The exact size, the filesystem full to the last block (vfat, erofs,
+	# A guess that holds the content with room to spare (ext4, xfs)
+	guess,
+	# The best size, the filesystem full to the last block (vfat, erofs,
 	# squashfs, btrfs)
-	exact
+	best
 )
 
 # A feature the filesystem can be made with or without, by its name in the
@@ -117,7 +118,8 @@ type TimeRules(
 # asked for and is not in it. A set is an array of an enum because Varlink
 # has no flags type.
 type Operation(
-	# Assemble with mode plan (Capabilities.sizeToFit says how exactly)
+	# Assemble with mode plan and with FormatOptions.minimize
+	# (Capabilities.sizeToFit says how well)
 	plan,
 	# Content at Assemble time
 	assembleWithContent,
@@ -193,7 +195,7 @@ type Capabilities(
 	readOnly: bool,
 	# What a caller can ask for; anything else is OperationNotSupported
 	operations: []Operation,
-	# Whether plan answers exactly or estimates; absent without plan
+	# Whether plan finds the best size or guesses; absent without plan
 	sizeToFit: ?SizeToFit,
 	# The smallest and largest filesystem the implementation makes, and the
 	# granularity sizes are rounded to
@@ -297,10 +299,10 @@ type ManifestFeature(
 # the source directory, or back to back in manifest order from the source
 # stream. A manifest and a source stream are read in lockstep, a record and
 # then the contents of the file it describes, so a client that passes both as
-# pipes writes to both at the same time. Assemble in mode assemble plans the
-# content first: it reads the whole manifest before it writes and needs it in
-# a regular file; a pipe is BadFileDescriptor with reason wrongType then. In
-# mode plan the manifest is read once, and a pipe will do.
+# pipes writes to both at the same time. Assemble with FormatOptions.minimize
+# plans the content first: it reads the whole manifest before it writes and
+# needs it in a regular file; a pipe is BadFileDescriptor with reason wrongType
+# then. In mode plan the manifest is read once, and a pipe will do.
 type Manifest(
 	# Index of the descriptor, open read-only
 	fileDescriptor: int,
@@ -399,6 +401,9 @@ type FormatOptions(
 	zero: ?bool,
 	# Format the image whatever it holds, false by default
 	force: ?bool,
+	# Make the filesystem the smallest that holds the content, false by
+	# default; Image.size is then the most it may take
+	minimize: ?bool,
 	# Make the bytes a function of the inputs alone: requires identifier and
 	# timestampUSec and pins everything else the implementation knows to
 	# vary (seeds, worker counts, walk order)
@@ -515,14 +520,14 @@ method GetCapabilities(
 # Lays out a filesystem and reports it. With mode assemble the image is
 # written: formatted, and filled with the content when there is one, in one
 # step, which is the only way for a read-only filesystem. With mode plan
-# nothing is written: the geometry, the size the content needs and whether
-# that size is exact are computed, from the content and the options, and
-# from the image's size when one is given. A regular image file without a
-# size is grown to the fit when content is given. With mode assemble, an
-# image that holds a filesystem, a partition table or other data that
-# formatting would destroy is refused with ImageNotEmpty, unless
-# FormatOptions.force is set. With offset and size, only that part of the
-# image counts. The reply contains the label and identifier as stored.
+# nothing is written: the geometry and the size the content needs are
+# computed, from the content and the options, and from the image's size
+# when one is given. With FormatOptions.minimize a regular image file is
+# grown to the size the content needs. With mode assemble, an image that
+# holds a filesystem, a partition table or other data that formatting would
+# destroy is refused with ImageNotEmpty, unless FormatOptions.force is set.
+# With offset and size, only that part of the image counts. The reply
+# contains the label and identifier as stored.
 # [Supports 'more' flag]: intermediate replies carry the phase and the
 # counts so far.
 method Assemble(
@@ -532,17 +537,15 @@ method Assemble(
 	mode: ?AssembleMode,
 	options: ?FormatOptions,
 	content: ?Content,
-	# Hash the filesystem as it is in the image after the call, all size bytes
-	# from offset: the written bytes and the rest, which the implementation
-	# knows to be zero when the call sized or zeroed the image, and reads back
-	# otherwise
+	# Hash the filesystem as it is in the image after the call, the bytes from
+	# offset to the end of the filesystem: the written bytes and the rest,
+	# which the implementation knows to be zero when the call sized or zeroed
+	# the image, and reads back otherwise
 	imageHash: ?HashAlgorithm
 ) -> (
 	# The step in progress, in intermediate replies only
 	phase: ?Phase,
 	description: ?Description,
-	# Whether the size is the exact minimum (plan, or assemble sized to fit)
-	exact: ?bool,
 	# What was written, when content was given
 	files: ?int,
 	directories: ?int,
@@ -674,7 +677,8 @@ error OperationNotSupported(operation: Operation)
 # A read-only filesystem is made with its content, and none was given.
 error ContentRequired()
 
-# The filesystem cannot be sized to fit and no size was given.
+# Nothing says how large the filesystem is to be: no size was given, the image
+# is empty, and FormatOptions.minimize is not set.
 error SizeRequired()
 
 # The image holds no filesystem of this type: nothing (blank), another
@@ -699,7 +703,10 @@ error Corrupt(where: CorruptPlace, field: ?string, path: ?string, block: ?int)
 type NoSpaceReason(blocks, directoryEntries, names, inodes, volume)
 error NoSpaceLeft(reason: NoSpaceReason, path: ?string)
 
-# The image is smaller than the content needs.
+# The image is smaller than the content needs: the smallest filesystem that
+# holds the content, minimalSizeBytes, is larger than sizeBytes, the Image.size
+# given with FormatOptions.minimize or what a block device has behind the
+# offset.
 error TooSmall(minimalSizeBytes: int, sizeBytes: int)
 
 # A file or the filesystem is larger than the filesystem allows.

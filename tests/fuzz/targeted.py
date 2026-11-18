@@ -37,11 +37,12 @@ class Probes:
         self.seed_img = os.path.join(seeds, "images", "ufat-512s-512c-2M.img")
         self.small_tree = os.path.join(seeds, "trees", "small")
 
-    def run(self, name, argv, stdin=None, env=None, expect_exit=None, timeout=None):
+    def run(self, name, argv, stdin=None, env=None, expect_exit=None, timeout=None, stdin_pipe=False):
         """Runs argv and records a defect unless it exits with one of
-        expect_exit: 0 or 1, for fsck the fsck(8) codes 0, 4 and 8."""
+        expect_exit: 0 or 1, for fsck the fsck(8) codes 0, 4 and 8. With
+        stdin_pipe the file stdin comes through a pipe."""
         err = os.path.join(self.work, "stderr.txt")
-        res = mutate.run_local(argv, stdin_path=stdin, timeout=timeout or self.timeout, stderr_path=err, env=env)
+        res = mutate.run_local(argv, stdin_path=stdin, timeout=timeout or self.timeout, stderr_path=err, env=env, stdin_pipe=stdin_pipe)
         res["cmd"] = argv[1]
         if expect_exit is None:
             expect_exit = mutate.clean_exits(argv[1])
@@ -229,10 +230,19 @@ class Probes:
             self.run("manifest %s: plan" % name, [self.ufat, "assemble", "--plan", "--manifest", m], timeout=60)
             if os.path.exists(img):
                 os.unlink(img)
-            self.run("manifest %s: assemble" % name, [self.ufat, "assemble", "--create", "--manifest", m, img, src], timeout=120)
+            self.run("manifest %s: assemble" % name, [self.ufat, "assemble", "--create", "--minimize", "--manifest", m, img, src], timeout=120)
             if os.path.exists(img):
                 os.unlink(img)
-            self.run("manifest %s: assemble from a stream" % name, [self.ufat, "assemble", "--create", "--manifest", m, img, "-"], stdin=os.devnull, timeout=120)
+            self.run("manifest %s: assemble from a stream" % name, [self.ufat, "assemble", "--create", "--minimize", "--manifest", m, img, "-"], stdin=os.devnull, timeout=120)
+            if os.path.exists(img):
+                os.unlink(img)
+            # Into a size given nothing is planned: the manifest is read
+            # while the volume is written, also through a pipe.
+            self.run("manifest %s: assemble into a size given" % name, [self.ufat, "assemble", "--create", "--size", mutate.SIZE_GIVEN, "--manifest", m, img, src], timeout=120)
+            if os.path.exists(img):
+                os.unlink(img)
+            self.run("manifest %s: assemble through a pipe" % name, [self.ufat, "assemble", "--create", "--size", mutate.SIZE_GIVEN, "--manifest", "-", img, src],
+                     stdin=m, stdin_pipe=True, timeout=120)
             if os.path.exists(img):
                 os.unlink(img)
         # Not a manifest at all.

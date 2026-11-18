@@ -41,7 +41,7 @@ use fat::{CorruptPlace, Detail, NoSpaceReason, NotFat32Reason, UnsupportedKind};
 use json::{Object, Value};
 use varlink::{Activation, Call, Connection, Info, Reply, Server, Service};
 
-use crate::util::{self, ManifestInput, ManifestUse};
+use crate::util::{self, ImageFlags, ManifestInput, ManifestUse, SizeMode, SizeRequest};
 
 /// The interface description, served verbatim.
 pub(crate) const INTERFACE: &str = include_str!("../../../docs/org.uapi-group.FileSystem.varlink");
@@ -344,7 +344,17 @@ fn fail(f: Failure) -> varlink::Error {
 /// The error of the fit, as a failure of the call.
 fn fit_error(e: util::FitError) -> Failure {
     match e {
+        util::FitError::SizeRequired => Failure::SizeRequired,
         util::FitError::TooSmall { minimal, actual } => Failure::TooSmall { minimal, actual },
+        // Only the command line asks for SizeMode::Fit, with --fit and with
+        // --manifest without a SOURCE. The service makes no such call. This
+        // is the room that writing the content would run out of.
+        util::FitError::TooFewClusters(shortfall) => Failure::Other(
+            fat::Error::new(errno::ENOSPC, shortfall.to_string()).with(Detail::NoSpace {
+                reason: NoSpaceReason::Clusters,
+                path: None,
+            }),
+        ),
         util::FitError::Other(e) => Failure::Other(e),
     }
 }
@@ -588,8 +598,10 @@ struct Options {
     format: FormatOptions,
     /// `timestampUSec` as given; None when the current time stands in.
     time: Option<SystemTime>,
-    /// `force`: format the image whatever it holds.
-    force: bool,
+    /// `force`: what may be done to the image.
+    image: ImageFlags,
+    /// `minimize`: how large the file system is made.
+    size_mode: SizeMode,
 }
 
 fn format_options(p: Option<Params<'_>>) -> Outcome<Options> {
@@ -605,7 +617,8 @@ fn format_options(p: Option<Params<'_>>) -> Outcome<Options> {
         return Ok(Options {
             format: o,
             time: None,
-            force: false,
+            image: ImageFlags::default(),
+            size_mode: SizeMode::Given,
         });
     };
     // What FAT has no notion of is refused, not ignored.
@@ -654,10 +667,18 @@ fn format_options(p: Option<Params<'_>>) -> Outcome<Options> {
         o.hidden_sectors = v.u32("hiddenSectors")?;
         o.mkfs_fat_compat = v.bool("mkfsFatCompatible", false);
     }
+    let mut image = ImageFlags::default();
+    image.set(ImageFlags::FORCE, p.bool("force", false));
+    let size_mode = if p.bool("minimize", false) {
+        SizeMode::Minimize
+    } else {
+        SizeMode::Given
+    };
     Ok(Options {
         format: o,
         time,
-        force: p.bool("force", false),
+        image,
+        size_mode,
     })
 }
 
@@ -759,7 +780,7 @@ pub(crate) fn capabilities() -> fat::Result<Object> {
             "manifest",
             "writeManifest",
         ],
-        "sizeToFit" => "exact",
+        "sizeToFit" => "best",
         "minimalSizeBytes" => minimal,
         // 0xFFFFFFFF sectors of 512 bytes, the total sectors field's limit.
         "maximalSizeBytes" => u64::from(u32::MAX) * u64::from(MIN_SECTOR_SIZE),
@@ -1237,13 +1258,13 @@ impl FileSystemService {
         };
         let options = format_options(p.object("options"))?;
         let content_time = options.format.timestamp.unwrap_or_else(util::now);
-        // The content is planned. A plan alone reads a manifest once, on
-        // from its root file object; an assembly reads it for the plan from
-        // its start, and once more while its content is written.
+        // A plan alone reads a manifest once, on from its root file object.
+        // An assembly that sizes the file system to fit reads it for the
+        // plan from its start, and once more while its content is written.
         let (taker, manifest_use) = if plan_only {
             (Taker::Plan, ManifestUse::PlanOnly)
         } else {
-            (Taker::Assemble, ManifestUse::Plan)
+            (Taker::Assemble, options.size_mode.manifest_use())
         };
         let content = match p.object("content") {
             None => None,
@@ -1469,7 +1490,6 @@ fn plan(mut options: Options, content: Option<Content>, c: &mut Connection, more
     optional(&mut d, "label", stored_label(&options.format)?);
     Ok(json::object! {
         "description" => d,
-        "exact" => true,
         "files" => e.files,
         "directories" => e.directories,
         "bytes" => e.bytes,
@@ -1519,13 +1539,15 @@ fn fill_image(
 }
 
 /// Assemble with mode assemble: the image written, filled with the content
-/// when there is one, sized to fit when no size is given. Everything that
-/// can be checked before the image is touched has been checked by now:
-/// the descriptors vetted, the manifest parsed and its source verified,
-/// the options validated. Without force in the options, an image that
-/// holds a file system, a partition table or other data is ImageNotEmpty.
-/// A call that fails after the format leaves the file system marked as not
-/// cleanly unmounted.
+/// when there is one. The file system takes the size given or the rest of
+/// the image, or with minimize the size the content needs. Everything that
+/// can be checked before the image is touched has been checked by now: the
+/// descriptors vetted, the root file object of a manifest read, the options
+/// validated. With minimize the content is planned before the image is
+/// touched. Without force in the options, an image that holds a file
+/// system, a partition table or other data is ImageNotEmpty. A call that
+/// fails after the format leaves the file system marked as not cleanly
+/// unmounted.
 fn assemble_image(
     image: Image,
     mut options: Options,
@@ -1539,38 +1561,33 @@ fn assemble_image(
         None => None,
     };
     let (mut device, offset, size) = image.device(Access::ReadWrite)?;
-    let (mut volume, exact) = match &content {
-        Some(ct) => {
-            phase(c, more, "planning")?;
-            let (estimate, fit) = util::plan_fit(&mut device, offset, size, &mut options.format, true, &mut |plan| {
-                ct.plan(plan)
-            })
-            .map_err(fit_error)?;
-            if !options.force {
-                Prober::new().ensure_empty(&device, offset, Some(fit))?;
-            }
-            phase(c, more, "formatting")?;
-            let (volume, _) = util::format_fit(device, offset, fit, estimate, &options.format).map_err(fit_error)?;
-            (volume, size.is_none())
-        }
-        None => {
-            if !options.force {
-                Prober::new().ensure_empty(&device, offset, size)?;
-            }
-            // A regular file is grown to a size given. An image with no
-            // bytes in it has no size at all.
-            if let Some(s) = size {
-                util::size_image(&mut device, offset, s)?;
-            }
-            let device = device.window(offset, size)?;
-            if device.is_empty() {
-                return Err(Failure::SizeRequired);
-            }
-            check_block_size(&options.format, &device)?;
-            phase(c, more, "formatting")?;
-            (Volume::create(device, &options.format)?, false)
-        }
+    check_block_size(&options.format, &device)?;
+    // Without a plan a tree is walked here, so that under UnsupportedPolicy
+    // fail what FAT cannot hold is refused before the image is touched.
+    let mode = options.size_mode;
+    match (mode, &content) {
+        (SizeMode::Given, Some(ct)) => ct.check_tree("/")?,
+        (SizeMode::Given, None) => {}
+        (SizeMode::Fit | SizeMode::Minimize, _) => phase(c, more, "planning")?,
+    }
+    let mut add = |plan: &mut Plan| match &content {
+        Some(ct) => ct.plan(plan),
+        None => Ok(()),
     };
+    let decision = util::decide_size(
+        &mut device,
+        offset,
+        size,
+        &mut options.format,
+        true,
+        SizeRequest::new(mode, &mut add),
+    )
+    .map_err(fit_error)?;
+    if !options.image.contains(ImageFlags::FORCE) {
+        Prober::new().ensure_empty(&device, offset, Some(decision.size))?;
+    }
+    phase(c, more, "formatting")?;
+    let mut volume = util::format_sized(device, offset, decision.size, &options.format)?;
     let (counts, omitted, description) = match fill_image(&mut volume, content, options.time, c, more) {
         Ok(filled) => filled,
         Err(e) => {
@@ -1584,7 +1601,7 @@ fn assemble_image(
     };
     let window = volume.device().len();
     volume.close()?;
-    let mut o = json::object! { "description" => description, "exact" => exact };
+    let mut o = json::object! { "description" => description };
     if let Some(counts) = counts {
         counts.put(&mut o);
     }

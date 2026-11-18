@@ -142,9 +142,11 @@ fresh_image() { cp --sparse=always "$IN/empty.img" "$IMG/target.img"; }
 no_image() { rm -f "$IMG/target.img"; }
 empty_image() { rm -f "$IMG/target.img" && : > "$IMG/target.img"; }
 nothing() { :; }
-ASM=(assemble --create --sector-size 512 --identifier 1234abcd --label ESP)
+# The file systems get a size: one both binaries make the same way whether
+# or not they size to fit on their own.
+ASM=(assemble --create --size 64M --sector-size 512 --identifier 1234abcd --label ESP)
 POPULATE='{"image":{"fileDescriptor":0},"path":"/","content":{"sourceFileDescriptor":1}}'
-ASSEMBLE='{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2},"options":{"sectorSize":512,"identifier":"1234-ABCD","label":"ESP"}}'
+ASSEMBLE='{"image":{"fileDescriptor":0,"size":67108864},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2},"options":{"sectorSize":512,"identifier":"1234-ABCD","label":"ESP"}}'
 workloads() {
     local r=$1
     $r assemble/esp no_image -- @UFAT@ "${ASM[@]}" "$IMG/target.img" "$IN/esp"

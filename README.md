@@ -57,7 +57,12 @@ This recording uses the tool to make, change and check an ESP image:
 
 Make an image that fits a directory tree and copy the tree into it:
 
-    ufat assemble --create --label ESP esp.img tree/
+    ufat assemble --create --minimize --label ESP esp.img tree/
+
+Without `--minimize` the file system takes the size given with `--size`,
+or the whole image, as mkfs.fat does:
+
+    ufat assemble --create --size 1G --label ESP esp.img tree/
 
 Copy more files into an existing file system, a directory tree or one
 file:
@@ -95,7 +100,7 @@ The commands are:
 
 | Command | What it does |
 |---|---|
-| `assemble IMAGE [SOURCE]` | Create a file system sized to fit SOURCE or what `--manifest` describes, and fill it with that. Without a SOURCE, create an empty file system. |
+| `assemble IMAGE [SOURCE]` | Create a file system and fill it with SOURCE or what `--manifest` describes. Without a SOURCE, create an empty file system. |
 | `assemble --plan [SOURCE]` | Print the smallest file system size that holds SOURCE or what `--manifest` describes. |
 | `populate IMAGE [SOURCE]` | Copy a directory tree, one file, or what `--manifest` describes into an existing file system. Without a SOURCE, create a directory. |
 | `remove IMAGE PATH...` | Remove files and empty directories. `-r` removes directories with everything in them. |
@@ -121,6 +126,8 @@ The most common ones:
 - `--path PATH` copies the directory tree below PATH instead of the root.
   For `populate` it is also the path of a single file, or the directory
   to create.
+- `--minimize` makes the file system of `assemble` as small as its
+  content allows. A `--size` is then the most it may take.
 - `--no-replace` fails instead of replacing files that exist.
 - `--unsupported fail` fails on files FAT cannot store, such as FIFOs
   and device nodes. By default they are left out with a message.
@@ -161,8 +168,8 @@ derived from the time stamp and the label instead of drawn at random.
 `assemble`, `populate` and `assemble --plan` can work from a UAPI.16
 manifest instead of a tree:
 
-    ufat assemble --create --manifest m.json esp.img tree/
-    ufat assemble --create --manifest m.json esp.img - < contents
+    ufat assemble --create --minimize --manifest m.json esp.img tree/
+    ufat assemble --create --minimize --manifest m.json esp.img - < contents
     ufat assemble --plan --manifest m.json
 
 With `--manifest`, the one SOURCE is the directory that the manifest's
@@ -177,14 +184,15 @@ paths from the root of the file system, so `--path` does not apply.
 contents then have to come from a directory.
 
 ufat reads a manifest one record at a time, and writes each file and
-directory when its record comes. So `populate` takes a manifest of any
-size, also through a pipe. To size the file system to fit, ufat reads
-the manifest once before it writes anything. So `assemble` with a SOURCE
-needs the manifest in a regular file. `assemble --plan` and `assemble`
-without a SOURCE read the manifest only once, so they take one through a
-pipe as well. While it sizes, ufat keeps the path of the deepest open
-directory, and a count for each directory on that path. Memory use does
-not grow with the manifest.
+directory when its record comes. So a manifest of any size can come
+through a pipe on standard input, with `--manifest -`. A `--manifest`
+PATH names a regular file. To size the file system to fit, ufat reads
+the manifest once before it writes anything. So `--minimize` with a
+SOURCE needs the manifest in a regular file, also on standard input.
+`assemble --plan` and `assemble` without a SOURCE read the manifest only
+once, so they take one through a pipe as well. While it sizes, ufat
+keeps the path of the deepest open directory, and a count for each
+directory on that path. Memory use does not grow with the manifest.
 
 The objects of a manifest have to be in code point order: every
 directory before what is in it, and the names of a directory sorted by
@@ -260,10 +268,19 @@ smaller volumes. ufat never creates a volume below that limit:
 | 4096 bytes | 269045760 bytes, about 257 MiB |
 
 `ufat assemble --plan` prints the smallest size for a tree or a manifest.
-`assemble` creates an image of exactly that size unless `--size` is given.
-An existing image file is grown when needed and never shrunk. A smaller
-volume made by another tool can still be read, filled and checked.
-`ufat check` reports that it is below the minimum.
+`assemble --minimize` creates a file system of exactly that size, and
+fails when it is more than `--size`. Without `--minimize` the file system
+takes `--size`, or the whole image, and an empty image without `--size`
+is refused. An empty file system made with `--fit DIR`, or with
+`--manifest` and no SOURCE, takes `--size` too, which DIR or what the
+manifest describes has to fit. Without `--size` it gets the smallest size
+that holds them. `--plan` with `--size` answers for `assemble` with the
+same options: without `--minimize` the content has to fit a file system
+of that size, in the clusters that size gets, and with `--minimize` the
+smallest file system has to fit in `--size`. An existing image file is
+grown when needed and never shrunk. A smaller volume made by another
+tool can still be read, filled and checked. `ufat check` reports that it
+is below the minimum.
 
 A plan does not compare names. Two names that FAT does not tell apart
 are two names to the plan: names that differ in case only, such as

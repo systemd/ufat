@@ -347,10 +347,10 @@ bench "sha256/esp/ufat-manifest" ":" -- "$UFAT" manifest "$IN/esp"
 [ -n "$SHA256SUM" ] && bench "sha256/esp/sha256sum" ":" -- "$SHA256SUM" "${ESP_FILES[@]}"
 for ss in 512 4096; do
     W=$IMG/asm-$ss.img
-    # --create without --size sizes the image to fit the manifest.
-    bench "assemble/$ss/esp/dir-fit" "rm -f $W" -- "$UFAT" assemble --create --sector-size "$ss" --identifier 1234abcd --label ESP \
+    # --minimize sizes the image to fit the manifest, which it reads twice.
+    bench "assemble/$ss/esp/dir-fit" "rm -f $W" -- "$UFAT" assemble --create --minimize --sector-size "$ss" --identifier 1234abcd --label ESP \
         --manifest "$IN/esp.manifest" "$W" "$IN/esp"
-    bench "assemble/$ss/esp/stream-fit" "rm -f $W" --stdin "$IN/esp.blob" -- "$UFAT" assemble --create --sector-size "$ss" --identifier 1234abcd --label ESP \
+    bench "assemble/$ss/esp/stream-fit" "rm -f $W" --stdin "$IN/esp.blob" -- "$UFAT" assemble --create --minimize --sector-size "$ss" --identifier 1234abcd --label ESP \
         --manifest "$IN/esp.manifest" "$W" -
     # Into a formatted 1 GiB image, like populate above: the difference to
     # populate is the manifest handling and the SHA-256 verification.
@@ -377,7 +377,7 @@ for ss in 512 4096; do
         --params '{"image":{"fileDescriptor":0},"path":"/","content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2},"timestampUSec":1700000000000000}'
     bench "varlink/$ss/esp/Assemble-manifest-stream-fit" "rm -f $W; : > $W" --ufat "$UFAT" --method org.uapi-group.FileSystem.Assemble \
         --fd "rw:$W" --fd "$IN/esp.manifest" --fd "$IN/esp.blob" \
-        --params "{\"image\":{\"fileDescriptor\":0},\"content\":{\"manifest\":{\"fileDescriptor\":1},\"sourceFileDescriptor\":2},\"options\":{\"sectorSize\":$ss,\"identifier\":\"1234-ABCD\",\"label\":\"ESP\",\"timestampUSec\":1700000000000000}}"
+        --params "{\"image\":{\"fileDescriptor\":0},\"content\":{\"manifest\":{\"fileDescriptor\":1},\"sourceFileDescriptor\":2},\"options\":{\"minimize\":true,\"sectorSize\":$ss,\"identifier\":\"1234-ABCD\",\"label\":\"ESP\",\"timestampUSec\":1700000000000000}}"
     rm -f "$W"
     for tree in esp wide-flat wide-flat83 wide-deep; do rm -f "$IMG/pop-$tree-$ss.img"; done
 done

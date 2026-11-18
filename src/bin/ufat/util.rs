@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! Helpers shared by the command line interface and the Varlink service.
 
+use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Seek};
 use std::os::fd::AsFd;
@@ -11,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fat::device::{Access, Device};
 use fat::errno;
 use fat::format::FormatOptions;
+use fat::layout::Layout;
 use fat::manifest::{Order, Reader, RootObject};
 use fat::plan::{Estimate, Plan, PlanOptions};
 use fat::probe::Prober;
@@ -71,8 +73,9 @@ pub(crate) enum ManifestUse {
     /// It is planned and none of its content is written: it is read once,
     /// on from its root file object. A pipe will do.
     PlanOnly,
-    /// It is planned before its content is written, and has to be in a
-    /// regular file for that: the plan reads it once more from its start.
+    /// It is planned before its content is written, with `--minimize` or
+    /// `minimize`, and has to be in a regular file for that: the plan reads
+    /// it once more from its start.
     Plan,
 }
 
@@ -286,10 +289,19 @@ pub(crate) struct Target<'a> {
     pub flags: ImageFlags,
 }
 
-/// Why [`fit_and_format`] could not fit the content.
+/// Why the size of a new file system could not be decided.
 pub(crate) enum FitError {
-    /// The image is fixed in size and smaller than the content needs.
+    /// Nothing says how large the file system is to be: no size was given
+    /// and the image is empty.
+    SizeRequired,
+    /// The smallest file system that holds the content, `minimal` bytes,
+    /// is larger than the most it may take, `actual` bytes: the size given
+    /// with a file system sized to fit, or the block device behind the
+    /// offset.
     TooSmall { minimal: u64, actual: u64 },
+    /// The file system of the size given holds fewer clusters than the
+    /// content takes.
+    TooFewClusters(ClusterShortfall),
     /// Anything else.
     Other(Error),
 }
@@ -304,6 +316,11 @@ impl FitError {
     /// The error as the command line tool reports it.
     pub(crate) fn into_error(self, image: &Path) -> Error {
         match self {
+            FitError::SizeRequired => err!(
+                errno::EINVAL,
+                "{} is empty: give --size, or --minimize to make the file system as small as its content allows",
+                image.display()
+            ),
             FitError::TooSmall { minimal, actual } => {
                 err!(
                     errno::ENOSPC,
@@ -313,32 +330,145 @@ impl FitError {
                     minimal
                 )
             }
+            FitError::TooFewClusters(shortfall) => err!(errno::ENOSPC, "{}: {}", image.display(), shortfall),
             FitError::Other(e) => e,
         }
     }
 }
 
-/// Sizes, formats and opens a file system that fits what `add` puts into
-/// the plan: the one way mkfs --fit and assemble make a volume, and what
-/// the Varlink Assemble method does in two steps with [`plan_fit`] and
-/// [`format_fit`]. The image is opened once; a block device
-/// is planned for its logical block size, a regular image file is grown,
-/// never shrunk, to the size given or to the fit, and created first with
-/// [`ImageFlags::CREATE`]. Everything that can go wrong before the first
-/// write, a source that cannot be read, content that does not fit the
-/// size given, is found out while the image is untouched, and a file created
-/// for the file system is removed again then, so a failed command leaves
-/// nothing behind. Without [`ImageFlags::FORCE`], an image that holds a
-/// file system, a partition table or other data is not formatted over
-/// ([`Prober::ensure_empty`]).
+/// The partition start [`fat::format::prepare`] is given where only the
+/// layout of a file system is wanted. It goes into the hidden sectors field
+/// of the boot sector, and the layout does not depend on it.
+const PARTITION_START_FOR_LAYOUT: u64 = 0;
+
+/// A size given for a new file system, with the layout the formatter makes
+/// of it. What goes into that file system is planned with the cluster size
+/// of the layout, and has to fit its clusters.
+pub(crate) struct GivenSize {
+    pub size: u64,
+    pub layout: Layout,
+}
+
+impl GivenSize {
+    /// Lays out a file system of `size` bytes the way the formatter does
+    /// with `options` on a device of `block_size`, and writes nothing. A
+    /// size no file system of the options fits in, 0 among them, fails as
+    /// the formatter fails on it.
+    pub(crate) fn new(options: &FormatOptions, size: u64, block_size: Option<u32>) -> Result<GivenSize> {
+        let layout = fat::format::prepare(options, size, block_size, PARTITION_START_FOR_LAYOUT)?.layout;
+        Ok(GivenSize { size, layout })
+    }
+
+    /// Whether the clusters a plan counts, `estimate`, fit the file system.
+    pub(crate) fn check(&self, estimate: &Estimate) -> std::result::Result<(), ClusterShortfall> {
+        if self.layout.clusters < estimate.data_clusters {
+            return Err(ClusterShortfall {
+                size: self.size,
+                cluster_size: self.layout.cluster_size(),
+                clusters: self.layout.clusters,
+                needed: estimate.data_clusters,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A file system of a size given that holds fewer clusters than the content
+/// takes. The clusters do not grow with the size in every step: one sector
+/// more can take one more sector for each FAT and leave one cluster less.
+/// So this is counted in clusters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClusterShortfall {
+    size: u64,
+    cluster_size: u32,
+    clusters: u32,
+    needed: u32,
+}
+
+impl fmt::Display for ClusterShortfall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "a file system of {} bytes holds {} clusters of {} bytes, the content needs {}",
+            self.size, self.clusters, self.cluster_size, self.needed
+        )
+    }
+}
+
+/// How large a new file system is made, decided before its content is
+/// looked at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SizeMode {
+    /// The size given, or else the rest of the image behind the offset, as
+    /// mkfs.fat does. The content is not planned.
+    Given,
+    /// The size given, which the content has to fit, or else the smallest
+    /// size that holds it.
+    Fit,
+    /// The smallest size that holds the content. A size given is the most
+    /// it may take.
+    Minimize,
+}
+
+impl SizeMode {
+    /// What it asks of the manifest of the content: everything but the
+    /// size given plans it before its content is written.
+    pub(crate) fn manifest_use(self) -> ManifestUse {
+        match self {
+            SizeMode::Given => ManifestUse::Write,
+            SizeMode::Fit | SizeMode::Minimize => ManifestUse::Plan,
+        }
+    }
+}
+
+/// How large a new file system is made, see [`SizeMode`], with the closure
+/// that puts its content into the plan.
+pub(crate) enum SizeRequest<'a> {
+    Given,
+    Fit(&'a mut dyn FnMut(&mut Plan) -> Result<()>),
+    Minimize(&'a mut dyn FnMut(&mut Plan) -> Result<()>),
+}
+
+impl<'a> SizeRequest<'a> {
+    /// The request for `mode`, with `add` to put the content into the
+    /// plan.
+    pub(crate) fn new(mode: SizeMode, add: &'a mut dyn FnMut(&mut Plan) -> Result<()>) -> SizeRequest<'a> {
+        match mode {
+            SizeMode::Given => SizeRequest::Given,
+            SizeMode::Fit => SizeRequest::Fit(add),
+            SizeMode::Minimize => SizeRequest::Minimize(add),
+        }
+    }
+}
+
+/// The size decided for a new file system, and the estimate of the plan
+/// when the content was planned.
+pub(crate) struct SizeDecision {
+    pub size: u64,
+    pub estimate: Option<Estimate>,
+}
+
+/// Makes and opens a file system the way `request` says: the one way the
+/// command line makes a volume, and what the Varlink Assemble method does
+/// in two steps with [`decide_size`] and [`format_sized`]. The image is
+/// opened once; a block device is planned for its logical block size, a
+/// regular image file is grown, never shrunk, to the size, and created
+/// first with [`ImageFlags::CREATE`]. What can be found out before the
+/// first write is found out while the image is untouched: a size no file
+/// system fits in and, when the content is planned, a source tree that
+/// cannot be read, a manifest that cannot be planned, and content that
+/// does not fit a size given. A file created for the file system is
+/// removed again then, so a failed command leaves nothing behind. Without
+/// [`ImageFlags::FORCE`], an image that holds a file system, a partition
+/// table or other data is not formatted over ([`Prober::ensure_empty`]).
 pub(crate) fn fit_and_format(
     target: &Target<'_>,
     options: &mut FormatOptions,
-    add: &mut dyn FnMut(&mut Plan) -> Result<()>,
-) -> std::result::Result<(Volume, Estimate), FitError> {
+    request: SizeRequest<'_>,
+) -> std::result::Result<(Volume, Option<Estimate>), FitError> {
     let mut device = open_target(target)?;
-    let (estimate, size) = match plan_fit(&mut device, target.offset, target.size, options, false, add) {
-        Ok(fit) => fit,
+    let decision = match decide_size(&mut device, target.offset, target.size, options, false, request) {
+        Ok(decision) => decision,
         Err(e) => {
             // Nothing has been written. The error of the removal, if any,
             // is not the one the user needs to hear about.
@@ -347,63 +477,113 @@ pub(crate) fn fit_and_format(
         }
     };
     if !target.flags.contains(ImageFlags::FORCE) {
-        Prober::new().ensure_empty(&device, target.offset, Some(size))?;
+        Prober::new().ensure_empty(&device, target.offset, Some(decision.size))?;
     }
-    format_fit(device, target.offset, size, estimate, options)
+    let volume = format_sized(device, target.offset, decision.size, options)?;
+    Ok((volume, decision.estimate))
 }
 
-/// Plans the content and decides the size of the file system: the size
-/// given, or the smallest that fits. Nothing is written; the image is only
-/// asked for its type, block size and length, so that content that does
-/// not fit is reported while the image is as it was. `device` covers the
-/// whole image, a descriptor the service was handed or the file the
-/// command line tool opened or created; the file system goes to `offset`
-/// and takes `size` bytes, or what fits when there is no size. With
-/// `label_slot` the root directory is planned with a volume label entry
-/// whether or not a label is given, for a caller that stamps the root's
-/// time on one afterwards ([`Volume::set_root_time`]).
-pub(crate) fn plan_fit(
+/// Decides the size of a new file system the way `request` says. Nothing
+/// is written; the image is only asked for its type, block size and
+/// length. `device` covers the whole image, a descriptor the service was
+/// handed or the file the command line tool opened or created; the file
+/// system goes to `offset` and takes `size` bytes. With `label_slot` the
+/// root directory is planned with a volume label entry whether or not a
+/// label is given, for a caller that stamps the root's time on one
+/// afterwards ([`Volume::set_root_time`]).
+///
+/// [`SizeRequest::Given`] without a size takes the rest of the image, and
+/// an empty image is [`FitError::SizeRequired`] then. A size the file
+/// system is to take that no file system of the options fits in, 0 among
+/// them, fails as the formatter fails on it. [`SizeRequest::Fit`] plans the
+/// content of a file system that takes the size given with the cluster
+/// size the formatter picks for that size, and the content has to fit the
+/// clusters the formatter lays out for it ([`FitError::TooFewClusters`]).
+/// A file system sized to fit has to fit a size given and a block device
+/// ([`FitError::TooSmall`]), and only it gets the sector and the cluster
+/// size it was planned with in `options`. Content that does not fit is
+/// reported while the image is as it was.
+pub(crate) fn decide_size(
     device: &mut Device,
     offset: u64,
     size: Option<u64>,
     options: &mut FormatOptions,
     label_slot: bool,
-    add: &mut dyn FnMut(&mut Plan) -> Result<()>,
-) -> std::result::Result<(Estimate, u64), FitError> {
+    request: SizeRequest<'_>,
+) -> std::result::Result<SizeDecision, FitError> {
     let block_size = device.logical_block_size()?;
+    // The size the file system keeps when the content fits it.
+    let (add, kept) = match request {
+        SizeRequest::Given => {
+            let size = match size {
+                Some(size) => size,
+                None if device.is_empty() => return Err(FitError::SizeRequired),
+                None => device.len().checked_sub(offset).ok_or_else(|| {
+                    err!(
+                        errno::EINVAL,
+                        "offset {} is beyond the end of the device ({} bytes)",
+                        offset,
+                        device.len()
+                    )
+                })?,
+            };
+            // A size no file system of the options fits in is found before
+            // the image is grown.
+            GivenSize::new(options, size, block_size)?;
+            return Ok(SizeDecision { size, estimate: None });
+        }
+        SizeRequest::Fit(add) => (add, size),
+        SizeRequest::Minimize(add) => (add, None),
+    };
     let mut plan_options = PlanOptions::from_format_options(options, block_size)?;
     plan_options.label |= label_slot;
+    // The content of a file system of the size kept is planned with the
+    // cluster size the formatter picks for that size. A size no file system
+    // of the options fits in is found before the image is grown.
+    let kept = kept.map(|size| GivenSize::new(options, size, block_size)).transpose()?;
+    if let Some(kept) = &kept {
+        plan_options.cluster_size = Some(kept.layout.cluster_size());
+    }
     let mut plan = Plan::new(plan_options);
     add(&mut plan)?;
     let estimate = plan.estimate()?;
-    estimate.apply(options);
-    let size = size.unwrap_or(estimate.size());
-    // A block device cannot grow: what lies behind the offset is all there
-    // is. A regular file is grown to the size, so the size is the limit.
-    let available = if device.is_block_device() {
-        size.min(device.len().saturating_sub(offset))
-    } else {
-        size
+    let size = match kept {
+        // The content has to fit the clusters of that file system.
+        Some(kept) => {
+            kept.check(&estimate).map_err(FitError::TooFewClusters)?;
+            kept.size
+        }
+        // Sized to fit, the file system is formatted as it was planned. A
+        // size given is the most it may take, and a block device cannot
+        // grow: what lies behind the offset is all there is.
+        None => {
+            let room = device.is_block_device().then(|| device.len().saturating_sub(offset));
+            if let Some(actual) = [size, room]
+                .into_iter()
+                .flatten()
+                .min()
+                .filter(|&actual| actual < estimate.size())
+            {
+                return Err(FitError::TooSmall {
+                    minimal: estimate.size(),
+                    actual,
+                });
+            }
+            estimate.apply(options);
+            estimate.size()
+        }
     };
-    if available < estimate.size() {
-        return Err(FitError::TooSmall {
-            minimal: estimate.size(),
-            actual: available,
-        });
-    }
-    Ok((estimate, size))
+    Ok(SizeDecision {
+        size,
+        estimate: Some(estimate),
+    })
 }
 
-/// Sizes the image for a planned file system, formats it and opens it:
-/// the second step of [`fit_and_format`], after [`plan_fit`].
-pub(crate) fn format_fit(
-    mut device: Device,
-    offset: u64,
-    size: u64,
-    estimate: Estimate,
-    options: &FormatOptions,
-) -> std::result::Result<(Volume, Estimate), FitError> {
+/// Sizes the image for a new file system of `size` bytes at `offset`,
+/// formats it and opens it: the second step of [`fit_and_format`], after
+/// [`decide_size`].
+pub(crate) fn format_sized(mut device: Device, offset: u64, size: u64, options: &FormatOptions) -> Result<Volume> {
     size_image(&mut device, offset, size)?;
     let device = device.window(offset, Some(size))?;
-    Ok((Volume::create(device, options)?, estimate))
+    Volume::create(device, options)
 }

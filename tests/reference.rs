@@ -632,7 +632,7 @@ fn an_assembled_tree_comes_back_through_mtools() {
     let img = image.0.to_str().unwrap();
 
     let out = std::process::Command::new(&ufat)
-        .args(["assemble", "--create", "--verbose", img, src])
+        .args(["assemble", "--create", "--minimize", "--verbose", img, src])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -731,6 +731,7 @@ fn fsck_fat_sees_a_failed_assemble() {
         .args([
             "assemble",
             "--create",
+            "--minimize",
             "--manifest",
             manifest.0.to_str().unwrap(),
             img,
