@@ -9,17 +9,33 @@
 //! objects can come after the file objects, and a trailer object ends the
 //! manifest.
 //!
+//! - [`RootObject`], [`FileObject`], [`Contents`] and [`Signature`] are the
+//!   objects, and [`Name`], [`InodeType`], [`Mode`], [`DosFlags`],
+//!   [`InodeFlags`], [`Sha256`] and [`Uuid`] what their fields hold. What
+//!   the root file object and a file object both have is in
+//!   [`InodeAttributes`] and [`ValidityWindow`].
+//!
 //! [UAPI.16 file manifest]: https://uapi-group.org/specifications/specs/file_manifest/
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 mod digest;
+mod error;
+mod features;
 mod hex;
 mod name;
+mod object;
 
 pub use digest::{Digest, Finalize, InvalidDigest, Sha256, Sha256Context};
+pub use error::{Error, ErrorKind, Field, Invalid};
+pub use features::{Features, Order, UnknownFeature};
 pub use name::{InvalidName, Name};
+pub use object::{
+    Contents, DosFlags, FatSerial, FileObject, FileSystemIdentity, FilledIn, FlagStates, GptPartition, InodeAttributes,
+    InodeFlags, InodeType, InvalidFatSerial, InvalidUuid, Location, Mode, RootObject, Signature, UnknownInodeType,
+    Uuid, Validity, ValidityWindow,
+};
 
 /// The name of a manifest that is stored in the tree it describes.
 pub const FILENAME: &str = "Uapi16Manifest";
