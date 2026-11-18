@@ -6,10 +6,12 @@
 //! from Assemble, Populate and Describe, see
 //! docs/org.uapi-group.FileSystem.varlink. It says what the volume stores
 //! as the volume stores it: times at FAT's 2 s, the read-only attribute as
-//! `readOnly`, and no mode, owner, device numbers, hardlinks or extended
-//! attributes, since FAT has no notion of them. A feature the file system
-//! has no notion of is not recorded and not counted; what FAT keeps and
-//! the manifest could not record is counted in the report's `omitted`.
+//! `readOnly`, the hidden, system and archive attributes as flags when
+//! asked for, and no mode, owner, device numbers, hardlinks, extended
+//! attributes or inode flags, since FAT has no notion of them. A feature
+//! the file system has no notion of is not recorded and not counted; what
+//! FAT keeps and the manifest could not record is counted in the report's
+//! `omitted`.
 //!
 //! The order is the specification's code point order: the root object
 //! first, every directory's entries right after it, sorted by the bytes of
@@ -27,8 +29,8 @@ use std::time::SystemTime;
 
 use uapi16::{Features, FileObject, Finalize, InodeType, Name, Order, RootObject, Sha256, Sha256Context, Writer};
 
+use super::DosAttributes;
 use crate::dir::NameDecoding;
-use crate::dirent::ATTR_READ_ONLY;
 use crate::errno::*;
 use crate::fat::BitSet;
 use crate::progress::Progress;
@@ -74,9 +76,10 @@ impl Volume {
     /// the read-only attribute, which every entry has set or cleared.
     const ALWAYS_RECORDED_FEATURES: Features = Features::READ_ONLY;
 
-    /// What the manifest of a FAT volume can record: sizes, hashes, times
-    /// and the read-only attribute, and that there are no symbolic links,
-    /// device nodes, hardlinks or extended attributes.
+    /// What the manifest of a FAT volume can record: sizes, hashes, times,
+    /// the read-only attribute and the hidden, system and archive
+    /// attributes, and that there are no symbolic links, device nodes,
+    /// hardlinks, extended attributes or inode flags.
     const MANIFEST_FEATURES: Features = Features::SIZE
         .union(Features::SHA256)
         .union(Features::MTIME)
@@ -84,7 +87,15 @@ impl Volume {
         .union(Features::SYMLINK)
         .union(Features::DEVICE)
         .union(Features::HARDLINK)
-        .union(Features::USER_XATTR);
+        .union(Features::USER_XATTR)
+        .union(Features::FLAG_HIDDEN)
+        .union(Features::FLAG_SYSTEM)
+        .union(Features::FLAG_ARCHIVE)
+        .union(Features::FLAG_APPEND_ONLY)
+        .union(Features::FLAG_IMMUTABLE)
+        .union(Features::FLAG_NO_ATIME)
+        .union(Features::FLAG_NO_COW)
+        .union(Features::FLAG_NO_DUMP);
 
     /// Writes the UAPI.16 manifest of everything the volume holds to `out`:
     /// the root object, one object per entry, the trailer. `root_time` is
@@ -96,15 +107,18 @@ impl Volume {
     /// `BufWriter` around it.
     ///
     /// The manifest records what `features` asks for and FAT has a notion
-    /// of. Of the features only [`Features::SIZE`], [`Features::SHA256`]
-    /// and [`Features::MTIME`] add fields. FAT has no symbolic links,
-    /// device nodes, hardlinks and extended attributes, so the manifest
-    /// records that it has none of them where `features` asks for them. FAT
-    /// has no mode, owner or user and group names, so the manifest does not
-    /// record them. It always records the read-only attribute, which every
-    /// entry has set or cleared: `readOnly` is written where it is set, and
-    /// an entry without it is not read-only. The manifest lists its
-    /// features, and declares the code point ordering its objects are in.
+    /// of. Of the features only [`Features::SIZE`], [`Features::SHA256`],
+    /// [`Features::MTIME`] and the flags of the hidden, system and archive
+    /// attributes add fields: a flag is written on a file or a directory
+    /// that has the attribute, and cleared where it is not written. FAT has
+    /// no symbolic links, device nodes, hardlinks, extended attributes and
+    /// inode flags, so the manifest records that it has none of them where
+    /// `features` asks for them. FAT has no mode, owner or user and group
+    /// names, so the manifest does not record them. It always records the
+    /// read-only attribute, which every entry has set or cleared:
+    /// `readOnly` is written where it is set, and an entry without it is
+    /// not read-only. The manifest lists its features, and declares the
+    /// code point ordering its objects are in.
     ///
     /// Names the manifest cannot carry are left out, with everything below
     /// them. The names the specification reserves in the top level for the
@@ -298,9 +312,7 @@ impl<W: Write> Listing<'_, W> {
             };
             // A regular file is what an object without a type is.
             let mut object = FileObject::new(name);
-            if md.attributes & ATTR_READ_ONLY != 0 {
-                object.inode.read_only = Some(true);
-            }
+            DosAttributes::new(md.attributes).record_in(&mut object, self.features);
             if self.features.contains(Features::MTIME) {
                 object.inode.set_mtime(md.modified);
             }
@@ -358,6 +370,7 @@ impl<W: Write> Listing<'_, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dirent::ATTR_READ_ONLY;
     use crate::manifest::HostTree;
     use crate::populate::CopyOptions;
     use crate::test_util::{volume, TempDir, TempImage};
@@ -365,17 +378,19 @@ mod tests {
     use json::Object;
     use std::os::fd::AsFd;
     use std::time::{Duration, UNIX_EPOCH};
-    use uapi16::{Digest, Object as ManifestObject, Reader, RECORD_SEPARATOR};
+    use uapi16::{Digest, DosFlags, InodeFlags, Object as ManifestObject, Reader, RECORD_SEPARATOR};
 
     fn t(secs: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(secs)
     }
 
-    /// Creates a file with `data`.
+    /// Creates a file with `data`, read-only as `read_only` says.
     fn put(v: &mut Volume, path: &str, data: &[u8], time: SystemTime, read_only: bool) {
         let mut w = v.create_file(path, time, NameCollision::Fail).unwrap();
         w.write_all(data).unwrap();
-        w.set_read_only(read_only);
+        if read_only {
+            w.set_attributes(w.attributes() | ATTR_READ_ONLY).unwrap();
+        }
         w.finish().unwrap();
     }
 
@@ -687,6 +702,86 @@ mod tests {
         // Without the feature the caller's time is not written either.
         let (bytes, _) = written(&v, Some(root_time), Features::DEFAULT);
         assert_eq!(WrittenManifest::read(&bytes).root.inode.mtime_nsec, None);
+    }
+
+    #[test]
+    fn records_the_flags_and_what_fat_has_none_of() {
+        let (_img, v) = populated();
+        // Asked for everything, the manifest lists what FAT records:
+        // sizes, hashes, times, the read-only attribute and the other DOS
+        // attributes, and that it has no symbolic links, device nodes,
+        // hardlinks, extended attributes and inode flags. Modes, owners and
+        // their names are not listed.
+        let (bytes, _) = written(&v, None, Features::ALL);
+        let m = WrittenManifest::read(&bytes);
+        assert_eq!(
+            m.root.features.unwrap().names().collect::<Vec<_>>(),
+            [
+                "device",
+                "flag-append-only",
+                "flag-archive",
+                "flag-hidden",
+                "flag-immutable",
+                "flag-no-atime",
+                "flag-no-cow",
+                "flag-no-dump",
+                "flag-system",
+                "hardlink",
+                "mtime",
+                "read-only",
+                "sha256",
+                "size",
+                "symlink",
+                "user-xattr"
+            ]
+        );
+        // The inode flags are cleared everywhere, the root's too, and the
+        // DOS attributes are what the entries have: every file the volume
+        // made has the archive attribute, a directory has not.
+        let inode_flags = [
+            InodeFlags::APPEND_ONLY,
+            InodeFlags::IMMUTABLE,
+            InodeFlags::NO_ATIME,
+            InodeFlags::NO_COW,
+            InodeFlags::NO_DUMP,
+        ];
+        for flag in inode_flags {
+            assert_eq!(m.root.inode.flags.get(flag), Some(false), "{:?}", flag);
+            assert!(
+                m.entries.iter().all(|e| e.inode.flags.get(flag) == Some(false)),
+                "{:?}",
+                flag
+            );
+        }
+        for e in &m.entries {
+            let archive = e.inode_type == InodeType::Regular;
+            assert_eq!(e.dos_flags.get(DosFlags::ARCHIVE), Some(archive), "{}", e.name);
+            assert_eq!(e.dos_flags.get(DosFlags::HIDDEN), Some(false), "{}", e.name);
+            assert_eq!(e.dos_flags.get(DosFlags::SYSTEM), Some(false), "{}", e.name);
+        }
+        let records = records(&bytes);
+        assert_eq!(
+            records[1].0,
+            format!(
+                r#"{{"flagArchive":true,"mTimeNSec":1700000000000000000,"name":"B.txt","sha256":"{}","size":7}}"#,
+                Sha256::digest(b"upper B")
+            )
+        );
+        assert_eq!(
+            records[2].0,
+            r#"{"mTimeNSec":1700000000000000000,"name":"EFI","type":"dir"}"#
+        );
+        // A read-only file has its other attributes as well.
+        assert_eq!(
+            records[4].0,
+            format!(
+                concat!(
+                    r#"{{"flagArchive":true,"mTimeNSec":1700000002000000000,"#,
+                    r#""name":"EFI/BOOT/BOOTX64.EFI","readOnly":true,"sha256":"{}","size":5000}}"#
+                ),
+                Sha256::digest(&boot_data())
+            )
+        );
     }
 
     #[test]

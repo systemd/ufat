@@ -16,7 +16,7 @@ use crate::errno::*;
 use crate::host::{walk_tree, FromStart, HostEntry, UnnamableEntry};
 use crate::progress::Progress;
 use crate::sys;
-use crate::volume::{NameCollision, Volume, MAX_FILE_SIZE};
+use crate::volume::{NameCollision, Volume, MAX_FILE_SIZE, NO_ATTRIBUTES};
 use crate::Detail;
 use crate::{Context, Error, Result};
 
@@ -255,7 +255,7 @@ impl Volume {
         let mut visit = |target: &str, entry: &HostEntry| -> Result<bool> {
             if entry.is_dir() {
                 let time = options.times.resolve(source_mtime(&entry.metadata));
-                self.find_or_create_dir(target, time, options.name_collision)?;
+                self.find_or_create_dir(target, time, NO_ATTRIBUTES, options.name_collision)?;
                 report.directories += 1;
                 progress(&report.progress());
                 Ok(true)

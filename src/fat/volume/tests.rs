@@ -163,19 +163,28 @@ fn replace_and_abort() {
     );
 }
 
-/// find_or_create_dir() makes a directory, or takes the one of the same
-/// name, and with NameCollision::Replace one under a name FAT does not
-/// tell apart. With NameCollision::Fail that is a case collision, which
-/// comes first and names the entry that is there the way the volume spells
-/// its path. A file of such a name is ENOTDIR.
+/// find_or_create_dir() makes a directory with the attributes it is given,
+/// or takes the one of the same name with the attributes it has, and with
+/// NameCollision::Replace one under a name FAT does not tell apart. With
+/// NameCollision::Fail that is a case collision, which comes first and
+/// names the entry that is there the way the volume spells its path. A
+/// file of such a name is ENOTDIR, and attribute bits that say what an
+/// entry is are EINVAL.
 #[test]
 fn directories_are_found_or_made() {
     let (_img, mut v) = volume(8 << 20, 512, 512);
     assert_eq!(
-        v.find_or_create_dir("/EFI", t(0), NameCollision::Fail).unwrap(),
+        v.find_or_create_dir("/EFI", t(0), ATTR_HIDDEN, NameCollision::Fail)
+            .unwrap(),
         DirectoryOrigin::Created
     );
-    v.set_attributes("/EFI", ATTR_HIDDEN).unwrap();
+    let efi = v.metadata("/EFI").unwrap();
+    assert_eq!(efi.attributes, ATTR_DIRECTORY | ATTR_HIDDEN);
+    // The dot entries are plain directories.
+    let dir = v.load_directory(efi.first_cluster).unwrap();
+    for e in dir.iter().filter(|e| e.is_dot()) {
+        assert_eq!(e.short.attr, ATTR_DIRECTORY);
+    }
     v.create_file("/EFI/x", t(0), NameCollision::Fail)
         .unwrap()
         .finish()
@@ -184,14 +193,31 @@ fn directories_are_found_or_made() {
         attributes: ATTR_DIRECTORY | ATTR_HIDDEN,
     };
     assert_eq!(
-        v.find_or_create_dir("/EFI", t(0), NameCollision::Fail).unwrap(),
+        v.find_or_create_dir("/EFI", t(0), ATTR_SYSTEM, NameCollision::Fail)
+            .unwrap(),
         existing
     );
     assert_eq!(
-        v.find_or_create_dir("/efi/", t(0), NameCollision::Replace).unwrap(),
+        v.find_or_create_dir("/efi/", t(0), NO_ATTRIBUTES, NameCollision::Replace)
+            .unwrap(),
         existing
     );
-    let e = v.find_or_create_dir("/efi", t(0), NameCollision::Fail).unwrap_err();
+    assert_eq!(v.metadata("/EFI").unwrap().attributes, ATTR_DIRECTORY | ATTR_HIDDEN);
+    let e = v
+        .find_or_create_dir("/new", t(0), ATTR_DIRECTORY, NameCollision::Fail)
+        .unwrap_err();
+    assert_eq!(
+        (e.errno(), e.detail()),
+        (EINVAL, Some(&Detail::InvalidOption("attributes")))
+    );
+    // The bits come before the path is looked up.
+    let e = v
+        .find_or_create_dir("/missing/d", t(0), ATTR_DIRECTORY, NameCollision::Fail)
+        .unwrap_err();
+    assert_eq!(e.errno(), EINVAL);
+    let e = v
+        .find_or_create_dir("/efi", t(0), NO_ATTRIBUTES, NameCollision::Fail)
+        .unwrap_err();
     assert_eq!(e.errno(), EEXIST);
     assert_eq!(
         e.detail(),
@@ -201,7 +227,9 @@ fn directories_are_found_or_made() {
         })
     );
     assert_eq!(e.message(), "'/efi' and '/EFI' are names FAT cannot tell apart");
-    let e = v.find_or_create_dir("/efi/X", t(0), NameCollision::Fail).unwrap_err();
+    let e = v
+        .find_or_create_dir("/efi/X", t(0), NO_ATTRIBUTES, NameCollision::Fail)
+        .unwrap_err();
     assert_eq!(e.message(), "'/efi/X' and '/EFI/x' are names FAT cannot tell apart");
     for (path, collision, errno) in [
         ("/EFI/x", NameCollision::Fail, ENOTDIR),
@@ -210,7 +238,7 @@ fn directories_are_found_or_made() {
         ("/EFI/X", NameCollision::Replace, ENOTDIR),
         ("/missing/d", NameCollision::Fail, ENOENT),
     ] {
-        let e = v.find_or_create_dir(path, t(0), collision).unwrap_err();
+        let e = v.find_or_create_dir(path, t(0), NO_ATTRIBUTES, collision).unwrap_err();
         assert_eq!(e.errno(), errno, "{} {:?}", path, collision);
     }
     assert_eq!(names(&v, "/"), vec!["EFI"]);
@@ -712,6 +740,7 @@ fn a_damaged_directory_is_read_but_not_written() {
     assert_eq!(v.create_dir_all("/d/sub/deeper", t(0)).unwrap_err().errno(), EUCLEAN);
     assert_eq!(v.set_times("/d/x", t(1_700_000_000)).unwrap_err().errno(), EUCLEAN);
     assert_eq!(v.set_times("/d", t(1_700_000_000)).unwrap_err().errno(), EUCLEAN);
+    assert_eq!(v.set_attributes("/d/x", ATTR_HIDDEN).unwrap_err().errno(), EUCLEAN);
     assert_eq!(std::fs::read(img.path()).unwrap(), bytes);
     assert!(!v.is_writing());
     assert_eq!(v.remove_file("/d/x").unwrap_err().errno(), EUCLEAN);
@@ -1216,8 +1245,9 @@ fn the_volume_is_marked_dirty_while_written() {
 /// What the volume refuses before it would write leaves it as it was: a
 /// name FAT cannot store, one that is too long, one that is taken or is a
 /// directory, one FAT does not tell apart from a name that is there, a
-/// parent that is missing. Nothing is marked, and the image does not
-/// change. A directory that is there is no write either.
+/// parent that is missing, attributes that cannot be set. Nothing is
+/// marked, and the image does not change. A directory that is there is no
+/// write either.
 #[test]
 fn refusals_leave_the_volume_unmarked() {
     let (img, mut v) = volume(1 << 20, 512, 512);
@@ -1248,11 +1278,24 @@ fn refusals_leave_the_volume_unmarked() {
         ),
         (v.create_file("/F", t(0), NameCollision::Fail).map(drop), EEXIST),
         (v.create_file("/D", t(0), NameCollision::Fail).map(drop), EEXIST),
-        (v.find_or_create_dir("/D", t(0), NameCollision::Fail).map(drop), EEXIST),
         (
-            v.find_or_create_dir("/f", t(0), NameCollision::Replace).map(drop),
+            v.find_or_create_dir("/D", t(0), NO_ATTRIBUTES, NameCollision::Fail)
+                .map(drop),
+            EEXIST,
+        ),
+        (
+            v.find_or_create_dir("/f", t(0), NO_ATTRIBUTES, NameCollision::Replace)
+                .map(drop),
             ENOTDIR,
         ),
+        (
+            v.find_or_create_dir("/new", t(0), ATTR_VOLUME_ID, NameCollision::Fail)
+                .map(drop),
+            EINVAL,
+        ),
+        (v.set_attributes("/", ATTR_HIDDEN), EINVAL),
+        (v.set_attributes("/missing", ATTR_HIDDEN), ENOENT),
+        (v.set_attributes("/f", ATTR_DIRECTORY), EINVAL),
     ] {
         assert_eq!(e.unwrap_err().errno(), errno);
     }
@@ -1260,7 +1303,7 @@ fn refusals_leave_the_volume_unmarked() {
     v.create_dir_all("/d", t(0)).unwrap();
     v.create_dir_all("/", t(0)).unwrap();
     for (path, collision) in [("/d", NameCollision::Fail), ("/D", NameCollision::Replace)] {
-        let origin = v.find_or_create_dir(path, t(0), collision).unwrap();
+        let origin = v.find_or_create_dir(path, t(0), NO_ATTRIBUTES, collision).unwrap();
         assert!(
             matches!(origin, DirectoryOrigin::Existing { .. }),
             "{} {:?}",

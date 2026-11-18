@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use uapi16::{ContentSource, Directory, ErrorKind, FileObject, Name, Object, OpenError, Order, Reader};
 
-use super::{path_in_volume, EntryKind, ObjectAction, ObjectTriage};
+use super::{path_in_volume, DosAttributes, EntryKind, ObjectAction, ObjectTriage};
 use crate::errno::*;
 use crate::progress::Progress;
 use crate::sys;
@@ -290,14 +290,18 @@ impl PendingFile<'_> {
     }
 
     /// Creates the file unless it is created: with the object's time, or
-    /// the assembly's where it gives none, read-only as the object is, and
-    /// replacing a file of the same name where the assembly says so.
+    /// the assembly's where it gives none, with the read-only, hidden,
+    /// system and archive attributes the object gives it, see
+    /// [`DosAttributes::with_object`], and replacing a file of the same
+    /// name where the assembly says so. The archive attribute a new file
+    /// has stays where the manifest says nothing about it.
     fn create(&mut self) -> Result<()> {
         if let Some(volume) = self.volume.take() {
             let time = self.object.inode.mtime().unwrap_or(self.options.default_time);
             let collision = self.options.flags.name_collision();
             let mut writer = volume.create_file(self.path, time, collision)?;
-            writer.set_read_only(self.object.inode.is_read_only());
+            let attributes = DosAttributes::new(writer.attributes()).with_object(self.object);
+            writer.set_attributes(attributes.settable())?;
             self.writer = Some(writer);
         }
         Ok(())
@@ -375,16 +379,30 @@ impl Assembly<'_> {
     }
 
     /// Creates the directory `object` describes, or gives the one that is
-    /// there its time.
+    /// there its time. Either gets the read-only, hidden, system and
+    /// archive attributes the object gives it, see
+    /// [`DosAttributes::with_object`]. A new directory has no others, and
+    /// one that is there keeps the hidden, system and archive attributes
+    /// whose flags the manifest does not list.
     fn store_directory(&mut self, object: &FileObject) -> Result<()> {
         let path = path_in_volume(&object.name);
         let time = object.inode.mtime().unwrap_or(self.options.default_time);
+        let made = DosAttributes::NONE.with_object(object);
+        let collision = self.options.flags.name_collision();
         match self
             .volume
-            .find_or_create_dir(&path, time, self.options.flags.name_collision())?
+            .find_or_create_dir(&path, time, made.settable(), collision)?
         {
             DirectoryOrigin::Created => {}
-            DirectoryOrigin::Existing { .. } => self.volume.set_times(&path, time)?,
+            DirectoryOrigin::Existing { attributes } => {
+                self.volume.set_times(&path, time)?;
+                // Only what changes is written.
+                let existing = DosAttributes::new(attributes);
+                let attributes = existing.with_object(object);
+                if attributes != existing {
+                    self.volume.set_attributes(&path, attributes.settable())?;
+                }
+            }
         }
         self.report.directories += 1;
         self.observer.progress(&self.report.progress());
@@ -459,7 +477,7 @@ impl Volume {
     /// `source` finds before the data, such as a missing file, and before
     /// those in the data, such as a hash that does not match. A directory
     /// the volume holds under the same name gets the directory object's
-    /// time.
+    /// time and attributes.
     pub fn assemble<R: Read>(
         &mut self,
         reader: &mut Reader<R>,

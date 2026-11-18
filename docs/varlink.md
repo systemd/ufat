@@ -450,6 +450,21 @@ fails with `ContentMismatch` and reason `size`. `sizeBytes` is the size of
 the file and `expectedSizeBytes` the size it needs. A file that changes
 while it is read fails with `ContentMismatch` and reason `sourceChanged`.
 
+Files of a manifest that share an `inodeToken` are hard links of one
+file. FAT has no hard links, so each of them becomes a copy.
+
+The flags `flagHidden`, `flagSystem` and `flagArchive` set or clear the
+hidden, system and archive attributes of a file or a directory, also of
+a directory that is there already. A flag that the manifest lists in
+`features` and an object leaves out clears the attribute: with
+`flag-archive` listed, a file without `flagArchive` has no archive
+attribute, which a new file has otherwise. `readOnly` sets or clears the
+read-only attribute the same way. An object without `readOnly` is not
+read-only, unless the manifest does not list `read-only` and the object
+has a `mode` that gives nobody write permission. FAT has no inode flags,
+so `flagAppendOnly`, `flagImmutable`, `flagNoAtime`, `flagNoCow` and
+`flagNoDump` are ignored.
+
 Symbolic links below a source directory are followed. They are resolved
 below that directory and never lead out of it.
 
@@ -502,16 +517,17 @@ A `ManifestSink` has a `fileDescriptor` open for writing and optional
 `features`, the default set of UAPI.16 is used: `device`, `gid`,
 `hardlink`, `mode`, `sha256`, `size`, `symlink` and `uid`.
 
-FAT records `size`, `sha256` and `mtime`. FAT has no symbolic links,
-device nodes, hard links or extended attributes. When asked for them,
-the manifest lists them in `features` and so says that there are none.
-The manifest records the read-only attribute whether it is asked for or
-not, and lists `read-only` in `features`. An entry with the attribute
-carries `readOnly`, and an entry without `readOnly` does not have the
-attribute. FAT has no notion of modes, owners and their names, and the
-manifest does not record them, nor any of the other features. The root
-object declares `"order": "codepoint"`, so the manifest can be given as
-content again.
+FAT records `size`, `sha256`, `mtime` and the hidden, system and archive
+attributes as `flag_hidden`, `flag_system` and `flag_archive`. FAT has
+no symbolic links, device nodes, hard links, extended attributes or inode
+flags. When asked for them, the manifest lists them in `features` and so
+says that there are none. The manifest records the read-only attribute
+whether it is asked for or not, and lists `read-only` in `features`. An
+entry with the attribute carries `readOnly`, and an entry without
+`readOnly` does not have the attribute. FAT has no notion of modes,
+owners and their names, and the manifest does not record them, nor any
+of the other features. The root object declares `"order": "codepoint"`,
+so the manifest can be given as content again.
 
 The manifest describes the whole volume, including files that were there
 before the call. Entries whose names a manifest cannot carry are left out

@@ -137,9 +137,10 @@ The most common ones:
 - `--write-manifest PATH` writes a UAPI.16 manifest of what the file
   system holds after `assemble` or `populate`, or of what `describe`
   finds. It has the size and the SHA-256 hash of every file, says which
-  files and directories are read-only, and has no times. With `-` as
-  PATH the manifest goes to standard output, and what the command prints
-  there otherwise goes to standard error.
+  files and directories are read-only, and has no times. It records no
+  hidden, system or archive attributes either. With `-` as PATH the
+  manifest goes to standard output, and what the command prints there
+  otherwise goes to standard error.
 - `--hash sha256` or `--hash sha512` prints the hash of the file system
   `assemble` wrote.
 - `--write-hash PATH` writes that hash to PATH instead, or with `-` to
@@ -216,6 +217,16 @@ too short for the data, or does not match fails the command. If
 `--create` made the image, nothing is left of it. Otherwise the file
 system is left marked as not cleanly unmounted, with the files that were
 complete.
+
+FAT has no hard links. Files that a manifest lists as hard links of one
+file become copies. `readOnly`, `flagHidden`, `flagSystem` and
+`flagArchive` set or clear the read-only, hidden, system and archive
+attributes of files and directories, also of directories that are there
+already. A flag that the manifest lists in `features` and an object
+leaves out clears its attribute. An object without `readOnly` is not
+read-only, unless the manifest does not list `read-only` and the object
+has a `mode` that gives nobody write permission. The inode flags such as
+`flagImmutable` are ignored, since FAT has none.
 
 Signatures in a manifest are recognized but not verified. Verify a
 signed manifest before you hand it to ufat.

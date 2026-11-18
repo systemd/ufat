@@ -97,7 +97,8 @@ pub enum NameCollision {
 /// The directory [`Volume::find_or_create_dir`] makes sure is there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectoryOrigin {
-    /// The volume had none, and it was made.
+    /// The volume had none, and it was made with the attributes it was
+    /// given.
     Created,
     /// It was there already.
     Existing {
@@ -265,7 +266,10 @@ fn writable(dir: &Directory) -> Result<()> {
 /// The attributes a caller may set on an entry: the four DOS bits a file or
 /// a directory carries. The others say what the entry is and are not for
 /// setting.
-const SETTABLE_ATTRIBUTES: u8 = ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_ARCHIVE;
+pub(crate) const SETTABLE_ATTRIBUTES: u8 = ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_ARCHIVE;
+
+/// None of the [`SETTABLE_ATTRIBUTES`].
+pub(crate) const NO_ATTRIBUTES: u8 = 0;
 
 /// Refuses attribute bits outside [`SETTABLE_ATTRIBUTES`].
 fn check_attributes(attributes: u8) -> Result<()> {
@@ -987,10 +991,18 @@ impl Volume {
         Ok(())
     }
 
-    /// Creates the directory `name` in `parent`, writes both and returns the
-    /// new directory, which matches the disk. On failure `parent` may hold
-    /// an entry that was never written, which keeps it out of the cache.
-    fn make_directory(&mut self, parent: &mut Directory, name: &LongName, time: SystemTime) -> Result<Directory> {
+    /// Creates the directory `name` in `parent` with the read-only, hidden,
+    /// system and archive attributes `attributes`, writes both and returns
+    /// the new directory, which matches the disk. On failure `parent` may
+    /// hold an entry that was never written, which keeps it out of the
+    /// cache.
+    fn make_directory(
+        &mut self,
+        parent: &mut Directory,
+        name: &LongName,
+        time: SystemTime,
+        attributes: u8,
+    ) -> Result<Directory> {
         let t = FatTimestamp::from_system_time(time);
         // place_entry() checks the parent first, also that a cluster is
         // free for the new directory, so a refusal writes nothing. The
@@ -1020,7 +1032,7 @@ impl Volume {
             data[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE].copy_from_slice(&dotdot.to_bytes());
             self.device.write_at(self.layout.cluster_offset(cluster)?, &data)?;
             let mut entry = RawDirEntry {
-                attr: ATTR_DIRECTORY,
+                attr: ATTR_DIRECTORY | attributes,
                 first_cluster: cluster,
                 ..RawDirEntry::default()
             };
@@ -1051,31 +1063,39 @@ impl Volume {
             if Self::find(parent, name.as_str()).is_some() {
                 bail!(EEXIST, Detail::Path(path.to_string()), "'{}' exists", path);
             }
-            vol.make_directory(parent, &name, time).map_err(|e| e.at_path(path))
+            vol.make_directory(parent, &name, time, NO_ATTRIBUTES)
+                .map_err(|e| e.at_path(path))
         })?;
         self.keep_directory(child);
         Ok(())
     }
 
     /// Makes sure there is a directory at `path` for content to go into, as
-    /// a copy or an assembly finds one or makes one with `time`, and says
-    /// which. A directory of the same name is that one. One under a name FAT
-    /// does not tell apart from the last name of `path` is that one with
-    /// [`NameCollision::Replace`], and a case collision with
-    /// [`NameCollision::Fail`], which comes before anything else about the
-    /// entry. A file of that name fails with ENOTDIR. The parent has to
-    /// exist. Only making a directory writes to the volume, and nothing
-    /// is written for one that is refused, as with [`Volume::create_dir`].
+    /// a copy or an assembly finds one or makes one with `time` and the
+    /// read-only, hidden, system and archive attributes `attributes`, and
+    /// says which. A directory of the same name is that one, and it keeps
+    /// its attributes. One under a name FAT does not tell apart from the
+    /// last name of `path` is that one with [`NameCollision::Replace`], and
+    /// a case collision with [`NameCollision::Fail`], which comes before
+    /// anything else about the entry. A file of that name fails with
+    /// ENOTDIR. The parent has to exist. Other attribute bits fail with
+    /// EINVAL, as for [`Volume::set_attributes`]. Only making a directory
+    /// writes to the volume, and nothing is written for one that is
+    /// refused, as with [`Volume::create_dir`].
     pub fn find_or_create_dir(
         &mut self,
         path: &str,
         time: SystemTime,
+        attributes: u8,
         collision: NameCollision,
     ) -> Result<DirectoryOrigin> {
+        check_attributes(attributes)?;
         let (parent, name) = self.locate_parent(path)?;
         self.with_directory_mut(parent, |vol, parent| {
             let Some(existing) = Self::find(parent, name.as_str()) else {
-                let child = vol.make_directory(parent, &name, time).map_err(|e| e.at_path(path))?;
+                let child = vol
+                    .make_directory(parent, &name, time, attributes)
+                    .map_err(|e| e.at_path(path))?;
                 vol.keep_directory(child);
                 return Ok(DirectoryOrigin::Created);
             };
@@ -1131,7 +1151,7 @@ impl Volume {
         for (i, name) in (there..).zip(&names) {
             cluster = self.with_directory_mut(cluster, |vol, dir| {
                 let child = vol
-                    .make_directory(dir, name, time)
+                    .make_directory(dir, name, time, NO_ATTRIBUTES)
                     .map_err(|e| e.at_path(&format!("/{}", comps[..=i].join("/"))))?;
                 let first = child.first_cluster();
                 vol.keep_directory(child);
@@ -1204,9 +1224,10 @@ impl Volume {
     /// again. Any other bit is refused with EINVAL. Works for files and
     /// directories; the root has no entry and is refused. The entry is
     /// rewritten in place, so a crash leaves the old attributes or the new.
+    /// Nothing is written for a call that is refused, also not for an entry
+    /// in a damaged directory.
     pub fn set_attributes(&mut self, path: &str, attributes: u8) -> Result<()> {
         check_attributes(attributes)?;
-        self.begin_write()?;
         let Located::Entry { parent, entry } = self.locate(path)? else {
             bail!(
                 EINVAL,
@@ -1214,10 +1235,11 @@ impl Volume {
                 "the root directory has no attributes"
             );
         };
+        self.with_directory(parent, |parent| writable(parent))?;
         let mut raw = entry.short;
         raw.attr = (raw.attr & !SETTABLE_ATTRIBUTES) | attributes;
+        self.begin_write()?;
         self.with_directory(parent, |parent| {
-            writable(parent)?;
             parent.set_slot(entry.slot, &raw.to_bytes());
             self.save_directory(parent)
         })

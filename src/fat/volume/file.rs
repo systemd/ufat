@@ -8,10 +8,11 @@ use std::io::{self, Read, Write};
 use std::time::SystemTime;
 
 use super::{
-    check_attributes, writable, Located, NameCollision, NewEntry, Placement, Volume, MAX_FILE_SIZE, SETTABLE_ATTRIBUTES,
+    check_attributes, writable, Located, NameCollision, NewEntry, Placement, Volume, MAX_FILE_SIZE, NO_ATTRIBUTES,
+    SETTABLE_ATTRIBUTES,
 };
 use crate::dir::{DirEntry, Directory};
-use crate::dirent::{RawDirEntry, ATTR_ARCHIVE, ATTR_READ_ONLY};
+use crate::dirent::{RawDirEntry, ATTR_ARCHIVE};
 use crate::errno::*;
 use crate::fat::{Entry, Extent};
 use crate::time::FatTimestamp;
@@ -474,14 +475,11 @@ impl OpenFile {
         self.size
     }
 
-    /// Sets or clears the read-only attribute the entry gets when the file
-    /// is finished.
-    pub fn set_read_only(&mut self, read_only: bool) {
-        if read_only {
-            self.entry.attr |= ATTR_READ_ONLY;
-        } else {
-            self.entry.attr &= !ATTR_READ_ONLY;
-        }
+    /// The read-only, hidden, system and archive attributes the entry gets
+    /// when the file is finished: the archive attribute alone for a new
+    /// file, unless they were set.
+    pub fn attributes(&self) -> u8 {
+        self.entry.attr & SETTABLE_ATTRIBUTES
     }
 
     /// Sets the read-only, hidden, system and archive attributes the entry
@@ -511,12 +509,10 @@ impl FileWriter<'_> {
         self.file.as_ref().map_or(0, OpenFile::size)
     }
 
-    /// Sets or clears the read-only attribute the entry gets when the writer
-    /// is finished.
-    pub fn set_read_only(&mut self, read_only: bool) {
-        if let Some(file) = self.file.as_mut() {
-            file.set_read_only(read_only);
-        }
+    /// The attributes the entry gets when the writer is finished, see
+    /// [`OpenFile::attributes`].
+    pub fn attributes(&self) -> u8 {
+        self.file.as_ref().map_or(NO_ATTRIBUTES, OpenFile::attributes)
     }
 
     /// Sets the attributes the entry gets when the writer is finished, see

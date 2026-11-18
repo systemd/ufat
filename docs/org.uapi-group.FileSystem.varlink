@@ -323,8 +323,8 @@ type ManifestSink(
 	# filesystem has no notion of is not recorded and not counted as omitted.
 	# Where the filesystem has none of what a feature describes, the manifest
 	# records that there is none, as for symbolic links, device nodes, hard
-	# links and extended attributes on vfat. The manifest of vfat records the
-	# read-only attribute whether read_only is asked for or not.
+	# links, extended attributes and inode flags on vfat. The manifest of vfat
+	# records the read-only attribute whether read_only is asked for or not.
 	features: ?[]ManifestFeature
 )
 

@@ -343,10 +343,7 @@ fn assembles_from_a_stream() {
     );
     let b = v.metadata("/EFI/Linux/b.efi").unwrap();
     assert_eq!(b.size, 5000);
-    assert_eq!(
-        b.attributes & crate::dirent::ATTR_READ_ONLY,
-        crate::dirent::ATTR_READ_ONLY
-    );
+    assert_eq!(b.attributes & ATTR_READ_ONLY, ATTR_READ_ONLY);
     // A directory without a time gets the default time, clamped to the FAT
     // epoch.
     assert_eq!(
@@ -864,9 +861,10 @@ fn case_collisions_are_refused_unless_replaced() {
     assert_eq!(names(&v, "/EFI"), ["x", "y"]);
 }
 
-/// Directories that the volume holds with the times the manifest gives
-/// are not written again. So a manifest refused at a file after them, or
-/// one of nothing but such directories, leaves the volume as it was.
+/// Directories that the volume holds with the times and the attributes
+/// the manifest gives are not written again. So a manifest refused at a
+/// file after them, or one of nothing but such directories, leaves the
+/// volume as it was.
 #[test]
 fn directories_that_are_there_with_their_times_write_nothing() {
     let dirs = [
@@ -893,6 +891,17 @@ fn directories_that_are_there_with_their_times_write_nothing() {
     let r = assemble_stream(&mut v, &seq(&[ROOT_MTIME, dirs[0], dirs[1], TRAILER]), b"", &keep).unwrap();
     assert_eq!(r.directories, 2);
     assert!(!v.is_writing());
+    // Other attributes are written, here the read-only attribute that a
+    // mode without write permission gives.
+    let read_only = seq(&[
+        ROOT_MTIME,
+        r#"{"mTimeNSec":1700000000000000000,"mode":365,"name":"EFI","type":"dir"}"#,
+        TRAILER,
+    ]);
+    assemble_stream(&mut v, &read_only, b"", &keep).unwrap();
+    assert!(v.is_writing());
+    assert_eq!(dos_attributes(&v, "/EFI"), ATTR_READ_ONLY);
+    v.sync().unwrap();
     // Another time is written.
     let later = seq(&[
         ROOT_MTIME,
@@ -905,6 +914,45 @@ fn directories_that_are_there_with_their_times_write_nothing() {
         v.metadata("/EFI").unwrap().modified,
         UNIX_EPOCH + Duration::from_secs(1_800_000_000)
     );
+}
+
+/// A directory that is there in a damaged directory, with the time the
+/// manifest gives and other attributes, fails before anything is written,
+/// so a manifest refused there leaves the volume as it was.
+#[test]
+fn attributes_in_a_damaged_directory_write_nothing() {
+    use crate::dirent::DIR_ENTRY_SIZE;
+    let (img, mut v) = volume(8 << 20, 512, 512);
+    v.create_dir_all("/d/sub", UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+        .unwrap();
+    let d = v.metadata("/d").unwrap();
+    let layout = *v.layout();
+    v.close().unwrap();
+    // Garbage behind the end marker of /d, in its slot 5 after ".", ".."
+    // and "sub": such a directory is read, but not written.
+    img.device()
+        .write_at(
+            layout.cluster_offset(d.first_cluster).unwrap() + 5 * DIR_ENTRY_SIZE as u64,
+            b"X",
+        )
+        .unwrap();
+    let mut v = Volume::open(img.device()).unwrap();
+    let bytes = std::fs::read(img.path()).unwrap();
+    let m = seq(&[
+        concat!(
+            r#"{"features":["flag-hidden","mtime"],"#,
+            r#""mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}"#
+        ),
+        r#"{"mTimeNSec":1700000000000000000,"name":"d","type":"dir"}"#,
+        r#"{"flagHidden":true,"mTimeNSec":1700000000000000000,"name":"d/sub","type":"dir"}"#,
+        TRAILER,
+    ]);
+    let e = assemble_stream(&mut v, &m, b"", &AssembleOptions::default()).unwrap_err();
+    assert_eq!(e.errno(), EUCLEAN);
+    // The image is read while the volume is open: closing it would put
+    // back marks a refusal set.
+    assert!(!v.is_writing());
+    assert_eq!(std::fs::read(img.path()).unwrap(), bytes);
 }
 
 /// What a volume holds under the same name as an object was there before
@@ -1394,4 +1442,244 @@ fn assemble_flags() {
     assert_eq!(format!("{:?}", flags), "AssembleFlags(SKIP_UNSUPPORTED)");
     assert_eq!(format!("{:?}", both), "AssembleFlags(REPLACE | SKIP_UNSUPPORTED)");
     assert_eq!(format!("{:?}", AssembleFlags::NONE), "AssembleFlags()");
+}
+
+/// The read-only, hidden, system and archive attributes of the entry at
+/// `path`.
+fn dos_attributes(v: &Volume, path: &str) -> u8 {
+    DosAttributes::new(v.metadata(path).unwrap().attributes).settable()
+}
+
+/// The error of reading the manifest `bytes` is an UnlistedFeature at
+/// record 1, the object `name`, field `field`.
+fn assert_unlisted(bytes: &[u8], name: &str, field: &str) {
+    let e = read(bytes).unwrap_err();
+    assert_eq!(
+        e.detail(),
+        Some(&Detail::Manifest {
+            problem: ManifestProblem::Malformed(Problem::UnlistedFeature),
+            record: Some(1),
+            name: Some(name.to_string()),
+            field: Some(field.to_string()),
+        })
+    );
+}
+
+#[test]
+fn applies_the_dos_attributes() {
+    // A manifest that records the read-only attribute and the flags of the
+    // archive, hidden and system attributes: an object without one of them
+    // has the attribute cleared, also the archive attribute a new file has
+    // otherwise.
+    let root = concat!(
+        r#"{"features":["flag-archive","flag-hidden","flag-system","read-only","sha256","size"],"#,
+        r#""mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}"#
+    );
+    let flagged = seq(&[
+        root,
+        r#"{"flagHidden":true,"flagSystem":true,"name":"d","type":"dir"}"#,
+        r#"{"flagArchive":true,"name":"d/a","size":0}"#,
+        r#"{"name":"d/b","size":0}"#,
+        r#"{"flagHidden":true,"name":"h","readOnly":true,"size":0}"#,
+        r#"{"name":"plain","type":"dir"}"#,
+        r#"{"name":"ro","readOnly":true,"type":"dir"}"#,
+        r#"{"name":"unlocked","readOnly":true,"type":"dir"}"#,
+        TRAILER,
+    ]);
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    assemble_stream(&mut v, &flagged, b"", &AssembleOptions::default()).unwrap();
+    assert_eq!(dos_attributes(&v, "/d"), ATTR_HIDDEN | ATTR_SYSTEM);
+    assert_eq!(dos_attributes(&v, "/d/a"), ATTR_ARCHIVE);
+    assert_eq!(dos_attributes(&v, "/d/b"), NO_ATTRIBUTES);
+    assert_eq!(dos_attributes(&v, "/h"), ATTR_HIDDEN | ATTR_READ_ONLY);
+    assert_eq!(dos_attributes(&v, "/plain"), NO_ATTRIBUTES);
+    assert_eq!(dos_attributes(&v, "/ro"), ATTR_READ_ONLY);
+    assert_eq!(dos_attributes(&v, "/unlocked"), ATTR_READ_ONLY);
+    // Without the features nothing is known about the flags: a new file
+    // keeps its archive attribute, and a flag that is not listed cannot be
+    // given at all, nor can readOnly.
+    let unflagged = seq(&[ROOT, r#"{"name":"f","size":0}"#, TRAILER]);
+    assemble_stream(&mut v, &unflagged, b"", &AssembleOptions::default()).unwrap();
+    assert_eq!(dos_attributes(&v, "/f"), ATTR_ARCHIVE);
+    let hidden = seq(&[ROOT, r#"{"flagHidden":true,"name":"g","size":0}"#, TRAILER]);
+    assert_unlisted(&hidden, "g", "flagHidden");
+    let read_only = seq(&[ROOT, r#"{"name":"g","readOnly":true,"size":0}"#, TRAILER]);
+    assert_unlisted(&read_only, "g", "readOnly");
+    // A directory that is there takes the attributes of its object as
+    // well: the flags the manifest lists, and the read-only attribute,
+    // which is cleared where the object does not say it is read-only. The
+    // system attribute, which this manifest does not list, stays, and so
+    // does everything of a directory the manifest does not name.
+    let cleared = seq(&[
+        concat!(
+            r#"{"features":["flag-hidden"],"#,
+            r#""mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}"#
+        ),
+        r#"{"name":"d","type":"dir"}"#,
+        r#"{"name":"unlocked","type":"dir"}"#,
+        TRAILER,
+    ]);
+    assemble_stream(&mut v, &cleared, b"", &AssembleOptions::default()).unwrap();
+    assert_eq!(dos_attributes(&v, "/d"), ATTR_SYSTEM);
+    assert_eq!(dos_attributes(&v, "/unlocked"), NO_ATTRIBUTES);
+    assert_eq!(dos_attributes(&v, "/ro"), ATTR_READ_ONLY);
+    // The manifest of the volume says what the volume holds, for files and
+    // directories, a read-only one among them. The assembly of it gives the
+    // same attributes again, and the manifest of that volume is the same.
+    let features = Features::from_names(["flag-archive", "flag-hidden", "flag-system", "size", "sha256"]).unwrap();
+    let mut written = Vec::new();
+    v.write_manifest(None, features, &mut written).unwrap();
+    let (root, objects) = read(&written).unwrap();
+    assert!(root.recorded_features().contains(Features::READ_ONLY));
+    let object = |name: &str| objects.iter().find(|o| o.name == name).unwrap();
+    let d = object("d").dos_flags;
+    assert_eq!(
+        (
+            d.get(DosFlags::HIDDEN),
+            d.get(DosFlags::SYSTEM),
+            d.get(DosFlags::ARCHIVE)
+        ),
+        (Some(false), Some(true), Some(false))
+    );
+    assert_eq!(object("d/a").dos_flags.get(DosFlags::ARCHIVE), Some(true));
+    assert_eq!(object("d/b").dos_flags.get(DosFlags::ARCHIVE), Some(false));
+    assert_eq!(object("f").dos_flags.get(DosFlags::ARCHIVE), Some(true));
+    assert_eq!(object("h").dos_flags.get(DosFlags::HIDDEN), Some(true));
+    assert!(object("h").inode.is_read_only());
+    assert!(object("ro").inode.is_read_only());
+    assert!(!object("unlocked").inode.is_read_only());
+    let (_img, mut again) = volume(8 << 20, 512, 512);
+    assemble_stream(&mut again, &written, b"", &AssembleOptions::default()).unwrap();
+    for path in ["/d", "/d/a", "/d/b", "/f", "/h", "/plain", "/ro", "/unlocked"] {
+        assert_eq!(dos_attributes(&again, path), dos_attributes(&v, path), "{}", path);
+    }
+    let mut rewritten = Vec::new();
+    again.write_manifest(None, features, &mut rewritten).unwrap();
+    assert_eq!(rewritten, written);
+    // Without the features no flag is written.
+    let mut written = Vec::new();
+    v.write_manifest(None, Features::DEFAULT, &mut written).unwrap();
+    assert!(read(&written)
+        .unwrap()
+        .1
+        .iter()
+        .all(|o| o.dos_flags == FlagStates::default()));
+}
+
+/// A mode that gives nobody write permission stands in for readOnly only
+/// where the manifest does not list read-only, for files and directories,
+/// new ones and those that are there.
+#[test]
+fn a_mode_stands_in_for_read_only_where_it_is_not_listed() {
+    // The default features have mode and not read-only.
+    let unlisted = seq(&[
+        ROOT,
+        r#"{"mode":365,"name":"locked","type":"dir"}"#,
+        r#"{"mode":292,"name":"locked/f","size":0}"#,
+        r#"{"mode":420,"name":"locked/g","size":0}"#,
+        r#"{"mode":493,"name":"open","type":"dir"}"#,
+        TRAILER,
+    ]);
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    assemble_stream(&mut v, &unlisted, b"", &AssembleOptions::default()).unwrap();
+    assert_eq!(dos_attributes(&v, "/locked"), ATTR_READ_ONLY);
+    assert_eq!(dos_attributes(&v, "/locked/f"), ATTR_ARCHIVE | ATTR_READ_ONLY);
+    assert_eq!(dos_attributes(&v, "/locked/g"), ATTR_ARCHIVE);
+    assert_eq!(dos_attributes(&v, "/open"), NO_ATTRIBUTES);
+    // Where the manifest lists read-only, an object without readOnly is not
+    // read-only, whatever its mode says.
+    let listed = seq(&[
+        concat!(
+            r#"{"features":["mode","read-only","size"],"#,
+            r#""mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}"#
+        ),
+        r#"{"mode":365,"name":"locked","type":"dir"}"#,
+        r#"{"mode":292,"name":"locked/h","size":0}"#,
+        r#"{"mode":365,"name":"open","type":"dir"}"#,
+        TRAILER,
+    ]);
+    assemble_stream(&mut v, &listed, b"", &AssembleOptions::default()).unwrap();
+    assert_eq!(dos_attributes(&v, "/locked"), NO_ATTRIBUTES);
+    assert_eq!(dos_attributes(&v, "/locked/h"), ATTR_ARCHIVE);
+    assert_eq!(dos_attributes(&v, "/open"), NO_ATTRIBUTES);
+    // Without it, the mode decides for a directory that is there too.
+    let again = seq(&[ROOT, r#"{"mode":365,"name":"open","type":"dir"}"#, TRAILER]);
+    assemble_stream(&mut v, &again, b"", &AssembleOptions::default()).unwrap();
+    assert_eq!(dos_attributes(&v, "/open"), ATTR_READ_ONLY);
+}
+
+#[test]
+fn dos_attributes_and_flags() {
+    use crate::dirent::ATTR_DIRECTORY;
+    let all = Features::FLAG_HIDDEN | Features::FLAG_SYSTEM | Features::FLAG_ARCHIVE;
+    let attributes = DosAttributes::new(ATTR_DIRECTORY | ATTR_HIDDEN | ATTR_READ_ONLY);
+    let states = attributes.flag_states(all);
+    assert_eq!(states.get(DosFlags::HIDDEN), Some(true));
+    assert_eq!(states.get(DosFlags::SYSTEM), Some(false));
+    assert_eq!(states.get(DosFlags::ARCHIVE), Some(false));
+    // A flag the manifest does not record is not known.
+    assert_eq!(
+        attributes.flag_states(Features::FLAG_SYSTEM).get(DosFlags::HIDDEN),
+        None
+    );
+    assert_eq!(attributes.settable(), ATTR_HIDDEN | ATTR_READ_ONLY);
+    // Setting flags touches what they state and nothing else.
+    let mut states = FlagStates::default();
+    states.put(DosFlags::HIDDEN, Some(false));
+    states.put(DosFlags::ARCHIVE, Some(true));
+    let changed = attributes.with_flags(states);
+    assert_eq!(
+        changed,
+        DosAttributes::new(ATTR_DIRECTORY | ATTR_READ_ONLY | ATTR_ARCHIVE)
+    );
+    assert_eq!(changed.with_flags(FlagStates::default()), changed);
+    assert_eq!(
+        changed.with_read_only(false),
+        DosAttributes::new(ATTR_DIRECTORY | ATTR_ARCHIVE)
+    );
+    assert_eq!(changed.with_read_only(true), changed);
+    // An object gives the read-only attribute as it is read-only or not,
+    // and the flags it states: one with neither readOnly nor a mode is not
+    // read-only, and a mode without write permission stands in for
+    // readOnly.
+    let mut object = FileObject::new(Name::new("x").unwrap());
+    object.dos_flags = states;
+    assert_eq!(
+        DosAttributes::NONE.with_object(&object),
+        DosAttributes::new(ATTR_ARCHIVE)
+    );
+    assert_eq!(attributes.with_object(&object), changed.with_read_only(false));
+    object.inode.mode = Mode::new(0o444);
+    assert_eq!(attributes.with_object(&object), changed);
+    object.inode.mode = Mode::new(0o644);
+    assert_eq!(attributes.with_object(&object), changed.with_read_only(false));
+    object.inode.mode = None;
+    object.inode.read_only = Some(true);
+    assert_eq!(attributes.with_object(&object), changed);
+    // What the attributes of an entry record in its object, an object
+    // gives back, for every combination of the four.
+    let recorded = all | Features::READ_ONLY;
+    for bits in NO_ATTRIBUTES..=SETTABLE_ATTRIBUTES {
+        if bits & !SETTABLE_ATTRIBUTES != 0 {
+            continue;
+        }
+        let mut object = FileObject::new(Name::new("x").unwrap());
+        DosAttributes::new(ATTR_DIRECTORY | bits).record_in(&mut object, recorded);
+        assert_eq!(
+            object.inode.read_only,
+            Some(bits & ATTR_READ_ONLY != 0),
+            "{:#04x}",
+            bits
+        );
+        assert_eq!(
+            DosAttributes::NONE.with_object(&object),
+            DosAttributes::new(bits),
+            "{:#04x}",
+            bits
+        );
+    }
+    // Without read-only it records no readOnly.
+    let mut object = FileObject::new(Name::new("x").unwrap());
+    DosAttributes::new(ATTR_READ_ONLY).record_in(&mut object, all);
+    assert_eq!(object.inode.read_only, None);
 }

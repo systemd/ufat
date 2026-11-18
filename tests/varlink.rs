@@ -2036,11 +2036,14 @@ fn manifest_problems_are_those_of_uapi16() {
     assert_eq!(declared, spelled);
 }
 
-/// The manifest sink takes the features of UAPI.16, with "_" for "-". A
-/// refused manifest names the field of a feature it does not list, and a
-/// key it has twice is a reason of its own.
+/// The manifest sink takes the features of UAPI.16, with "_" for "-", and
+/// records the hidden, system and archive attributes when asked. A
+/// manifest given as content sets and clears them. A refused manifest
+/// names the field of a feature it does not list, and a key it has twice
+/// is a reason of its own.
 #[test]
 fn manifests_record_and_apply_features() {
+    use fat::manifest::{DosFlags, InodeFlags, InodeType};
     let _serial = common::serial();
     let Some(ufat) = ufat() else {
         return eprintln!("skipping: no ufat binary");
@@ -2094,6 +2097,14 @@ fn manifests_record_and_apply_features() {
         listed(&out),
         [
             "device",
+            "flag-append-only",
+            "flag-archive",
+            "flag-hidden",
+            "flag-immutable",
+            "flag-no-atime",
+            "flag-no-cow",
+            "flag-no-dump",
+            "flag-system",
             "hardlink",
             "mtime",
             "read-only",
@@ -2103,6 +2114,13 @@ fn manifests_record_and_apply_features() {
             "user-xattr"
         ]
     );
+    // Every file the volume made has the archive attribute, no directory
+    // has, and FAT has no inode flags.
+    for e in &read_manifest(&std::fs::read(&out).unwrap()).entries {
+        let regular = e.inode_type == InodeType::Regular;
+        assert_eq!(e.dos_flags.get(DosFlags::ARCHIVE), Some(regular), "{}", e.name);
+        assert_eq!(e.inode.flags.get(InodeFlags::IMMUTABLE), Some(false), "{}", e.name);
+    }
     let out_file = sink(&out);
     reply(call(
         &mut c,
@@ -2125,10 +2143,54 @@ fn manifests_record_and_apply_features() {
     );
     assert_eq!(e.name, "org.varlink.service.InvalidParameter");
     assert_eq!(str_of(&e.parameters, "parameter"), "manifestSink");
+    // A manifest that records the flags of the hidden and the archive
+    // attribute: what an object leaves out is cleared, the archive
+    // attribute of a new file too.
+    let root = concat!(
+        "\x1e{\"features\":[\"flag-archive\",\"flag-hidden\",\"sha256\",\"size\"],",
+        "\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n"
+    );
+    let trailer = "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n";
+    let flags = format!(
+        "{}{}{}{}{}",
+        root,
+        "\x1e{\"flagHidden\":true,\"name\":\"hidden\",\"size\":0}\n",
+        "\x1e{\"flagArchive\":true,\"name\":\"kept\",\"size\":0}\n",
+        "\x1e{\"name\":\"plain\",\"size\":0}\n",
+        trailer
+    );
+    let manifest_file = file_with(scratch.path(), "flags", flags.as_bytes());
+    let empty = file_with(scratch.path(), "empty", b"");
+    let (flagged, flagged_img) = fresh_image();
+    reply(call(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0,"size":41943040},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        &[flagged_img.as_fd(), manifest_file.as_fd(), empty.as_fd()],
+    ));
+    let flagged_ro = ro(flagged.path());
+    for (name, attributes) in [
+        ("/hidden", vec!["hidden"]),
+        ("/kept", vec!["archive"]),
+        ("/plain", vec![]),
+    ] {
+        let r = reply(call(
+            &mut c,
+            "List",
+            &format!(r#"{{"image":{{"fileDescriptor":0}},"path":"{}"}}"#, name),
+            &[flagged_ro.as_fd()],
+        ));
+        let entry = object_of(&r, "entry");
+        let has = if entry.get("dosAttributes").is_some() {
+            strings_of(entry, "dosAttributes")
+        } else {
+            Vec::new()
+        };
+        assert_eq!(has, attributes, "{}", name);
+    }
     // A field of a feature the manifest does not list is named, and a key
     // twice in an object is duplicateKey.
     let declared = "\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n";
-    let trailer = "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n";
     for (record, reason, field) in [
         (
             "\x1e{\"mTimeNSec\":1,\"name\":\"a\",\"size\":0}\n",
