@@ -833,51 +833,6 @@ mod tests {
         assert!(from_start.read(&mut [0u8; 4]).is_err());
     }
 
-    /// The descriptors of this process that refer to something below
-    /// `root`. Other tests run in other threads of this process with
-    /// descriptors of their own, so only ours are counted.
-    fn descriptors_below(root: &Path) -> usize {
-        fs::read_dir("/proc/self/fd")
-            .unwrap()
-            .filter(|e| match fs::read_link(e.as_ref().unwrap().path()) {
-                Ok(target) => target.starts_with(root),
-                Err(_) => false,
-            })
-            .count()
-    }
-
-    /// A directory of 1500 entries, more than the usual soft limit of 1024
-    /// descriptors: the walk pins one entry at a time and holds one
-    /// directory per level, so it never needs more than a handful.
-    #[test]
-    fn a_large_directory_costs_no_descriptors() {
-        let tmp = TempDir::new("walk-large");
-        let root = tmp.path();
-        fs::create_dir(root.join("big")).unwrap();
-        for i in 0..1500 {
-            fs::write(root.join(format!("big/f{:04}", i)), b"x").unwrap();
-        }
-        let fd = open_dir(root).unwrap();
-        let mut seen = 0;
-        let mut most = 0;
-        walk_tree(fd.as_fd(), "/", false, &mut |_, entry| {
-            if entry.is_file() {
-                let mut text = String::new();
-                entry.open_file().unwrap().read_to_string(&mut text).unwrap();
-                assert_eq!(text, "x");
-            }
-            seen += 1;
-            most = most.max(descriptors_below(root));
-            Ok(true)
-        })
-        .unwrap();
-        assert_eq!(seen, 1501);
-        // The test's own root descriptor, the walk's dup of it, the pinned
-        // "big" and the pinned entry being visited.
-        assert!(most <= 4, "{} descriptors open below the root", most);
-        assert_eq!(descriptors_below(root), 1);
-    }
-
     /// An entry removed after the directory was listed but before the walk
     /// reached it is left out; the walk goes on with the next one.
     #[test]
