@@ -20,7 +20,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -206,13 +206,72 @@ pub fn passed_file(fd: OwnedFd) -> Result<File> {
     Ok(File::from(fd))
 }
 
+/// A regular file or pipe another process handed over, read or written
+/// from where it stands to its end: a manifest, the contents of files in
+/// manifest order, or the sink a manifest goes to.
+///
+/// It was vetted without O_NONBLOCK, but the flag belongs to the open file
+/// description, which the client shares through the copy it kept, and the
+/// client can set it during the call. A blocking pipe or a regular file
+/// never fails with EAGAIN, so a read or write that does while O_NONBLOCK
+/// is set fails as the vetting fails a descriptor with the flag: EBADFD
+/// with the `Flags` problem.
+#[derive(Debug)]
+pub struct PassedStream(File);
+
+impl PassedStream {
+    /// The metadata of the file or pipe.
+    pub fn metadata(&self) -> io::Result<fs::Metadata> {
+        self.0.metadata()
+    }
+
+    /// The error a read or write returned, or the flags problem when it
+    /// would have blocked because O_NONBLOCK is set now.
+    fn explain(&self, e: io::Error) -> io::Error {
+        if e.kind() != io::ErrorKind::WouldBlock {
+            return e;
+        }
+        match sys::descriptor_flags(self.0.as_fd()) {
+            Ok(flags) if flags & sys::O_NONBLOCK != 0 => err!(
+                EBADFD,
+                unusable(DescriptorProblem::Flags, Some(sys::O_NONBLOCK)),
+                "the descriptor was made non-blocking during the call"
+            )
+            .into(),
+            _ => e,
+        }
+    }
+}
+
+impl Read for PassedStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf).map_err(|e| self.explain(e))
+    }
+}
+
+impl Write for PassedStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf).map_err(|e| self.explain(e))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl AsFd for PassedStream {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
 /// What a source descriptor turned out to be.
 #[derive(Debug)]
 pub enum PassedSource {
     /// A directory, the tree the files come from.
     Directory(OwnedFd),
     /// A regular file or pipe carrying the files' contents in order.
-    Stream(File),
+    Stream(PassedStream),
 }
 
 /// Takes a descriptor another process handed over as the source of a
@@ -233,7 +292,7 @@ pub fn passed_source(fd: OwnedFd) -> Result<PassedSource> {
     if ft.is_dir() {
         Ok(PassedSource::Directory(fd))
     } else if ft.is_file() || ft.is_fifo() {
-        Ok(PassedSource::Stream(File::from(fd)))
+        Ok(PassedSource::Stream(PassedStream(File::from(fd))))
     } else {
         bail!(
             EBADFD,
@@ -248,7 +307,7 @@ pub fn passed_source(fd: OwnedFd) -> Result<PassedSource> {
 /// manifest order: a regular file or a pipe, open for reading only, without
 /// O_NONBLOCK since a pipe would then fail instead of wait. A socket is
 /// always open for reading and writing and so never passes here.
-pub fn passed_stream(fd: OwnedFd) -> Result<File> {
+pub fn passed_stream(fd: OwnedFd) -> Result<PassedStream> {
     if vet_flags(fd.as_fd(), 0, "stream")? != Access::ReadOnly {
         bail!(
             EBADFD,
@@ -264,7 +323,7 @@ pub fn passed_stream(fd: OwnedFd) -> Result<File> {
             "the stream descriptor is not a regular file or pipe"
         );
     }
-    Ok(File::from(fd))
+    Ok(PassedStream(File::from(fd)))
 }
 
 /// Takes a descriptor another process handed over as the sink a manifest
@@ -274,7 +333,7 @@ pub fn passed_stream(fd: OwnedFd) -> Result<File> {
 /// O_NONBLOCK is not, since a full pipe would then fail instead of wait.
 /// A descriptor open read-only is `NotWritable`, anything but a regular
 /// file or pipe `WrongType`.
-pub fn passed_sink(fd: OwnedFd) -> Result<File> {
+pub fn passed_sink(fd: OwnedFd) -> Result<PassedStream> {
     if vet_status(fd.as_fd(), sys::O_APPEND, "sink")? == sys::O_RDONLY {
         bail!(
             EBADFD,
@@ -290,7 +349,7 @@ pub fn passed_sink(fd: OwnedFd) -> Result<File> {
             "the sink descriptor is not a regular file or pipe"
         );
     }
-    Ok(File::from(fd))
+    Ok(PassedStream(File::from(fd)))
 }
 
 /// Raises the soft limit on open descriptors to the hard limit and returns
@@ -988,5 +1047,61 @@ mod tests {
             PassedSource::Stream(_)
         ));
         assert_eq!(passed_source(open("file", sys::O_RDWR)).unwrap_err().errno(), EBADFD);
+    }
+
+    /// What a full pipe is filled with at a time.
+    const FILL: &[u8] = &[0; 4096];
+
+    /// A client that kept copies of the ends of a pipe it passed sets
+    /// O_NONBLOCK on them after the vetting: the read from the empty pipe
+    /// and the write to the full one fail with the vetting's flags problem
+    /// instead of a bare EAGAIN. Other errors are left as they are, and so
+    /// is EAGAIN while the pipe still blocks.
+    #[test]
+    fn a_pipe_made_non_blocking_during_the_call_is_refused() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let tmp = TempDir::new("flipped");
+        let fifo = tmp.path().join("fifo");
+        sys::make_fifo(&fifo).unwrap();
+        // Opened without waiting for a writer, then made blocking for the
+        // vetting.
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(sys::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        let flags = sys::descriptor_flags(reader.as_fd()).unwrap();
+        sys::set_status_flags(reader.as_fd(), flags & !sys::O_NONBLOCK).unwrap();
+        let writer = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        let clients = [reader.try_clone().unwrap(), writer.try_clone().unwrap()];
+        let mut stream = passed_stream(OwnedFd::from(reader)).unwrap();
+        let mut sink = passed_sink(OwnedFd::from(writer)).unwrap();
+        let again = stream.explain(io::Error::from_raw_os_error(EAGAIN));
+        assert_eq!(again.raw_os_error(), Some(EAGAIN));
+        for client in &clients {
+            let flags = sys::descriptor_flags(client.as_fd()).unwrap();
+            sys::set_status_flags(client.as_fd(), flags | sys::O_NONBLOCK).unwrap();
+        }
+        let refused = |e: io::Error| {
+            let e = crate::Error::from(e);
+            assert_eq!(e.errno(), EBADFD);
+            assert_eq!(
+                e.detail(),
+                Some(&Detail::Descriptor {
+                    problem: DescriptorProblem::Flags,
+                    flags: Some(sys::O_NONBLOCK),
+                })
+            );
+            assert_eq!(e.message(), "the descriptor was made non-blocking during the call");
+        };
+        refused(stream.read(&mut [0; 1]).unwrap_err());
+        let full = loop {
+            if let Err(e) = sink.write(FILL) {
+                break e;
+            }
+        };
+        refused(full);
+        let other = stream.explain(io::Error::from_raw_os_error(EIO));
+        assert_eq!(other.raw_os_error(), Some(EIO));
     }
 }

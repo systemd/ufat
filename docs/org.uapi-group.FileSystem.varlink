@@ -15,8 +15,9 @@
 # without O_PATH and with no flags beyond the access mode (O_NONBLOCK is
 # accepted on an image, O_DIRECTORY on a directory); everything the service
 # reads from is open read-only, the image is open read-write for the methods
-# that write. Descriptors no parameter names are closed when the call is
-# answered.
+# that write. A pipe that is made non-blocking during the call fails it with
+# BadFileDescriptor and reason flags once the service has to wait for it.
+# Descriptors no parameter names are closed when the call is answered.
 #
 # Nothing the service answers is text meant for a person: every error is a
 # name with typed fields and every finding of Check is a kind with its facts;

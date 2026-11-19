@@ -480,6 +480,10 @@ All descriptors are checked, and the manifest is read and verified,
 before the image is opened. A call that fails this way leaves the image
 unchanged.
 
+A pipe that is made non-blocking during the call fails it with
+`BadFileDescriptor` and the reason `flags` once the service has to wait
+for it.
+
 A block device is claimed exclusively while a writing call runs. A
 mounted device, or one that another process has claimed, fails with
 `ImageBusy`. The service takes no lock on a passed image file. The

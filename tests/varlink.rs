@@ -10,7 +10,7 @@ mod common;
 use std::ffi::c_int;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -2369,6 +2369,191 @@ fn passed_descriptors_are_vetted() {
         &[img_ro.as_fd()],
     );
     assert_eq!(str_of(&e.parameters, "parameter"), "manifestSink");
+}
+
+/// How often a client looks whether the service took what is in a pipe.
+const DRAIN_POLL: Duration = Duration::from_millis(1);
+/// What the manifest of a volume carries for every file at least: the
+/// hash of its contents in hex.
+const MANIFEST_BYTES_PER_FILE: usize = 2 * fat::sha256::DIGEST_SIZE;
+/// How many times over the manifest of the sink test fills its pipe.
+const PIPEFULS: usize = 4;
+/// The size asked for a pipe that is to be as small as a pipe can be: the
+/// kernel rounds it up to one page.
+const SMALLEST_PIPE: c_int = 1;
+
+/// A pipe as a client makes it to pass one of its ends, blocking: its read
+/// end and its write end.
+fn pipe() -> (File, File) {
+    let mut fds: [c_int; 2] = [-1; 2];
+    // SAFETY: pipe2() stores two new descriptors in the array.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: both descriptors were just created and nothing else owns
+    // them.
+    unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
+}
+
+/// Sets O_NONBLOCK on the open file description `fd` refers to, which a
+/// descriptor passed to the service shares with the client's copy.
+fn set_nonblocking(fd: BorrowedFd<'_>) {
+    // SAFETY: F_GETFL takes no argument and F_SETFL an int.
+    unsafe {
+        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+        assert!(flags >= 0, "F_GETFL: {}", std::io::Error::last_os_error());
+        assert_eq!(libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK), 0);
+    }
+}
+
+/// The bytes queued in the pipe `fd` is an end of (FIONREAD).
+fn queued(fd: BorrowedFd<'_>) -> usize {
+    let mut n: c_int = 0;
+    // SAFETY: FIONREAD stores an int through the pointer.
+    assert_eq!(
+        unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONREAD, &mut n as *mut c_int) },
+        0
+    );
+    usize::try_from(n).unwrap()
+}
+
+/// Looks at the bytes queued in the pipe `fd` is an end of, every
+/// [`DRAIN_POLL`], until `done` is true of them.
+fn wait_for_pipe(fd: BorrowedFd<'_>, done: impl Fn(usize) -> bool) {
+    while !done(queued(fd)) {
+        std::thread::sleep(DRAIN_POLL);
+    }
+}
+
+/// Feeds `data` into the pipe whose ends are `r` and `w` like a client
+/// that makes the read end it passed non-blocking during the call: the
+/// first half, then, once the service took all of it and so vetted the
+/// descriptor, O_NONBLOCK on the read end, then the rest, which wakes a
+/// service that waits for it. Once the service took the rest, its next
+/// read finds the pipe empty. The caller keeps both ends open until the
+/// reply.
+fn feed_and_flip(r: &File, w: &File, data: &[u8]) -> std::thread::JoinHandle<()> {
+    let r = r.try_clone().unwrap();
+    let mut w = w.try_clone().unwrap();
+    let data = data.to_vec();
+    std::thread::spawn(move || {
+        let (first, rest) = data.split_at(data.len() / 2);
+        w.write_all(first).unwrap();
+        wait_for_pipe(w.as_fd(), |n| n == 0);
+        set_nonblocking(r.as_fd());
+        w.write_all(rest).unwrap();
+    })
+}
+
+/// Takes from the pipe whose ends are `r` and `w` like a client that makes
+/// the write end it passed non-blocking during the call: once the service
+/// wrote to it, and so vetted the descriptor, O_NONBLOCK on the write end,
+/// then one read of up to `capacity` bytes, which wakes a service that
+/// waits for room. Nothing is read after that, so a service with more
+/// than two pipefuls to write finds the pipe full. The caller keeps both
+/// ends open until the reply.
+fn drain_once_and_flip(r: &File, w: &File, capacity: usize) -> std::thread::JoinHandle<()> {
+    let mut r = r.try_clone().unwrap();
+    let w = w.try_clone().unwrap();
+    std::thread::spawn(move || {
+        wait_for_pipe(r.as_fd(), |n| n > 0);
+        set_nonblocking(w.as_fd());
+        assert!(r.read(&mut vec![0; capacity]).unwrap() > 0);
+    })
+}
+
+/// The reply to a call sent before, held to the interface.
+fn receive(c: &mut Client, name: &str) -> Response {
+    let r = c.receive().unwrap().expect("the connection closed without a reply");
+    conforms(name, &r);
+    r
+}
+
+/// A client keeps a copy of a pipe it passed and sets O_NONBLOCK on it
+/// during the call, once the service vetted it: the manifest, the contents
+/// of the files and the manifest sink. The read or write that then fails
+/// with EAGAIN fails the call with BadFileDescriptor and reason flags, as
+/// the vetting does when the flag is set before the call.
+#[test]
+fn pipes_made_non_blocking_during_the_call_are_refused() {
+    let _serial = common::serial();
+    let Some(ufat) = ufat() else {
+        return eprintln!("skipping: no ufat binary");
+    };
+    let refused = |c: &mut Client, name: &str, parameter: &str| {
+        let e = error(receive(c, name));
+        assert_eq!(
+            e.name,
+            format!("{}.BadFileDescriptor", IFACE),
+            "{}",
+            Value::Object(e.parameters.clone())
+        );
+        assert_eq!(str_of(&e.parameters, "parameter"), parameter);
+        assert_eq!(str_of(&e.parameters, "reason"), "flags");
+        assert_eq!(
+            e.parameters.get("flags").and_then(Value::as_i64),
+            Some(i64::from(libc::O_NONBLOCK))
+        );
+    };
+    let tree = esp_tree();
+    let (manifest, blob) = manifest_and_blob(tree.path());
+    let mut c = connect_fd3(&ufat);
+    // The manifest, which a plan reads to its end.
+    let (r, w) = pipe();
+    c.send_with_fds(
+        &method("Assemble"),
+        params(r#"{"mode":"plan","content":{"manifest":{"fileDescriptor":0}}}"#),
+        &[r.as_fd()],
+    )
+    .unwrap();
+    let client = feed_and_flip(&r, &w, &manifest);
+    refused(&mut c, "Assemble", "manifest");
+    client.join().unwrap();
+    // The contents of the files, with the manifest in a regular file.
+    let scratch = Temp::dir();
+    let manifest_file = file_with(scratch.path(), "manifest", &manifest);
+    let (_image, img) = fresh_image();
+    let (r, w) = pipe();
+    c.send_with_fds(
+        &method("Assemble"),
+        params(
+            r#"{"image":{"fileDescriptor":0},"content":{"manifest":{"fileDescriptor":1},"sourceFileDescriptor":2}}"#,
+        ),
+        &[img.as_fd(), manifest_file.as_fd(), r.as_fd()],
+    )
+    .unwrap();
+    let client = feed_and_flip(&r, &w, &blob);
+    refused(&mut c, "Assemble", "sourceFileDescriptor");
+    client.join().unwrap();
+    // The manifest sink, a pipe as small as can be, and a volume whose
+    // manifest fills it PIPEFULS times over.
+    let (r, w) = pipe();
+    // SAFETY: F_SETPIPE_SZ takes an int.
+    let capacity = unsafe { libc::fcntl(w.as_raw_fd(), libc::F_SETPIPE_SZ, SMALLEST_PIPE) };
+    assert!(capacity > 0, "F_SETPIPE_SZ: {}", std::io::Error::last_os_error());
+    let capacity = usize::try_from(capacity).unwrap();
+    let many = Temp::dir();
+    let names: Vec<String> = (0..PIPEFULS * capacity / MANIFEST_BYTES_PER_FILE)
+        .map(|i| format!("f{:05}", i))
+        .collect();
+    let files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), n.as_bytes())).collect();
+    build_tree(many.path(), &files);
+    let (image, img) = fresh_image();
+    let source = ro(many.path());
+    reply(call(
+        &mut c,
+        "Assemble",
+        r#"{"image":{"fileDescriptor":0},"content":{"sourceFileDescriptor":1}}"#,
+        &[img.as_fd(), source.as_fd()],
+    ));
+    let img_ro = ro(image.path());
+    c.send_with_fds(
+        &method("Describe"),
+        params(r#"{"image":{"fileDescriptor":0},"manifestSink":{"fileDescriptor":1}}"#),
+        &[img_ro.as_fd(), w.as_fd()],
+    )
+    .unwrap();
+    let client = drain_once_and_flip(&r, &w, capacity);
+    refused(&mut c, "Describe", "manifestSink");
+    client.join().unwrap();
 }
 
 /// The errors the options and the paths can provoke, each the typed one

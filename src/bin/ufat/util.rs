@@ -26,14 +26,14 @@ pub(crate) const MAX_MANIFEST_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Reads a UAPI.16 manifest from an open file or pipe to its end, within
 /// [`MAX_MANIFEST_BYTES`], and parses it.
-pub(crate) fn read_manifest(file: std::fs::File) -> Result<fat::manifest::Manifest> {
+pub(crate) fn read_manifest(file: impl Read) -> Result<fat::manifest::Manifest> {
     let text = read_all(file, MAX_MANIFEST_BYTES).with_context(|| "cannot read the manifest")?;
     fat::manifest::parse(&text)
 }
 
 /// Reads an open file to its end, refusing one of more than `limit` bytes
 /// (EFBIG) instead of holding it in memory.
-pub(crate) fn read_all(file: std::fs::File, limit: u64) -> Result<Vec<u8>> {
+pub(crate) fn read_all(file: impl Read, limit: u64) -> Result<Vec<u8>> {
     let mut data = Vec::new();
     file.take(limit + 1).read_to_end(&mut data)?;
     if data.len() as u64 > limit {
