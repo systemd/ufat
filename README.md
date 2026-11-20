@@ -263,7 +263,8 @@ libblkid, the message can only say whether the image is blank.
 ufat writes data and the allocation table before the directory entry
 that points at them. A new file's entry is written only when the file is
 complete. A removed entry is gone before its clusters are freed. A new
-directory cluster is zeroed on disk before anything points at it.
+directory cluster is zeroed and allocated on disk before anything points
+at it.
 
 A device with a write cache can reorder writes. So on block devices,
 ufat waits for the data to reach the device (fdatasync) before it writes

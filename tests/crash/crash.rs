@@ -180,7 +180,7 @@ impl Op {
 
 /// A tree with long names, files replaced within one directory cluster and
 /// across two, a directory grown past its first cluster, a removed file
-/// whose slots are reused, nested directories. The big file is written in
+/// whose slots are reused, nested directories. BOOTX64.EFI is written in
 /// small pieces so that its epoch holds many writes; the kernel names take
 /// four slots each.
 fn scenario(slots_per_cluster: usize) -> Vec<Op> {
@@ -199,6 +199,11 @@ fn scenario(slots_per_cluster: usize) -> Vec<Op> {
     ops.push(Op::Mkdir("/EFI/BOOT".into()));
     file(&mut ops, "/EFI/BOOT/BOOTX64.EFI", 70_000, false, 4096);
     ops.push(Op::Mkdir("/EFI/Linux".into()));
+    // More clusters than a 512 byte FAT sector has entries go to a file
+    // before /EFI/Linux grows. So with 512 byte sectors the FAT entries of
+    // its first cluster and of the one it grows by are in different
+    // sectors.
+    file(&mut ops, "/EFI/BOOT/mmx64.efi", 300_000, false, whole);
     // Enough long names to grow the directory past its first cluster.
     let kernels = slots_per_cluster / 4 + 2;
     for i in 0..kernels {
@@ -531,6 +536,8 @@ struct Boundary {
     shorts: BTreeMap<String, String>,
     /// Which path owns a cluster.
     owners: HashMap<u32, (String, bool)>,
+    /// The cluster chain of every directory, the root's included.
+    chains: HashMap<String, Vec<u32>>,
 }
 
 struct Harness {
@@ -727,6 +734,20 @@ impl Harness {
             conflicts,
         };
         h.read_boundaries();
+        // A directory that grows gets two FAT entries: the end marker of
+        // its new cluster and the link to it from its last one. When they
+        // are in different sectors, a crash can leave one of them written
+        // and not the other. The scenario makes that happen to /EFI/Linux,
+        // which needs a FAT of more than one sector.
+        let entries_per_sector = h.layout.sector_size / ENTRY_SIZE as u32;
+        if Fat::used_sectors(&h.layout) > 1 {
+            assert!(
+                h.directory_growths()
+                    .iter()
+                    .any(|&(last, next)| last / entries_per_sector != next / entries_per_sector),
+                "no directory growth has its two FAT entries in different sectors"
+            );
+        }
         h
     }
 
@@ -767,15 +788,44 @@ impl Harness {
                 expected
             );
             let mut owners = HashMap::new();
+            let mut chains = HashMap::new();
             for e in &raw.entries {
                 assert!(!e.broken, "{}: broken chain at boundary {}", e.path, j);
                 for &c in &e.chain {
                     owners.insert(c, (e.path.clone(), e.is_dir));
                 }
+                if e.is_dir {
+                    chains.insert(e.path.clone(), e.chain.clone());
+                }
             }
             self.legit.extend(raw.referenced());
-            self.boundaries.push(Boundary { tree, shorts, owners });
+            self.boundaries.push(Boundary {
+                tree,
+                shorts,
+                owners,
+                chains,
+            });
         }
+    }
+
+    /// The links the ops added to directory chains: the cluster a directory
+    /// ended at before the op, and the cluster it grew by.
+    fn directory_growths(&self) -> Vec<(u32, u32)> {
+        let mut growths = Vec::new();
+        for pair in self.boundaries.windows(2) {
+            let (before, after) = (&pair[0], &pair[1]);
+            for (dir, chain) in &after.chains {
+                let Some(old) = before.chains.get(dir) else {
+                    continue;
+                };
+                if let (Some(&last), Some(&next)) = (old.last(), chain.get(old.len())) {
+                    if chain.starts_with(old) {
+                        growths.push((last, next));
+                    }
+                }
+            }
+        }
+        growths
     }
 
     fn boundary_name(&self, j: usize) -> String {
@@ -1661,7 +1711,9 @@ fn run(cfg: Config) {
 }
 
 /// 512 byte sectors with two sectors per cluster: directory writes can
-/// tear between their long name slots and the short entry.
+/// tear between their long name slots and the short entry, and /EFI/Linux
+/// grows into a cluster whose FAT entry is in another sector than the link
+/// to it.
 #[test]
 fn sectors_512_clusters_1024() {
     run(Config {
@@ -1672,7 +1724,8 @@ fn sectors_512_clusters_1024() {
 }
 
 /// 4096 byte sectors, as on a 4Kn disk: a cluster is a sector, the FAT
-/// fits one sector, and a directory grows only after 32 long names.
+/// fits one sector, and a directory grows only after 32 long names. Both
+/// FAT entries of a growth are in that one sector.
 #[test]
 fn sectors_4096_clusters_4096() {
     run(Config {

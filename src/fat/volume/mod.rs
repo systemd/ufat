@@ -731,10 +731,10 @@ impl Volume {
         })
     }
 
-    /// Adds a zeroed cluster to a directory. The cluster is written out right
-    /// away: an all-zero tail is always a valid extension, so whatever
-    /// happens to the caller afterwards the directory stays consistent once
-    /// the FAT is flushed.
+    /// Adds a zeroed cluster to a directory. The cluster and its FAT entry
+    /// are written out right away: an all-zero tail is always a valid
+    /// extension, so whatever happens to the caller afterwards the directory
+    /// stays consistent once the FAT is flushed.
     fn grow_directory(&mut self, dir: &mut Directory) -> Result<()> {
         let per_cluster = self.layout.cluster_size() as usize / DIR_ENTRY_SIZE;
         if dir.slots() + per_cluster > MAX_SLOTS {
@@ -750,12 +750,15 @@ impl Volume {
         }
         let cluster = self.allocate(1)?.first;
         let zeros = vec![0u8; self.layout.cluster_size() as usize];
-        // The zeros reach the device before the FAT links the cluster into
-        // the chain, else a crash could leave the directory running into
-        // whatever the cluster held before.
+        // The zeros and the cluster's own FAT entry reach the device before
+        // the FAT links the cluster into the chain. Else a crash could leave
+        // the directory running into whatever the cluster held before, or
+        // into a cluster the FAT has as free when the two entries are in
+        // different sectors and only the link was written.
         let written = self
             .device
             .write_at(self.layout.cluster_offset(cluster)?, &zeros)
+            .and_then(|()| self.flush())
             .and_then(|()| self.commit_barrier());
         if let Err(e) = written {
             let _ = self.free_chain(cluster);
