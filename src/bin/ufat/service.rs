@@ -118,11 +118,13 @@ fn invalid(parameter: &str) -> Failure {
     Failure::Invalid(parameter.to_string())
 }
 
-/// Turns the vetting error of a passed descriptor into the interface's
-/// error for it, naming the parameter; anything else passes through.
+/// Turns the error of a passed descriptor that cannot be used, found when
+/// it is vetted or when it is read or written (see [`host::PassedStream`]),
+/// into the interface's error for it, naming the parameter; anything else
+/// passes through.
 fn bad(parameter: &str) -> impl Fn(fat::Error) -> Failure + '_ {
     move |e| {
-        if e.errno() == errno::EBADFD {
+        if matches!(e.detail(), Some(Detail::Descriptor { .. })) {
             Failure::BadDescriptor {
                 parameter: parameter.to_string(),
                 error: e,
@@ -825,7 +827,7 @@ impl Hash {
 
 /// The manifest sink: the descriptor and the fields the manifest carries.
 struct Sink {
-    file: File,
+    file: host::PassedStream,
     fields: Fields,
 }
 
@@ -843,14 +845,10 @@ impl Sink {
     /// Writes the manifest of everything `volume` holds, telling `progress`
     /// what it covered so far.
     fn write(self, volume: &Volume, progress: &mut dyn FnMut(&Progress)) -> Outcome<WriteReport> {
+        let root_time = volume.root_time()?;
         let mut out = BufWriter::new(self.file);
-        Ok(fat::manifest::volume::write_with_progress(
-            volume,
-            volume.root_time()?,
-            self.fields,
-            &mut out,
-            progress,
-        )?)
+        fat::manifest::volume::write_with_progress(volume, root_time, self.fields, &mut out, progress)
+            .map_err(bad("manifestSink"))
     }
 }
 
@@ -860,11 +858,11 @@ enum Fill {
     /// The tree below a directory, copied as it is.
     Tree(OwnedFd),
     /// One regular file, Populate only.
-    File(File),
+    File(host::PassedStream),
     /// A manifest with its files below a directory.
     FromDirectory(Manifest, DirectorySource),
     /// A manifest with its files' contents in a stream.
-    FromStream(Manifest, File),
+    FromStream(Manifest, host::PassedStream),
     /// A manifest alone, enough for a plan.
     ManifestOnly(Manifest),
 }
@@ -982,7 +980,7 @@ impl Content {
                 let fd = required_fd(c, &m, "fileDescriptor").map_err(|_| invalid("manifest"))?;
                 let file = host::passed_stream(fd).map_err(bad("manifest"))?;
                 check_validity = m.bool("checkValidity", true);
-                Some(util::read_manifest(file)?)
+                Some(util::read_manifest(file).map_err(bad("manifest"))?)
             }
         };
         let sink = match p.object("manifestSink") {
@@ -1125,12 +1123,10 @@ impl Content {
             Some(Fill::FromDirectory(m, mut source)) => {
                 Counts::of_assembly(&v.assemble_with_progress(&m, &mut source, &assembly, progress)?)
             }
-            Some(Fill::FromStream(m, mut file)) => Counts::of_assembly(&v.assemble_with_progress(
-                &m,
-                &mut StreamSource::new(&mut file),
-                &assembly,
-                progress,
-            )?),
+            Some(Fill::FromStream(m, mut file)) => Counts::of_assembly(
+                &v.assemble_with_progress(&m, &mut StreamSource::new(&mut file), &assembly, progress)
+                    .map_err(bad("sourceFileDescriptor"))?,
+            ),
             // Never taken for a method that writes, see Content::take.
             Some(Fill::ManifestOnly(_)) => return Err(invalid("content")),
         })

@@ -803,6 +803,18 @@ pub(crate) fn make_fifo(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Sets the status flags of the open file description `fd` refers to
+/// (F_SETFL), for the tests of passed streams: what a client that kept a
+/// copy of a descriptor it passed can do to it at any time.
+#[cfg(test)]
+pub(crate) fn set_status_flags(fd: BorrowedFd<'_>, flags: c_int) -> io::Result<()> {
+    // SAFETY: F_SETFL takes an int and reads nothing through a pointer.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
