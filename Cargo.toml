@@ -44,7 +44,6 @@ blkid = { path = "src/blkid" }
 dlopen = { path = "src/dlopen" }
 dlopen-note = { path = "src/dlopen-note" }
 fat = { path = "src/fat" }
-json = { path = "src/json" }
 lexopt = "0.3.2"
 # The _IO and _IOR helpers came with 0.2.172. Stay on 0.2: 1.0 may drop
 # the LFS64 functions such as openat64 and fstatfs64.

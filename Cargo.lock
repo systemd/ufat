@@ -84,8 +84,8 @@ name = "fat"
 version = "0.1.0"
 dependencies = [
  "blkid",
- "json",
  "libc",
+ "serde_json",
  "sha2",
  "uapi16",
 ]
@@ -95,8 +95,8 @@ name = "fat-trace"
 version = "0.1.0"
 dependencies = [
  "blkid",
- "json",
  "libc",
+ "serde_json",
  "sha2",
  "uapi16",
 ]
