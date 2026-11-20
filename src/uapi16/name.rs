@@ -7,8 +7,7 @@ use std::iter;
 use std::ops::Deref;
 use std::str::FromStr;
 
-use json::StringRules;
-
+use crate::strict::StringRules;
 use crate::{InodeType, FILENAME, STRING_RULES};
 
 /// What separates the components of a name.

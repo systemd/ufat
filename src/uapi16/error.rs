@@ -6,6 +6,7 @@ use std::io;
 
 use crate::decode::Subject;
 use crate::object::FileObject;
+use crate::strict::{ParseError, ParseErrorKind};
 use crate::{MAX_CONTENTS, MAX_RECORD_SIZE};
 
 /// What is wrong with a manifest.
@@ -442,7 +443,7 @@ impl fmt::Display for Field {
 #[derive(Debug)]
 enum Cause {
     Io(io::Error),
-    Json(json::ParseError),
+    Json(ParseError),
 }
 
 /// What went wrong reading a manifest, or using one.
@@ -536,20 +537,20 @@ impl Error {
 
     /// A record that is not JSON, that has a key twice in an object, or
     /// that has a string the specification does not permit.
-    pub(crate) fn not_json(record_number: u64, error: json::ParseError) -> Error {
+    pub(crate) fn not_json(record_number: u64, error: ParseError) -> Error {
         let (problem, message) = match error.kind {
-            json::ParseErrorKind::Syntax => (
+            ParseErrorKind::Syntax => (
                 Problem::NotJson,
                 format!("manifest record {} is not valid JSON: {}", record_number, error),
             ),
-            json::ParseErrorKind::DuplicateKey => (
+            ParseErrorKind::DuplicateKey => (
                 Problem::DuplicateKey,
                 format!(
                     "manifest record {} has a key twice in an object: {}",
                     record_number, error
                 ),
             ),
-            json::ParseErrorKind::StringRule => (
+            ParseErrorKind::StringRule => (
                 Problem::InvalidString,
                 format!("manifest record {} has an invalid string: {}", record_number, error),
             ),
@@ -729,6 +730,7 @@ impl From<Error> for io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strict::Strict;
 
     #[test]
     fn an_io_error_passes_through() {
@@ -770,12 +772,14 @@ mod tests {
             (e.found_size(), e.expected_size(), e.value()),
             (Some(1), Some(2), Some("gzip"))
         );
-        let e = Error::not_json(7, json::parse("{").unwrap_err());
+        let text = "{";
+        let json = serde_json::from_str::<serde_json::Value>(text).unwrap_err();
+        let e = Error::not_json(7, Strict::default().error(text, &json));
         assert_eq!(e.kind(), ErrorKind::Manifest(Problem::NotJson));
         assert_eq!(e.record_number(), Some(7));
         assert_eq!(
             e.to_string(),
-            "manifest record 7 is not valid JSON: expected a string key at byte 1"
+            "manifest record 7 is not valid JSON: EOF while parsing an object at byte 1"
         );
         assert!(std::error::Error::source(&e).is_some());
     }

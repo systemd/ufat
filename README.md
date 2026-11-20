@@ -27,8 +27,8 @@ tool and the service are the same binary.
 - Writes are ordered so that a crash or a power loss leaves every file
   in its old state, its new state, or absent. A file is never left
   damaged.
-- The code uses the Rust standard library and the crates libc, sha2 and
-  lexopt.
+- The code uses the Rust standard library and the crates libc, sha2,
+  lexopt and serde_json.
 - libblkid names what an image holds when it holds no FAT32 file
   system, and keeps `assemble` from formatting over a file system or a
   partition table. ufat loads it at run time when it is installed, and

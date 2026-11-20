@@ -66,8 +66,20 @@
 //! have to be fetched from a URL are not taken.
 //!
 //! The reader takes every field the specification has. A field it does
-//! not know is passed over, whatever its value is, as the specification
-//! asks.
+//! not know is passed over, as the specification asks, unless it holds a
+//! number too large for a double, such as 1E400, or more arrays and
+//! objects inside each other than serde_json reads. serde_json reads 127,
+//! the object of the record included.
+//!
+//! The reader reads JSON with serde_json. The features of serde_json are
+//! the same for every crate of a build, and uapi16 cannot turn one off that
+//! another crate turns on. With arbitrary_precision, serde_json hands every
+//! number with a fraction or an exponent, -0 and every integer that does
+//! not fit into 64 bits to the reader as an object. Then a field the reader
+//! does not know may hold a number too large for a double. A field it knows
+//! that holds such a number has a value of the wrong type instead of not
+//! being JSON. A record that is one of these numbers, such as 1.5 or -0, is
+//! read as an object without a name.
 //!
 //! [UAPI.16 file manifest]: https://uapi-group.org/specifications/specs/file_manifest/
 //! [`Read`]: std::io::Read
@@ -88,6 +100,7 @@ mod name;
 mod object;
 mod reader;
 mod sequence;
+mod strict;
 mod writer;
 
 pub use blocking::{Reader, Writer};
@@ -132,7 +145,8 @@ pub const MAX_CONTENTS: usize = 256;
 
 /// What the strings of a manifest may not hold beyond what JSON forbids:
 /// noncharacters and the NUL character, escaped or not.
-pub(crate) const STRING_RULES: json::StringRules = json::StringRules::NO_NONCHARACTERS.union(json::StringRules::NO_NUL);
+pub(crate) const STRING_RULES: strict::StringRules =
+    strict::StringRules::NO_NONCHARACTERS.union(strict::StringRules::NO_NUL);
 
 /// What the tests of this crate build manifests from.
 #[cfg(test)]
@@ -142,6 +156,8 @@ pub(crate) mod testing {
         Contents, DosFlags, Error, Features, FileObject, GptPartition, InodeFlags, InodeType, Location, Mode, Name,
         Object, Reader, RootObject, Sha256, Signature, Uuid, Validity, Writer, RECORD_END, RECORD_SEPARATOR,
     };
+    use crate::strict::{ParseError, Skip, Strict};
+    use serde_core::de::DeserializeSeed;
     use std::collections::BTreeMap;
     use std::num::NonZeroU64;
 
@@ -186,6 +202,18 @@ pub(crate) mod testing {
         pub(crate) root: RootObject,
         pub(crate) objects: Vec<FileObject>,
         pub(crate) signatures: Vec<Signature>,
+    }
+
+    /// How many arrays and objects serde_json reads inside each other.
+    pub(crate) const MAX_NESTING: usize = 127;
+
+    /// Reads the JSON text `text` the way a reader reads a value it passes
+    /// over: every key and every string held to the rules of a manifest.
+    pub(crate) fn read_json(text: &str) -> Result<(), ParseError> {
+        let mut strict = Strict::default();
+        let mut json = serde_json::Deserializer::from_str(text);
+        let read = Skip(&mut strict).deserialize(&mut json).and_then(|()| json.end());
+        read.map_err(|e| strict.error(text, &e))
     }
 
     /// Reads the manifest `bytes` to its end.

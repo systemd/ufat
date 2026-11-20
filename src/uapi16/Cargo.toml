@@ -14,6 +14,10 @@ path = "lib.rs"
 [dependencies]
 json.workspace = true
 libc.workspace = true
+serde_core.workspace = true
+# Without float_roundtrip serde_json refuses some spellings of the largest
+# doubles as out of range, such as 1.7976931348623158e308.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha2.workspace = true
 
 [lints]

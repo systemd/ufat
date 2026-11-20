@@ -4,12 +4,11 @@
 use std::fmt;
 use std::io::{self, BufRead};
 
-use json::is_whitespace;
-
 use crate::decode::{DecodedObject, RecordDecoder, ROOT_RECORD};
 use crate::error::{Error, Problem};
 use crate::object::{FileObject, RootObject, Signature};
 use crate::sequence::SequenceCheck;
+use crate::strict::is_whitespace;
 use crate::{MAX_RECORD_SIZE, RECORD_END, RECORD_SEPARATOR};
 
 /// The most bytes a record has behind its record separator, which counts

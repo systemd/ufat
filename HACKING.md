@@ -1,7 +1,8 @@
 # Hacking on ufat
 
-ufat is built with cargo. It depends on the libc, sha2 and lexopt
-crates. lexopt parses the command line of the tool.
+ufat is built with cargo. It depends on the libc, sha2, lexopt and
+serde_json crates. lexopt parses the command line of the tool, and
+serde_json reads and writes JSON.
 
 ufat does not link against libblkid. It loads libblkid.so.1 with
 dlopen() when it needs it. The workspace has a crate for each part of
@@ -279,7 +280,7 @@ every push to main and once a week. It runs:
 - Kani with `--only-codegen`, which checks that every proof builds. The
   proofs themselves need more time and memory than the CI has,
 - a check that the crates from outside the tree are libc, lexopt, sha2
-  and the crates sha2 needs,
+  and serde_json, and the crates they need,
 - bench/compare.sh with the release binary and that of the base: the
   target branch for a pull request, main before a push, and main of a
   week earlier for the weekly run. It accepts the regressions that the

@@ -3,19 +3,21 @@
 //! rules for the fields of the objects, which the writer checks what it
 //! writes against as well.
 //!
-//! A record is read once, member by member. Whether it is JSON at all is
-//! only known at its end, and so is its media type, which says what kind
-//! of object it is. So the first error in a field is noted and reported
-//! when the record is known to be a file object. The rules are those of
-//! the specification, and where it leaves something open those of
-//! systemd's reader, src/shared/uapi16-manifest.c.
+//! A record is read once, member by member: serde_json reads it, and the
+//! visitors here take its values as they come. Whether it is JSON at all
+//! is only known at its end, and so is its media type, which says what
+//! kind of object it is. So the first error in a field is noted and
+//! reported when the record is known to be a file object. The rules are
+//! those of the specification, and where it leaves something open those
+//! of systemd's reader, src/shared/uapi16-manifest.c.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
+use std::convert::Infallible;
 use std::fmt;
 use std::num::NonZeroU64;
 
-use json::{ParseError, Parser};
+use serde_core::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use crate::base64::Base64;
 use crate::digest::Digest;
@@ -25,9 +27,9 @@ use crate::object::{
     Contents, DosFlags, FatSerial, FileObject, FileSystemIdentity, FlagSet, GptPartition, InodeAttributes, InodeFlags,
     InodeType, Location, Mode, RootObject, Signature, Uuid, Validity,
 };
+use crate::strict::{FieldTable, Key, Members, Skip, Strict};
 use crate::{
-    Features, Name, Order, Sha256, MAX_CONTENTS, MEDIA_TYPE, SIGNATURE_MEDIA_TYPE, STRING_RULES, TRAILER_MEDIA_TYPE,
-    USER_NAMESPACE,
+    Features, Name, Order, Sha256, MAX_CONTENTS, MEDIA_TYPE, SIGNATURE_MEDIA_TYPE, TRAILER_MEDIA_TYPE, USER_NAMESPACE,
 };
 
 /// The user and group ID that is -1 as an unsigned 32-bit integer,
@@ -192,7 +194,7 @@ impl SizeHashConflict {
 impl Field {
     /// The fields of a file object this crate reads, the most common
     /// first.
-    const FILE_OBJECT: [Field; 40] = [
+    const FILE_OBJECT: FieldTable = FieldTable::new(&[
         Field::Name,
         Field::Size,
         Field::Sha256,
@@ -233,9 +235,9 @@ impl Field {
         Field::ValidSinceUSec,
         Field::ValidUntilUSec,
         Field::Validity,
-    ];
+    ]);
     /// The fields of a contents object.
-    const CONTENTS: [Field; 10] = [
+    const CONTENTS: FieldTable = FieldTable::new(&[
         Field::File,
         Field::Url,
         Field::Literal,
@@ -246,40 +248,11 @@ impl Field {
         Field::OriginalSha256,
         Field::Offset,
         Field::HttpHeaders,
-    ];
+    ]);
     /// The fields of the value of an extended attribute.
-    const EXTENDED_ATTRIBUTE: [Field; 2] = [Field::Text, Field::Base64];
+    const EXTENDED_ATTRIBUTE: FieldTable = FieldTable::new(&[Field::Text, Field::Base64]);
     /// The fields of a signature object.
-    const SIGNATURE: [Field; 3] = [Field::Mechanism, Field::Key, Field::Data];
-
-    /// The field among `fields` whose name is `name`.
-    fn find_by_name(fields: &[Field], name: &str) -> Option<Field> {
-        fields.iter().copied().find(|field| field.as_str() == name)
-    }
-
-    /// The field of a file object the key `key` names, if this crate reads
-    /// it.
-    fn from_file_object_key(key: &str) -> Option<Field> {
-        Field::find_by_name(&Field::FILE_OBJECT, key)
-    }
-
-    /// The field of a contents object the key `key` names, if this crate
-    /// reads it.
-    fn from_contents_key(key: &str) -> Option<Field> {
-        Field::find_by_name(&Field::CONTENTS, key)
-    }
-
-    /// The field of the value of an extended attribute the key `key`
-    /// names.
-    fn from_extended_attribute_key(key: &str) -> Option<Field> {
-        Field::find_by_name(&Field::EXTENDED_ATTRIBUTE, key)
-    }
-
-    /// The field of a signature object the key `key` names, if this crate
-    /// reads it.
-    fn from_signature_key(key: &str) -> Option<Field> {
-        Field::find_by_name(&Field::SIGNATURE, key)
-    }
+    const SIGNATURE: FieldTable = FieldTable::new(&[Field::Mechanism, Field::Key, Field::Data]);
 }
 
 /// An object as far as its record was read: what does not go into a
@@ -959,7 +932,8 @@ const ROOT_NAME: &str = "root";
 
 /// Reads one record, member by member, into the object it holds.
 pub(crate) struct RecordDecoder<'a> {
-    json: Parser<'a>,
+    /// What holds the JSON of the record to the rules of a manifest.
+    json: Strict<'a>,
     /// The number of the record, for what is said about it.
     record_number: u64,
     /// The first error found in a field.
@@ -1009,27 +983,178 @@ impl Candidate {
     }
 }
 
+/// A value of a record as a field takes it: its type, and what it holds
+/// where a field can take that. What a [`Part`] made of an array or an
+/// object is a `T`.
+enum Value<'a, T> {
+    /// `null`. A field that is null is not there.
+    Null,
+    Bool(bool),
+    /// A number without sign, fraction and exponent that fits into 64
+    /// bits.
+    Unsigned(u64),
+    String(Cow<'a, str>),
+    /// What a part made of an array or an object.
+    Part(T),
+    /// Any other number, and an array or an object the part read through.
+    Other,
+}
+
+/// What a [`Part`] parsed: the value it read, or the error that ended the
+/// read.
+type Parsed<'a, T, E> = Result<Value<'a, T>, E>;
+
+impl<'a, T> From<Value<'a, T>> for StringMember<'a> {
+    fn from(value: Value<'a, T>) -> StringMember<'a> {
+        match value {
+            Value::Null => StringMember::Absent,
+            Value::String(text) => StringMember::String(text),
+            _ => StringMember::NotString,
+        }
+    }
+}
+
+impl MediaType {
+    /// What the `mediaType` `value` says the record is. None is a media
+    /// type that is not a string.
+    fn of<T>(value: Value<'_, T>) -> Option<MediaType> {
+        let Value::String(media_type) = value else {
+            return None;
+        };
+        Some(match media_type.as_ref() {
+            MEDIA_TYPE => MediaType::Manifest,
+            SIGNATURE_MEDIA_TYPE => MediaType::Signature,
+            TRAILER_MEDIA_TYPE => MediaType::Trailer,
+            _ => MediaType::Other,
+        })
+    }
+}
+
+/// A part of a record that is an array or an object: the record itself,
+/// and the fields that have elements or members. A [`RecordDecoder`] reads
+/// a value with a part, and the part reads the array or the object. An
+/// array or an object the part does not read is read through, and so is a
+/// member or an element the part passes over. Their keys and strings are
+/// held to the rules of a manifest all the same.
+trait Part<'a>: Sized {
+    /// What the part makes of what it reads.
+    type Value;
+
+    /// Reads the array `seq` hands out.
+    fn array<A: SeqAccess<'a>>(self, decoder: &mut RecordDecoder<'a>, seq: A) -> Parsed<'a, Self::Value, A::Error> {
+        Skip(&mut decoder.json).visit_seq(seq).map(|()| Value::Other)
+    }
+
+    /// Reads the object `map` hands out.
+    fn object<A: MapAccess<'a>>(self, decoder: &mut RecordDecoder<'a>, map: A) -> Parsed<'a, Self::Value, A::Error> {
+        Skip(&mut decoder.json).visit_map(map).map(|()| Value::Other)
+    }
+}
+
+/// Reads a value of a record, whatever its type is, and an array or an
+/// object with `part`.
+struct ValueSeed<'r, 'a, P> {
+    decoder: &'r mut RecordDecoder<'a>,
+    part: P,
+}
+
+impl<'a, P: Part<'a>> DeserializeSeed<'a> for ValueSeed<'_, 'a, P> {
+    type Value = Value<'a, P::Value>;
+
+    fn deserialize<D: Deserializer<'a>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'a, P: Part<'a>> Visitor<'a> for ValueSeed<'_, 'a, P> {
+    type Value = Value<'a, P::Value>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    // serde_json hands out a number without sign, fraction and exponent
+    // that fits into 64 bits as a u64, and any other number as an i64 or
+    // an f64.
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(Value::Unsigned(value))
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(Value::Other)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(Value::Other)
+    }
+
+    fn visit_borrowed_str<E: de::Error>(self, value: &'a str) -> Result<Self::Value, E> {
+        self.decoder.json.check_unescaped(value)?;
+        Ok(Value::String(Cow::Borrowed(value)))
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        self.decoder.json.check_string(value)?;
+        Ok(Value::String(Cow::Owned(value.to_owned())))
+    }
+
+    fn visit_seq<A: SeqAccess<'a>>(self, seq: A) -> Result<Self::Value, A::Error> {
+        self.part.array(self.decoder, seq)
+    }
+
+    fn visit_map<A: MapAccess<'a>>(self, map: A) -> Result<Self::Value, A::Error> {
+        self.part.object(self.decoder, map)
+    }
+}
+
 impl<'a> RecordDecoder<'a> {
-    /// Reads the record `text`, the one with the number `record_number`, as
-    /// far as a file object goes, and says what its media type makes it.
-    fn read(text: &'a str, record_number: u64) -> Result<(MediaType, Candidate), Error> {
-        let mut decoder = RecordDecoder {
-            json: Parser::with_rules(text, STRING_RULES),
+    /// The decoder of the record with the number `record_number`.
+    fn new(record_number: u64) -> RecordDecoder<'a> {
+        RecordDecoder {
+            json: Strict::default(),
             record_number,
             first_error: None,
-        };
-        let not_json = |e| Error::not_json(record_number, e);
-        if !decoder.json.object().map_err(not_json)? {
-            decoder.json.skip().map_err(not_json)?;
-            decoder.json.end().map_err(not_json)?;
-            return Err(Error::manifest(
+        }
+    }
+
+    /// What reads a value of the record with `part`.
+    fn seed<P: Part<'a>>(&mut self, part: P) -> ValueSeed<'_, 'a, P> {
+        ValueSeed { decoder: self, part }
+    }
+
+    /// Reads `text`, the whole record, as an object with `part`. A record
+    /// that is JSON but no object is an error too.
+    fn object<P: Part<'a>>(&mut self, text: &'a str, part: P) -> Result<P::Value, Error> {
+        let mut json = serde_json::Deserializer::from_str(text);
+        let read = self
+            .seed(part)
+            .deserialize(&mut json)
+            .and_then(|value| json.end().map(|()| value));
+        let record_number = self.record_number;
+        match read {
+            Ok(Value::Part(object)) => Ok(object),
+            Ok(_) => Err(Error::manifest(
                 Problem::NotObject,
                 format!("manifest record {} is not a JSON object", record_number),
             )
-            .in_record(record_number));
+            .in_record(record_number)),
+            Err(e) => Err(Error::not_json(record_number, self.json.error(text, &e))),
         }
-        let (media_type, draft) = decoder.file_object().map_err(not_json)?;
-        decoder.json.end().map_err(not_json)?;
+    }
+
+    /// Reads the record `text`, the one with the number `record_number`, as
+    /// far as a file object goes, and says what its media type makes it.
+    fn read(text: &'a str, record_number: u64) -> Result<(MediaType, Candidate), Error> {
+        let mut decoder = RecordDecoder::new(record_number);
+        let (media_type, draft) = decoder.object(text, FileObjectRecord)?;
         let Some(media_type) = media_type else {
             return Err(Error::manifest(
                 Problem::InvalidMediaType,
@@ -1101,101 +1226,104 @@ impl<'a> RecordDecoder<'a> {
         }
     }
 
-    /// Reads a string. Any other value is an error, which is noted.
-    fn string(&mut self, field: Field) -> Result<Option<Cow<'a, str>>, ParseError> {
-        let value = self.json.string()?;
-        if value.is_none() {
-            self.json.skip()?;
+    /// What the part made of `value`, which is none for null. A value of
+    /// another type is the error `problem` in `field`, which `message`
+    /// describes, and is noted.
+    fn part<T>(
+        &mut self,
+        value: Value<'a, T>,
+        problem: Problem,
+        field: Field,
+        message: impl FnOnce() -> String,
+    ) -> Option<T> {
+        match value {
+            Value::Part(part) => Some(part),
+            Value::Null => None,
+            _ => {
+                self.note_error(problem, field, message);
+                None
+            }
+        }
+    }
+
+    /// The string `value` is. Any other value is an error, which is noted.
+    fn string<T>(&mut self, field: Field, value: Value<'a, T>) -> Option<Cow<'a, str>> {
+        let Value::String(value) = value else {
             self.note_error(Problem::WrongFieldType, field, || {
                 format!("manifest field '{}' is not a string", field)
             });
-        }
-        Ok(value)
+            return None;
+        };
+        Some(value)
     }
 
-    /// Reads a boolean. Any other value is an error, which is noted.
-    fn bool(&mut self, field: Field) -> Result<Option<bool>, ParseError> {
-        let value = self.json.bool()?;
-        if value.is_none() {
-            self.json.skip()?;
+    /// The boolean `value` is. Any other value is an error, which is noted.
+    fn bool<T>(&mut self, field: Field, value: Value<'a, T>) -> Option<bool> {
+        let Value::Bool(value) = value else {
             self.note_error(Problem::WrongFieldType, field, || {
                 format!("manifest field '{}' is not a boolean", field)
             });
-        }
-        Ok(value)
+            return None;
+        };
+        Some(value)
     }
 
-    /// Reads an unsigned integer of 64 bits: a number written as decimal
-    /// digits without sign, fraction or exponent, as the specification has
-    /// it. Any other value is an error, which is noted, a string of digits
-    /// too.
-    fn unsigned(&mut self, field: Field) -> Result<Option<u64>, ParseError> {
-        let value = match self.json.number()? {
-            Some(number) => number.as_u64(),
-            None => {
-                self.json.skip()?;
-                None
-            }
-        };
-        if value.is_none() {
+    /// The unsigned integer of 64 bits `value` is: a number written as
+    /// decimal digits without sign, fraction or exponent, as the
+    /// specification has it. Any other value is an error, which is noted, a
+    /// string of digits too.
+    fn unsigned<T>(&mut self, field: Field, value: Value<'a, T>) -> Option<u64> {
+        let Value::Unsigned(value) = value else {
             self.note_error(Problem::WrongFieldType, field, || {
                 format!("manifest field '{}' is not an unsigned integer", field)
             });
-        }
-        Ok(value)
+            return None;
+        };
+        Some(value)
     }
 
-    /// Reads a hash. Anything but the hex digits of one is an error, which
-    /// is noted.
-    fn digest(&mut self, field: Field) -> Result<Option<Sha256>, ParseError> {
-        let Some(text) = self.string(field)? else {
-            return Ok(None);
-        };
+    /// The hash `value` is. Anything but the hex digits of one is an error,
+    /// which is noted.
+    fn digest<T>(&mut self, field: Field, value: Value<'a, T>) -> Option<Sha256> {
+        let text = self.string(field, value)?;
         let digest = text.parse().ok();
         if digest.is_none() {
             self.note_error(Problem::WrongFieldType, field, || {
                 format!("manifest field '{}' is not a SHA-256 hash", field)
             });
         }
-        Ok(digest)
+        digest
     }
 
-    /// Reads an access mode, an unsigned integer like every other one.
-    fn mode(&mut self, field: Field) -> Result<Option<Mode>, ParseError> {
-        let Some(bits) = self.unsigned(field)? else {
-            return Ok(None);
-        };
+    /// The access mode `value` is, an unsigned integer like every other
+    /// one.
+    fn mode<T>(&mut self, field: Field, value: Value<'a, T>) -> Option<Mode> {
+        let bits = self.unsigned(field, value)?;
         let mode = u32::try_from(bits).ok().and_then(Mode::new);
         if mode.is_none() {
             self.note_error(Problem::FieldOutOfRange, field, || {
                 format!("manifest field '{}' is out of range: {}", field, bits)
             });
         }
-        Ok(mode)
+        mode
     }
 
-    /// Reads a user or group ID.
-    fn id(&mut self, field: Field) -> Result<Option<u32>, ParseError> {
-        let Some(id) = self.unsigned(field)? else {
-            return Ok(None);
-        };
-        Ok(self.note_err(FileObject::check_id(field, id, self.subject())))
+    /// The user or group ID `value` is.
+    fn id<T>(&mut self, field: Field, value: Value<'a, T>) -> Option<u32> {
+        let id = self.unsigned(field, value)?;
+        self.note_err(FileObject::check_id(field, id, self.subject()))
     }
 
-    /// Reads the name of a user or of a group.
-    fn user_or_group_name(&mut self, field: Field) -> Result<Option<Box<str>>, ParseError> {
-        let Some(name) = self.string(field)? else {
-            return Ok(None);
-        };
+    /// The name of a user or of a group `value` is.
+    fn user_or_group_name<T>(&mut self, field: Field, value: Value<'a, T>) -> Option<Box<str>> {
+        let name = self.string(field, value)?;
         let checked = FileObject::check_owner_name(field, &name, self.subject());
-        Ok(self.note_err(checked).map(|()| name.into()))
+        self.note_err(checked).map(|()| name.into())
     }
 
-    /// Reads a UUID.
-    fn uuid(&mut self, field: Field) -> Result<Option<Uuid>, ParseError> {
-        let Some(text) = self.string(field)? else {
-            return Ok(None);
-        };
+    /// The UUID `value` is.
+    fn uuid<T>(&mut self, field: Field, value: Value<'a, T>) -> Option<Uuid> {
+        let text = self.string(field, value)?;
         let uuid = text.parse().ok();
         if uuid.is_none() {
             let subject = self.subject();
@@ -1203,23 +1331,19 @@ impl<'a> RecordDecoder<'a> {
                 format!("{}: {} '{}' is not a UUID", subject, field, text.escape_debug())
             });
         }
-        Ok(uuid)
+        uuid
     }
 
-    /// Reads a GPT partition label.
-    fn gpt_label(&mut self, field: Field) -> Result<Option<String>, ParseError> {
-        let Some(label) = self.string(field)? else {
-            return Ok(None);
-        };
+    /// The GPT partition label `value` is.
+    fn gpt_label<T>(&mut self, field: Field, value: Value<'a, T>) -> Option<String> {
+        let label = self.string(field, value)?;
         let checked = GptPartition::check_label(&label, self.subject());
-        Ok(self.note_err(checked).map(|()| label.into_owned()))
+        self.note_err(checked).map(|()| label.into_owned())
     }
 
-    /// Reads a FAT volume serial number, `1234-ABCD`.
-    fn fat_serial(&mut self, field: Field) -> Result<Option<FatSerial>, ParseError> {
-        let Some(text) = self.string(field)? else {
-            return Ok(None);
-        };
+    /// The FAT volume serial number `value` is, `1234-ABCD`.
+    fn fat_serial<T>(&mut self, field: Field, value: Value<'a, T>) -> Option<FatSerial> {
+        let text = self.string(field, value)?;
         let serial = text.parse().ok();
         if serial.is_none() {
             let subject = self.subject();
@@ -1232,41 +1356,199 @@ impl<'a> RecordDecoder<'a> {
                 )
             });
         }
-        Ok(serial)
+        serial
     }
 
-    /// Reads a file system label.
-    fn fs_label(&mut self, field: Field) -> Result<Option<String>, ParseError> {
-        let Some(label) = self.string(field)? else {
-            return Ok(None);
-        };
+    /// The file system label `value` is.
+    fn fs_label<T>(&mut self, field: Field, value: Value<'a, T>) -> Option<String> {
+        let label = self.string(field, value)?;
         let checked = FileSystemIdentity::check_label(&label, self.subject());
-        Ok(self.note_err(checked).map(|()| label.into_owned()))
+        self.note_err(checked).map(|()| label.into_owned())
     }
 
-    /// Reads `order`. A value the specification does not have declares no
-    /// order, as it asks.
-    fn order(&mut self, field: Field) -> Result<Option<Order>, ParseError> {
-        Ok(self.string(field)?.and_then(|value| Order::declared(&value)))
+    /// The order `value`, the value of `order`, declares. A value the
+    /// specification does not have declares no order, as it asks.
+    fn order<T>(&mut self, field: Field, value: Value<'a, T>) -> Option<Order> {
+        self.string(field, value).and_then(|value| Order::declared(&value))
     }
 
-    /// Reads `features`: an array of strings, none of them twice. Names
-    /// the specification does not have are passed over, as it asks.
-    fn features(&mut self, field: Field) -> Result<Option<Features>, ParseError> {
-        let subject = self.subject();
-        if !self.json.array()? {
-            self.json.skip()?;
-            self.note_error(Problem::WrongFieldType, field, || {
-                format!("{}: '{}' is not an array of strings", subject, field)
-            });
-            return Ok(None);
+    /// Takes `value`, which is not null, as the value of `field` into
+    /// `draft`: one of the fields of a file object or of the root file
+    /// object that hold no array and no object.
+    fn file_field(&mut self, field: Field, value: Value<'a, Infallible>, draft: &mut Draft) {
+        let object = &mut *draft.object;
+        match field {
+            Field::Name => {
+                if let Some(name) = self.string(field, value) {
+                    match Name::new(name.as_ref()) {
+                        Ok(name) => draft.name = Some(name),
+                        Err(reason) => {
+                            let subject = self.subject();
+                            self.note_error(Problem::InvalidName, field, || {
+                                format!("{}: {}: '{}'", subject, reason, name.escape_debug())
+                            });
+                            draft.invalid_name = Some(name.into_owned());
+                        }
+                    }
+                }
+            }
+            Field::Type => {
+                if let Some(name) = self.string(field, value) {
+                    draft.inode_type = name.parse().ok();
+                    if draft.inode_type.is_none() {
+                        let subject = self.subject();
+                        self.note_error(Problem::UnknownType, field, || {
+                            format!("{}: unknown inode type '{}'", subject, name.escape_debug())
+                        });
+                    }
+                }
+            }
+            Field::Size => object.size = self.unsigned(field, value),
+            Field::Mode => object.inode.mode = self.mode(field, value),
+            Field::Uid => object.inode.uid = self.id(field, value),
+            Field::Gid => object.inode.gid = self.id(field, value),
+            Field::UserName => object.inode.user_name = self.user_or_group_name(field, value),
+            Field::GroupName => object.inode.group_name = self.user_or_group_name(field, value),
+            Field::Major => object.major = self.unsigned(field, value),
+            Field::Minor => object.minor = self.unsigned(field, value),
+            Field::MTimeNSec => object.inode.mtime_nsec = self.unsigned(field, value),
+            // The token 0 is that of a file with one name.
+            Field::InodeToken => object.inode_token = self.unsigned(field, value).and_then(NonZeroU64::new),
+            Field::GptLabel => draft.gpt().label = self.gpt_label(field, value),
+            Field::GptUuid => draft.gpt().uuid = self.uuid(field, value),
+            Field::GptTypeUuid => draft.gpt().type_uuid = self.uuid(field, value),
+            Field::GptFlags => draft.gpt().flags = self.unsigned(field, value),
+            Field::GptFlagNoAuto => draft.gpt().no_auto = self.bool(field, value),
+            Field::GptFlagGrowFileSystem => draft.gpt().grow_file_system = self.bool(field, value),
+            Field::ReadOnly => object.inode.read_only = self.bool(field, value),
+            Field::FlagHidden | Field::FlagSystem | Field::FlagArchive => {
+                if let (Some(flag), Some(set)) = (DosFlags::from_field(field), self.bool(field, value)) {
+                    object.dos_flags.put(flag, Some(set));
+                }
+            }
+            Field::FlagAppendOnly
+            | Field::FlagImmutable
+            | Field::FlagNoAtime
+            | Field::FlagNoCow
+            | Field::FlagNoDump => {
+                if let (Some(flag), Some(set)) = (InodeFlags::from_field(field), self.bool(field, value)) {
+                    object.inode.flags.put(flag, Some(set));
+                }
+            }
+            Field::FatSerial => {
+                draft.root_only.get_or_insert(field);
+                draft.file_system.fat_serial = self.fat_serial(field, value);
+            }
+            Field::FsUuid => {
+                draft.root_only.get_or_insert(field);
+                draft.file_system.uuid = self.uuid(field, value);
+            }
+            Field::FsLabel => {
+                draft.root_only.get_or_insert(field);
+                draft.file_system.label = self.fs_label(field, value);
+            }
+            Field::GptDiskUuid => {
+                draft.root_only.get_or_insert(field);
+                draft.gpt_disk_uuid = self.uuid(field, value);
+            }
+            Field::Order => {
+                draft.root_only.get_or_insert(field);
+                draft.order = self.order(field, value);
+            }
+            Field::Sha256 => object.sha256 = self.digest(field, value),
+            Field::ValidSinceUSec => object.validity.since_usec = self.unsigned(field, value).unwrap_or_default(),
+            Field::ValidUntilUSec => object.validity.until_usec = self.unsigned(field, value),
+            // A value the specification does not have yet is good.
+            Field::Validity => {
+                let validity = self.string(field, value);
+                if validity.is_some_and(|validity| validity == Validity::Revoked.as_str()) {
+                    object.validity.state = Validity::Revoked;
+                }
+            }
+            _ => {}
         }
+    }
+}
+
+/// The part of a member that is to be a string, a number or a boolean: it
+/// reads no array and no object.
+struct Scalar;
+
+impl Part<'_> for Scalar {
+    type Value = Infallible;
+}
+
+/// The record as a file object or as the root file object: the draft of
+/// the object, and the media type the record gives. None is a media type
+/// that is not a string.
+struct FileObjectRecord;
+
+impl<'a> Part<'a> for FileObjectRecord {
+    type Value = (Option<MediaType>, Draft);
+
+    fn object<A: MapAccess<'a>>(self, decoder: &mut RecordDecoder<'a>, map: A) -> Parsed<'a, Self::Value, A::Error> {
+        let subject = decoder.subject();
+        let mut media_type = Some(MediaType::Absent);
+        let mut draft = Draft::new();
+        let mut members = Members::new(map, &Field::FILE_OBJECT, &mut decoder.json);
+        while let Some(key) = members.next_key(&mut decoder.json)? {
+            let Key::Field(field) = key else {
+                members.skip(&mut decoder.json)?;
+                continue;
+            };
+            // A field that is null is a field that is not there. The fields
+            // that hold an array or an object are read with their parts.
+            match field {
+                Field::ExtendedAttributes => {
+                    let value = members.value(decoder.seed(XattrNamespaces))?;
+                    let user = decoder.part(value, Problem::InvalidExtendedAttributes, field, || {
+                        format!("{}: 'extendedAttributes' is not an object", subject)
+                    });
+                    draft.object.inode.user_xattrs = user.flatten().map(Box::new);
+                }
+                Field::Contents => {
+                    let value = members.value(decoder.seed(ContentsArray))?;
+                    let contents = decoder.part(value, Problem::WrongFieldType, field, || {
+                        format!("manifest field '{}' is not an array", field)
+                    });
+                    draft.object.contents = contents.unwrap_or_default();
+                }
+                Field::Features => {
+                    let value = members.value(decoder.seed(FeatureNames))?;
+                    if !matches!(value, Value::Null) {
+                        draft.root_only.get_or_insert(field);
+                    }
+                    draft.features = decoder.part(value, Problem::WrongFieldType, field, || {
+                        format!("{}: '{}' is not an array of strings", subject, field)
+                    });
+                }
+                _ => match members.value(decoder.seed(Scalar))? {
+                    Value::Null => {}
+                    value if field == Field::MediaType => media_type = MediaType::of(value),
+                    value => decoder.file_field(field, value, &mut draft),
+                },
+            }
+        }
+        Ok(Value::Part((media_type, draft)))
+    }
+}
+
+/// `features`: the names of the features the manifest records, strings
+/// and none of them twice. Names the specification does not have are
+/// passed over, as it asks.
+struct FeatureNames;
+
+impl<'a> Part<'a> for FeatureNames {
+    type Value = Features;
+
+    fn array<A: SeqAccess<'a>>(self, decoder: &mut RecordDecoder<'a>, mut seq: A) -> Parsed<'a, Self::Value, A::Error> {
+        let field = Field::Features;
+        let subject = decoder.subject();
         let mut features = Features::NONE;
         let mut names = HashSet::new();
-        while self.json.element()? {
-            let Some(name) = self.json.string()? else {
-                self.json.skip()?;
-                self.note_error(Problem::WrongFieldType, field, || {
+        while let Some(value) = seq.next_element_seed(decoder.seed(Scalar))? {
+            let Value::String(name) = value else {
+                decoder.note_error(Problem::WrongFieldType, field, || {
                     format!("{}: '{}' is not an array of strings", subject, field)
                 });
                 continue;
@@ -1275,325 +1557,164 @@ impl<'a> RecordDecoder<'a> {
                 features |= feature;
             }
             if names.contains(&name) {
-                self.note_error(Problem::FieldOutOfRange, field, || {
+                decoder.note_error(Problem::FieldOutOfRange, field, || {
                     format!("{}: '{}' lists '{}' twice", subject, field, name.escape_debug())
                 });
             }
             names.insert(name);
         }
-        Ok(Some(features))
+        Ok(Value::Part(features))
     }
+}
 
-    /// Reads `httpHeaders`: an object that maps the names of HTTP header
-    /// fields to their values, see [`Contents::check_headers`].
-    fn http_headers(&mut self) -> Result<Vec<(String, String)>, ParseError> {
-        let field = Field::HttpHeaders;
-        let subject = self.subject();
-        let mut headers = Vec::new();
-        if !self.json.object()? {
-            self.json.skip()?;
-            self.note_error(Problem::InvalidContents, field, || {
-                format!("{}: '{}' is not an object", subject, field)
-            });
-            return Ok(headers);
-        }
-        while let Some(name) = self.json.key()? {
-            // A header field that is null is not there.
-            if self.json.null()? {
-                continue;
-            }
-            let Some(value) = self.json.string()? else {
-                self.json.skip()?;
-                self.note_error(Problem::InvalidContents, field, || {
-                    format!(
-                        "{}: the value of HTTP header field '{}' is not a string",
-                        subject,
-                        name.escape_debug()
-                    )
-                });
-                continue;
-            };
-            headers.push((name.into_owned(), value.into_owned()));
-        }
-        self.note_err(Contents::check_headers(&headers, subject));
-        Ok(headers)
-    }
+/// `extendedAttributes`: namespaces that map the names of extended
+/// attributes to their values. Only the `user` namespace is defined, and
+/// what the part makes of it. Others are passed over, as systemd passes
+/// over them.
+struct XattrNamespaces;
 
-    /// Reads a member that has to be a string, whatever it is.
-    fn member(&mut self) -> Result<StringMember<'a>, ParseError> {
-        if self.json.null()? {
-            return Ok(StringMember::Absent);
-        }
-        Ok(match self.json.string()? {
-            Some(text) => StringMember::String(text),
-            None => {
-                self.json.skip()?;
-                StringMember::NotString
-            }
-        })
-    }
+impl<'a> Part<'a> for XattrNamespaces {
+    type Value = Option<BTreeMap<String, Vec<u8>>>;
 
-    /// What the `mediaType` in front of the parser says the record is.
-    /// None is a media type that is not a string.
-    fn media_type(&mut self) -> Result<Option<MediaType>, ParseError> {
-        Ok(match self.json.string()?.as_deref() {
-            Some(MEDIA_TYPE) => Some(MediaType::Manifest),
-            Some(SIGNATURE_MEDIA_TYPE) => Some(MediaType::Signature),
-            Some(TRAILER_MEDIA_TYPE) => Some(MediaType::Trailer),
-            Some(_) => Some(MediaType::Other),
-            None => {
-                self.json.skip()?;
-                None
-            }
-        })
-    }
-
-    /// Reads the members of the object the parser is in as those of a
-    /// file object or of the root file object, and says what media type
-    /// the record has. None is a media type that is not a string.
-    fn file_object(&mut self) -> Result<(Option<MediaType>, Draft), ParseError> {
-        let mut media_type = Some(MediaType::Absent);
-        let mut draft = Draft::new();
-        while let Some(key) = self.json.key()? {
-            let Some(field) = Field::from_file_object_key(&key) else {
-                self.json.skip()?;
-                continue;
-            };
-            // A field that is null is a field that is not there.
-            if self.json.null()? {
-                continue;
-            }
-            if field == Field::MediaType {
-                media_type = self.media_type()?;
-                continue;
-            }
-            let object = &mut *draft.object;
-            match field {
-                Field::Name => {
-                    if let Some(name) = self.string(field)? {
-                        match Name::new(name.as_ref()) {
-                            Ok(name) => draft.name = Some(name),
-                            Err(reason) => {
-                                let subject = self.subject();
-                                self.note_error(Problem::InvalidName, field, || {
-                                    format!("{}: {}: '{}'", subject, reason, name.escape_debug())
-                                });
-                                draft.invalid_name = Some(name.into_owned());
-                            }
-                        }
-                    }
-                }
-                Field::Type => {
-                    if let Some(name) = self.string(field)? {
-                        draft.inode_type = name.parse().ok();
-                        if draft.inode_type.is_none() {
-                            let subject = self.subject();
-                            self.note_error(Problem::UnknownType, field, || {
-                                format!("{}: unknown inode type '{}'", subject, name.escape_debug())
-                            });
-                        }
-                    }
-                }
-                Field::Size => object.size = self.unsigned(field)?,
-                Field::Mode => object.inode.mode = self.mode(field)?,
-                Field::Uid => object.inode.uid = self.id(field)?,
-                Field::Gid => object.inode.gid = self.id(field)?,
-                Field::UserName => object.inode.user_name = self.user_or_group_name(field)?,
-                Field::GroupName => object.inode.group_name = self.user_or_group_name(field)?,
-                Field::Major => object.major = self.unsigned(field)?,
-                Field::Minor => object.minor = self.unsigned(field)?,
-                Field::MTimeNSec => object.inode.mtime_nsec = self.unsigned(field)?,
-                // The token 0 is that of a file with one name.
-                Field::InodeToken => object.inode_token = self.unsigned(field)?.and_then(NonZeroU64::new),
-                Field::ExtendedAttributes => object.inode.user_xattrs = self.extended_attributes()?.map(Box::new),
-                Field::GptLabel => draft.gpt().label = self.gpt_label(field)?,
-                Field::GptUuid => draft.gpt().uuid = self.uuid(field)?,
-                Field::GptTypeUuid => draft.gpt().type_uuid = self.uuid(field)?,
-                Field::GptFlags => draft.gpt().flags = self.unsigned(field)?,
-                Field::GptFlagNoAuto => draft.gpt().no_auto = self.bool(field)?,
-                Field::GptFlagGrowFileSystem => draft.gpt().grow_file_system = self.bool(field)?,
-                Field::ReadOnly => object.inode.read_only = self.bool(field)?,
-                Field::FlagHidden | Field::FlagSystem | Field::FlagArchive => {
-                    if let (Some(flag), Some(set)) = (DosFlags::from_field(field), self.bool(field)?) {
-                        object.dos_flags.put(flag, Some(set));
-                    }
-                }
-                Field::FlagAppendOnly
-                | Field::FlagImmutable
-                | Field::FlagNoAtime
-                | Field::FlagNoCow
-                | Field::FlagNoDump => {
-                    if let (Some(flag), Some(set)) = (InodeFlags::from_field(field), self.bool(field)?) {
-                        object.inode.flags.put(flag, Some(set));
-                    }
-                }
-                Field::FatSerial => {
-                    draft.root_only.get_or_insert(field);
-                    draft.file_system.fat_serial = self.fat_serial(field)?;
-                }
-                Field::FsUuid => {
-                    draft.root_only.get_or_insert(field);
-                    draft.file_system.uuid = self.uuid(field)?;
-                }
-                Field::FsLabel => {
-                    draft.root_only.get_or_insert(field);
-                    draft.file_system.label = self.fs_label(field)?;
-                }
-                Field::GptDiskUuid => {
-                    draft.root_only.get_or_insert(field);
-                    draft.gpt_disk_uuid = self.uuid(field)?;
-                }
-                Field::Order => {
-                    draft.root_only.get_or_insert(field);
-                    draft.order = self.order(field)?;
-                }
-                Field::Features => {
-                    draft.root_only.get_or_insert(field);
-                    draft.features = self.features(field)?;
-                }
-                Field::Contents => object.contents = self.contents()?,
-                Field::Sha256 => object.sha256 = self.digest(field)?,
-                Field::ValidSinceUSec => object.validity.since_usec = self.unsigned(field)?.unwrap_or_default(),
-                Field::ValidUntilUSec => object.validity.until_usec = self.unsigned(field)?,
-                // A value the specification does not have yet is good.
-                Field::Validity => {
-                    if self
-                        .string(field)?
-                        .is_some_and(|validity| validity == Validity::Revoked.as_str())
-                    {
-                        object.validity.state = Validity::Revoked;
-                    }
-                }
-                _ => self.json.skip()?,
-            }
-        }
-        Ok((media_type, draft))
-    }
-
-    /// Reads the `extendedAttributes` field: namespaces that map names to
-    /// values, a value being an object with exactly one of `text` and
-    /// `base64`. Only the `user` namespace is defined. Others are passed
-    /// over, as systemd passes over them.
-    fn extended_attributes(&mut self) -> Result<Option<BTreeMap<String, Vec<u8>>>, ParseError> {
+    fn object<A: MapAccess<'a>>(self, decoder: &mut RecordDecoder<'a>, map: A) -> Parsed<'a, Self::Value, A::Error> {
         let field = Field::ExtendedAttributes;
-        let subject = self.subject();
-        if !self.json.object()? {
-            self.json.skip()?;
-            self.note_error(Problem::InvalidExtendedAttributes, field, || {
-                format!("{}: 'extendedAttributes' is not an object", subject)
-            });
-            return Ok(None);
-        }
+        let subject = decoder.subject();
         let mut user = None;
-        while let Some(namespace) = self.json.key()? {
+        let mut members = Members::new(map, &FieldTable::NONE, &mut decoder.json);
+        while let Some(namespace) = members.next_name(&mut decoder.json)? {
             if namespace != USER_NAMESPACE {
-                self.json.skip()?;
+                members.skip(&mut decoder.json)?;
                 continue;
             }
             // A namespace that is null says nothing about its attributes.
-            if self.json.null()? {
+            let value = members.value(decoder.seed(UserXattrs))?;
+            user = decoder.part(value, Problem::InvalidExtendedAttributes, field, || {
+                format!(
+                    "{}: extended attribute namespace '{}' is not an object",
+                    subject, namespace
+                )
+            });
+        }
+        Ok(Value::Part(user))
+    }
+}
+
+/// The extended attributes of the `user` namespace: their names and
+/// their values.
+struct UserXattrs;
+
+impl<'a> Part<'a> for UserXattrs {
+    type Value = BTreeMap<String, Vec<u8>>;
+
+    fn object<A: MapAccess<'a>>(self, decoder: &mut RecordDecoder<'a>, map: A) -> Parsed<'a, Self::Value, A::Error> {
+        let field = Field::ExtendedAttributes;
+        let subject = decoder.subject();
+        let mut attributes = BTreeMap::new();
+        let mut members = Members::new(map, &FieldTable::NONE, &mut decoder.json);
+        while let Some(name) = members.next_name(&mut decoder.json)? {
+            let value = members.value(decoder.seed(XattrValue))?;
+            // An attribute that is null is not there.
+            if matches!(value, Value::Null) || decoder.note_err(FileObject::check_xattr_name(&name, subject)).is_none()
+            {
                 continue;
             }
-            if !self.json.object()? {
-                self.json.skip()?;
-                self.note_error(Problem::InvalidExtendedAttributes, field, || {
-                    format!(
-                        "{}: extended attribute namespace '{}' is not an object",
-                        subject, namespace
-                    )
-                });
+            let Some((text, base64)) = decoder.part(value, Problem::InvalidExtendedAttributes, field, || {
+                format!(
+                    "{}: value of extended attribute '{}' is not an object",
+                    subject,
+                    name.escape_debug()
+                )
+            }) else {
                 continue;
-            }
-            let attributes = user.insert(BTreeMap::new());
-            while let Some(name) = self.json.key()? {
-                // An attribute that is null is not there.
-                if self.json.null()? {
-                    continue;
-                }
-                if self.note_err(FileObject::check_xattr_name(&name, subject)).is_none() {
-                    self.json.skip()?;
-                    continue;
-                }
-                if !self.json.object()? {
-                    self.json.skip()?;
-                    self.note_error(Problem::InvalidExtendedAttributes, field, || {
-                        format!(
-                            "{}: value of extended attribute '{}' is not an object",
-                            subject,
-                            name.escape_debug()
-                        )
+            };
+            let value = match (text, base64) {
+                (StringMember::String(text), StringMember::Absent) => Some(text.into_owned().into_bytes()),
+                (StringMember::NotString, StringMember::Absent) => {
+                    decoder.note_error(Problem::WrongFieldType, Field::Text, || {
+                        format!("manifest field '{}' is not a string", Field::Text)
                     });
-                    continue;
+                    None
                 }
-                let (mut text, mut base64) = (StringMember::Absent, StringMember::Absent);
-                while let Some(key) = self.json.key()? {
-                    match Field::from_extended_attribute_key(&key) {
-                        Some(Field::Text) => text = self.member()?,
-                        Some(Field::Base64) => base64 = self.member()?,
-                        _ => self.json.skip()?,
-                    }
-                }
-                let value = match (text, base64) {
-                    (StringMember::String(text), StringMember::Absent) => Some(text.into_owned().into_bytes()),
-                    (StringMember::NotString, StringMember::Absent) => {
-                        self.note_error(Problem::WrongFieldType, Field::Text, || {
-                            format!("manifest field '{}' is not a string", Field::Text)
-                        });
-                        None
-                    }
-                    (StringMember::Absent, StringMember::String(base64)) => {
-                        let value = Base64::decode(&base64);
-                        if value.is_none() {
-                            self.note_error(Problem::InvalidExtendedAttributes, field, || {
-                                format!(
-                                    "{}: extended attribute '{}' is not valid Base64",
-                                    subject,
-                                    name.escape_debug()
-                                )
-                            });
-                        }
-                        value
-                    }
-                    (StringMember::Absent, StringMember::NotString) => {
-                        self.note_error(Problem::WrongFieldType, Field::Base64, || {
-                            format!("manifest field '{}' is not a string", Field::Base64)
-                        });
-                        None
-                    }
-                    _ => {
-                        self.note_error(Problem::InvalidExtendedAttributes, field, || {
+                (StringMember::Absent, StringMember::String(base64)) => {
+                    let value = Base64::decode(&base64);
+                    if value.is_none() {
+                        decoder.note_error(Problem::InvalidExtendedAttributes, field, || {
                             format!(
-                                "{}: extended attribute '{}' needs exactly one of 'text' and 'base64'",
+                                "{}: extended attribute '{}' is not valid Base64",
                                 subject,
                                 name.escape_debug()
                             )
                         });
-                        None
                     }
-                };
-                if let Some(value) = value {
-                    attributes.insert(name.into_owned(), value);
+                    value
                 }
+                (StringMember::Absent, StringMember::NotString) => {
+                    decoder.note_error(Problem::WrongFieldType, Field::Base64, || {
+                        format!("manifest field '{}' is not a string", Field::Base64)
+                    });
+                    None
+                }
+                _ => {
+                    decoder.note_error(Problem::InvalidExtendedAttributes, field, || {
+                        format!(
+                            "{}: extended attribute '{}' needs exactly one of 'text' and 'base64'",
+                            subject,
+                            name.escape_debug()
+                        )
+                    });
+                    None
+                }
+            };
+            if let Some(value) = value {
+                attributes.insert(name.into_owned(), value);
             }
         }
-        Ok(user)
+        Ok(Value::Part(attributes))
     }
+}
 
-    /// Reads the `contents` field: an array of contents objects.
-    fn contents(&mut self) -> Result<Vec<Contents>, ParseError> {
-        let field = Field::Contents;
-        let mut list = Vec::new();
-        if !self.json.array()? {
-            self.json.skip()?;
-            self.note_error(Problem::WrongFieldType, field, || {
-                format!("manifest field '{}' is not an array", field)
-            });
-            return Ok(list);
+/// The value of an extended attribute, an object that is to have exactly
+/// one of `text` and `base64`: the two as they were found.
+struct XattrValue;
+
+impl<'a> Part<'a> for XattrValue {
+    type Value = (StringMember<'a>, StringMember<'a>);
+
+    fn object<A: MapAccess<'a>>(self, decoder: &mut RecordDecoder<'a>, map: A) -> Parsed<'a, Self::Value, A::Error> {
+        let (mut text, mut base64) = (StringMember::Absent, StringMember::Absent);
+        let mut members = Members::new(map, &Field::EXTENDED_ATTRIBUTE, &mut decoder.json);
+        while let Some(key) = members.next_key(&mut decoder.json)? {
+            match key {
+                Key::Field(Field::Text) => text = members.value(decoder.seed(Scalar))?.into(),
+                Key::Field(Field::Base64) => base64 = members.value(decoder.seed(Scalar))?.into(),
+                _ => members.skip(&mut decoder.json)?,
+            }
         }
-        let error_before = self.first_error.is_some();
+        Ok(Value::Part((text, base64)))
+    }
+}
+
+/// `contents`: the contents objects of a file object.
+struct ContentsArray;
+
+impl<'a> Part<'a> for ContentsArray {
+    type Value = Vec<Contents>;
+
+    fn array<A: SeqAccess<'a>>(self, decoder: &mut RecordDecoder<'a>, mut seq: A) -> Parsed<'a, Self::Value, A::Error> {
+        let subject = decoder.subject();
+        let mut list = Vec::new();
+        let error_before = decoder.first_error.is_some();
         let mut count = 0usize;
-        while self.json.element()? {
-            let contents = self.contents_object()?;
+        while let Some(value) = seq.next_element_seed(decoder.seed(ContentsObject))? {
+            let contents = match value {
+                Value::Part(contents) => contents,
+                _ => {
+                    decoder.note_error(Problem::InvalidContents, Field::Contents, || {
+                        format!("{}: contents entry is not an object", subject)
+                    });
+                    Contents::default()
+                }
+            };
             count += 1;
             if count <= MAX_CONTENTS {
                 list.push(contents);
@@ -1602,41 +1723,51 @@ impl<'a> RecordDecoder<'a> {
         // Too many of them is what is wrong with the field, whatever is
         // wrong with one of them.
         if count > MAX_CONTENTS && !error_before {
-            self.first_error = Some(Error::too_many_contents(self.subject()));
+            decoder.first_error = Some(Error::too_many_contents(subject));
         }
-        Ok(list)
+        Ok(Value::Part(list))
     }
+}
 
-    /// Reads one contents object.
-    fn contents_object(&mut self) -> Result<Contents, ParseError> {
-        let subject = self.subject();
+/// A contents object.
+struct ContentsObject;
+
+impl<'a> Part<'a> for ContentsObject {
+    type Value = Contents;
+
+    fn object<A: MapAccess<'a>>(self, decoder: &mut RecordDecoder<'a>, map: A) -> Parsed<'a, Self::Value, A::Error> {
+        let subject = decoder.subject();
         let mut contents = Contents::default();
-        if !self.json.object()? {
-            self.json.skip()?;
-            self.note_error(Problem::InvalidContents, Field::Contents, || {
-                format!("{}: contents entry is not an object", subject)
-            });
-            return Ok(contents);
-        }
         // How many of file, url and literal the object has.
         let mut places = 0;
-        while let Some(key) = self.json.key()? {
-            let Some(field) = Field::from_contents_key(&key) else {
-                self.json.skip()?;
+        let mut members = Members::new(map, &Field::CONTENTS, &mut decoder.json);
+        while let Some(key) = members.next_key(&mut decoder.json)? {
+            let Key::Field(field) = key else {
+                members.skip(&mut decoder.json)?;
                 continue;
             };
-            if self.json.null()? {
+            // A field that is null is a field that is not there.
+            if field == Field::HttpHeaders {
+                let value = members.value(decoder.seed(HeaderFields))?;
+                let headers = decoder.part(value, Problem::InvalidContents, field, || {
+                    format!("{}: '{}' is not an object", subject, field)
+                });
+                contents.http_headers = headers.unwrap_or_default();
+                continue;
+            }
+            let value = members.value(decoder.seed(Scalar))?;
+            if matches!(value, Value::Null) {
                 continue;
             }
             match field {
                 Field::File => {
-                    if let Some(file) = self.string(field)? {
+                    if let Some(file) = decoder.string(field, value) {
                         match Name::new(file.as_ref()) {
                             Ok(file) => {
                                 contents.location = Location::File(file);
                                 places += 1;
                             }
-                            Err(reason) => self.note_error(Problem::InvalidContents, field, || {
+                            Err(reason) => decoder.note_error(Problem::InvalidContents, field, || {
                                 format!(
                                     "{}: contents file reference: {}: '{}'",
                                     subject,
@@ -1648,46 +1779,45 @@ impl<'a> RecordDecoder<'a> {
                     }
                 }
                 Field::Url => {
-                    if let Some(url) = self.string(field)? {
-                        if self.note_err(Contents::check_url(&url, subject)).is_some() {
+                    if let Some(url) = decoder.string(field, value) {
+                        if decoder.note_err(Contents::check_url(&url, subject)).is_some() {
                             contents.location = Location::Url(url.into_owned());
                             places += 1;
                         }
                     }
                 }
                 Field::Literal => {
-                    if let Some(literal) = self.string(field)? {
+                    if let Some(literal) = decoder.string(field, value) {
                         match Base64::decode(&literal) {
                             Some(literal) => {
                                 contents.location = Location::Literal(literal);
                                 places += 1;
                             }
-                            None => self.note_error(Problem::InvalidContents, field, || {
+                            None => decoder.note_error(Problem::InvalidContents, field, || {
                                 format!("{}: literal contents are not Base64", subject)
                             }),
                         }
                     }
                 }
                 Field::Encoding => {
-                    if let Some(encoding) = self.string(field)? {
+                    if let Some(encoding) = decoder.string(field, value) {
                         let encoding = encoding.to_ascii_lowercase();
-                        if self.note_err(Contents::check_encoding(&encoding, subject)).is_some() {
+                        if decoder.note_err(Contents::check_encoding(&encoding, subject)).is_some() {
                             contents.encoding = Some(encoding);
                         }
                     }
                 }
-                Field::EncodedSize => contents.encoded_size = self.unsigned(field)?,
-                Field::EncodedSha256 => contents.encoded_sha256 = self.digest(field)?,
-                Field::OriginalSize => contents.original_size = self.unsigned(field)?,
-                Field::OriginalSha256 => contents.original_sha256 = self.digest(field)?,
-                Field::Offset => contents.offset = self.unsigned(field)?.unwrap_or_default(),
-                Field::HttpHeaders => contents.http_headers = self.http_headers()?,
-                _ => self.json.skip()?,
+                Field::EncodedSize => contents.encoded_size = decoder.unsigned(field, value),
+                Field::EncodedSha256 => contents.encoded_sha256 = decoder.digest(field, value),
+                Field::OriginalSize => contents.original_size = decoder.unsigned(field, value),
+                Field::OriginalSha256 => contents.original_sha256 = decoder.digest(field, value),
+                Field::Offset => contents.offset = decoder.unsigned(field, value).unwrap_or_default(),
+                _ => {}
             }
         }
         // What is wrong with the contents object as a whole counts unless an
         // error was noted before.
-        if self.first_error.is_none() {
+        if decoder.first_error.is_none() {
             let checked = if places > 1 {
                 Err(Error::manifest(
                     Problem::InvalidContents,
@@ -1698,10 +1828,78 @@ impl<'a> RecordDecoder<'a> {
             };
             match checked {
                 Ok(data) => contents.fill_in(data),
-                Err(e) => self.first_error = Some(e),
+                Err(e) => decoder.first_error = Some(e),
             }
         }
-        Ok(contents)
+        Ok(Value::Part(contents))
+    }
+}
+
+/// `httpHeaders`: an object that maps the names of HTTP header fields to
+/// their values, see [`Contents::check_headers`].
+struct HeaderFields;
+
+impl<'a> Part<'a> for HeaderFields {
+    type Value = Vec<(String, String)>;
+
+    fn object<A: MapAccess<'a>>(self, decoder: &mut RecordDecoder<'a>, map: A) -> Parsed<'a, Self::Value, A::Error> {
+        let field = Field::HttpHeaders;
+        let subject = decoder.subject();
+        let mut headers = Vec::new();
+        let mut members = Members::new(map, &FieldTable::NONE, &mut decoder.json);
+        while let Some(name) = members.next_name(&mut decoder.json)? {
+            match members.value(decoder.seed(Scalar))? {
+                // A header field that is null is not there.
+                Value::Null => {}
+                Value::String(value) => headers.push((name.into_owned(), value.into_owned())),
+                _ => decoder.note_error(Problem::InvalidContents, field, || {
+                    format!(
+                        "{}: the value of HTTP header field '{}' is not a string",
+                        subject,
+                        name.escape_debug()
+                    )
+                }),
+            }
+        }
+        decoder.note_err(Contents::check_headers(&headers, subject));
+        Ok(Value::Part(headers))
+    }
+}
+
+/// The record as a signature object: its `mechanism`, `key` and `data`
+/// as they were found.
+struct SignatureRecord;
+
+/// The members of a signature object, as they were found.
+struct SignatureMembers<'a> {
+    mechanism: StringMember<'a>,
+    key: StringMember<'a>,
+    data: StringMember<'a>,
+}
+
+impl<'a> Part<'a> for SignatureRecord {
+    type Value = SignatureMembers<'a>;
+
+    fn object<A: MapAccess<'a>>(self, decoder: &mut RecordDecoder<'a>, map: A) -> Parsed<'a, Self::Value, A::Error> {
+        let mut signature = SignatureMembers {
+            mechanism: StringMember::Absent,
+            key: StringMember::Absent,
+            data: StringMember::Absent,
+        };
+        let mut members = Members::new(map, &Field::SIGNATURE, &mut decoder.json);
+        while let Some(key) = members.next_key(&mut decoder.json)? {
+            let found = match key {
+                Key::Field(Field::Mechanism) => &mut signature.mechanism,
+                Key::Field(Field::Key) => &mut signature.key,
+                Key::Field(Field::Data) => &mut signature.data,
+                _ => {
+                    members.skip(&mut decoder.json)?;
+                    continue;
+                }
+            };
+            *found = members.value(decoder.seed(Scalar))?.into();
+        }
+        Ok(Value::Part(signature))
     }
 }
 
@@ -1711,33 +1909,17 @@ impl Signature {
     /// signature is not verified, but a manifest whose signature objects
     /// are malformed is refused like systemd refuses it.
     fn decode(text: &str, record_number: u64) -> Result<Signature, Error> {
-        let mut decoder = RecordDecoder {
-            json: Parser::with_rules(text, STRING_RULES),
-            record_number,
-            first_error: None,
-        };
-        decoder
-            .signature()
-            .map_err(|e| Error::not_json(record_number, e))?
+        RecordDecoder::new(record_number)
+            .object(text, SignatureRecord)?
+            .into_signature(record_number)
             .map_err(|e| e.in_record(record_number))
     }
 }
 
-impl RecordDecoder<'_> {
-    /// Reads the members of the record as those of a signature object.
-    fn signature(&mut self) -> Result<Result<Signature, Error>, ParseError> {
-        let record_number = self.record_number;
-        let (mut mechanism, mut key, mut data) = (StringMember::Absent, StringMember::Absent, StringMember::Absent);
-        self.json.object()?;
-        while let Some(member) = self.json.key()? {
-            match Field::from_signature_key(&member) {
-                Some(Field::Mechanism) => mechanism = self.member()?,
-                Some(Field::Key) => key = self.member()?,
-                Some(Field::Data) => data = self.member()?,
-                _ => self.json.skip()?,
-            }
-        }
-        self.json.end()?;
+impl SignatureMembers<'_> {
+    /// The signature object of the record with the number `record_number`
+    /// that has these members.
+    fn into_signature(self, record_number: u64) -> Result<Signature, Error> {
         let not_a_string = |field: Field| {
             Error::manifest(
                 Problem::WrongFieldType,
@@ -1745,45 +1927,45 @@ impl RecordDecoder<'_> {
             )
             .at(field)
         };
-        let StringMember::String(mechanism) = mechanism else {
-            return Ok(Err(Error::manifest(
+        let StringMember::String(mechanism) = self.mechanism else {
+            return Err(Error::manifest(
                 Problem::InvalidSignature,
                 format!("manifest signature object {} has no 'mechanism' string", record_number),
             )
-            .at(Field::Mechanism)));
+            .at(Field::Mechanism));
         };
-        let key = match key {
+        let key = match self.key {
             StringMember::Absent => None,
-            StringMember::NotString => return Ok(Err(not_a_string(Field::Key))),
+            StringMember::NotString => return Err(not_a_string(Field::Key)),
             StringMember::String(key) => match Hex::decode(&key) {
                 Some(key) => Some(key),
                 None => {
-                    return Ok(Err(Error::manifest(
+                    return Err(Error::manifest(
                         Problem::InvalidSignature,
                         format!("manifest signature object {}: 'key' is not hex", record_number),
                     )
-                    .at(Field::Key)));
+                    .at(Field::Key));
                 }
             },
         };
-        let data = match data {
+        let data = match self.data {
             StringMember::Absent => None,
-            StringMember::NotString => return Ok(Err(not_a_string(Field::Data))),
+            StringMember::NotString => return Err(not_a_string(Field::Data)),
             StringMember::String(data) => match Base64::decode(&data) {
                 Some(data) => Some(data),
                 None => {
-                    return Ok(Err(Error::manifest(
+                    return Err(Error::manifest(
                         Problem::InvalidSignature,
                         format!("manifest signature object {}: 'data' is not Base64", record_number),
                     )
-                    .at(Field::Data)));
+                    .at(Field::Data));
                 }
             },
         };
         let mut signature = Signature::new(mechanism);
         signature.key = key;
         signature.data = data;
-        Ok(Ok(signature))
+        Ok(signature)
     }
 }
 
@@ -1791,7 +1973,7 @@ impl RecordDecoder<'_> {
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
-    use crate::testing::{read_whole, sequence, EMPTY, HELLO, ROOT, SIGNATURE, TRAILER, WORLD};
+    use crate::testing::{read_whole, sequence, EMPTY, HELLO, MAX_NESTING, ROOT, SIGNATURE, TRAILER, WORLD};
 
     /// The file object of `record`, the record after the root file object.
     fn object(record: &str) -> FileObject {
@@ -2003,11 +2185,34 @@ mod tests {
             o
         );
         assert_eq!(object(r#"{"name":"x","mediaType":null}"#), o);
-        // Also a number of any size and nesting of any depth.
-        let deep = format!("{}1{}", r#"[{"a":"#.repeat(1000), "}]".repeat(1000));
-        for value in ["1e400", "-1e400", &"9".repeat(400), &deep] {
+        // Also large numbers and nesting. What JSON takes nowhere else in
+        // a record it does not take in such a field either: a number too
+        // large for a double, and more arrays and objects inside each other
+        // than serde_json reads, the object of the record among them.
+        // 1.7976931348623158e308 rounds to the largest double, and only
+        // float_roundtrip reads it as that.
+        let largest = "1.7976931348623158e308";
+        let deep = |depth: usize| format!("{}1{}", r#"[{"a":"#.repeat(depth), "}]".repeat(depth));
+        let nested = |depth: usize| format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        for value in [
+            "1e300",
+            "-1e300",
+            &"9".repeat(300),
+            largest,
+            &deep(50),
+            &nested(MAX_NESTING - 1),
+        ] {
             assert_eq!(object(&format!(r#"{{"name":"x","xUnknown":{}}}"#, value)), o);
         }
+        for value in ["1e400", "-1e400", &"9".repeat(400), &deep(500), &nested(MAX_NESTING)] {
+            let e = refused(&format!(r#"{{"name":"x","xUnknown":{}}}"#, value));
+            assert_eq!(e.kind(), ErrorKind::Manifest(Problem::NotJson), "{}", value);
+        }
+        let e = refused(&format!(r#"{{"name":"x","size":{}}}"#, largest));
+        assert_eq!(
+            (e.kind(), e.field()),
+            (ErrorKind::Manifest(Problem::WrongFieldType), Some(Field::Size))
+        );
         // Integers are numbers of up to 64 bits.
         for (text, size) in [("5", 5), ("0", 0), ("18446744073709551615", u64::MAX)] {
             assert_eq!(
@@ -2121,7 +2326,7 @@ mod tests {
         ] {
             let e = refused(&format!(
                 r#"{{"name":"x","gptLabel":{}}}"#,
-                json::Value::from(label.as_str())
+                serde_json::Value::from(label.as_str())
             ));
             assert_eq!(e.kind(), ErrorKind::Manifest(Problem::WrongFieldType), "{:?}", label);
         }
@@ -2691,7 +2896,7 @@ mod tests {
             ("pkcs7", None, Some(&[0u8, 0, 0][..]))
         );
         let s = signature(concat!(
-            r#"{"data":null,"key":"ABcd01","mechanism":"openpgp","other":[1,2,1e400],"#,
+            r#"{"data":null,"key":"ABcd01","mechanism":"openpgp","other":[1,2,1e300],"#,
             r#""mediaType":"application/vnd.uapi.16.signature"}"#
         ));
         assert_eq!(
@@ -2845,25 +3050,126 @@ mod tests {
     /// [`Field::as_str`], in the objects it is a field of.
     #[test]
     fn fields_are_read_by_their_names() {
-        /// Finds the field a key is the name of.
-        type Lookup = fn(&str) -> Option<Field>;
-        let kinds: [(&[Field], Lookup); 4] = [
-            (&Field::FILE_OBJECT, Field::from_file_object_key),
-            (&Field::CONTENTS, Field::from_contents_key),
-            (&Field::EXTENDED_ATTRIBUTE, Field::from_extended_attribute_key),
-            (&Field::SIGNATURE, Field::from_signature_key),
+        let tables = [
+            &Field::FILE_OBJECT,
+            &Field::CONTENTS,
+            &Field::EXTENDED_ATTRIBUTE,
+            &Field::SIGNATURE,
         ];
         let mut names = HashSet::new();
-        for (fields, of) in kinds {
-            for &field in fields {
-                assert_eq!(of(field.as_str()), Some(field), "{}", field);
-                assert_eq!(fields_of(field), fields, "{}", field);
+        for table in tables {
+            for (place, &field) in table.iter().enumerate() {
+                assert_eq!(table.find(field.as_str()), Some((place, field)), "{}", field);
+                assert_eq!(fields_of(field), &table[..], "{}", field);
                 assert!(names.insert(field.as_str()), "{}", field);
             }
-            assert_eq!(of("xUnknown"), None);
+            assert_eq!(table.find("xUnknown"), None);
         }
         // Data is the last of the fields.
         assert_eq!(names.len(), Field::Data as usize + 1);
+    }
+
+    /// A key twice in an object is refused right behind the second one,
+    /// whether it names a field of the object or not, and however it is
+    /// written.
+    #[test]
+    fn keys_twice() {
+        let records = [
+            // A field of a file object, also one written with an escape.
+            (r#"{"name":"x","size":1,"size":2}"#, r#""size""#),
+            (r#"{"name":"x","s\u0069ze":1,"size":2}"#, r#""size""#),
+            // A key that is no field of the object, between fields.
+            (r#"{"name":"x","xA":1,"size":1,"xA":2}"#, r#""xA""#),
+            // The name of a field as a key of a value that is passed over.
+            (r#"{"name":"x","xB":{"name":1,"name":2}}"#, r#""name""#),
+            // A field of a contents object, and a key that is none.
+            (r#"{"name":"x","contents":[{"file":"a","file":"b"}]}"#, r#""file""#),
+            (r#"{"name":"x","contents":[{"file":"a","xC":1,"xC":2}]}"#, r#""xC""#),
+            // Names: of a namespace, of an extended attribute and of an HTTP
+            // header field.
+            (
+                r#"{"name":"x","extendedAttributes":{"user":{},"user":{}}}"#,
+                r#""user""#,
+            ),
+            (
+                r#"{"name":"x","extendedAttributes":{"user":{"a":{"text":"1"},"a":{"text":"2"}}}}"#,
+                r#""a""#,
+            ),
+            (
+                r#"{"name":"x","contents":[{"url":"https://x","httpHeaders":{"A":"1","A":"2"}}]}"#,
+                r#""A""#,
+            ),
+            // A field of the value of an extended attribute.
+            (
+                r#"{"name":"x","extendedAttributes":{"user":{"a":{"text":"1","text":"2"}}}}"#,
+                r#""text""#,
+            ),
+            // A field of a signature object.
+            (
+                r#"{"mediaType":"application/vnd.uapi.16.signature","mechanism":"a","mechanism":"b"}"#,
+                r#""mechanism""#,
+            ),
+            // What follows the second key is not read: whitespace, the colon
+            // and the value.
+            (r#"{"name":"x","size":1,"size" :[}"#, r#""size""#),
+            ("{\"name\":\"x\",\"xA\":1,\"xA\"\n\t2}", r#""xA""#),
+            (r#"{"name":"x","xB":{"a":1,"a" :}}"#, r#""a""#),
+        ];
+        let root = r#"{"mediaType":"application/vnd.uapi.16.manifest","order":"codepoint","order":"codepoint"}"#;
+        let errors = records
+            .iter()
+            .map(|&(record, key)| (record, key, refused(record)))
+            .chain([(root, r#""order""#, RecordDecoder::root(root).unwrap_err())]);
+        for (record, key, e) in errors {
+            assert_eq!(e.kind(), ErrorKind::Manifest(Problem::DuplicateKey), "{}", record);
+            let behind = record.rfind(key).unwrap() + key.len();
+            let message = format!("has a key twice in an object: duplicate key at byte {}", behind);
+            assert!(e.to_string().ends_with(&message), "{}: {}", record, e);
+        }
+    }
+
+    /// A key twice in an object, and a key with a noncharacter or NUL in
+    /// it, is refused right behind the key, whatever follows it: the colon
+    /// and the value, a comma, or the end of the object, right away or
+    /// after whitespace. That holds for the fields of an object, for a
+    /// value the reader passes over, and for the names of extended
+    /// attributes and of HTTP header fields.
+    #[test]
+    fn refuses_a_key_right_behind_it() {
+        // What comes in front of the key, with a member whose key is the
+        // one that comes twice, and what closes the objects around the one
+        // the key is in.
+        let places = [
+            (r#"{"name":"x","#, r#""name""#, ""),
+            (r#"{"name":"x","xA":{"b":1,"#, r#""b""#, "}"),
+            (
+                r#"{"name":"x","extendedAttributes":{"user":{"b":{"text":"1"},"#,
+                r#""b""#,
+                "}}",
+            ),
+            (
+                r#"{"name":"x","contents":[{"url":"https://x","httpHeaders":{"B":"1","#,
+                r#""B""#,
+                "}}]}",
+            ),
+        ];
+        let followers = [":1}", " :1}", r#","c":1}"#, "}", " \n }"];
+        for (front, twice, behind) in places {
+            let keys = [
+                (twice, Problem::DuplicateKey, "duplicate key"),
+                (r#""\uFDD0""#, Problem::InvalidString, "noncharacter in string"),
+                (r#""a\u0000""#, Problem::InvalidString, "NUL in string"),
+            ];
+            for (key, problem, message) in keys {
+                for follower in followers {
+                    let record = format!("{}{}{}{}", front, key, follower, behind);
+                    let e = refused(&record);
+                    assert_eq!(e.kind(), ErrorKind::Manifest(problem), "{}", record);
+                    let at = format!("{} at byte {}", message, front.len() + key.len());
+                    assert!(e.to_string().ends_with(&at), "{}: {}", record, e);
+                }
+            }
+        }
     }
 
     /// refused.jsonl holds manifests a reader refuses, one to a line: its
@@ -2876,8 +3182,8 @@ mod tests {
         let vectors = include_str!("refused.jsonl");
         let mut problems = HashSet::new();
         for line in vectors.lines() {
-            let vector = json::parse(line).unwrap();
-            let [records, problem, record_number, name, field, message] = vector.as_array().unwrap() else {
+            let vector: serde_json::Value = serde_json::from_str(line).unwrap();
+            let [records, problem, record_number, name, field, message] = vector.as_array().unwrap().as_slice() else {
                 panic!("{}", line);
             };
             let records: Vec<&str> = records
