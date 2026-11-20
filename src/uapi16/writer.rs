@@ -4,10 +4,11 @@
 //!
 //! [`Writer`]: crate::Writer
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU64;
 
-use json::{ObjectWriter, ValueWriter};
+use serde_core::ser::{Serialize, SerializeMap, Serializer};
 
 use crate::base64::Base64;
 use crate::decode::{Subject, ROOT_RECORD};
@@ -23,6 +24,11 @@ use crate::{
     Features, Name, Order, Sha256, MAX_CONTENTS, MAX_RECORD_SIZE, MEDIA_TYPE, RECORD_END, RECORD_SEPARATOR,
     SIGNATURE_MEDIA_TYPE, STRING_RULES, TRAILER_MEDIA_TYPE, USER_NAMESPACE,
 };
+
+/// The most room for a record that an [`Encoder`] keeps from one record to
+/// the next. A larger record takes more, and gives it back once it went
+/// out.
+pub(crate) const RECORD_CAPACITY: usize = 64 * 1024;
 
 /// How far an encoder has got in the manifest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,10 +52,11 @@ enum Stage {
 ///
 /// An encoder checks every object the way a [`Reader`](crate::Reader)
 /// does, see [`Writer`], and keeps the name of the last file object for
-/// that: at most [`Name::MAX_LEN`] bytes. A method that fails appends
-/// nothing, and the encoder goes on as if it had not been called. Nothing
-/// can follow the trailer object, so after [`Encoder::finish`] every
-/// method fails.
+/// that: at most [`Name::MAX_LEN`] bytes. It keeps room for the record it
+/// puts together, and gives back what a record larger than 64 KiB took
+/// once it was appended. A method that fails appends nothing, and the
+/// encoder goes on as if it had not been called. Nothing can follow the
+/// trailer object, so after [`Encoder::finish`] every method fails.
 ///
 /// ```
 /// use uapi16::{Encoder, FileObject, Name, RootObject};
@@ -82,33 +89,68 @@ pub struct Encoder {
     /// The check of the file objects so far, which the next one is checked
     /// against.
     sequence_check: SequenceCheck,
+    /// The record put together last, with its record separator and its
+    /// newline. serde_json writes JSON into an [`io::Write`](std::io::Write),
+    /// which a string is not.
+    pub(crate) record: Vec<u8>,
 }
 
 impl Encoder {
     /// Starts a manifest with the root file object `root`: appends its
     /// record to `text`.
     pub fn begin(root: &RootObject, text: &mut String) -> Result<Encoder, Error> {
-        let sequence_check = SequenceCheck::new(root.recorded_features(), root.order);
-        let start = text.len();
-        // In the order a reader finds what is wrong with the record, see
-        // Encoder::file().
-        Encoder::write_record(text, |object| root.write(object))
-            .and_then(|()| root.check_strings())
-            .and_then(|()| root.check())
-            .and_then(|()| sequence_check.check_root_fields(root))
-            .map_err(|e| {
-                text.truncate(start);
-                e.in_record(ROOT_RECORD)
-            })?;
-        Ok(Encoder {
-            next_record: ROOT_RECORD + 1,
-            stage: Stage::Files,
-            sequence_check,
-        })
+        let mut encoder = Encoder::start(root)?;
+        encoder.append_to(text);
+        Ok(encoder)
     }
 
     /// Appends the record of the file object `file` to `text`.
     pub fn file(&mut self, file: &FileObject, text: &mut String) -> Result<(), Error> {
+        self.encode_file(file)?;
+        self.append_to(text);
+        Ok(())
+    }
+
+    /// Appends the record of the signature object `signature` to `text`.
+    /// No file object can follow it: it would be one the signature does
+    /// not cover.
+    pub fn signature(&mut self, signature: &Signature, text: &mut String) -> Result<(), Error> {
+        self.encode_signature(signature)?;
+        self.append_to(text);
+        Ok(())
+    }
+
+    /// Ends the manifest: appends the record of the trailer object to
+    /// `text`.
+    pub fn finish(&mut self, text: &mut String) -> Result<(), Error> {
+        self.encode_trailer()?;
+        self.append_to(text);
+        Ok(())
+    }
+
+    /// An encoder that puts together the record of the root file object
+    /// `root` first.
+    pub(crate) fn start(root: &RootObject) -> Result<Encoder, Error> {
+        let mut encoder = Encoder {
+            next_record: ROOT_RECORD,
+            stage: Stage::Files,
+            sequence_check: SequenceCheck::new(root.recorded_features(), root.order),
+            record: Vec::new(),
+        };
+        // In the order a reader finds what is wrong with the record, see
+        // Encoder::encode_file().
+        encoder
+            .write_record(root)
+            .and_then(|()| root.check_strings())
+            .and_then(|()| root.check())
+            .and_then(|()| encoder.sequence_check.check_root_fields(root))
+            .map_err(|e| e.in_record(ROOT_RECORD))?;
+        encoder.next_record += 1;
+        Ok(encoder)
+    }
+
+    /// Puts together the record of the file object `file`.
+    pub(crate) fn encode_file(&mut self, file: &FileObject) -> Result<(), Error> {
         let record_number = self.next_record;
         if self.stage == Stage::Done {
             return Err(Error::data_after_trailer(record_number));
@@ -124,8 +166,8 @@ impl Encoder {
         // its flags, and where it comes. So the record is put together
         // first. Admitting the object makes it the one the next one is
         // checked against, which comes last.
-        let start = text.len();
-        let appended = Encoder::write_record(text, |object| file.write(object))
+        let encoded = self
+            .write_record(file)
             .and_then(|()| file.check_strings(record_number))
             .and_then(|()| match self.stage {
                 Stage::Signatures => Err(Error::file_after_signature(record_number)),
@@ -134,8 +176,8 @@ impl Encoder {
             .and_then(|()| file.check(record_number))
             .and_then(|()| self.sequence_check.check_fields(file, record_number))
             .and_then(|()| self.sequence_check.admit(file, record_number));
-        if let Err(e) = appended {
-            text.truncate(start);
+        if let Err(e) = encoded {
+            self.clear_record();
             let e = e.in_record(record_number);
             return Err(if file.name.is_root() {
                 e
@@ -147,16 +189,13 @@ impl Encoder {
         Ok(())
     }
 
-    /// Appends the record of the signature object `signature` to `text`.
-    /// No file object can follow it: it would be one the signature does
-    /// not cover.
-    pub fn signature(&mut self, signature: &Signature, text: &mut String) -> Result<(), Error> {
+    /// Puts together the record of the signature object `signature`.
+    pub(crate) fn encode_signature(&mut self, signature: &Signature) -> Result<(), Error> {
         let record_number = self.next_record;
         if self.stage == Stage::Done {
             return Err(Error::data_after_trailer(record_number));
         }
-        let start = text.len();
-        Encoder::write_record(text, |object| signature.write(object))
+        self.write_record(signature)
             .and_then(|()| {
                 Field::Mechanism.check_string(
                     &signature.mechanism,
@@ -164,7 +203,7 @@ impl Encoder {
                 )
             })
             .map_err(|e| {
-                text.truncate(start);
+                self.clear_record();
                 e.in_record(record_number)
             })?;
         self.stage = Stage::Signatures;
@@ -172,58 +211,90 @@ impl Encoder {
         Ok(())
     }
 
-    /// Ends the manifest: appends the record of the trailer object to
-    /// `text`.
-    pub fn finish(&mut self, text: &mut String) -> Result<(), Error> {
+    /// Puts together the record of the trailer object.
+    pub(crate) fn encode_trailer(&mut self) -> Result<(), Error> {
         let record_number = self.next_record;
         if self.stage == Stage::Done {
             return Err(Error::data_after_trailer(record_number));
         }
-        Encoder::write_record(text, |object| {
-            FieldWriter::new(object, FilledIn::default()).string(Field::MediaType, Some(TRAILER_MEDIA_TYPE));
-        })
-        .map_err(|e| e.in_record(record_number))?;
+        self.write_record(&Trailer).map_err(|e| e.in_record(record_number))?;
         self.stage = Stage::Done;
         self.next_record += 1;
         Ok(())
     }
 
-    /// Appends a record to `text`, the members of whose object `members`
-    /// writes. A record larger than [`MAX_RECORD_SIZE`], its record
-    /// separator included, is refused and taken back.
-    fn write_record(text: &mut String, members: impl FnOnce(&mut ObjectWriter<'_>)) -> Result<(), Error> {
-        let start = text.len();
-        text.push(char::from(RECORD_SEPARATOR));
-        members(&mut ObjectWriter::new(text));
-        text.push(char::from(RECORD_END));
-        if text.len() - start > MAX_RECORD_SIZE {
-            text.truncate(start);
+    /// Puts together the record of `object`, in place of the one before.
+    /// A record larger than [`MAX_RECORD_SIZE`], its record separator
+    /// included, is refused.
+    fn write_record(&mut self, object: &impl Fields) -> Result<(), Error> {
+        self.record.clear();
+        self.record.push(RECORD_SEPARATOR);
+        serde_json::to_writer(&mut self.record, &Json(object)).expect("a record serializes into a Vec");
+        self.record.push(RECORD_END);
+        if self.record.len() > MAX_RECORD_SIZE {
+            self.clear_record();
             return Err(Error::record_too_large());
         }
         Ok(())
+    }
+
+    /// Appends the record that was put together to `text`.
+    fn append_to(&mut self, text: &mut String) {
+        text.push_str(std::str::from_utf8(&self.record).expect("serde_json writes UTF-8"));
+        self.clear_record();
+    }
+
+    /// Forgets the record that was put together. A record larger than
+    /// [`RECORD_CAPACITY`] gives back the room it took beyond that.
+    pub(crate) fn clear_record(&mut self) {
+        self.record.clear();
+        self.record.shrink_to(RECORD_CAPACITY);
+    }
+}
+
+/// An object of a manifest: what writes its fields.
+trait Fields {
+    /// The fields a reader filled in, of the object and of the parts it
+    /// has, such as its inode attributes. They are not written.
+    fn filled_in(&self) -> FilledIn;
+
+    /// Writes the fields into `fields` in the order of their names.
+    fn write_fields<M: SerializeMap>(&self, fields: &mut FieldWriter<M>) -> Result<(), M::Error>;
+}
+
+/// An object of a manifest as JSON.
+struct Json<'a, T>(&'a T);
+
+impl<T: Fields> Serialize for Json<'_, T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut fields = FieldWriter::new(serializer.serialize_map(None)?, self.0.filled_in());
+        self.0.write_fields(&mut fields)?;
+        fields.end()
+    }
+}
+
+/// What `T` prints, as a JSON string.
+struct Text<T>(T);
+
+impl<T: fmt::Display> Serialize for Text<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&self.0)
     }
 }
 
 /// Writes the fields of an object of a manifest in the order they come,
 /// and leaves out every field a reader filled in, whatever the field.
-struct FieldWriter<'w, 'o> {
-    object: &'w mut ObjectWriter<'o>,
-    /// The fields a reader filled in, of the object and of the parts it
-    /// has, such as its inode attributes.
+struct FieldWriter<M> {
+    map: M,
+    /// The fields a reader filled in.
     filled_in: FilledIn,
 }
 
-impl<'w, 'o> FieldWriter<'w, 'o> {
-    /// Writes the fields of an object into `object`, but none of those of
+impl<M: SerializeMap> FieldWriter<M> {
+    /// Writes the fields of an object into `map`, but none of those of
     /// `filled_in`.
-    fn new(object: &'w mut ObjectWriter<'o>, filled_in: FilledIn) -> FieldWriter<'w, 'o> {
-        FieldWriter { object, filled_in }
-    }
-
-    /// Starts the member of the field `field`, unless a reader filled the
-    /// field in.
-    fn field(&mut self, field: Field) -> Option<ValueWriter<'_>> {
-        (!self.filled_in.contains(field)).then(|| self.object.key(field.as_str()))
+    fn new(map: M, filled_in: FilledIn) -> FieldWriter<M> {
+        FieldWriter { map, filled_in }
     }
 
     /// What is written of `value`, the value of `field`: nothing where a
@@ -232,34 +303,38 @@ impl<'w, 'o> FieldWriter<'w, 'o> {
         value.filter(|_| !self.filled_in.contains(field))
     }
 
-    /// Writes `value`, if there is one, with `write` as the field `field`.
-    fn put<T>(&mut self, field: Field, value: Option<T>, write: impl FnOnce(ValueWriter<'_>, T)) {
-        if let Some(value) = value {
-            if let Some(member) = self.field(field) {
-                write(member, value);
-            }
+    /// Writes `value`, if there is one, as the field `field`.
+    fn put<T: Serialize + ?Sized>(&mut self, field: Field, value: Option<&T>) -> Result<(), M::Error> {
+        match self.written(field, value) {
+            Some(value) => self.map.serialize_entry(field.as_str(), value),
+            None => Ok(()),
         }
     }
 
     /// Writes the integer `value`, if there is one, as the field `field`.
-    fn unsigned(&mut self, field: Field, value: Option<u64>) {
-        self.put(field, value, |member, value| member.unsigned(value));
+    fn unsigned(&mut self, field: Field, value: Option<u64>) -> Result<(), M::Error> {
+        self.put(field, value.as_ref())
     }
 
     /// Writes the boolean `value`, if there is one, as the field `field`.
-    fn bool(&mut self, field: Field, value: Option<bool>) {
-        self.put(field, value, |member, value| member.bool(value));
+    fn bool(&mut self, field: Field, value: Option<bool>) -> Result<(), M::Error> {
+        self.put(field, value.as_ref())
     }
 
     /// Writes the string `value`, if there is one, as the field `field`.
-    fn string(&mut self, field: Field, value: Option<&str>) {
-        self.put(field, value, |member, value| member.string(value));
+    fn string(&mut self, field: Field, value: Option<&str>) -> Result<(), M::Error> {
+        self.put(field, value)
     }
 
     /// Writes what `value` prints, if there is a value, as the field
     /// `field`.
-    fn display(&mut self, field: Field, value: Option<impl fmt::Display>) {
-        self.put(field, value, |member, value| member.display(value));
+    fn display(&mut self, field: Field, value: Option<impl fmt::Display>) -> Result<(), M::Error> {
+        self.put(field, value.map(Text).as_ref())
+    }
+
+    /// Ends the object.
+    fn end(self) -> Result<M::Ok, M::Error> {
+        self.map.end()
     }
 }
 
@@ -324,40 +399,47 @@ impl RootObject {
         }
         self.check_consistency()
     }
+}
 
-    /// Writes the fields of the root file object in the order of their
-    /// names. It has the media type of a manifest, and neither a name nor a
-    /// type: it is a directory.
-    fn write(&self, object: &mut ObjectWriter<'_>) {
-        let mut fields = FieldWriter::new(object, self.inode.filled_in);
+/// The root file object has the media type of a manifest, and neither a
+/// name nor a type: it is a directory.
+impl Fields for RootObject {
+    fn filled_in(&self) -> FilledIn {
+        self.inode.filled_in
+    }
+
+    fn write_fields<M: SerializeMap>(&self, fields: &mut FieldWriter<M>) -> Result<(), M::Error> {
         let inode = &self.inode;
         let identity = &self.file_system;
-        inode.write_xattrs(&mut fields);
-        fields.display(Field::FatSerial, identity.fat_serial);
-        if let Some(listed) = self.features.filter(|listed| *listed != Features::DEFAULT) {
-            if let Some(member) = fields.field(Field::Features) {
-                let mut array = member.array();
-                for name in listed.names() {
-                    array.element().string(name);
-                }
-            }
-        }
+        inode.write_xattrs(fields)?;
+        fields.display(Field::FatSerial, identity.fat_serial)?;
+        let listed = self.features.filter(|listed| *listed != Features::DEFAULT);
+        fields.put(Field::Features, listed.map(FeatureNames).as_ref())?;
         for field in inode.flags.set_fields() {
-            fields.bool(field, Some(true));
+            fields.bool(field, Some(true))?;
         }
-        fields.string(Field::FsLabel, identity.label.as_deref());
-        fields.display(Field::FsUuid, identity.uuid);
-        fields.unsigned(Field::Gid, inode.gid.map(u64::from));
-        fields.display(Field::GptDiskUuid, self.gpt_disk_uuid);
-        fields.string(Field::GroupName, inode.group_name.as_deref());
-        fields.unsigned(Field::MTimeNSec, inode.mtime_nsec);
-        fields.string(Field::MediaType, Some(MEDIA_TYPE));
-        fields.unsigned(Field::Mode, inode.mode.map(|mode| u64::from(mode.bits())));
-        fields.string(Field::Order, self.order.map(Order::as_str));
-        fields.bool(Field::ReadOnly, inode.read_only.filter(|&read_only| read_only));
-        fields.unsigned(Field::Uid, inode.uid.map(u64::from));
-        fields.string(Field::UserName, inode.user_name.as_deref());
-        self.validity.write(&mut fields);
+        fields.string(Field::FsLabel, identity.label.as_deref())?;
+        fields.display(Field::FsUuid, identity.uuid)?;
+        fields.unsigned(Field::Gid, inode.gid.map(u64::from))?;
+        fields.display(Field::GptDiskUuid, self.gpt_disk_uuid)?;
+        fields.string(Field::GroupName, inode.group_name.as_deref())?;
+        fields.unsigned(Field::MTimeNSec, inode.mtime_nsec)?;
+        fields.string(Field::MediaType, Some(MEDIA_TYPE))?;
+        fields.unsigned(Field::Mode, inode.mode.map(|mode| u64::from(mode.bits())))?;
+        fields.string(Field::Order, self.order.map(Order::as_str))?;
+        fields.bool(Field::ReadOnly, inode.read_only.filter(|&read_only| read_only))?;
+        fields.unsigned(Field::Uid, inode.uid.map(u64::from))?;
+        fields.string(Field::UserName, inode.user_name.as_deref())?;
+        self.validity.write_fields(fields)
+    }
+}
+
+/// The names of the features a manifest records, as `features` has them.
+struct FeatureNames(Features);
+
+impl Serialize for FeatureNames {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.names())
     }
 }
 
@@ -419,58 +501,10 @@ impl FileObject {
         Ok(())
     }
 
-    /// Writes the fields of the object in the order of their names.
-    fn write(&self, object: &mut ObjectWriter<'_>) {
-        let mut fields = FieldWriter::new(object, self.filled_in.union(self.inode.filled_in));
-        let inode = &self.inode;
-        let gpt = self.gpt.as_deref();
-        if !self.contents.is_empty() {
-            if let Some(member) = fields.field(Field::Contents) {
-                let mut array = member.array();
-                for contents in &self.contents {
-                    contents.write(array.element());
-                }
-            }
-        }
-        inode.write_xattrs(&mut fields);
-        self.write_flags(&mut fields);
-        fields.unsigned(Field::Gid, inode.gid.map(u64::from));
-        fields.bool(
-            Field::GptFlagGrowFileSystem,
-            gpt.and_then(|gpt| gpt.grow_file_system).filter(|&set| set),
-        );
-        fields.bool(Field::GptFlagNoAuto, gpt.and_then(|gpt| gpt.no_auto).filter(|&set| set));
-        fields.unsigned(
-            Field::GptFlags,
-            gpt.and_then(|gpt| gpt.flags).filter(|&flags| flags != 0),
-        );
-        fields.string(Field::GptLabel, gpt.and_then(|gpt| gpt.label.as_deref()));
-        fields.display(Field::GptTypeUuid, gpt.and_then(|gpt| gpt.type_uuid));
-        fields.display(Field::GptUuid, gpt.and_then(|gpt| gpt.uuid));
-        fields.string(Field::GroupName, inode.group_name.as_deref());
-        fields.unsigned(Field::InodeToken, self.inode_token.map(NonZeroU64::get));
-        fields.unsigned(Field::MTimeNSec, inode.mtime_nsec);
-        fields.unsigned(Field::Major, self.major);
-        fields.unsigned(Field::Minor, self.minor);
-        fields.unsigned(Field::Mode, inode.mode.map(|mode| u64::from(mode.bits())));
-        fields.string(Field::Name, (!self.name.is_root()).then_some(self.name.as_str()));
-        fields.bool(Field::ReadOnly, inode.read_only.filter(|&read_only| read_only));
-        let size = fields.written(Field::Size, self.size);
-        let sha256 = fields.written(Field::Sha256, self.sha256.as_ref());
-        fields.display(Field::Sha256, sha256.filter(|sha256| !sha256.implied_by(size)));
-        fields.unsigned(Field::Size, size);
-        // The specification implies the type of a regular file.
-        let inode_type = Some(self.inode_type).filter(|&inode_type| inode_type != InodeType::Regular);
-        fields.string(Field::Type, inode_type.map(InodeType::as_str));
-        fields.unsigned(Field::Uid, inode.uid.map(u64::from));
-        fields.string(Field::UserName, inode.user_name.as_deref());
-        self.validity.write(&mut fields);
-    }
-
     /// Writes the fields of the flags that are set, of the DOS attributes
     /// and of the inode flags. In the order of their names the two kinds
     /// mix, so the fields of the two, each kind in that order, are merged.
-    fn write_flags(&self, fields: &mut FieldWriter<'_, '_>) {
+    fn write_flags<M: SerializeMap>(&self, fields: &mut FieldWriter<M>) -> Result<(), M::Error> {
         let mut dos = self.dos_flags.set_fields();
         let mut inode = self.inode.flags.set_fields();
         let (mut next_dos, mut next_inode) = (dos.next(), inode.next());
@@ -488,10 +522,65 @@ impl FileObject {
                     next_inode = inode.next();
                     second
                 }
-                (None, None) => break,
+                (None, None) => return Ok(()),
             };
-            fields.bool(field, Some(true));
+            fields.bool(field, Some(true))?;
         }
+    }
+}
+
+impl Fields for FileObject {
+    fn filled_in(&self) -> FilledIn {
+        self.filled_in.union(self.inode.filled_in)
+    }
+
+    fn write_fields<M: SerializeMap>(&self, fields: &mut FieldWriter<M>) -> Result<(), M::Error> {
+        let inode = &self.inode;
+        let gpt = self.gpt.as_deref();
+        let contents = (!self.contents.is_empty()).then_some(ContentsList(&self.contents));
+        fields.put(Field::Contents, contents.as_ref())?;
+        inode.write_xattrs(fields)?;
+        self.write_flags(fields)?;
+        fields.unsigned(Field::Gid, inode.gid.map(u64::from))?;
+        fields.bool(
+            Field::GptFlagGrowFileSystem,
+            gpt.and_then(|gpt| gpt.grow_file_system).filter(|&set| set),
+        )?;
+        fields.bool(Field::GptFlagNoAuto, gpt.and_then(|gpt| gpt.no_auto).filter(|&set| set))?;
+        fields.unsigned(
+            Field::GptFlags,
+            gpt.and_then(|gpt| gpt.flags).filter(|&flags| flags != 0),
+        )?;
+        fields.string(Field::GptLabel, gpt.and_then(|gpt| gpt.label.as_deref()))?;
+        fields.display(Field::GptTypeUuid, gpt.and_then(|gpt| gpt.type_uuid))?;
+        fields.display(Field::GptUuid, gpt.and_then(|gpt| gpt.uuid))?;
+        fields.string(Field::GroupName, inode.group_name.as_deref())?;
+        fields.unsigned(Field::InodeToken, self.inode_token.map(NonZeroU64::get))?;
+        fields.unsigned(Field::MTimeNSec, inode.mtime_nsec)?;
+        fields.unsigned(Field::Major, self.major)?;
+        fields.unsigned(Field::Minor, self.minor)?;
+        fields.unsigned(Field::Mode, inode.mode.map(|mode| u64::from(mode.bits())))?;
+        fields.string(Field::Name, (!self.name.is_root()).then_some(self.name.as_str()))?;
+        fields.bool(Field::ReadOnly, inode.read_only.filter(|&read_only| read_only))?;
+        let size = fields.written(Field::Size, self.size);
+        let sha256 = fields.written(Field::Sha256, self.sha256.as_ref());
+        fields.display(Field::Sha256, sha256.filter(|sha256| !sha256.implied_by(size)))?;
+        fields.unsigned(Field::Size, size)?;
+        // The specification implies the type of a regular file.
+        let inode_type = Some(self.inode_type).filter(|&inode_type| inode_type != InodeType::Regular);
+        fields.string(Field::Type, inode_type.map(InodeType::as_str))?;
+        fields.unsigned(Field::Uid, inode.uid.map(u64::from))?;
+        fields.string(Field::UserName, inode.user_name.as_deref())?;
+        self.validity.write_fields(fields)
+    }
+}
+
+/// The contents objects of a file object, as `contents` has them.
+struct ContentsList<'a>(&'a [Contents]);
+
+impl Serialize for ContentsList<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(Json))
     }
 }
 
@@ -527,25 +616,48 @@ impl InodeAttributes {
             .try_for_each(|name| FileObject::check_xattr_name(name, subject))
     }
 
-    /// Writes `extendedAttributes`, unless there are none. A value goes out
-    /// as text if it is a string a manifest can have, and as Base64
-    /// otherwise.
-    fn write_xattrs(&self, fields: &mut FieldWriter<'_, '_>) {
-        let Some(attributes) = self.user_xattrs.as_deref().filter(|attributes| !attributes.is_empty()) else {
-            return;
-        };
-        let Some(member) = fields.field(Field::ExtendedAttributes) else {
-            return;
-        };
-        let mut namespaces = member.object();
-        let mut user = namespaces.key(USER_NAMESPACE).object();
-        for (name, value) in attributes {
-            let mut value_object = user.key(name).object();
-            match std::str::from_utf8(value) {
-                Ok(text) if STRING_RULES.admits(text) => value_object.key(Field::Text.as_str()).string(text),
-                _ => value_object.key(Field::Base64.as_str()).display(Base64(value)),
-            }
+    /// Writes `extendedAttributes`, unless there are none.
+    fn write_xattrs<M: SerializeMap>(&self, fields: &mut FieldWriter<M>) -> Result<(), M::Error> {
+        let attributes = self.user_xattrs.as_deref().filter(|attributes| !attributes.is_empty());
+        fields.put(Field::ExtendedAttributes, attributes.map(XattrNamespaces).as_ref())
+    }
+}
+
+/// The extended attributes of a file, as `extendedAttributes` has them:
+/// all of them in the `user` namespace.
+struct XattrNamespaces<'a>(&'a BTreeMap<String, Vec<u8>>);
+
+impl Serialize for XattrNamespaces<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut namespaces = serializer.serialize_map(Some(1))?;
+        let attributes = self.0.iter().map(|(name, value)| (name, XattrValue(value)));
+        namespaces.serialize_entry(USER_NAMESPACE, &Entries(attributes))?;
+        namespaces.end()
+    }
+}
+
+/// The value of an extended attribute: text if it is a string a manifest
+/// can have, and Base64 otherwise.
+struct XattrValue<'a>(&'a [u8]);
+
+impl Serialize for XattrValue<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut value = serializer.serialize_map(Some(1))?;
+        match std::str::from_utf8(self.0) {
+            Ok(text) if STRING_RULES.admits(text) => value.serialize_entry(Field::Text.as_str(), text)?,
+            _ => value.serialize_entry(Field::Base64.as_str(), &Text(Base64(self.0)))?,
         }
+        value.end()
+    }
+}
+
+/// The keys and the values of a JSON object, which an iterator hands out
+/// once.
+struct Entries<I>(I);
+
+impl<K: Serialize, V: Serialize, I: Iterator<Item = (K, V)> + Clone> Serialize for Entries<I> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.clone())
     }
 }
 
@@ -564,11 +676,11 @@ impl ValidityWindow {
     /// are the last ones of the root file object and of a file object. A
     /// `validSinceUSec` of 0 and a `validity` of good are what the
     /// specification implies.
-    fn write(&self, fields: &mut FieldWriter<'_, '_>) {
-        fields.unsigned(Field::ValidSinceUSec, Some(self.since_usec).filter(|&since| since != 0));
-        fields.unsigned(Field::ValidUntilUSec, self.until_usec);
+    fn write_fields<M: SerializeMap>(&self, fields: &mut FieldWriter<M>) -> Result<(), M::Error> {
+        fields.unsigned(Field::ValidSinceUSec, Some(self.since_usec).filter(|&since| since != 0))?;
+        fields.unsigned(Field::ValidUntilUSec, self.until_usec)?;
         let state = Some(self.state).filter(|&state| state != Validity::Good);
-        fields.string(Field::Validity, state.map(Validity::as_str));
+        fields.string(Field::Validity, state.map(Validity::as_str))
     }
 }
 
@@ -631,15 +743,18 @@ impl Contents {
         headers.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
         headers
     }
+}
 
-    /// Writes the contents object, its fields in the order of their names.
-    /// Of the sizes and hashes it leaves out what a reader filled in, the
-    /// hash of no data next to the size 0, and without an encoding the
-    /// encoded size and hash where the original ones say the same. A reader
-    /// fills them in again.
-    fn write(&self, value: ValueWriter<'_>) {
-        let mut object = value.object();
-        let mut fields = FieldWriter::new(&mut object, self.filled_in);
+/// Of the sizes and hashes a contents object leaves out what a reader
+/// filled in, the hash of no data next to the size 0, and without an
+/// encoding the encoded size and hash where the original ones say the
+/// same. A reader fills them in again.
+impl Fields for Contents {
+    fn filled_in(&self) -> FilledIn {
+        self.filled_in
+    }
+
+    fn write_fields<M: SerializeMap>(&self, fields: &mut FieldWriter<M>) -> Result<(), M::Error> {
         let original_size = fields.written(Field::OriginalSize, self.original_size);
         let original_sha256 = fields
             .written(Field::OriginalSha256, self.original_sha256.as_ref())
@@ -658,24 +773,19 @@ impl Contents {
                 encoded_sha256 = None;
             }
         }
-        fields.display(Field::EncodedSha256, encoded_sha256);
-        fields.unsigned(Field::EncodedSize, encoded_size);
-        fields.string(Field::Encoding, self.encoding.as_deref());
-        fields.string(Field::File, self.file().map(Name::as_str));
-        if !self.http_headers.is_empty() {
-            if let Some(member) = fields.field(Field::HttpHeaders) {
-                let mut members = member.object();
-                for (name, value) in self.sorted_headers() {
-                    members.key(name).string(value);
-                }
-            }
-        }
-        fields.display(Field::Literal, self.literal().map(Base64));
+        fields.display(Field::EncodedSha256, encoded_sha256)?;
+        fields.unsigned(Field::EncodedSize, encoded_size)?;
+        fields.string(Field::Encoding, self.encoding.as_deref())?;
+        fields.string(Field::File, self.file().map(Name::as_str))?;
+        let headers = Some(self.sorted_headers()).filter(|headers| !headers.is_empty());
+        let headers = headers.map(|headers| Entries(headers.into_iter().map(|(name, value)| (name, value))));
+        fields.put(Field::HttpHeaders, headers.as_ref())?;
+        fields.display(Field::Literal, self.literal().map(Base64))?;
         // The specification implies an offset of 0.
-        fields.unsigned(Field::Offset, Some(self.offset).filter(|&offset| offset != 0));
-        fields.display(Field::OriginalSha256, original_sha256);
-        fields.unsigned(Field::OriginalSize, original_size);
-        fields.string(Field::Url, self.url());
+        fields.unsigned(Field::Offset, Some(self.offset).filter(|&offset| offset != 0))?;
+        fields.display(Field::OriginalSha256, original_sha256)?;
+        fields.unsigned(Field::OriginalSize, original_size)?;
+        fields.string(Field::Url, self.url())
     }
 }
 
@@ -687,15 +797,29 @@ impl Sha256 {
     }
 }
 
-impl Signature {
-    /// Writes the fields of the signature object in the order of their
-    /// names.
-    fn write(&self, object: &mut ObjectWriter<'_>) {
-        let mut fields = FieldWriter::new(object, FilledIn::default());
-        fields.display(Field::Data, self.data.as_deref().map(Base64));
-        fields.display(Field::Key, self.key.as_deref().map(Hex));
-        fields.string(Field::Mechanism, Some(&self.mechanism));
-        fields.string(Field::MediaType, Some(SIGNATURE_MEDIA_TYPE));
+impl Fields for Signature {
+    fn filled_in(&self) -> FilledIn {
+        FilledIn::default()
+    }
+
+    fn write_fields<M: SerializeMap>(&self, fields: &mut FieldWriter<M>) -> Result<(), M::Error> {
+        fields.display(Field::Data, self.data.as_deref().map(Base64))?;
+        fields.display(Field::Key, self.key.as_deref().map(Hex))?;
+        fields.string(Field::Mechanism, Some(&self.mechanism))?;
+        fields.string(Field::MediaType, Some(SIGNATURE_MEDIA_TYPE))
+    }
+}
+
+/// The trailer object, which ends a manifest.
+struct Trailer;
+
+impl Fields for Trailer {
+    fn filled_in(&self) -> FilledIn {
+        FilledIn::default()
+    }
+
+    fn write_fields<M: SerializeMap>(&self, fields: &mut FieldWriter<M>) -> Result<(), M::Error> {
+        fields.string(Field::MediaType, Some(TRAILER_MEDIA_TYPE))
     }
 }
 
@@ -705,8 +829,8 @@ mod tests {
     use crate::error::ErrorKind;
     use crate::object::{DosFlags, FatSerial, InodeFlags, Location, Mode, Uuid};
     use crate::testing::{
-        directory, everything, name, read_whole, record, recording_all, sequence, write_whole, written, Whole, EMPTY,
-        HELLO, ROOT, SIGNATURE, TRAILER,
+        directory, everything, json, name, read_whole, record, recording_all, sequence, write_whole, written, Whole,
+        EMPTY, HELLO, ROOT, SIGNATURE, TRAILER,
     };
     use crate::{Sha256, Writer};
     use std::collections::BTreeMap;
@@ -871,10 +995,10 @@ mod tests {
 
     /// Checks that the keys of every object in `value` are in the order of
     /// their bytes.
-    fn sorted(value: &json::Value) {
+    fn sorted(value: &serde_json::Value) {
         match value {
-            json::Value::Object(object) => {
-                let keys: Vec<&str> = object.keys().collect();
+            serde_json::Value::Object(object) => {
+                let keys: Vec<&str> = object.keys().map(String::as_str).collect();
                 assert!(
                     keys.windows(2).all(|pair| pair[0].as_bytes() < pair[1].as_bytes()),
                     "{:?}",
@@ -882,7 +1006,7 @@ mod tests {
                 );
                 object.iter().for_each(|(_, value)| sorted(value));
             }
-            json::Value::Array(items) => items.iter().for_each(sorted),
+            serde_json::Value::Array(items) => items.iter().for_each(sorted),
             _ => {}
         }
     }
@@ -925,10 +1049,10 @@ mod tests {
                 "{}",
                 record
             );
-            sorted(&json::parse(record).unwrap());
+            sorted(&json(record).unwrap());
         }
-        let whole = json::parse(&records[2]).unwrap();
-        let keys: Vec<&str> = whole.as_object().unwrap().keys().collect();
+        let whole = json(&records[2]).unwrap();
+        let keys: Vec<&str> = whole.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
             [
@@ -962,9 +1086,9 @@ mod tests {
         );
         // A flag that is set goes out as true. One that is cleared needs
         // no field in a manifest that records it.
-        assert_eq!(whole.get("flagHidden"), Some(&json::Value::Bool(true)));
+        assert_eq!(whole.get("flagHidden"), Some(&serde_json::Value::Bool(true)));
         let contents = whole.get("contents").unwrap().as_array().unwrap();
-        let keys: Vec<&str> = contents[0].as_object().unwrap().keys().collect();
+        let keys: Vec<&str> = contents[0].as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
             [

@@ -1081,7 +1081,7 @@ impl<R: Read> ContentSource for StreamSource<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{manifest, read_whole, sequence, HELLO, TRAILER, WORLD};
+    use crate::testing::{json, manifest, read_whole, sequence, HELLO, TRAILER, WORLD};
     use crate::Digest;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
@@ -1226,9 +1226,13 @@ mod tests {
     /// The file object of `record`, which comes after the objects of the
     /// directories it is in.
     fn object(record: &str) -> FileObject {
-        let name = json::parse(record)
-            .ok()
-            .and_then(|value| value.get("name").and_then(json::Value::as_str).map(str::to_string))
+        let name = json(record)
+            .and_then(|value| {
+                value
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
             .unwrap_or_default();
         let mut records: Vec<String> = name
             .match_indices('/')

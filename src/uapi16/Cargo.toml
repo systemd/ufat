@@ -12,13 +12,16 @@ publish.workspace = true
 path = "lib.rs"
 
 [dependencies]
-json.workspace = true
 libc.workspace = true
 serde_core.workspace = true
 # Without float_roundtrip serde_json refuses some spellings of the largest
 # doubles as out of range, such as 1.7976931348623158e308.
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha2.workspace = true
+
+# The tests look at the order of the keys the writer writes.
+[dev-dependencies]
+serde_json = { workspace = true, features = ["preserve_order"] }
 
 [lints]
 workspace = true

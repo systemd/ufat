@@ -14,10 +14,6 @@ use crate::writer::Encoder;
 
 /// How much is read from the input at a time.
 pub(crate) const READ_SIZE: usize = 64 * 1024;
-/// The most room for the text of a record that a [`Writer`] keeps from one
-/// record to the next. A larger record takes more, and gives it back once
-/// it went out.
-const TEXT_CAPACITY: usize = 64 * 1024;
 
 /// Reads a manifest record by record.
 ///
@@ -274,38 +270,34 @@ impl<R: Read> FusedIterator for Reader<R> {}
 #[derive(Debug)]
 pub struct Writer<W> {
     out: W,
-    /// The text of the record that goes out next. The room for it is kept
-    /// from one record to the next.
-    text: String,
     encoder: Encoder,
 }
 
 impl<W: Write> Writer<W> {
     /// Starts a manifest in `out` with the root file object `root`.
     pub fn begin(out: W, root: &RootObject) -> Result<Writer<W>, Error> {
-        let mut text = String::new();
-        let encoder = Encoder::begin(root, &mut text)?;
-        let mut writer = Writer { out, text, encoder };
+        let encoder = Encoder::start(root)?;
+        let mut writer = Writer { out, encoder };
         writer.write_out(ROOT_RECORD)?;
         Ok(writer)
     }
 
     /// Writes the file object `file`.
     pub fn file(&mut self, file: &FileObject) -> Result<(), Error> {
-        self.send_record(|encoder, text| encoder.file(file, text))
+        self.send_record(|encoder| encoder.encode_file(file))
     }
 
     /// Writes a signature object. No file object can follow it: it would
     /// be one the signature does not cover.
     pub fn signature(&mut self, signature: &Signature) -> Result<(), Error> {
-        self.send_record(|encoder, text| encoder.signature(signature, text))
+        self.send_record(|encoder| encoder.encode_signature(signature))
     }
 
     /// Ends the manifest with the trailer object, flushes what it was
     /// written to and returns it.
     pub fn finish(mut self) -> Result<W, Error> {
         let record_number = self.encoder.next_record;
-        self.send_record(|encoder, text| encoder.finish(text))?;
+        self.send_record(Encoder::encode_trailer)?;
         self.out.flush().map_err(|e| Error::from(e).in_record(record_number))?;
         Ok(self.out)
     }
@@ -318,30 +310,18 @@ impl<W: Write> Writer<W> {
         &self.out
     }
 
-    /// Writes out the record that `encode` has the encoder append to the
-    /// text. When the encoder took it back as too large, the text gives
-    /// back the room it took.
-    fn send_record(
-        &mut self,
-        encode: impl FnOnce(&mut Encoder, &mut String) -> Result<(), Error>,
-    ) -> Result<(), Error> {
+    /// Writes out the record that `encode` has the encoder put together.
+    fn send_record(&mut self, encode: impl FnOnce(&mut Encoder) -> Result<(), Error>) -> Result<(), Error> {
         let record_number = self.encoder.next_record;
-        match encode(&mut self.encoder, &mut self.text) {
-            Ok(()) => self.write_out(record_number),
-            Err(e) => {
-                self.text.shrink_to(TEXT_CAPACITY);
-                Err(e)
-            }
-        }
+        encode(&mut self.encoder)?;
+        self.write_out(record_number)
     }
 
-    /// Writes out the text, the record with the number `record_number`, in
-    /// one write, and empties it for the next record. A record larger than
-    /// [`TEXT_CAPACITY`] gives back the room it took beyond that.
+    /// Writes out the record the encoder put together, the one with the
+    /// number `record_number`, in one write.
     fn write_out(&mut self, record_number: u64) -> Result<(), Error> {
-        let written = self.out.write_all(self.text.as_bytes());
-        self.text.clear();
-        self.text.shrink_to(TEXT_CAPACITY);
+        let written = self.out.write_all(&self.encoder.record);
+        self.encoder.clear_record();
         written.map_err(|e| Error::from(e).in_record(record_number))
     }
 }
@@ -354,6 +334,7 @@ mod tests {
         directory, everything, manifest, name, read_whole, read_whole_from, record, recording_all, sequence,
         write_whole, Whole, EMPTY, PIECES, ROOT, SIGNATURE, TRAILER,
     };
+    use crate::writer::RECORD_CAPACITY;
     use crate::{InodeType, Name, Sha256, MAX_RECORD_SIZE, RECORD_SEPARATOR};
     use std::collections::BTreeMap;
 
@@ -628,7 +609,7 @@ mod tests {
             format!("manifest record exceeds {} bytes", MAX_RECORD_SIZE)
         );
         assert_eq!(writer.get_ref().len(), before);
-        assert!(writer.text.capacity() <= TEXT_CAPACITY);
+        assert!(writer.encoder.record.capacity() <= RECORD_CAPACITY);
         // A directory that is not written is not the directory of what
         // comes next.
         let mut large = padded("d", MAX_RECORD_SIZE);
@@ -641,7 +622,7 @@ mod tests {
         let largest = padded("a", MAX_RECORD_SIZE - frame);
         writer.file(&largest).unwrap();
         assert_eq!(writer.get_ref().len() - before, MAX_RECORD_SIZE);
-        assert!(writer.text.capacity() <= TEXT_CAPACITY);
+        assert!(writer.encoder.record.capacity() <= RECORD_CAPACITY);
         let mut signature = Signature::new("pkcs7");
         signature.data = Some(vec![0; MAX_RECORD_SIZE]);
         let e = writer.signature(&signature).unwrap_err();

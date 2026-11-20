@@ -216,6 +216,14 @@ pub(crate) mod testing {
         read.map_err(|e| strict.error(text, &e))
     }
 
+    /// The JSON value of `text`, none for a text a reader refuses, see
+    /// [`read_json`]: one with a key twice in an object too, which
+    /// serde_json's own Value takes.
+    pub(crate) fn json(text: &str) -> Option<serde_json::Value> {
+        read_json(text).ok()?;
+        serde_json::from_str(text).ok()
+    }
+
     /// Reads the manifest `bytes` to its end.
     pub(crate) fn read_whole(bytes: &[u8]) -> Result<Whole, Error> {
         read_whole_from(bytes)

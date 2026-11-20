@@ -457,8 +457,9 @@ jobs:
         # Cargo.lock, and nothing builds them.
         env:
           EXPECTED: >-
-            block-buffer cfg-if cpufeatures crypto-common digest hybrid-array itoa lexopt libc memchr
-            proc-macro2 quote serde serde_core serde_derive serde_json sha2 syn typenum unicode-ident zmij
+            block-buffer cfg-if cpufeatures crypto-common digest equivalent foldhash hashbrown hybrid-array
+            indexmap itoa lexopt libc memchr proc-macro2 quote serde serde_core serde_derive serde_json sha2
+            syn typenum unicode-ident zmij
         run: |
           deps=$(cargo metadata --locked --format-version 1 |
             jq -r '.workspace_members as $m | .packages[] | select(.id as $i | $m | index($i) | not) | .name' |
