@@ -77,6 +77,7 @@
 #![warn(missing_docs)]
 
 mod base64;
+mod blocking;
 mod content;
 mod decode;
 mod digest;
@@ -89,6 +90,7 @@ mod reader;
 mod sequence;
 mod writer;
 
+pub use blocking::{Reader, Writer};
 pub use content::{ContentCheck, ContentSource, Data, Directory, DirectorySource, OpenError, Reference, StreamSource};
 pub use digest::{Digest, Finalize, InvalidDigest, Sha256, Sha256Context};
 pub use error::{ContentProblem, Error, ErrorKind, Field, Invalid, Problem, SourceProblem, UnsupportedContent};
@@ -99,8 +101,8 @@ pub use object::{
     InodeFlags, InodeType, InvalidFatSerial, InvalidUuid, Location, Mode, RootObject, Signature, UnknownInodeType,
     Uuid, Validity, ValidityWindow,
 };
-pub use reader::{Decoder, Object, Reader, Step};
-pub use writer::{Encoder, Writer};
+pub use reader::{Decoder, Object, Step};
+pub use writer::Encoder;
 
 /// The media type of a manifest, which its first object carries.
 pub const MEDIA_TYPE: &str = "application/vnd.uapi.16.manifest";
@@ -135,7 +137,13 @@ pub(crate) const STRING_RULES: json::StringRules = json::StringRules::NO_NONCHAR
 /// What the tests of this crate build manifests from.
 #[cfg(test)]
 pub(crate) mod testing {
-    use super::{Error, FileObject, Name, Object, Reader, RootObject, Signature, Writer, RECORD_END, RECORD_SEPARATOR};
+    use super::blocking::READ_SIZE;
+    use super::{
+        Contents, DosFlags, Error, Features, FileObject, GptPartition, InodeFlags, InodeType, Location, Mode, Name,
+        Object, Reader, RootObject, Sha256, Signature, Uuid, Validity, Writer, RECORD_END, RECORD_SEPARATOR,
+    };
+    use std::collections::BTreeMap;
+    use std::num::NonZeroU64;
 
     /// The root file object that says nothing but that this is a manifest.
     pub(crate) const ROOT: &str = r#"{"mediaType":"application/vnd.uapi.16.manifest"}"#;
@@ -150,6 +158,10 @@ pub(crate) mod testing {
     pub(crate) const WORLD: &str = "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7";
     /// The hash of no data, in hex.
     pub(crate) const EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    /// How many bytes the tests feed a decoder at a time. The pieces end
+    /// anywhere: inside a record, inside a character, right in front of a
+    /// separator, and around the size a reader reads at a time.
+    pub(crate) const PIECES: [usize; 8] = [1, 2, 3, 7, 4096, READ_SIZE - 1, READ_SIZE, READ_SIZE + 1];
 
     /// The JSON text sequence of `records`.
     pub(crate) fn sequence(records: &[&str]) -> Vec<u8> {
@@ -224,5 +236,137 @@ pub(crate) mod testing {
             writer.signature(signature)?;
         }
         writer.finish()
+    }
+
+    pub(crate) fn name(name: &str) -> Name {
+        Name::new(name).unwrap()
+    }
+
+    /// The records `writer` wrote after `root`, without the frame of
+    /// each: the separator in front and the newline behind.
+    pub(crate) fn written(root: &RootObject, write: impl FnOnce(&mut Writer<Vec<u8>>)) -> Vec<String> {
+        let mut writer = Writer::begin(Vec::new(), root).unwrap();
+        write(&mut writer);
+        let text = String::from_utf8(writer.finish().unwrap()).unwrap();
+        let separator = char::from(RECORD_SEPARATOR);
+        assert!(text.starts_with(separator));
+        text.split(separator)
+            .skip(1)
+            .map(|record| record.strip_suffix(char::from(RECORD_END)).unwrap().to_string())
+            .collect()
+    }
+
+    /// The root file object of a manifest that records every feature, and
+    /// its record.
+    pub(crate) fn recording_all() -> (RootObject, String) {
+        let root = RootObject {
+            features: Some(Features::ALL),
+            ..RootObject::default()
+        };
+        let names: Vec<String> = Features::ALL.names().map(|name| format!("\"{}\"", name)).collect();
+        let text = format!(
+            r#"{{"features":[{}],"mediaType":"application/vnd.uapi.16.manifest"}}"#,
+            names.join(",")
+        );
+        (root, text)
+    }
+
+    /// A directory that says nothing else about itself.
+    pub(crate) fn directory(name_of: &str) -> FileObject {
+        let mut directory = FileObject::new(name(name_of));
+        directory.inode_type = InodeType::Directory;
+        directory
+    }
+
+    /// The record the writer writes for `object`, in a manifest that
+    /// records every feature, after the objects of the directories it is
+    /// in.
+    pub(crate) fn record(object: &FileObject) -> String {
+        let (root, root_text) = recording_all();
+        let directories: Vec<FileObject> = object
+            .name
+            .match_indices('/')
+            .map(|(end, _)| directory(&object.name[..end]))
+            .collect();
+        let mut records = written(&root, |writer| {
+            for directory in &directories {
+                writer.file(directory).unwrap();
+            }
+            writer.file(object).unwrap();
+        });
+        assert_eq!(records.len(), directories.len() + 3);
+        assert_eq!(records[0], root_text);
+        assert_eq!(records.pop().as_deref(), Some(TRAILER));
+        records.pop().unwrap()
+    }
+
+    /// An object with every field there is, and one of its contents
+    /// objects with every field.
+    pub(crate) fn everything() -> FileObject {
+        let uuid = |last: u8| {
+            let mut bytes = [0x11; Uuid::SIZE];
+            bytes[Uuid::SIZE - 1] = last;
+            Uuid::new(bytes)
+        };
+        let mut encoded = Contents::new(Location::File(name("blob.gz")));
+        encoded.encoding = Some("gzip".into());
+        encoded.encoded_size = Some(3);
+        encoded.encoded_sha256 = Some(Sha256::digest(b"gz"));
+        encoded.original_size = Some(9);
+        encoded.original_sha256 = Some(Sha256::digest(b"original"));
+        encoded.offset = 4;
+        let mut object = FileObject::new(name("a/\u{e9} \"quoted\"\\"));
+        object.size = Some(5);
+        object.inode.mode = Mode::new(0o440);
+        object.inode.uid = Some(1);
+        object.inode.gid = Some(2);
+        object.inode.user_name = Some("user".into());
+        object.inode.group_name = Some("group".into());
+        object.inode.mtime_nsec = Some(u64::MAX);
+        object.inode_token = NonZeroU64::new(3);
+        object.inode.user_xattrs = Some(Box::new(BTreeMap::from([
+            ("text".to_string(), b"value".to_vec()),
+            ("empty".to_string(), Vec::new()),
+            ("binary".to_string(), vec![0xff, 0x00]),
+            ("nul".to_string(), b"a\0b".to_vec()),
+            ("noncharacter".to_string(), "a\u{fffe}".as_bytes().to_vec()),
+        ])));
+        // Flags of both kinds, which mix in the order of their names.
+        object.inode.flags.put(InodeFlags::APPEND_ONLY, Some(true));
+        object.dos_flags.put(DosFlags::ARCHIVE, Some(false));
+        object.dos_flags.put(DosFlags::HIDDEN, Some(true));
+        object.inode.flags.put(InodeFlags::IMMUTABLE, Some(true));
+        object.inode.flags.put(InodeFlags::NO_COW, Some(false));
+        object.dos_flags.put(DosFlags::SYSTEM, Some(true));
+        // The partition is read-only, which gptFlags says as well where the
+        // manifest records both.
+        object.gpt = Some(Box::new(GptPartition {
+            label: Some("label".into()),
+            uuid: Some(uuid(1)),
+            type_uuid: Some(uuid(2)),
+            flags: Some(
+                GptPartition::FLAG_NO_AUTO | GptPartition::FLAG_GROW_FILE_SYSTEM | GptPartition::FLAG_READ_ONLY,
+            ),
+            no_auto: Some(true),
+            grow_file_system: Some(true),
+        }));
+        object.inode.read_only = Some(true);
+        object.contents = vec![
+            encoded,
+            Contents {
+                http_headers: vec![
+                    ("X-Foo".into(), "bar".into()),
+                    ("Authorization".into(), "Bearer x".into()),
+                ],
+                ..Contents::new(Location::Url("https://example.com/blob".into()))
+            },
+            Contents::new(Location::Literal(b"hello".to_vec())),
+            Contents::default(),
+        ];
+        object.sha256 = HELLO.parse().ok();
+        object.validity.since_usec = 6;
+        object.validity.until_usec = Some(7);
+        object.validity.state = Validity::Revoked;
+        object
     }
 }

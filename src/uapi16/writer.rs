@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! Writing a manifest record by record: an [`Encoder`] puts the records
 //! together, and a [`Writer`] writes them out.
+//!
+//! [`Writer`]: crate::Writer
 
 use std::fmt;
-use std::io::Write;
 use std::num::NonZeroU64;
 
 use json::{ObjectWriter, ValueWriter};
@@ -23,11 +24,6 @@ use crate::{
     SIGNATURE_MEDIA_TYPE, STRING_RULES, TRAILER_MEDIA_TYPE, USER_NAMESPACE,
 };
 
-/// The most room for the text of a record that a [`Writer`] keeps from one
-/// record to the next. A larger record takes more, and gives it back once
-/// it went out.
-const TEXT_CAPACITY: usize = 64 * 1024;
-
 /// How far an encoder has got in the manifest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
@@ -37,152 +33,6 @@ enum Stage {
     Signatures,
     /// The trailer object was appended. Nothing can follow.
     Done,
-}
-
-/// Writes a manifest record by record.
-///
-/// [`Writer::begin`] writes the root file object, [`Writer::file`] the
-/// file objects, [`Writer::signature`] the signature objects after them
-/// and [`Writer::finish`] the trailer object. A manifest without its
-/// trailer is one a reader takes as incomplete, so a writer that is
-/// dropped before it finished leaves nothing that passes for a manifest.
-///
-/// Every object is one record of the JSON text sequence: a record
-/// separator, the object with its keys sorted and without whitespace, and
-/// a newline, the way `systemd-manifest` writes it. A field that says
-/// nothing is left out. So is the inode type where the specification
-/// implies it, on the root file object and on regular files. An
-/// [`Encoder`] puts each record together, and it goes out in one write, so
-/// a file wants a `BufWriter` around it.
-///
-/// The root file object says what the manifest records in `features` and
-/// which order it lists its file objects in in `order`. The writer checks
-/// every object against them as a [`Reader`](crate::Reader) does: an object
-/// has no fields of features the manifest does not record, it comes right
-/// after the object of its directory, and it keeps to the order. It checks
-/// what an object is itself as a reader does too: the fields its inode
-/// type permits, the value of every field and every string it writes, and
-/// the fields against each other. An object with more than one fault is
-/// refused for the one a reader finds first. The one fault a reader does
-/// not find is an encoding that is not in lower case: a reader lowers its
-/// case, and the writer refuses it. No record is larger than
-/// [`MAX_RECORD_SIZE`], its record separator included, and no file object
-/// has more than [`MAX_CONTENTS`] contents objects. An object the writer
-/// refuses is not written, and the writer goes on as if it had not been
-/// given it.
-///
-/// The writer leaves out what the manifest says without it: where the
-/// manifest records them, a flag that is cleared, `readOnly` of false,
-/// `gptFlags` of 0 and extended attributes there are none of, and
-/// `features` if they are the default ones. It leaves out the hash of no
-/// data next to the size 0, as the specification recommends. Without an
-/// encoding the specification says that the encoded size and hash should
-/// not be there. The writer leaves them out next to the original ones, and
-/// writes one that is the only statement of the size or the hash: written
-/// as the original size or hash it would come back as another field, and
-/// left out it would be lost. The writer also leaves out every field a
-/// [`Reader`](crate::Reader) filled in, see [`FilledIn`]. So what a reader
-/// returns can be written back with the root file object it read. A record
-/// close to [`MAX_RECORD_SIZE`] can grow past it on the way back, as the
-/// writer writes some values in another form than a manifest may have them
-/// in: a UUID with its hyphens, and the value of an extended attribute as
-/// text where it can. The writer refuses such a record.
-///
-/// ```
-/// use uapi16::{FileObject, Name, Object, Order, Reader, RootObject, Writer};
-///
-/// let mut root = RootObject::default();
-/// root.order = Some(Order::CodePoint);
-/// let mut file = FileObject::new(Name::new("a")?);
-/// file.size = Some(3);
-/// let mut writer = Writer::begin(Vec::new(), &root)?;
-/// writer.file(&file)?;
-/// let bytes = writer.finish()?;
-/// assert_eq!(
-///     String::from_utf8_lossy(&bytes),
-///     concat!(
-///         "\x1e{\"mediaType\":\"application/vnd.uapi.16.manifest\",\"order\":\"codepoint\"}\n",
-///         "\x1e{\"name\":\"a\",\"size\":3}\n",
-///         "\x1e{\"mediaType\":\"application/vnd.uapi.16.trailer\"}\n",
-///     )
-/// );
-/// let mut reader = Reader::open(&bytes[..])?;
-/// assert!(matches!(reader.next(), Some(Ok(Object::File(object))) if *object == file));
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-#[derive(Debug)]
-pub struct Writer<W: Write> {
-    out: W,
-    /// The text of the record that goes out next. The room for it is kept
-    /// from one record to the next.
-    text: String,
-    encoder: Encoder,
-}
-
-impl<W: Write> Writer<W> {
-    /// Starts a manifest in `out` with the root file object `root`.
-    pub fn begin(out: W, root: &RootObject) -> Result<Writer<W>, Error> {
-        let mut text = String::new();
-        let encoder = Encoder::begin(root, &mut text)?;
-        let mut writer = Writer { out, text, encoder };
-        writer.write_out(ROOT_RECORD)?;
-        Ok(writer)
-    }
-
-    /// Writes the file object `file`.
-    pub fn file(&mut self, file: &FileObject) -> Result<(), Error> {
-        self.send_record(|encoder, text| encoder.file(file, text))
-    }
-
-    /// Writes a signature object. No file object can follow it: it would
-    /// be one the signature does not cover.
-    pub fn signature(&mut self, signature: &Signature) -> Result<(), Error> {
-        self.send_record(|encoder, text| encoder.signature(signature, text))
-    }
-
-    /// Ends the manifest with the trailer object, flushes what it was
-    /// written to and returns it.
-    pub fn finish(mut self) -> Result<W, Error> {
-        let record_number = self.encoder.next_record;
-        self.send_record(|encoder, text| encoder.finish(text))?;
-        self.out.flush().map_err(|e| Error::from(e).in_record(record_number))?;
-        Ok(self.out)
-    }
-
-    /// What the manifest is written to. Every method writes its record to
-    /// it before it returns, so it has the manifest up to the last record.
-    /// Before the first signature object, that is what the signature
-    /// objects sign.
-    pub fn get_ref(&self) -> &W {
-        &self.out
-    }
-
-    /// Writes out the record that `encode` has the encoder append to the
-    /// text. When the encoder took it back as too large, the text gives
-    /// back the room it took.
-    fn send_record(
-        &mut self,
-        encode: impl FnOnce(&mut Encoder, &mut String) -> Result<(), Error>,
-    ) -> Result<(), Error> {
-        let record_number = self.encoder.next_record;
-        match encode(&mut self.encoder, &mut self.text) {
-            Ok(()) => self.write_out(record_number),
-            Err(e) => {
-                self.text.shrink_to(TEXT_CAPACITY);
-                Err(e)
-            }
-        }
-    }
-
-    /// Writes out the text, the record with the number `record_number`, in
-    /// one write, and empties it for the next record. A record larger than
-    /// [`TEXT_CAPACITY`] gives back the room it took beyond that.
-    fn write_out(&mut self, record_number: u64) -> Result<(), Error> {
-        let written = self.out.write_all(self.text.as_bytes());
-        self.text.clear();
-        self.text.shrink_to(TEXT_CAPACITY);
-        written.map_err(|e| Error::from(e).in_record(record_number))
-    }
 }
 
 /// Puts a manifest together record by record, and does no I/O.
@@ -221,10 +71,13 @@ impl<W: Write> Writer<W> {
 /// );
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
+///
+/// [`Write`]: std::io::Write
+/// [`Writer`]: crate::Writer
 #[derive(Debug)]
 pub struct Encoder {
     /// The number of the record that is appended next.
-    next_record: u64,
+    pub(crate) next_record: u64,
     stage: Stage,
     /// The check of the file objects so far, which the next one is checked
     /// against.
@@ -851,72 +704,12 @@ mod tests {
     use super::*;
     use crate::error::ErrorKind;
     use crate::object::{DosFlags, FatSerial, InodeFlags, Location, Mode, Uuid};
-    use crate::testing::{read_whole, sequence, write_whole, Whole, EMPTY, HELLO, ROOT, SIGNATURE, TRAILER};
-    use crate::{Reader, Sha256};
+    use crate::testing::{
+        directory, everything, name, read_whole, record, recording_all, sequence, write_whole, written, Whole, EMPTY,
+        HELLO, ROOT, SIGNATURE, TRAILER,
+    };
+    use crate::{Sha256, Writer};
     use std::collections::BTreeMap;
-    use std::io;
-
-    fn name(name: &str) -> Name {
-        Name::new(name).unwrap()
-    }
-
-    /// The records `writer` wrote after `root`, without the frame of
-    /// each: the separator in front and the newline behind.
-    fn written(root: &RootObject, write: impl FnOnce(&mut Writer<Vec<u8>>)) -> Vec<String> {
-        let mut writer = Writer::begin(Vec::new(), root).unwrap();
-        write(&mut writer);
-        let text = String::from_utf8(writer.finish().unwrap()).unwrap();
-        let separator = char::from(RECORD_SEPARATOR);
-        assert!(text.starts_with(separator));
-        text.split(separator)
-            .skip(1)
-            .map(|record| record.strip_suffix(char::from(RECORD_END)).unwrap().to_string())
-            .collect()
-    }
-
-    /// The root file object of a manifest that records every feature, and
-    /// its record.
-    fn recording_all() -> (RootObject, String) {
-        let root = RootObject {
-            features: Some(Features::ALL),
-            ..RootObject::default()
-        };
-        let names: Vec<String> = Features::ALL.names().map(|name| format!("\"{}\"", name)).collect();
-        let text = format!(
-            r#"{{"features":[{}],"mediaType":"application/vnd.uapi.16.manifest"}}"#,
-            names.join(",")
-        );
-        (root, text)
-    }
-
-    /// A directory that says nothing else about itself.
-    fn directory(name_of: &str) -> FileObject {
-        let mut directory = FileObject::new(name(name_of));
-        directory.inode_type = InodeType::Directory;
-        directory
-    }
-
-    /// The record the writer writes for `object`, in a manifest that
-    /// records every feature, after the objects of the directories it is
-    /// in.
-    fn record(object: &FileObject) -> String {
-        let (root, root_text) = recording_all();
-        let directories: Vec<FileObject> = object
-            .name
-            .match_indices('/')
-            .map(|(end, _)| directory(&object.name[..end]))
-            .collect();
-        let mut records = written(&root, |writer| {
-            for directory in &directories {
-                writer.file(directory).unwrap();
-            }
-            writer.file(object).unwrap();
-        });
-        assert_eq!(records.len(), directories.len() + 3);
-        assert_eq!(records[0], root_text);
-        assert_eq!(records.pop().as_deref(), Some(TRAILER));
-        records.pop().unwrap()
-    }
 
     /// What `systemd-manifest` writes, see the manifests in tests/fixtures:
     /// the same objects give the same records.
@@ -1074,76 +867,6 @@ mod tests {
         let mut writer = Writer::begin(Vec::new(), &RootObject::default()).unwrap();
         let e = writer.file(&object).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Manifest(Problem::UnlistedFeature));
-    }
-
-    /// An object with every field there is, and one of its contents
-    /// objects with every field.
-    fn everything() -> FileObject {
-        let uuid = |last: u8| {
-            let mut bytes = [0x11; Uuid::SIZE];
-            bytes[Uuid::SIZE - 1] = last;
-            Uuid::new(bytes)
-        };
-        let mut encoded = Contents::new(Location::File(name("blob.gz")));
-        encoded.encoding = Some("gzip".into());
-        encoded.encoded_size = Some(3);
-        encoded.encoded_sha256 = Some(Sha256::digest(b"gz"));
-        encoded.original_size = Some(9);
-        encoded.original_sha256 = Some(Sha256::digest(b"original"));
-        encoded.offset = 4;
-        let mut object = FileObject::new(name("a/\u{e9} \"quoted\"\\"));
-        object.size = Some(5);
-        object.inode.mode = Mode::new(0o440);
-        object.inode.uid = Some(1);
-        object.inode.gid = Some(2);
-        object.inode.user_name = Some("user".into());
-        object.inode.group_name = Some("group".into());
-        object.inode.mtime_nsec = Some(u64::MAX);
-        object.inode_token = NonZeroU64::new(3);
-        object.inode.user_xattrs = Some(Box::new(BTreeMap::from([
-            ("text".to_string(), b"value".to_vec()),
-            ("empty".to_string(), Vec::new()),
-            ("binary".to_string(), vec![0xff, 0x00]),
-            ("nul".to_string(), b"a\0b".to_vec()),
-            ("noncharacter".to_string(), "a\u{fffe}".as_bytes().to_vec()),
-        ])));
-        // Flags of both kinds, which mix in the order of their names.
-        object.inode.flags.put(InodeFlags::APPEND_ONLY, Some(true));
-        object.dos_flags.put(DosFlags::ARCHIVE, Some(false));
-        object.dos_flags.put(DosFlags::HIDDEN, Some(true));
-        object.inode.flags.put(InodeFlags::IMMUTABLE, Some(true));
-        object.inode.flags.put(InodeFlags::NO_COW, Some(false));
-        object.dos_flags.put(DosFlags::SYSTEM, Some(true));
-        // The partition is read-only, which gptFlags says as well where the
-        // manifest records both.
-        object.gpt = Some(Box::new(GptPartition {
-            label: Some("label".into()),
-            uuid: Some(uuid(1)),
-            type_uuid: Some(uuid(2)),
-            flags: Some(
-                GptPartition::FLAG_NO_AUTO | GptPartition::FLAG_GROW_FILE_SYSTEM | GptPartition::FLAG_READ_ONLY,
-            ),
-            no_auto: Some(true),
-            grow_file_system: Some(true),
-        }));
-        object.inode.read_only = Some(true);
-        object.contents = vec![
-            encoded,
-            Contents {
-                http_headers: vec![
-                    ("X-Foo".into(), "bar".into()),
-                    ("Authorization".into(), "Bearer x".into()),
-                ],
-                ..Contents::new(Location::Url("https://example.com/blob".into()))
-            },
-            Contents::new(Location::Literal(b"hello".to_vec())),
-            Contents::default(),
-        ];
-        object.sha256 = HELLO.parse().ok();
-        object.validity.since_usec = 6;
-        object.validity.until_usec = Some(7);
-        object.validity.state = Validity::Revoked;
-        object
     }
 
     /// Checks that the keys of every object in `value` are in the order of
@@ -2129,70 +1852,6 @@ mod tests {
         }
     }
 
-    /// No record is larger than MAX_RECORD_SIZE, its record separator
-    /// included, which is how a reader counts it too. A larger one is not
-    /// written, and the writer goes on.
-    #[test]
-    fn the_largest_record() {
-        // An object whose record is as large as one with the name `name_of`
-        // and an extended attribute, plus `pad` bytes.
-        let padded = |name_of: &str, pad: usize| {
-            let mut object = FileObject::new(name(name_of));
-            object.inode.user_xattrs = Some(Box::new(BTreeMap::from([("p".to_string(), vec![b'x'; pad])])));
-            object
-        };
-        // The separator and the newline are not in what record() returns.
-        let frame = record(&padded("a", 0)).len() + 2;
-        let (root, _) = recording_all();
-        let mut writer = Writer::begin(Vec::new(), &root).unwrap();
-        let before = writer.get_ref().len();
-        let e = writer.file(&padded("a", MAX_RECORD_SIZE - frame + 1)).unwrap_err();
-        assert_eq!(
-            (e.kind(), e.record_number(), e.name()),
-            (ErrorKind::Manifest(Problem::RecordTooLarge), Some(1), Some("a"))
-        );
-        assert_eq!(
-            e.to_string(),
-            format!("manifest record exceeds {} bytes", MAX_RECORD_SIZE)
-        );
-        assert_eq!(writer.get_ref().len(), before);
-        assert!(writer.text.capacity() <= TEXT_CAPACITY);
-        // A directory that is not written is not the directory of what
-        // comes next.
-        let mut large = padded("d", MAX_RECORD_SIZE);
-        large.inode_type = InodeType::Directory;
-        let e = writer.file(&large).unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::Manifest(Problem::RecordTooLarge));
-        let e = writer.file(&FileObject::new(name("d/x"))).unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::Manifest(Problem::Misplaced));
-        // The largest one, which a reader takes.
-        let largest = padded("a", MAX_RECORD_SIZE - frame);
-        writer.file(&largest).unwrap();
-        assert_eq!(writer.get_ref().len() - before, MAX_RECORD_SIZE);
-        assert!(writer.text.capacity() <= TEXT_CAPACITY);
-        let mut signature = Signature::new("pkcs7");
-        signature.data = Some(vec![0; MAX_RECORD_SIZE]);
-        let e = writer.signature(&signature).unwrap_err();
-        assert_eq!(
-            (e.kind(), e.record_number()),
-            (ErrorKind::Manifest(Problem::RecordTooLarge), Some(2))
-        );
-        let bytes = writer.finish().unwrap();
-        let m = read_whole(&bytes).unwrap();
-        assert_eq!(m.objects.len(), 1);
-        assert_eq!(m.objects[0].inode.user_xattrs, largest.inode.user_xattrs);
-        // What a reader read, the writer writes back.
-        assert_eq!(write_whole(&m).unwrap(), bytes);
-        // The root file object's record is record 0.
-        let mut root = recording_all().0;
-        root.inode.user_xattrs = padded("a", MAX_RECORD_SIZE).inode.user_xattrs;
-        let e = Writer::begin(Vec::new(), &root).unwrap_err();
-        assert_eq!(
-            (e.kind(), e.record_number()),
-            (ErrorKind::Manifest(Problem::RecordTooLarge), Some(0))
-        );
-    }
-
     /// An encoder appends what a writer writes, and nothing where it fails.
     #[test]
     fn encodes_what_a_writer_writes() {
@@ -2235,77 +1894,5 @@ mod tests {
             );
         }
         assert_eq!(text.len(), appended);
-    }
-
-    /// What was written so far is there to be signed: the signature
-    /// objects sign what comes before the first of them.
-    #[test]
-    fn what_was_written_can_be_signed() {
-        let mut writer = Writer::begin(Vec::new(), &RootObject::default()).unwrap();
-        writer.file(&FileObject::new(name("a"))).unwrap();
-        let signed = writer.get_ref().len();
-        let hash = Sha256::digest(writer.get_ref());
-        let mut signature = Signature::new("pkcs7");
-        signature.data = Some(hash.as_bytes().to_vec());
-        writer.signature(&signature).unwrap();
-        let bytes = writer.finish().unwrap();
-        let mut reader = Reader::open(&bytes[..]).unwrap();
-        let objects: Vec<_> = reader.by_ref().collect::<Result<_, _>>().unwrap();
-        assert_eq!(objects.len(), 2);
-        assert_eq!(reader.signed_len(), u64::try_from(signed).ok());
-        assert_eq!(Sha256::digest(&bytes[..signed]), hash);
-    }
-
-    /// Notes every write and every flush, and fails the write `fail_at`.
-    #[derive(Debug, Default)]
-    struct Calls {
-        writes: Vec<usize>,
-        flushes: usize,
-        fail_at: Option<usize>,
-    }
-
-    impl Write for Calls {
-        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-            if self.fail_at == Some(self.writes.len()) {
-                return Err(io::Error::from_raw_os_error(libc::ENOSPC));
-            }
-            self.writes.push(data.len());
-            Ok(data.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            self.flushes += 1;
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn a_record_is_one_write() {
-        let mut calls = Calls::default();
-        let (root, root_text) = recording_all();
-        let mut writer = Writer::begin(&mut calls, &root).unwrap();
-        writer.file(&directory("a")).unwrap();
-        writer.file(&everything()).unwrap();
-        let mut empty = FileObject::new(name("empty"));
-        empty.sha256 = EMPTY.parse().ok();
-        writer.file(&empty).unwrap();
-        writer.finish().unwrap();
-        assert_eq!(calls.writes.len(), 5);
-        assert_eq!(calls.writes[0], sequence(&[root_text.as_str()]).len());
-        assert_eq!(calls.writes[4], sequence(&[TRAILER]).len());
-        assert_eq!(calls.flushes, 1);
-        // An error of what is written to is the writer's, about the record
-        // it wrote.
-        for (fail_at, record_number) in [(0, 0), (1, 1)] {
-            let mut calls = Calls {
-                fail_at: Some(fail_at),
-                ..Calls::default()
-            };
-            let e = Writer::begin(&mut calls, &RootObject::default())
-                .and_then(|mut writer| writer.file(&FileObject::new(name("a"))))
-                .unwrap_err();
-            assert_eq!((e.kind(), e.record_number()), (ErrorKind::Io, Some(record_number)));
-            assert_eq!(e.io_error().and_then(io::Error::raw_os_error), Some(libc::ENOSPC));
-        }
     }
 }
