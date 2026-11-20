@@ -31,6 +31,7 @@
 
 pub mod idl;
 mod sys;
+mod value;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -42,7 +43,26 @@ use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub use json::{Object, Value};
+pub use serde_json::Value;
+pub use value::UniqueKeys;
+
+/// A JSON object: the parameters of a call, of a reply or of an error.
+pub type Object = serde_json::Map<String, Value>;
+
+/// Builds an [`Object`] from keys and values.
+///
+/// ```
+/// let o = varlink::object! { "name" => "a", "size" => 3u64 };
+/// assert_eq!(serde_json::to_string(&o).unwrap(), r#"{"name":"a","size":3}"#);
+/// ```
+#[macro_export]
+macro_rules! object {
+    ($($key:expr => $value:expr),* $(,)?) => {{
+        let mut o = $crate::Object::new();
+        $( o.insert(::std::string::String::from($key), $crate::Value::from($value)); )*
+        o
+    }};
+}
 
 /// Largest message accepted, the same limit sd-varlink uses.
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
@@ -124,23 +144,20 @@ impl Error {
     pub fn interface_not_found(interface: &str) -> Error {
         Error::new(
             "org.varlink.service.InterfaceNotFound",
-            json::object! { "interface" => interface },
+            object! { "interface" => interface },
         )
     }
 
     /// `org.varlink.service.MethodNotFound`
     pub fn method_not_found(method: &str) -> Error {
-        Error::new(
-            "org.varlink.service.MethodNotFound",
-            json::object! { "method" => method },
-        )
+        Error::new("org.varlink.service.MethodNotFound", object! { "method" => method })
     }
 
     /// `org.varlink.service.MethodNotImplemented`
     pub fn method_not_implemented(method: &str) -> Error {
         Error::new(
             "org.varlink.service.MethodNotImplemented",
-            json::object! { "method" => method },
+            object! { "method" => method },
         )
     }
 
@@ -148,7 +165,7 @@ impl Error {
     pub fn invalid_parameter(parameter: &str) -> Error {
         Error::new(
             "org.varlink.service.InvalidParameter",
-            json::object! { "parameter" => parameter },
+            object! { "parameter" => parameter },
         )
     }
 
@@ -170,9 +187,9 @@ impl Error {
     /// `io.systemd.System`, the generic errno error systemd tools use.
     pub fn system(errno: i32) -> Error {
         let errno = i32::try_from(errno.unsigned_abs()).unwrap_or(i32::MAX);
-        let mut p = json::object! { "origin" => "linux", "errno" => errno };
+        let mut p = object! { "origin" => "linux", "errno" => errno };
         if let Some(name) = errno_name(errno) {
-            p.insert("errnoName", name);
+            p.insert("errnoName".into(), name.into());
         }
         Error::new("io.systemd.System", p)
     }
@@ -451,7 +468,7 @@ impl Connection {
             .stream
             .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection was upgraded"))?;
-        let mut text = message.to_string().into_bytes();
+        let mut text = serde_json::to_vec(message).expect("an object of JSON values is JSON");
         text.push(0);
         stream.write_all(&text)?;
         stream.flush()
@@ -468,9 +485,9 @@ impl Connection {
         }
         let mut m = Object::new();
         if !parameters.is_empty() {
-            m.insert("parameters", parameters);
+            m.insert("parameters".into(), Value::Object(parameters));
         }
-        m.insert("continues", true);
+        m.insert("continues".into(), Value::Bool(true));
         self.send(&m)
     }
 
@@ -486,7 +503,7 @@ impl Connection {
         }
         let mut m = Object::new();
         if !parameters.is_empty() {
-            m.insert("parameters", parameters);
+            m.insert("parameters".into(), Value::Object(parameters));
         }
         self.send(&m)?;
         let stream = self
@@ -598,13 +615,14 @@ impl Server {
     /// Parses and checks a request. Err means the connection must be closed.
     fn parse_call(&self, message: &[u8]) -> Result<Call, &'static str> {
         let text = std::str::from_utf8(message).map_err(|_| "message is not UTF-8")?;
-        let value = json::parse(text).map_err(|_| "message is not valid JSON")?;
+        let value = UniqueKeys::parse(text).map_err(|_| "message is not valid JSON")?;
         let Value::Object(mut object) = value else {
             return Err("message is not a JSON object");
         };
         // The parameters are taken out of the message, not copied: they can
-        // be most of a message of MAX_MESSAGE_SIZE bytes.
-        let parameters = match object.remove("parameters") {
+        // be most of a message of MAX_MESSAGE_SIZE bytes. The other members
+        // keep their order.
+        let parameters = match object.shift_remove("parameters") {
             None | Some(Value::Null) => Object::new(),
             Some(Value::Object(o)) => o,
             Some(_) => return Err("parameters is not an object"),
@@ -618,18 +636,18 @@ impl Server {
         };
         let mut has_method = false;
         let mut flags = 0;
-        for (key, value) in object.iter() {
-            match key {
+        for (key, value) in &object {
+            match key.as_str() {
                 "method" => {
                     call.method = value.as_str().ok_or("method is not a string")?.to_string();
                     has_method = true;
                 }
-                "oneway" | "more" | "upgrade" => {
+                flag @ ("oneway" | "more" | "upgrade") => {
                     let b = value.as_bool().ok_or("flag is not a boolean")?;
                     if b {
                         flags += 1;
                     }
-                    match key {
+                    match flag {
                         "oneway" => call.oneway = b,
                         "more" => call.more = b,
                         _ => call.upgrade = b,
@@ -652,7 +670,7 @@ impl Server {
     }
 
     fn get_info(&self) -> Object {
-        json::object! {
+        object! {
             "vendor" => self.info.vendor.as_str(),
             "product" => self.info.product.as_str(),
             "version" => self.info.version.as_str(),
@@ -682,7 +700,7 @@ impl Server {
                 }
                 let name = call.parameters.get("interface").and_then(Value::as_str).unwrap_or("");
                 match self.interfaces.get(name) {
-                    Some(i) => Reply::Final(json::object! { "description" => i.text.as_str() }),
+                    Some(i) => Reply::Final(object! { "description" => i.text.as_str() }),
                     None => Reply::Error(Error::interface_not_found(name)),
                 }
             }
@@ -749,14 +767,14 @@ impl Server {
                 Reply::Final(parameters) => {
                     let mut m = Object::new();
                     if !parameters.is_empty() {
-                        m.insert("parameters", parameters);
+                        m.insert("parameters".into(), Value::Object(parameters));
                     }
                     m
                 }
                 Reply::Error(e) => {
-                    let mut m = json::object! { "error" => e.name.as_str() };
+                    let mut m = object! { "error" => e.name.as_str() };
                     if !e.parameters.is_empty() {
-                        m.insert("parameters", e.parameters);
+                        m.insert("parameters".into(), Value::Object(e.parameters));
                     }
                     m
                 }
@@ -1097,9 +1115,9 @@ impl Client {
 
     /// Sends a call, to be answered the way `mode` asks.
     pub fn send(&mut self, method: &str, parameters: Object, mode: CallMode) -> io::Result<()> {
-        let mut m = json::object! { "method" => method };
+        let mut m = object! { "method" => method };
         if !parameters.is_empty() {
-            m.insert("parameters", parameters);
+            m.insert("parameters".into(), Value::Object(parameters));
         }
         let flag = match mode {
             CallMode::Plain => None,
@@ -1108,7 +1126,7 @@ impl Client {
             CallMode::Upgrade => Some("upgrade"),
         };
         if let Some(flag) = flag {
-            m.insert(flag, true);
+            m.insert(flag.into(), Value::Bool(true));
         }
         self.connection.more = mode == CallMode::More;
         self.connection.send(&m)
@@ -1131,12 +1149,12 @@ impl Client {
     }
 
     fn send_fds(&mut self, method: &str, parameters: Object, fds: &[BorrowedFd<'_>], more: bool) -> io::Result<()> {
-        let mut m = json::object! { "method" => method };
+        let mut m = object! { "method" => method };
         if !parameters.is_empty() {
-            m.insert("parameters", parameters);
+            m.insert("parameters".into(), Value::Object(parameters));
         }
         if more {
-            m.insert("more", true);
+            m.insert("more".into(), Value::Bool(true));
         }
         self.connection.more = more;
         let stream = self
@@ -1147,7 +1165,7 @@ impl Client {
         let socket = stream
             .socket()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOTSOCK))?;
-        let mut text = m.to_string().into_bytes();
+        let mut text = serde_json::to_vec(&m).expect("an object of JSON values is JSON");
         text.push(0);
         let sent = sys::send_with_fds(socket, &text, fds)?;
         stream.write_all(&text[sent..])?;
@@ -1171,19 +1189,19 @@ impl Client {
             Message::End(_) => return Ok(None),
         };
         let text = std::str::from_utf8(&message).map_err(|_| protocol_error("reply is not UTF-8"))?;
-        let value = json::parse(text).map_err(|_| protocol_error("reply is not JSON"))?;
+        let value = UniqueKeys::parse(text).map_err(|_| protocol_error("reply is not JSON"))?;
         let Value::Object(mut object) = value else {
             return Err(protocol_error("reply is not an object"));
         };
-        let parameters = match object.remove("parameters") {
+        let parameters = match object.shift_remove("parameters") {
             None | Some(Value::Null) => Object::new(),
             Some(Value::Object(o)) => o,
             Some(_) => return Err(protocol_error("unexpected field in reply")),
         };
         let mut error = None;
         let mut continues = false;
-        for (key, value) in object.iter() {
-            match (key, value) {
+        for (key, value) in &object {
+            match (key.as_str(), value) {
                 ("error", Value::String(name)) => error = Some(name.clone()),
                 ("continues", Value::Bool(b)) => continues = *b,
                 (k, _) if k.contains('.') => {}
@@ -1250,19 +1268,16 @@ error Boom(reason: string)
                     let text = call.parameters.get("text").and_then(Value::as_str).unwrap();
                     let times = call.parameters.get("times").and_then(Value::as_u64).unwrap_or(1);
                     if text == "boom" {
-                        return Reply::Error(Error::new(
-                            "io.test.Echo.Boom",
-                            json::object! { "reason" => "asked for it" },
-                        ));
+                        return Reply::Error(Error::new("io.test.Echo.Boom", object! { "reason" => "asked for it" }));
                     }
-                    Reply::Final(json::object! { "text" => text.repeat(times as usize) })
+                    Reply::Final(object! { "text" => text.repeat(times as usize) })
                 }
                 "io.test.Echo.Count" => {
                     let upto = call.parameters.get("upto").and_then(Value::as_u64).unwrap();
                     for n in 0..upto {
-                        connection.notify(json::object! { "n" => n }).unwrap();
+                        connection.notify(object! { "n" => n }).unwrap();
                     }
-                    Reply::Final(json::object! { "n" => upto })
+                    Reply::Final(object! { "n" => upto })
                 }
                 "io.test.Echo.Read" => {
                     let index = call.parameters.get("fileDescriptor").and_then(Value::as_u64).unwrap() as usize;
@@ -1270,13 +1285,13 @@ error Boom(reason: string)
                         Ok(fd) => {
                             let mut text = String::new();
                             std::fs::File::from(fd).read_to_string(&mut text).unwrap();
-                            Reply::Final(json::object! { "text" => text })
+                            Reply::Final(object! { "text" => text })
                         }
                         Err(_) => Reply::Error(Error::invalid_parameter("fileDescriptor")),
                     }
                 }
                 "io.test.Echo.Take" => {
-                    let mut up = connection.upgrade(json::object! { "bytes" => 5u32 }).unwrap();
+                    let mut up = connection.upgrade(object! { "bytes" => 5u32 }).unwrap();
                     let mut data = up.buffered;
                     let mut rest = vec![0u8; 5 - data.len()];
                     up.stream.read_exact(&mut rest).unwrap();
@@ -1396,7 +1411,10 @@ error Boom(reason: string)
     }
 
     fn params(text: &str) -> Object {
-        json::parse(text).unwrap().as_object().unwrap().clone()
+        match UniqueKeys::parse(text).unwrap() {
+            Value::Object(o) => o,
+            other => panic!("{} is not an object", other),
+        }
     }
 
     #[test]
@@ -1574,6 +1592,8 @@ error Boom(reason: string)
             "{\"method\":\"a.b.C\",\"more\":1}",
             "{\"method\":\"a.b.C\",\"parameters\":[]}",
             "{\"method\":5}",
+            "{\"method\":\"a.b.C\",\"method\":\"a.b.C\"}",
+            "{\"method\":\"io.test.Echo.Echo\",\"parameters\":{\"text\":\"a\",\"text\":\"b\"}}",
         ] {
             let (mut a, b) = UnixStream::pair().unwrap();
             let h = std::thread::spawn(move || server().serve(Box::new(b), &Echo));

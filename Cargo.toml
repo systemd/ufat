@@ -51,8 +51,8 @@ lexopt = "0.3.2"
 libc = "0.2.191"
 # Reads and writes JSON. What a manifest asks for beyond JSON is checked
 # by src/uapi16/strict.rs. Never turn on arbitrary_precision: serde_json
-# then hands numbers to the visitors of uapi16 as objects, see its crate
-# docs.
+# then hands numbers to the visitors of uapi16 and varlink as objects, see
+# the crate docs of uapi16.
 serde_core = "1.0.229"
 serde_json = "1.0.154"
 # 0.11.1 and later need rustc 1.88.
@@ -75,7 +75,6 @@ publish.workspace = true
 
 [dependencies]
 fat.workspace = true
-json.workspace = true
 lexopt.workspace = true
 libc.workspace = true
 varlink.workspace = true

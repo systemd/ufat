@@ -1547,7 +1547,7 @@ fn cmd_capabilities(argv: &[OsString]) -> Result<()> {
     if !args.positional.is_empty() {
         bail!(errno::EINVAL, "capabilities takes no arguments");
     }
-    println!("{}", json::Value::Object(service::capabilities()?));
+    println!("{}", varlink::Value::Object(service::capabilities()?));
     Ok(())
 }
 

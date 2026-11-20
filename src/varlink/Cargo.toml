@@ -12,8 +12,11 @@ publish.workspace = true
 path = "lib.rs"
 
 [dependencies]
-json.workspace = true
 libc.workspace = true
+serde_core.workspace = true
+# A service reads the floats of its parameters as they were written, and
+# a reply keeps its members in the order they were given.
+serde_json = { workspace = true, features = ["float_roundtrip", "preserve_order"] }
 
 [lints]
 workspace = true

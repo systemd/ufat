@@ -18,7 +18,6 @@ name = "measure"
 path = "measure.rs"
 
 [dependencies]
-json.workspace = true
 libc.workspace = true
 varlink.workspace = true
 

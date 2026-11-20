@@ -4,7 +4,7 @@
 //! bytes the child passed to read and write system calls.
 //!
 //! Like the rest of ufat, it uses the standard library and the libc crate,
-//! and the json and varlink crates of this tree.
+//! and the varlink crate of this tree.
 //!
 //! Usage:
 //!   measure [OPTIONS] -- COMMAND [ARGS...]
@@ -213,11 +213,16 @@ fn spawn_ufat(o: &Options) -> io::Result<(Child, UnixStream)> {
 }
 
 fn varlink_call(o: &Options, socket: UnixStream) -> io::Result<()> {
-    let Ok(json::Value::Object(params)) = json::parse(&o.params) else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--params is not a JSON object",
-        ));
+    // A key twice is refused, as the service refuses it.
+    let params = match varlink::UniqueKeys::parse(&o.params) {
+        Ok(varlink::Value::Object(params)) => params,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--params is not a JSON object",
+            ))
+        }
+        Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("--params: {}", e))),
     };
     // The descriptors, in the order given: index n of the call is fds[n].
     let mut files = Vec::new();
@@ -240,7 +245,7 @@ fn varlink_call(o: &Options, socket: UnixStream) -> io::Result<()> {
             "{} failed: {} {}",
             method,
             e.name,
-            json::Value::Object(e.parameters)
+            varlink::Value::Object(e.parameters)
         ))),
     }
 }
