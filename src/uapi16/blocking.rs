@@ -272,7 +272,7 @@ impl<R: Read> FusedIterator for Reader<R> {}
 /// [`MAX_CONTENTS`]: crate::MAX_CONTENTS
 /// [`MAX_RECORD_SIZE`]: crate::MAX_RECORD_SIZE
 #[derive(Debug)]
-pub struct Writer<W: Write> {
+pub struct Writer<W> {
     out: W,
     /// The text of the record that goes out next. The room for it is kept
     /// from one record to the next.
