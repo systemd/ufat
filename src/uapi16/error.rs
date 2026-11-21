@@ -55,7 +55,7 @@ pub enum Problem {
     /// An object after the first has no name.
     NoName,
     /// A name is not one a file object can have, for one of the reasons of
-    /// [`InvalidName`](crate::InvalidName).
+    /// [`NameProblem`](crate::NameProblem).
     InvalidName,
     /// Two objects carry the same name.
     DuplicateName,
@@ -227,7 +227,7 @@ pub enum UnsupportedContent {
 
 /// Why a file object must not be used now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Invalid {
+pub enum ValidityProblem {
     /// Its `validity` is `revoked`.
     Revoked,
     /// The time is before its `validSinceUSec`.
@@ -249,7 +249,7 @@ pub enum ErrorKind {
     /// The manifest gives contents in a way this crate cannot take.
     Unsupported(UnsupportedContent),
     /// A file object is revoked or outside its validity window.
-    NotValid(Invalid),
+    NotValid(ValidityProblem),
     /// Reading or writing failed.
     Io,
 }

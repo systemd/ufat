@@ -9,7 +9,7 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::decode::ROOT_RECORD;
-use crate::error::{Error, ErrorKind, Field, Invalid, Problem};
+use crate::error::{Error, ErrorKind, Field, Problem, ValidityProblem};
 use crate::hex::Hex;
 use crate::{Features, Name, Order, Sha256, STRING_RULES};
 
@@ -200,11 +200,11 @@ impl ValidityWindow {
     /// that it is not revoked and that the time is inside the window.
     fn check(&self, now_usec: u64, subject: impl fmt::Display) -> Result<(), Error> {
         let (reason, state) = if self.state == Validity::Revoked {
-            (Invalid::Revoked, "is revoked")
+            (ValidityProblem::Revoked, "is revoked")
         } else if now_usec < self.since_usec {
-            (Invalid::NotYetValid, "is not valid yet")
+            (ValidityProblem::NotYetValid, "is not valid yet")
         } else if self.until_usec.is_some_and(|until| now_usec >= until) {
-            (Invalid::Expired, "has expired")
+            (ValidityProblem::Expired, "has expired")
         } else {
             return Ok(());
         };
@@ -1542,10 +1542,10 @@ mod tests {
         assert_eq!(kind(&object, u64::MAX), Ok(()));
         object.validity.since_usec = 10;
         object.validity.until_usec = Some(20);
-        assert_eq!(kind(&object, 9), Err(ErrorKind::NotValid(Invalid::NotYetValid)));
+        assert_eq!(kind(&object, 9), Err(ErrorKind::NotValid(ValidityProblem::NotYetValid)));
         assert_eq!(kind(&object, 10), Ok(()));
         assert_eq!(kind(&object, 19), Ok(()));
-        assert_eq!(kind(&object, 20), Err(ErrorKind::NotValid(Invalid::Expired)));
+        assert_eq!(kind(&object, 20), Err(ErrorKind::NotValid(ValidityProblem::Expired)));
         let e = object.check_validity(20).unwrap_err();
         assert_eq!((e.name(), e.to_string().as_str()), (Some("d/x"), "d/x has expired"));
         assert_eq!(
@@ -1555,7 +1555,7 @@ mod tests {
         // Revoked whatever the time is.
         object.validity.state = Validity::Revoked;
         for now in [9, 15, 20] {
-            assert_eq!(kind(&object, now), Err(ErrorKind::NotValid(Invalid::Revoked)));
+            assert_eq!(kind(&object, now), Err(ErrorKind::NotValid(ValidityProblem::Revoked)));
         }
         assert_eq!(object.check_validity(15).unwrap_err().to_string(), "d/x is revoked");
         // The root file object speaks for the manifest, which has no name.
@@ -1563,7 +1563,7 @@ mod tests {
         assert_eq!(root.check_validity(u64::MAX).map_err(|e| e.kind()), Ok(()));
         root.validity.until_usec = Some(1);
         let e = root.check_validity(1).unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::NotValid(Invalid::Expired));
+        assert_eq!(e.kind(), ErrorKind::NotValid(ValidityProblem::Expired));
         assert_eq!((e.name(), e.to_string().as_str()), (None, "the manifest has expired"));
         root.validity.state = Validity::Revoked;
         assert_eq!(

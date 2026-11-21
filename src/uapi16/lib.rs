@@ -106,9 +106,9 @@ mod writer;
 pub use blocking::{Reader, Writer};
 pub use content::{ContentCheck, ContentSource, Data, Directory, DirectorySource, OpenError, Reference, StreamSource};
 pub use digest::{Digest, Finalize, InvalidDigest, Sha256, Sha256Context};
-pub use error::{ContentProblem, Error, ErrorKind, Field, Invalid, Problem, SourceProblem, UnsupportedContent};
+pub use error::{ContentProblem, Error, ErrorKind, Field, Problem, SourceProblem, UnsupportedContent, ValidityProblem};
 pub use features::{Features, Order, UnknownFeature};
-pub use name::{InvalidName, Name};
+pub use name::{Name, NameProblem};
 pub use object::{
     Contents, DosFlags, FatSerial, FileObject, FileSystemIdentity, FilledIn, FlagStates, GptPartition, InodeAttributes,
     InodeFlags, InodeType, InvalidFatSerial, InvalidUuid, Location, Mode, RootObject, Signature, UnknownInodeType,
