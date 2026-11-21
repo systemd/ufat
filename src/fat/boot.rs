@@ -38,6 +38,9 @@ pub const OEM_NAME_SIZE: usize = size(field::OEM_NAME);
 pub const FS_TYPE_FAT32: [u8; size(field::FS_TYPE)] = *b"FAT32   ";
 /// The label stored when the volume has none.
 pub const NO_NAME: [u8; LABEL_SIZE] = *b"NO NAME    ";
+/// What a label is padded with to [`LABEL_SIZE`]. A label is read without
+/// the padding at its end.
+pub const LABEL_PADDING: u8 = b' ';
 /// The OEM name the FAT specification recommends for maximum compatibility.
 pub const OEM_NAME_DEFAULT: [u8; OEM_NAME_SIZE] = *b"MSWIN4.1";
 /// The media descriptor for fixed media.

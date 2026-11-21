@@ -87,6 +87,10 @@ const LFN_UNIT_OFFSETS: [usize; LFN_UNITS_PER_ENTRY] = {
     offsets
 };
 
+/// The short entries of a directory entry: one, after its long name
+/// entries if it has any.
+const SHORT_ENTRIES: usize = 1;
+
 /// A validated long file name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LongName {
@@ -100,6 +104,19 @@ impl LongName {
     /// `" * / : < > ? \ |`, must not start with a space and must not end
     /// with a space or a dot, and must not be "." or "..".
     pub fn new(name: &str) -> Result<LongName> {
+        let len = LongName::check(name)?;
+        // The units take one allocation of the size check() counted.
+        let mut units = Vec::with_capacity(len);
+        units.extend(name.encode_utf16());
+        Ok(LongName {
+            text: name.to_string(),
+            units,
+        })
+    }
+
+    /// Checks `name` the way [`LongName::new`] does and returns its length
+    /// in UTF-16 units. Nothing is allocated unless it fails.
+    fn check(name: &str) -> Result<usize> {
         let bad = |problem: NameProblem| Detail::Name {
             name: name.to_string(),
             problem,
@@ -115,6 +132,7 @@ impl LongName {
                 name
             );
         }
+        let mut len = 0;
         for c in name.chars() {
             if c.is_ascii_control() {
                 bail!(
@@ -143,6 +161,7 @@ impl LongName {
                     c
                 );
             }
+            len += c.len_utf16();
         }
         if name.starts_with(' ') {
             bail!(
@@ -160,13 +179,7 @@ impl LongName {
                 name
             );
         }
-        // A name has no more UTF-16 units than UTF-8 bytes, so this is the
-        // only allocation. collect() would size the vector from the
-        // iterator's lower bound, a third of that, and reallocate as it
-        // grows.
-        let mut units = Vec::with_capacity(name.len());
-        units.extend(name.encode_utf16());
-        if units.len() > MAX_LONG_NAME {
+        if len > MAX_LONG_NAME {
             bail!(
                 ENAMETOOLONG,
                 bad(NameProblem::TooLong),
@@ -175,10 +188,20 @@ impl LongName {
                 MAX_LONG_NAME
             );
         }
-        Ok(LongName {
-            text: name.to_string(),
-            units,
-        })
+        Ok(len)
+    }
+
+    /// The directory slots an entry named `name` takes: its long name
+    /// entries, if it needs any, and its short entry. Fails where
+    /// [`LongName::new`] fails, and allocates nothing.
+    pub(crate) fn slots_for(name: &str) -> Result<usize> {
+        let len = LongName::check(name)?;
+        let long = if Alias::from_name(name).needs_long_name {
+            len.div_ceil(LFN_UNITS_PER_ENTRY)
+        } else {
+            0
+        };
+        Ok(long + SHORT_ENTRIES)
     }
 
     /// The name as a string.
@@ -275,11 +298,11 @@ impl Case {
     }
 }
 
-/// Converts one part (base or extension) of a name into at most `max`
-/// alias bytes. Returns the bytes, whether information was lost and the
-/// case of the letters seen.
-fn convert_part(part: &str, max: usize) -> (Vec<u8>, bool, Case) {
-    let mut out = Vec::with_capacity(max);
+/// Converts one part (base or extension) of a name into the alias bytes
+/// `out`, as many as fit. Returns how many it wrote, whether information
+/// was lost and the case of the letters seen.
+fn convert_part(part: &str, out: &mut [u8]) -> (usize, bool, Case) {
+    let mut len = 0;
     let mut lossy = false;
     let mut case = Case::NoLetters;
     for c in part.chars() {
@@ -287,21 +310,22 @@ fn convert_part(part: &str, max: usize) -> (Vec<u8>, bool, Case) {
             lossy = true;
             continue;
         }
-        if out.len() == max {
+        let Some(byte) = out.get_mut(len) else {
             lossy = true;
             break;
-        }
+        };
         if c.is_ascii_alphabetic() {
             case = case.add(c.is_ascii_lowercase());
-            out.push(c.to_ascii_uppercase() as u8);
+            *byte = c.to_ascii_uppercase() as u8;
         } else if c.is_ascii() && valid_short_char(c as u8) {
-            out.push(c as u8);
+            *byte = c as u8;
         } else {
             lossy = true;
-            out.push(b'_');
+            *byte = b'_';
         }
+        len += 1;
     }
-    (out, lossy, case)
+    (len, lossy, case)
 }
 
 /// The 8.3 alias derived from a long name, before any numeric tail.
@@ -322,17 +346,23 @@ pub struct Alias {
 impl Alias {
     /// Derives the alias of a long name.
     pub fn of(name: &LongName) -> Alias {
-        let text = name.as_str();
-        let trimmed = text.trim_start_matches(['.', ' ']);
-        let mut lossy = trimmed.len() != text.len();
+        Alias::from_name(name.as_str())
+    }
+
+    /// Derives the alias of `name`, a name [`LongName::new`] takes,
+    /// without allocating.
+    fn from_name(name: &str) -> Alias {
+        let trimmed = name.trim_start_matches(['.', ' ']);
+        let mut lossy = trimmed.len() != name.len();
         let (base, ext) = match trimmed.rfind('.') {
             Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
             None => (trimmed, ""),
         };
-        let (base_bytes, base_lossy, base_case) = convert_part(base, NAME_BASE.len());
-        let (ext_bytes, ext_lossy, ext_case) = convert_part(ext, NAME_EXT.len());
+        let mut alias = [b' '; SHORT_NAME_SIZE];
+        let (base_len, base_lossy, base_case) = convert_part(base, &mut alias[NAME_BASE]);
+        let (_, ext_lossy, ext_case) = convert_part(ext, &mut alias[NAME_EXT]);
         lossy |= base_lossy || ext_lossy;
-        if base_bytes.is_empty() || RESERVED_NAMES.contains(&base_bytes.as_slice()) {
+        if base_len == 0 || RESERVED_NAMES.contains(&&alias[..base_len]) {
             lossy = true;
         }
         let mixed = base_case == Case::Mixed || ext_case == Case::Mixed;
@@ -346,12 +376,9 @@ impl Alias {
                 case_flags |= CASE_LOWER_EXT;
             }
         }
-        let mut alias = [b' '; SHORT_NAME_SIZE];
-        alias[..base_bytes.len()].copy_from_slice(&base_bytes);
-        alias[NAME_EXT.start..NAME_EXT.start + ext_bytes.len()].copy_from_slice(&ext_bytes);
         Alias {
             name: alias,
-            base_len: base_bytes.len(),
+            base_len,
             lossy,
             needs_long_name,
             case_flags,
@@ -531,6 +558,46 @@ mod tests {
         // Surrogate pairs count as two units.
         let astral: String = std::iter::repeat_n('\u{1F600}', 128).collect();
         assert_eq!(LongName::new(&astral).unwrap_err().errno(), ENAMETOOLONG);
+    }
+
+    /// The slots counted from a name are those of its long name entries,
+    /// where its alias needs them, and its short entry. A name that
+    /// LongName::new() refuses is refused alike.
+    #[test]
+    fn slots_of_names() {
+        let longest: String = std::iter::repeat_n('x', MAX_LONG_NAME).collect();
+        let astral: String = std::iter::repeat_n('\u{1F600}', 7).collect();
+        for (name, slots) in [
+            ("README.TXT", 1),
+            ("readme.txt", 1),
+            ("loader", 1),
+            ("Readme.txt", 2),
+            ("thirteen_char", 2),
+            ("linux-6.12.efi", 3),
+            ("\u{fc}n\u{ef}c\u{f6}d\u{e9}", 2),
+            (astral.as_str(), 3),
+            (longest.as_str(), 21),
+        ] {
+            assert_eq!(LongName::slots_for(name).unwrap(), slots, "{:?}", name);
+            let long_name = LongName::new(name).unwrap();
+            let entries = if Alias::of(&long_name).needs_long_name {
+                long_name.entry_count()
+            } else {
+                0
+            };
+            assert_eq!(entries + SHORT_ENTRIES, slots, "{:?}", name);
+        }
+        let too_long: String = std::iter::repeat_n('x', MAX_LONG_NAME + 1).collect();
+        for bad in ["", ".", "..", "a/b", "a:b", "a\tb", "a ", " a", "a.", too_long.as_str()] {
+            let refused = LongName::slots_for(bad).unwrap_err();
+            let expected = LongName::new(bad).unwrap_err();
+            assert_eq!(
+                (refused.errno(), refused.detail()),
+                (expected.errno(), expected.detail()),
+                "{:?}",
+                bad
+            );
+        }
     }
 
     #[test]

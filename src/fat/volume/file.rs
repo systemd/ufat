@@ -7,9 +7,12 @@
 use std::io::{self, Read, Write};
 use std::time::SystemTime;
 
-use super::{check_attributes, writable, Located, Placement, Volume, MAX_FILE_SIZE, SETTABLE_ATTRIBUTES};
+use super::{
+    check_attributes, writable, Located, NameCollision, NewEntry, Placement, Volume, MAX_FILE_SIZE, NO_ATTRIBUTES,
+    SETTABLE_ATTRIBUTES,
+};
 use crate::dir::{DirEntry, Directory};
-use crate::dirent::{RawDirEntry, ATTR_ARCHIVE, ATTR_READ_ONLY};
+use crate::dirent::{RawDirEntry, ATTR_ARCHIVE};
 use crate::errno::*;
 use crate::fat::{Entry, Extent};
 use crate::time::FatTimestamp;
@@ -30,9 +33,12 @@ impl Volume {
     /// written to the directory until the file is finished: its slots are
     /// reserved in memory and the entry goes in, complete, after the data
     /// and the FAT. So a crash while the file is written leaves the
-    /// directory as it was, never an empty file. With `replace` an existing
-    /// file of the same name stays in place until the new one is complete
-    /// and is removed then; without it an existing file is an EEXIST error.
+    /// directory as it was, never an empty file. With
+    /// [`NameCollision::Replace`] an existing file of the same name, or of a
+    /// name FAT does not tell apart from it, stays in place until the new
+    /// one is complete and is removed then. With [`NameCollision::Fail`] an
+    /// existing file is an EEXIST error, which for a name of another
+    /// spelling says that FAT does not tell the two apart.
     ///
     /// The token borrows nothing, so any number of files can be open at
     /// once and the volume stays usable in between; whether another
@@ -40,19 +46,31 @@ impl Volume {
     /// finished. A token that is dropped leaves its clusters allocated until
     /// the next fsck; [`Volume::create_file`] wraps it in a guard that
     /// aborts instead.
-    pub fn begin_file(&mut self, path: &str, time: SystemTime, replace: bool) -> Result<OpenFile> {
-        self.begin_write()?;
+    ///
+    /// Nothing is written for a file that is refused: a name FAT cannot
+    /// store or one that is too long, a parent that is missing, damaged or
+    /// full, too few free clusters for the parent to grow, a directory of
+    /// the name, or under [`NameCollision::Fail`] a file of the name or one
+    /// FAT does not tell apart from it.
+    pub fn begin_file(&mut self, path: &str, time: SystemTime, collision: NameCollision) -> Result<OpenFile> {
         let (dir_cluster, name) = self.locate_parent(path)?;
         let (placement, replaced) = self.with_directory_mut(dir_cluster, |vol, parent| {
+            // A name of another spelling is a case collision first, as for
+            // a directory, see Volume::find_or_create_dir.
             let replaced = match Self::find(parent, name.as_str()) {
+                Some(existing) if collision == NameCollision::Fail && existing.name() != name.as_str() => {
+                    return Err(vol.case_collision(path, &existing));
+                }
                 Some(existing) if existing.short.is_directory() => {
                     bail!(EISDIR, Detail::Path(path.to_string()), "'{}' is a directory", path);
                 }
-                Some(_) if !replace => bail!(EEXIST, Detail::Path(path.to_string()), "'{}' exists", path),
+                Some(_) if collision == NameCollision::Fail => {
+                    bail!(EEXIST, Detail::Path(path.to_string()), "'{}' exists", path)
+                }
                 existing => existing,
             };
             let placement = vol
-                .place_entry(parent, &name, replaced.as_ref())
+                .place_entry(parent, &name, replaced.as_ref(), NewEntry::File)
                 .map_err(|e| e.at_path(path))?;
             if !vol.reserve_slots(parent, placement.start, placement.long.len() + 1) {
                 bail!(
@@ -94,8 +112,8 @@ impl Volume {
     /// Creates a file and returns a writer for its contents; see
     /// [`Volume::begin_file`] for what happens when and [`FileWriter`] for
     /// the guard that aborts an unfinished file on drop.
-    pub fn create_file(&mut self, path: &str, time: SystemTime, replace: bool) -> Result<FileWriter<'_>> {
-        let file = self.begin_file(path, time, replace)?;
+    pub fn create_file(&mut self, path: &str, time: SystemTime, collision: NameCollision) -> Result<FileWriter<'_>> {
+        let file = self.begin_file(path, time, collision)?;
         Ok(FileWriter {
             volume: self,
             file: Some(file),
@@ -128,6 +146,27 @@ impl Volume {
                 clusters
             );
         }
+        self.begin_read_at(first, size)
+    }
+
+    /// Opens the file of `size` bytes whose chain starts at `first` for
+    /// sequential reading, as [`Volume::begin_read`] opens the file at a
+    /// path, without looking up a path and without walking the chain
+    /// first. The reads follow the chain as far as the file goes. The read
+    /// that runs past the end of a chain shorter than the file fails with
+    /// EUCLEAN, and so does the read of the last cluster of the file when
+    /// the FAT entry of that cluster is free, bad or invalid. The rest of a
+    /// chain longer than the file is not followed.
+    pub(crate) fn begin_read_at(&self, first: u32, size: u64) -> Result<OpenRead> {
+        if size > 0 && !self.layout.valid_cluster(first) {
+            bail!(
+                EUCLEAN,
+                damaged(CorruptPlace::Chain, None, Some(first)),
+                "a file of {} bytes starts at cluster {}, which the volume does not have",
+                size,
+                first
+            );
+        }
         Ok(OpenRead {
             first,
             size,
@@ -148,6 +187,7 @@ impl Volume {
                 Entry::Next(next) => next,
                 other => bail!(
                     EUCLEAN,
+                    damaged(CorruptPlace::Chain, None, Some(cluster)),
                     "the chain of the file ends after {} clusters ({:?})",
                     at + 1,
                     other
@@ -168,7 +208,9 @@ impl Volume {
     }
 
     /// Reads from an open file into `buf`, up to the end of a cluster or of
-    /// the file. Returns the number of bytes read, 0 at the end.
+    /// the file. Returns the number of bytes read, 0 at the end. The read
+    /// that reaches the end of the file fails with EUCLEAN when the FAT
+    /// entry of its last cluster is free, bad or invalid.
     pub fn read_file_data(&self, file: &mut OpenRead, buf: &mut [u8]) -> Result<usize> {
         if file.pos >= file.size || buf.is_empty() {
             return Ok(0);
@@ -181,6 +223,21 @@ impl Volume {
         let off = self.layout.cluster_offset(cluster)? + within;
         self.device.read_at(off, &mut buf[..n])?;
         file.pos += n as u64;
+        if file.pos == file.size {
+            // The chain ends at the last cluster of the file or goes on.
+            // The steps to the clusters before looked at their entries,
+            // nothing looked at this one.
+            match self.fat_entry(cluster)? {
+                Entry::End | Entry::Next(_) => {}
+                other => bail!(
+                    EUCLEAN,
+                    damaged(CorruptPlace::Chain, None, Some(cluster)),
+                    "cluster {}, the last of the file, has the FAT entry {:?}",
+                    cluster,
+                    other
+                ),
+            }
+        }
         Ok(n)
     }
 
@@ -418,14 +475,11 @@ impl OpenFile {
         self.size
     }
 
-    /// Sets or clears the read-only attribute the entry gets when the file
-    /// is finished.
-    pub fn set_read_only(&mut self, read_only: bool) {
-        if read_only {
-            self.entry.attr |= ATTR_READ_ONLY;
-        } else {
-            self.entry.attr &= !ATTR_READ_ONLY;
-        }
+    /// The read-only, hidden, system and archive attributes the entry gets
+    /// when the file is finished: the archive attribute alone for a new
+    /// file, unless they were set.
+    pub fn attributes(&self) -> u8 {
+        self.entry.attr & SETTABLE_ATTRIBUTES
     }
 
     /// Sets the read-only, hidden, system and archive attributes the entry
@@ -455,12 +509,10 @@ impl FileWriter<'_> {
         self.file.as_ref().map_or(0, OpenFile::size)
     }
 
-    /// Sets or clears the read-only attribute the entry gets when the writer
-    /// is finished.
-    pub fn set_read_only(&mut self, read_only: bool) {
-        if let Some(file) = self.file.as_mut() {
-            file.set_read_only(read_only);
-        }
+    /// The attributes the entry gets when the writer is finished, see
+    /// [`OpenFile::attributes`].
+    pub fn attributes(&self) -> u8 {
+        self.file.as_ref().map_or(NO_ATTRIBUTES, OpenFile::attributes)
     }
 
     /// Sets the attributes the entry gets when the writer is finished, see
@@ -532,6 +584,12 @@ impl OpenRead {
     /// The file size.
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// The cluster the last read came from, the first cluster before the
+    /// first read.
+    pub(crate) fn cluster(&self) -> u32 {
+        self.current.map_or(self.first, |(cluster, _)| cluster)
     }
 }
 

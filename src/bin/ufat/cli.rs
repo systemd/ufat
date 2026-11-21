@@ -14,16 +14,21 @@ use fat::format::{self, FormatOptions, VolumeId};
 use fat::fsck;
 use fat::host;
 use fat::layout::MIN_SECTOR_SIZE;
-use fat::manifest::{self, AssembleOptions, DirectorySource, StreamSource};
+use fat::manifest::{
+    AssembleFlags, AssembleObserver, AssembleOptions, DirectorySource, Features, HostTree, Name, PinnedDirectory,
+    Problem, SerialSource, SkipReason, StreamSource, WriteReport,
+};
 use fat::plan::{Plan, PlanOptions};
 use fat::populate::{CopyOptions, TimePolicy};
-use fat::probe::Prober;
 use fat::time::civil_from_days;
-use fat::volume::Volume;
-use fat::{bail, err, Context, Detail, Error, Result};
+use fat::volume::{NameCollision, Volume};
+use fat::{bail, err, Context, DescriptorProblem, Detail, Error, ManifestProblem, Result};
 
 use crate::service;
-use crate::util::{self, ImageFlags};
+use crate::util::{
+    self, Failure, GivenSize, ImageFlags, ManifestInput, ManifestOperation, ManifestUse, NewVolume, PlanOutcome,
+    SerialDerivation, SizeMode, SizeRequest,
+};
 
 const USAGE: &str = "\
 Usage: ufat COMMAND [OPTIONS...] ARGS...
@@ -31,11 +36,12 @@ Usage: ufat COMMAND [OPTIONS...] ARGS...
        ufat --version
 
 Commands:
-  assemble [OPTIONS] IMAGE [SOURCE...]   Create a FAT32 file system sized to fit
-                                         the sources and fill it with them
-  assemble --plan [OPTIONS] [SOURCE...]  Print the smallest file system size for
-                                         the sources
-  populate [OPTIONS] IMAGE [SOURCE...]   Fill an existing FAT32 file system
+  assemble [OPTIONS] IMAGE [SOURCE]      Create a FAT32 file system and fill it
+                                         with SOURCE or what --manifest
+                                         describes
+  assemble --plan [OPTIONS] [SOURCE]     Print the smallest file system size for
+                                         SOURCE or what --manifest describes
+  populate [OPTIONS] IMAGE [SOURCE]      Fill an existing FAT32 file system
   remove [OPTIONS] IMAGE PATH...         Remove files and directories
   list [-l] IMAGE [PATH]                 List a directory
   describe [OPTIONS] IMAGE               Show a file system's geometry
@@ -48,8 +54,11 @@ Commands:
 The commands are the methods of the org.uapi-group.FileSystem Varlink
 interface that ufat serves; cat and manifest have no method.
 
-assemble without a SOURCE creates an empty file system of the size of IMAGE or
---size, or sized to hold the --fit directories or what --manifest describes.
+assemble makes the file system as large as --size, or else as large as the
+part of IMAGE behind --offset. --minimize makes it the smallest that holds the
+content, and --size is then the most it may take. Without a SOURCE it is
+empty. The --fit directory or what --manifest describes then has to fit
+--size, and without --size the file system is the smallest that holds it.
 assemble refuses an IMAGE that holds a file system, a partition table or other
 data libblkid recognizes, or without libblkid anything that is not blank.
 --force formats it anyway.
@@ -58,7 +67,16 @@ Without a SOURCE it creates the directory --path.
 
 A SOURCE is a directory tree, or for populate one file. With --manifest the
 one SOURCE is the tree the manifest describes, where its file contents are
-read, or - for the contents on standard input, back to back in manifest order:
+read, or - for the contents on standard input, back to back in manifest order.
+The manifest has to declare \"order\": \"codepoint\" and be in that order. Its
+fatSerial or fsUUID and its fsLabel, or no fsLabel where it lists fs-label,
+give the file system assemble makes its serial number and label, which
+--identifier and --label have to agree with and populate checks. Without
+fatSerial, fsUUID and --identifier the serial number is the start of the
+manifest's SHA-256 hash.
+assemble --minimize with a SOURCE reads the manifest twice, to plan the file
+system and to fill it, and needs it in a regular file. Everything else reads
+it once and takes a pipe:
   --manifest PATH       Build what the UAPI.16 manifest at PATH, or on standard
                         input for -, describes
   --no-check-validity   Accept revoked and expired manifest entries
@@ -67,12 +85,15 @@ read, or - for the contents on standard input, back to back in manifest order:
 
 Options common to commands taking IMAGE:
   --offset BYTES        Byte offset of the file system inside IMAGE
-  --size BYTES          Size of the file system inside IMAGE (assemble: instead
-                        of the size that fits the sources; assemble --plan:
-                        fail when the sources do not fit this size)
+  --size BYTES          Size of the file system inside IMAGE, or with
+                        --minimize the most it may take (--minimize, --plan,
+                        --fit and --manifest without a SOURCE fail when the
+                        content does not fit this size)
 
 Options for assemble:
-  --plan                Print the size the sources need and write nothing
+  --plan                Print the size the content needs and write nothing
+  --minimize            Make the file system the smallest that holds the
+                        content
   --sector-size BYTES   Logical sector size, 512 or 4096 (1024 and 2048 work)
   --cluster-size BYTES  Cluster size
   --identifier ID       Volume serial number, XXXX-XXXX or 8 hex digits
@@ -85,11 +106,14 @@ Options for assemble:
   --fats N              FAT copies (default 2)
   --mkfs-fat-compat     Reproduce mkfs.fat's layout quirks exactly
   --zero                Zero the whole data area
-  --create              Create IMAGE if it does not exist (without a SOURCE it
-                        needs --size, --fit or --manifest for that)
+  --create              Create IMAGE if it does not exist (it then needs --size,
+                        --minimize, --fit, or --manifest without a SOURCE).
+                        IMAGE gets its name only once assemble succeeded (the
+                        README says when a failure leaves it nonetheless)
   --force, -f           Format IMAGE whatever it holds
-  --fit DIR             Size IMAGE to the smallest file system holding DIR
-                        and leave it empty (no SOURCE; repeatable)
+  --fit DIR             Size IMAGE for DIR and leave it empty (no SOURCE):
+                        --size, which DIR has to fit, or else the smallest
+                        file system holding DIR
   --hash ALGORITHM      Print the sha256 or sha512 hash of the file system
                         written
   --write-hash PATH     Write that hash to PATH instead, or to standard output
@@ -100,7 +124,9 @@ Options for assemble and populate:
                         for a manifest the time of entries that carry none
   --times POLICY        preserve (default), fixed or clamp (clamp is the default
                         when $SOURCE_DATE_EPOCH is set; trees and files)
-  --no-replace          Fail on existing files instead of replacing them
+  --replace             Replace a file that is there already, and take a name
+                        FAT does not tell apart from one that is there as that
+                        name, instead of failing
   --path PATH           The directory a SOURCE tree goes below (default /), the
                         path of a SOURCE file, or the directory to create
   --parents             Create missing parent directories of --path, and
@@ -327,8 +353,16 @@ const FILL_VALUES: &[&str] = &[
     "unsupported",
     "write-manifest",
 ];
-const FILL_FLAGS: &[&str] = &["no-replace", "no-check-validity", "verbose"];
-const FORMAT_FLAGS: &[&str] = &["no-align", "mkfs-fat-compat", "zero", "create", "force", "verbose"];
+const FILL_FLAGS: &[&str] = &["no-check-validity", "replace", "verbose"];
+const FORMAT_FLAGS: &[&str] = &[
+    "no-align",
+    "mkfs-fat-compat",
+    "zero",
+    "create",
+    "force",
+    "minimize",
+    "verbose",
+];
 
 fn with(a: &[&'static str], b: &[&'static str]) -> Vec<&'static str> {
     a.iter().chain(b).copied().collect()
@@ -357,14 +391,19 @@ fn time_policy(args: &Args) -> Result<TimePolicy> {
     })
 }
 
+/// The serial number `--identifier` gives.
+fn identifier(args: &Args) -> Result<Option<VolumeId>> {
+    args.value("identifier").map(str::parse::<VolumeId>).transpose()
+}
+
 fn format_options(args: &Args) -> Result<FormatOptions> {
     let (time, reproducible) = stamp_time(args)?;
     let mut o = FormatOptions::default();
     o.sector_size = args.u32("sector-size")?;
     o.cluster_size = args.u32("cluster-size")?;
     o.label = args.value("label").map(str::to_string);
-    o.volume_id = match args.value("identifier") {
-        Some(v) => v.parse::<VolumeId>()?.0,
+    o.volume_id = match identifier(args)? {
+        Some(identifier) => identifier.0,
         None => util::pick_volume_id(time, o.label.as_deref(), reproducible),
     };
     o.timestamp = Some(time);
@@ -398,13 +437,13 @@ fn fail_unsupported(args: &Args) -> Result<bool> {
     }
 }
 
-/// Where SOURCE trees go: `--path`, the root by default.
+/// Where a SOURCE tree goes: `--path`, the root by default.
 fn dest(args: &Args) -> &str {
     args.value("path").unwrap_or("/")
 }
 
 /// Where the contents of a manifest's files come from.
-enum Data {
+enum ContentOrigin {
     /// The tree the manifest describes, pinned.
     Directory { path: PathBuf, dir: OwnedFd },
     /// Standard input: every file's contents back to back, in manifest
@@ -412,26 +451,56 @@ enum Data {
     Stdin,
 }
 
-/// The manifest `--manifest` named, read once, and where its data is.
-struct ManifestSource {
-    /// How messages name the manifest: its path, or standard input.
-    name: String,
-    manifest: manifest::Manifest,
-    /// None for the commands that only size.
-    data: Option<Data>,
+/// The SOURCE argument, resolved once and before any image is touched.
+enum Source {
+    /// Neither a SOURCE nor `--manifest`.
+    None,
+    /// A directory tree, pinned.
+    Tree { path: PathBuf, dir: OwnedFd },
+    /// The manifest `--manifest` named, open with its root file object
+    /// read, and where the contents of its files come from.
+    Manifest {
+        /// How messages name the manifest: its path, or standard input.
+        name: String,
+        manifest: Box<ManifestInput>,
+        /// None for the commands that only size, and once the contents
+        /// were written.
+        contents: Option<ContentOrigin>,
+    },
 }
 
-/// The SOURCE arguments, resolved once and before any image is touched:
-/// directory trees, or with `--manifest` the one place the manifest's file
-/// contents come from.
-struct Sources {
-    trees: Vec<(PathBuf, OwnedFd)>,
-    manifest: Option<ManifestSource>,
+/// What a command does with its SOURCE.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sourcing {
+    /// The caller sizes a file system for the SOURCE and writes nothing of
+    /// it. A manifest takes no SOURCE then, since it carries the sizes, and
+    /// is planned on from its root file object, so it is read once.
+    Size,
+    /// The caller writes the SOURCE into a file system, and reads a manifest
+    /// as the use says. A manifest takes one SOURCE then: the directory its
+    /// file contents are read from, or "-" for standard input.
+    Write(ManifestUse),
 }
 
-/// Reads and parses the manifest `path` names, or the one on standard input
-/// for "-". Returns it with the name messages give it.
-fn read_manifest(path: &Path) -> Result<(manifest::Manifest, String)> {
+impl Sourcing {
+    /// What the command does with a manifest.
+    fn manifest_use(self) -> ManifestUse {
+        match self {
+            Sourcing::Size => ManifestUse::PlanOnly,
+            Sourcing::Write(manifest_use) => manifest_use,
+        }
+    }
+}
+
+/// Opens the manifest `path` names, or the one on standard input for "-",
+/// for `manifest_use`, and reads its first record. Its bytes are hashed
+/// where `derivation` says that a serial number may be derived from them.
+/// Returns it with the name messages give it.
+fn read_manifest(
+    path: &Path,
+    manifest_use: ManifestUse,
+    derivation: SerialDerivation,
+) -> Result<(ManifestInput, String)> {
     let (file, name) = if path == Path::new("-") {
         // A descriptor of our own, since the reader closes it.
         let fd = std::io::stdin().as_fd().try_clone_to_owned()?;
@@ -439,128 +508,282 @@ fn read_manifest(path: &Path) -> Result<(manifest::Manifest, String)> {
     } else {
         (host::open_file(path)?, path.display().to_string())
     };
-    let manifest = util::read_manifest(file).map_err(|e| {
-        if e.is_manifest() {
-            e.context(format_args!("{} is not a UAPI.16 manifest", name))
-        } else {
-            e.context(format_args!("cannot read {} as a manifest", name))
-        }
+    let input = ManifestInput::open(file, manifest_use, derivation).map_err(|e| match e.detail() {
+        // A manifest, but not one ufat takes.
+        Some(Detail::Manifest {
+            problem: ManifestProblem::Malformed(Problem::NoOrder),
+            ..
+        }) => e.context(&name),
+        // A pipe, refused before anything was read from it.
+        Some(Detail::Descriptor {
+            problem: DescriptorProblem::WrongType,
+            ..
+        }) => err!(
+            errno::EINVAL,
+            "{} is not a regular file: --minimize with a SOURCE needs the manifest in one",
+            name
+        ),
+        _ if e.is_manifest() => e.context(format_args!("{} is not a UAPI.16 manifest", name)),
+        _ => e.context(format_args!("cannot read {} as a manifest", name)),
     })?;
-    Ok((manifest, name))
+    Ok((input, name))
 }
 
-/// Resolves the SOURCE arguments (the `--fit` directories for an empty
-/// file system), each exactly once. Without `--manifest` every one is a
-/// directory tree. With it there is exactly one, the directory the manifest
-/// describes or "-" for the file contents on standard input; sizing takes
-/// none, the manifest carries the sizes. `--path` is for trees only.
-fn sources(args: &Args, paths: &[&Path], sizing: bool) -> Result<Sources> {
-    let Some(m) = args.path("manifest") else {
-        let mut trees = Vec::with_capacity(paths.len());
-        for &p in paths {
-            let dir = host::open_dir(p).map_err(|e| {
-                if e.errno() == errno::ENOTDIR {
-                    e.context("a SOURCE is a directory tree; --manifest PATH names a manifest")
-                } else {
-                    e
+impl Source {
+    /// Resolves the SOURCE argument (the `--fit` directory for an empty file
+    /// system) exactly once. Without `--manifest` it is a directory tree.
+    /// With it, it is the directory the manifest describes or "-" for the
+    /// file contents on standard input; [`Sourcing::Size`] takes none, the
+    /// manifest carries the sizes. `--path` is for trees only. The SOURCE
+    /// arguments and `--path` are checked before anything is opened. The
+    /// manifest is opened last, for what `sourcing` does with it, and its
+    /// root file object is read. It is hashed where `operation`, the one of
+    /// the command, may derive a serial number from it.
+    fn open(args: &Args, paths: &[&Path], sourcing: Sourcing, operation: ManifestOperation) -> Result<Source> {
+        let Some(m) = args.path("manifest") else {
+            return match paths {
+                [] => Ok(Source::None),
+                [path] => {
+                    let dir = host::open_dir(path).map_err(|e| {
+                        if e.errno() == errno::ENOTDIR {
+                            e.context("a SOURCE is a directory tree; --manifest PATH names a manifest")
+                        } else {
+                            e
+                        }
+                    })?;
+                    Ok(Source::Tree {
+                        path: path.to_path_buf(),
+                        dir,
+                    })
                 }
-            })?;
-            trees.push((p.to_path_buf(), dir));
-        }
-        return Ok(Sources { trees, manifest: None });
-    };
-    if m == Path::new("-") && !sizing && matches!(paths, [p] if *p == Path::new("-")) {
-        bail!(
-            errno::EINVAL,
-            "--manifest - and a SOURCE of - cannot both read standard input"
-        );
-    }
-    let (manifest, name) = read_manifest(m)?;
-    if dest(args) != "/" {
-        bail!(
-            errno::EINVAL,
-            "--path applies to directory trees; a manifest names its paths from the root"
-        );
-    }
-    let data = match (sizing, paths) {
-        (true, []) => None,
-        (true, _) => bail!(
-            errno::EINVAL,
-            "--manifest carries the sizes, no SOURCE or --fit directory is taken with it"
-        ),
-        (false, [p]) if *p == Path::new("-") => Some(Data::Stdin),
-        (false, [p]) => Some(Data::Directory {
-            path: p.to_path_buf(),
-            dir: host::open_dir(p)?,
-        }),
-        (false, _) => bail!(
-            errno::EINVAL,
-            "--manifest takes exactly one SOURCE: the directory the manifest describes, or - for the file contents on standard input"
-        ),
-    };
-    Ok(Sources {
-        trees: Vec::new(),
-        manifest: Some(ManifestSource { name, manifest, data }),
-    })
-}
-
-/// What can be checked before an image is created, formatted or written:
-/// that the manifest and, under `--unsupported fail`, the trees can be
-/// stored, and that every file the manifest names is below the SOURCE with
-/// the size it says.
-fn check_sources(args: &Args, sources: &Sources) -> Result<()> {
-    if fail_unsupported(args)? {
-        for (path, dir) in &sources.trees {
-            let mut plan = Plan::new(PlanOptions::new(MIN_SECTOR_SIZE));
-            if let Some(skipped) = plan.add_tree(dir.as_fd(), dest(args), true)?.first() {
-                bail!(
+                _ => bail!(
                     errno::EINVAL,
-                    "{} cannot be stored on FAT",
-                    path.join(skipped).display()
-                );
+                    "only one directory tree can be given; --manifest PATH names a manifest"
+                ),
+            };
+        };
+        if m == Path::new("-") && sourcing != Sourcing::Size && matches!(paths, [p] if *p == Path::new("-")) {
+            bail!(
+                errno::EINVAL,
+                "--manifest - and a SOURCE of - cannot both read standard input"
+            );
+        }
+        if dest(args) != "/" {
+            bail!(
+                errno::EINVAL,
+                "--path applies to directory trees; a manifest names its paths from the root"
+            );
+        }
+        let contents = match (sourcing, paths) {
+            (Sourcing::Size, []) => None,
+            (Sourcing::Size, _) => bail!(
+                errno::EINVAL,
+                "--manifest carries the sizes, no SOURCE or --fit directory is taken with it"
+            ),
+            (Sourcing::Write(_), [path]) if *path == Path::new("-") => Some(ContentOrigin::Stdin),
+            (Sourcing::Write(_), [path]) => Some(ContentOrigin::Directory {
+                path: path.to_path_buf(),
+                dir: host::open_dir(path)?,
+            }),
+            (Sourcing::Write(_), _) => bail!(
+                errno::EINVAL,
+                "--manifest takes exactly one SOURCE: the directory the manifest describes, or - for the file contents on standard input"
+            ),
+        };
+        let derivation = operation.serial_derivation(identifier(args)?);
+        let (manifest, name) = read_manifest(m, sourcing.manifest_use(), derivation)?;
+        Ok(Source::Manifest {
+            name,
+            manifest: Box::new(manifest),
+            contents,
+        })
+    }
+
+    /// What can be checked before an image is created, formatted or
+    /// written: under `--unsupported fail`, that the tree can be stored. A
+    /// manifest is checked as it is written.
+    fn check(&mut self, args: &Args) -> Result<()> {
+        match self {
+            Source::Tree { .. } if fail_unsupported(args)? => {
+                self.add_to(&mut Plan::new(PlanOptions::new(MIN_SECTOR_SIZE)), args)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Adds the source to a plan, the way [`Source::fill`] writes it, and
+    /// returns how many objects of a manifest are left out. Under
+    /// `--unsupported fail` what FAT cannot store of a tree fails the plan.
+    /// The plan reads the manifest once more from its start, so its content
+    /// can be written after, and keeps its hash where it is wanted.
+    fn add_to(&mut self, plan: &mut Plan, args: &Args) -> Result<u64> {
+        match self {
+            Source::None => Ok(0),
+            Source::Tree { path, dir } => {
+                let skipped = plan.add_tree(dir.as_fd(), dest(args), &copy_options(args)?)?;
+                if let (Some(skipped), true) = (skipped.first(), fail_unsupported(args)?) {
+                    bail!(
+                        errno::EINVAL,
+                        "{} cannot be stored on FAT",
+                        path.join(skipped).display()
+                    );
+                }
+                Ok(0)
+            }
+            Source::Manifest { name, manifest, .. } => {
+                manifest.plan(plan, assemble_flags(args)?).map_err(about_manifest(name))
             }
         }
     }
-    let Some(m) = &sources.manifest else {
-        return Ok(());
-    };
-    if fail_unsupported(args)? {
-        m.manifest.check_supported()?;
-    }
-    if let Some(Data::Directory { path, dir }) = &m.data {
-        DirectorySource::new(dir.try_clone()?)
-            .follow_symlinks(true)
-            .verify(&m.manifest)
-            .map_err(|e| {
-                e.context(format!(
-                    "the files {} describes are not all below {}",
-                    m.name,
-                    path.display()
-                ))
-            })?;
-    }
-    Ok(())
-}
 
-/// Adds the sources to a plan, the way `fill` will write them.
-fn plan_sources(plan: &mut Plan, args: &Args, sources: &Sources) -> Result<()> {
-    for (_, dir) in &sources.trees {
-        plan.add_tree(dir.as_fd(), dest(args), true)?;
-    }
-    if let Some(m) = &sources.manifest {
-        for skipped in plan.add_manifest(&m.manifest)? {
-            eprintln!("ufat: not counted {}: it cannot be stored on FAT", skipped);
+    /// Adds the source to a plan when nothing is written after it, and
+    /// returns what the plan found in a manifest. The manifest is read on
+    /// from its root file object, so it is read once.
+    fn into_plan(self, plan: &mut Plan, args: &Args) -> Result<PlanOutcome> {
+        match self {
+            Source::Manifest { name, manifest, .. } => manifest
+                .plan_once(plan, assemble_flags(args)?)
+                .map_err(about_manifest(&name)),
+            mut source => source
+                .add_to(plan, args)
+                .map(|skipped| PlanOutcome { skipped, digest: None }),
         }
     }
-    Ok(())
+
+    /// Reconciles the serial number and the label of a file system made
+    /// from a manifest with `options` and with `--identifier`, see
+    /// [`fat::manifest::VolumeIdentity::reconcile`], and returns where the
+    /// serial number comes from. A manifest is not hashed any further where
+    /// the serial number is not derived from it. Any other source gives the
+    /// file system nothing.
+    fn reconcile(&mut self, options: &mut FormatOptions, args: &Args) -> Result<SerialSource> {
+        let Source::Manifest { name, manifest, .. } = self else {
+            return Ok(SerialSource::Given);
+        };
+        let serial = manifest
+            .identity()
+            .reconcile(options, identifier(args)?)
+            .map_err(|e| e.context(name.as_str()))?;
+        if serial == SerialSource::Given {
+            manifest.stop_hashing();
+        }
+        Ok(serial)
+    }
+
+    /// Gives `volume`, made from a manifest and filled with its content,
+    /// the serial number derived from the manifest where `serial` says that
+    /// it takes that one.
+    fn stamp_serial(&self, volume: &mut Volume, serial: SerialSource) -> Result<()> {
+        match self {
+            Source::Manifest { manifest, .. } => manifest.stamp_serial(volume, serial),
+            Source::None | Source::Tree { .. } => Ok(()),
+        }
+    }
+
+    /// Writes the source into an open volume: the tree copied, or the
+    /// manifest assembled while it is read, which takes the contents of its
+    /// files.
+    fn fill(&mut self, volume: &mut Volume, args: &Args) -> Result<()> {
+        let copy = copy_options(args)?;
+        match self {
+            Source::None => {}
+            Source::Tree { path, dir } => {
+                let report = volume.copy_tree(dir.as_fd(), dest(args), &copy)?;
+                if args.flag("verbose") {
+                    eprintln!(
+                        "{}: {}",
+                        path.display(),
+                        contents(report.files, report.directories, report.bytes)
+                    );
+                }
+                for skipped in report.skipped {
+                    eprintln!(
+                        "ufat: skipped {}: not a regular file or directory",
+                        path.join(skipped).display()
+                    );
+                }
+            }
+            Source::Manifest {
+                name,
+                manifest,
+                contents: origin,
+            } => {
+                let options = assemble_options(args)?;
+                let reader = manifest.reader();
+                let report = match origin.take() {
+                    Some(ContentOrigin::Stdin) => {
+                        let stdin = std::io::stdin();
+                        let mut lock = stdin.lock();
+                        let mut source = StreamSource::new(&mut lock);
+                        volume.assemble_with_observer(reader, &mut source, &options, &mut SkipNotes)
+                    }
+                    Some(ContentOrigin::Directory { path, dir }) => {
+                        let mut source = DirectorySource::new(PinnedDirectory::new(dir).follow_symlinks(true));
+                        volume
+                            .assemble_with_observer(reader, &mut source, &options, &mut SkipNotes)
+                            .map_err(about_source_directory(&path))
+                    }
+                    None => bail!(errno::EINVAL, "a manifest needs a SOURCE to be filled from"),
+                }
+                .map_err(about_manifest(name))?;
+                if args.flag("verbose") {
+                    eprintln!("{}: {}", name, contents(report.files, report.directories, report.bytes));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
+/// Says what an assembly leaves out, on standard error.
+struct SkipNotes;
+
+impl AssembleObserver for SkipNotes {
+    fn skipped(&mut self, name: &Name, reason: SkipReason) {
+        match reason {
+            SkipReason::Unsupported => eprintln!("ufat: skipped {}: it cannot be stored on FAT", name),
+            _ => eprintln!("ufat: skipped {}: the directory it is in was skipped", name),
+        }
+    }
+}
+
+/// What a copy does with a name the volume holds already: it takes what is
+/// there with `--replace` and fails without.
+fn name_collision(args: &Args) -> NameCollision {
+    if args.flag("replace") {
+        NameCollision::Replace
+    } else {
+        NameCollision::Fail
+    }
+}
+
+/// How the command line asks a copy of a tree, and the plan of one, to
+/// take it: following symbolic links, and replacing what is there with
+/// `--replace`.
+fn copy_options(args: &Args) -> Result<CopyOptions> {
+    Ok(CopyOptions {
+        times: time_policy(args)?,
+        name_collision: name_collision(args),
+        follow_symlinks: true,
+    })
+}
+
+/// How the command line asks an assembly, and the plan of one, to store a
+/// manifest's objects: replacing what is there with `--replace`, and
+/// leaving out what FAT cannot store unless `--unsupported fail`.
+fn assemble_flags(args: &Args) -> Result<AssembleFlags> {
+    Ok(AssembleFlags::NONE
+        .with(AssembleFlags::REPLACE, args.flag("replace"))
+        .with(AssembleFlags::SKIP_UNSUPPORTED, !fail_unsupported(args)?))
+}
+
+/// What the command line asks of an assembly.
 fn assemble_options(args: &Args) -> Result<AssembleOptions> {
     let (time, _) = stamp_time(args)?;
     Ok(AssembleOptions {
         default_time: time,
-        replace: !args.flag("no-replace"),
-        skip_unsupported: !fail_unsupported(args)?,
+        flags: assemble_flags(args)?,
         now_usec: if args.flag("no-check-validity") {
             None
         } else {
@@ -569,57 +792,32 @@ fn assemble_options(args: &Args) -> Result<AssembleOptions> {
     })
 }
 
-/// Writes the sources into an open volume: the trees copied in the order
-/// given, or the manifest assembled.
-fn fill(v: &mut Volume, args: &Args, sources: &Sources) -> Result<()> {
-    let copy = CopyOptions {
-        times: time_policy(args)?,
-        replace: !args.flag("no-replace"),
-        follow_symlinks: true,
-    };
-    for (path, dir) in &sources.trees {
-        let report = v.copy_tree(dir.as_fd(), dest(args), &copy)?;
-        if args.flag("verbose") {
-            eprintln!(
-                "{}: {}",
-                path.display(),
-                contents(report.files, report.directories, report.bytes)
-            );
-        }
-        for skipped in report.skipped {
-            eprintln!(
-                "ufat: skipped {}: not a regular file or directory",
-                path.join(skipped).display()
-            );
-        }
+/// Names the manifest `name` in an error that is about it: one about the
+/// manifest itself, or about the label it names.
+fn about_manifest(name: &str) -> impl Fn(Error) -> Error + '_ {
+    move |e| match e.detail() {
+        Some(Detail::Manifest { .. } | Detail::Label { .. }) => e.context(name),
+        _ => e,
     }
-    if let Some(m) = &sources.manifest {
-        let options = assemble_options(args)?;
-        let report = match &m.data {
-            Some(Data::Stdin) => {
-                let stdin = std::io::stdin();
-                let mut lock = stdin.lock();
-                v.assemble(&m.manifest, &mut StreamSource::new(&mut lock), &options)?
-            }
-            Some(Data::Directory { dir, .. }) => v.assemble(
-                &m.manifest,
-                &mut DirectorySource::new(dir.try_clone()?).follow_symlinks(true),
-                &options,
-            )?,
-            None => bail!(errno::EINVAL, "a manifest needs a SOURCE to be filled from"),
-        };
-        if args.flag("verbose") {
-            eprintln!(
-                "{}: {}",
-                m.name,
-                contents(report.files, report.directories, report.bytes)
-            );
-        }
-        for skipped in report.skipped {
-            eprintln!("ufat: skipped {}: it cannot be stored on FAT", skipped);
-        }
+}
+
+/// Names the image `image` in an error about the file system in it: that
+/// it is not the one a manifest names.
+fn about_file_system(image: &Path) -> impl Fn(Error) -> Error + '_ {
+    move |e| match e.detail() {
+        Some(Detail::FileSystemMismatch { .. }) => e.context(image.display()),
+        _ => e,
     }
-    Ok(())
+}
+
+/// Names the directory `path`, where the contents of a manifest's files
+/// are looked up, in an error about one of its files: one that is missing
+/// or not a regular file, or whose contents are not what the manifest says.
+fn about_source_directory(path: &Path) -> impl Fn(Error) -> Error + '_ {
+    move |e| match e.detail() {
+        Some(Detail::Source { .. } | Detail::Content { .. }) => e.context(path.display()),
+        _ => e,
+    }
 }
 
 /// Whether `--write-manifest -` puts the manifest on standard output. What
@@ -631,17 +829,29 @@ fn manifest_to_stdout(args: &Args) -> bool {
 /// Writes the UAPI.16 manifest of everything `v` holds to the file `path`,
 /// or to standard output for "-", for `--write-manifest`.
 fn write_manifest(v: &Volume, path: &Path) -> Result<()> {
-    let fields = manifest::volume::Fields::default();
-    let (report, shown) = if path == Path::new("-") {
-        let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-        let report = manifest::volume::write(v, v.root_time()?, fields, &mut out)?;
-        (report, "the manifest on standard output".to_string())
+    if path == Path::new("-") {
+        write_manifest_to(v, std::io::stdout().lock(), STDOUT_MANIFEST)
     } else {
         let file = std::fs::File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
-        let mut out = std::io::BufWriter::new(file);
-        let report = manifest::volume::write(v, v.root_time()?, fields, &mut out)?;
-        (report, path.display().to_string())
-    };
+        write_manifest_to(v, file, &path.display().to_string())
+    }
+}
+
+/// Writes the UAPI.16 manifest of everything `v` holds to `out`, which the
+/// messages call `shown`.
+fn write_manifest_to(v: &Volume, out: impl Write, shown: &str) -> Result<()> {
+    let report = v.write_manifest(v.root_time()?, Features::DEFAULT, std::io::BufWriter::new(out))?;
+    warn_about_manifest(&report, shown);
+    Ok(())
+}
+
+/// How the messages name a manifest written to standard output.
+const STDOUT_MANIFEST: &str = "the manifest on standard output";
+
+/// Says how many entries the manifest `shown`, of which `report` is what
+/// it covers, leaves out, which label it leaves out, and how many files
+/// changed while they were read for it.
+fn warn_about_manifest(report: &WriteReport, shown: &str) {
     match report.omitted {
         0 => {}
         1 => eprintln!(
@@ -653,7 +863,23 @@ fn write_manifest(v: &Volume, path: &Path) -> Result<()> {
             n, shown
         ),
     }
-    Ok(())
+    if let Some(label) = &report.omitted_label {
+        eprintln!(
+            "ufat: the label '{}' is not in {}: a file system made from it would not get that label",
+            label, shown
+        );
+    }
+    match report.changed {
+        0 => {}
+        1 => eprintln!(
+            "ufat: 1 file changed while it was read: {} has the size and the hash of what was read",
+            shown
+        ),
+        n => eprintln!(
+            "ufat: {} files changed while they were read: {} has the sizes and the hashes of what was read",
+            n, shown
+        ),
+    }
 }
 
 /// Reports the geometry of a freshly made file system.
@@ -689,25 +915,57 @@ fn image_arg<'a>(args: &'a Args, command: &str) -> Result<&'a Path> {
     }
 }
 
-/// `assemble --plan`: the size the sources need, with nothing written.
+/// `assemble --plan`: the size the content needs, with nothing written. It
+/// answers for `assemble` with the same options. With `--size` and without
+/// `--minimize` that makes a file system of that size, so the content is
+/// planned with the cluster size the formatter picks for it and has to fit
+/// its clusters. Otherwise the plan is of the smallest file system, which
+/// with `--minimize` has to fit in `--size`.
 fn plan(args: &Args) -> Result<()> {
     if args.positional.is_empty() && args.path("manifest").is_none() {
-        bail!(errno::EINVAL, "assemble --plan needs at least one SOURCE or --manifest");
+        bail!(errno::EINVAL, "assemble --plan needs a SOURCE or --manifest");
     }
-    let options = format_options(args)?;
-    let mut plan = Plan::new(PlanOptions::from_format_options(&options, None)?);
-    let sources = sources(args, &args.positional_paths(), true)?;
-    plan_sources(&mut plan, args, &sources)?;
+    // Nothing is written after a plan, so it reads the manifest on from its
+    // root file object, and the manifest is read once. A pipe will do. The
+    // plan prints no serial number, so the manifest is not hashed.
+    let mut source = Source::open(
+        args,
+        &args.positional_paths(),
+        Sourcing::Size,
+        ManifestOperation::PlanSize,
+    )?;
+    let mut options = format_options(args)?;
+    // The label a manifest gives takes an entry in the root directory.
+    source.reconcile(&mut options, args)?;
+    let mut plan_options = PlanOptions::from_format_options(&options, None)?;
+    let size = args.size("size")?;
+    let given = match size {
+        Some(size) if !args.flag("minimize") => Some(GivenSize::new(&options, size, None)?),
+        _ => None,
+    };
+    if let Some(given) = &given {
+        plan_options.cluster_size = Some(given.layout.cluster_size());
+    }
+    let mut plan = Plan::new(plan_options);
+    let skipped = source.into_plan(&mut plan, args)?.skipped;
+    if skipped > 0 {
+        eprintln!(
+            "ufat: not counted: {}",
+            plural(skipped, "object FAT cannot store", "objects FAT cannot store")
+        );
+    }
     let e = plan.estimate()?;
-    if let Some(size) = args.size("size")? {
-        if e.size() > size {
-            bail!(
-                errno::ENOSPC,
-                "the sources need a {} byte file system, more than --size {}",
-                e.size(),
-                size
-            );
-        }
+    match (&given, size) {
+        (Some(given), _) => given
+            .check(&e)
+            .map_err(|shortfall| err!(errno::ENOSPC, "{}", shortfall))?,
+        (None, Some(size)) if e.size() > size => bail!(
+            errno::ENOSPC,
+            "the content needs a {} byte file system, more than --size {}",
+            e.size(),
+            size
+        ),
+        _ => {}
     }
     println!("{}", e.size());
     if args.flag("verbose") {
@@ -722,77 +980,107 @@ fn plan(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// `assemble` without a SOURCE: an empty file system, of the size of the
-/// image or `--size`, or sized for the `--fit` directories or what
-/// `--manifest` describes.
-fn assemble_empty(args: &Args, path: &Path) -> Result<Volume> {
-    let mut options = format_options(args)?;
-    let offset = args.size("offset")?.unwrap_or(0);
-    let size = args.size("size")?;
+/// `assemble` without a SOURCE: an empty file system of the size of
+/// `--size` or of the image, or with `--minimize` the smallest one. The
+/// `--fit` directory or what `--manifest` describes has to fit a size
+/// given, and without one the file system is the smallest that holds it.
+fn assemble_empty(args: &Args, path: &Path) -> std::result::Result<NewVolume, Failure> {
     let fit = args.paths("fit");
-    let target = util::Target {
-        path,
-        offset,
-        size,
-        flags: args.image_flags(),
-    };
-    if fit.is_empty() && args.path("manifest").is_none() {
-        let mut device = util::open_target(&target)?;
-        if !target.flags.contains(ImageFlags::FORCE) {
-            Prober::new().ensure_empty(&device, offset, size)?;
-        }
-        if target.flags.contains(ImageFlags::CREATE) {
-            let size = size.ok_or_else(|| err!(errno::EINVAL, "--create needs --size, --fit or --manifest"))?;
-            util::size_image(&mut device, offset, size)?;
-        }
-        let device = device.window(offset, size)?;
-        format::format(&device, &options)?;
-        return Volume::open(device);
-    }
-    let sources = sources(args, &fit, true)?;
-    let (volume, estimate) =
-        util::fit_and_format(&target, &mut options, &mut |plan| plan_sources(plan, args, &sources))
-            .map_err(|e| e.into_error(path))?;
-    report_estimate(args, path, &estimate);
-    Ok(volume)
-}
-
-/// `assemble` with SOURCE arguments: the file system sized to fit them,
-/// unless `--size` says otherwise, and filled with them.
-fn assemble_filled(args: &Args, path: &Path, paths: &[&Path]) -> Result<Volume> {
-    if !args.paths("fit").is_empty() {
-        bail!(
-            errno::EINVAL,
-            "--fit sizes an empty file system; with a SOURCE the file system is sized for it"
-        );
-    }
-    let sources = sources(args, paths, false)?;
-    // Better to learn about a bad manifest or tree before an image is sized
-    // and formatted.
-    check_sources(args, &sources)?;
-    let mut options = format_options(args)?;
     let target = util::Target {
         path,
         offset: args.size("offset")?.unwrap_or(0),
         size: args.size("size")?,
         flags: args.image_flags(),
     };
-    let (mut v, estimate) = util::fit_and_format(&target, &mut options, &mut |plan| plan_sources(plan, args, &sources))
-        .map_err(|e| e.into_error(path))?;
-    report_estimate(args, path, &estimate);
-    match fill(&mut v, args, &sources) {
-        Ok(()) => Ok(v),
-        Err(e) => Err(unfinished(v, e)),
+    // Nothing of the content is written, so a manifest is planned on from
+    // its root file object, through the reader that read it, and is read
+    // once: a pipe will do. fit_and_format() plans the content at most once.
+    let mut source = Source::open(args, &fit, Sourcing::Size, ManifestOperation::Assemble)?;
+    let mut options = format_options(args)?;
+    let serial = source.reconcile(&mut options, args)?;
+    let mode = if args.flag("minimize") {
+        SizeMode::Minimize
+    } else if matches!(source, Source::None) {
+        SizeMode::Given
+    } else {
+        SizeMode::Fit
+    };
+    let mut source = Some(source);
+    let mut digest = None;
+    let mut add = |plan: &mut Plan| match source.take() {
+        Some(source) => {
+            digest = source.into_plan(plan, args)?.digest;
+            Ok(())
+        }
+        None => bail!(errno::EINVAL, "the content is planned once"),
+    };
+    let (mut new, estimate) = util::fit_and_format(&target, &mut options, SizeRequest::new(mode, &mut add))?;
+    if let Some(estimate) = estimate {
+        report_estimate(args, path, &estimate);
     }
+    // The plan read all of a manifest, so a serial number derived from it
+    // is known now.
+    let stamped = serial
+        .derived_serial(digest)
+        .and_then(|id| id.map_or(Ok(()), |id| new.volume_mut().set_volume_id(id)));
+    if let Err(e) = stamped {
+        let leftovers = new.abandon();
+        return Err(Failure::new(e, leftovers));
+    }
+    Ok(new)
 }
 
-/// Closes the file system `assemble` failed to finish with `e`, marked as
-/// not cleanly unmounted as after a crash, so that nobody takes it for a
-/// finished one. Returns `e`: an error of the close is not the one the
-/// user needs to hear about.
-fn unfinished(v: Volume, e: Error) -> Error {
-    let _ = v.close_unfinished();
-    e
+/// `assemble` with a SOURCE: the file system of the size of `--size` or of
+/// the image, or with `--minimize` the smallest that holds it, filled with
+/// it.
+fn assemble_filled(args: &Args, path: &Path, paths: &[&Path]) -> std::result::Result<NewVolume, Failure> {
+    if !args.paths("fit").is_empty() {
+        return Err(err!(
+            errno::EINVAL,
+            "--fit sizes an empty file system; with a SOURCE --minimize sizes it for the SOURCE"
+        )
+        .into());
+    }
+    let mode = if args.flag("minimize") {
+        SizeMode::Minimize
+    } else {
+        SizeMode::Given
+    };
+    let mut source = Source::open(
+        args,
+        paths,
+        Sourcing::Write(mode.manifest_use()),
+        ManifestOperation::Assemble,
+    )?;
+    // Better to learn about a tree FAT cannot hold before an image is sized
+    // and formatted. With --minimize the plan finds it.
+    if mode == SizeMode::Given {
+        source.check(args)?;
+    }
+    let mut options = format_options(args)?;
+    let serial = source.reconcile(&mut options, args)?;
+    let target = util::Target {
+        path,
+        offset: args.size("offset")?.unwrap_or(0),
+        size: args.size("size")?,
+        flags: args.image_flags(),
+    };
+    let mut add = |plan: &mut Plan| source.add_to(plan, args).map(drop);
+    let (mut new, estimate) = util::fit_and_format(&target, &mut options, SizeRequest::new(mode, &mut add))?;
+    if let Some(estimate) = estimate {
+        report_estimate(args, path, &estimate);
+    }
+    // A serial number derived from a manifest is known once its content is
+    // written, whichever way the manifest came: in a regular file, read
+    // once more for --minimize or not, or through a pipe.
+    let filled = source
+        .fill(new.volume_mut(), args)
+        .and_then(|()| source.stamp_serial(new.volume_mut(), serial));
+    if let Err(e) = filled {
+        let leftovers = new.abandon();
+        return Err(Failure::new(e, leftovers));
+    }
+    Ok(new)
 }
 
 fn report_estimate(args: &Args, path: &Path, estimate: &fat::plan::Estimate) {
@@ -819,7 +1107,7 @@ fn force_hint(e: Error) -> Error {
     }
 }
 
-fn cmd_assemble(argv: &[OsString]) -> Result<()> {
+fn cmd_assemble(argv: &[OsString]) -> std::result::Result<(), Failure> {
     let args = Args::parse(
         argv,
         &with(
@@ -828,8 +1116,12 @@ fn cmd_assemble(argv: &[OsString]) -> Result<()> {
         ),
         &with(FORMAT_FLAGS, &with(FILL_FLAGS, &["plan"])),
     )?;
+    // Bad values fail here, whatever the command goes on to do. What uses
+    // them takes them from args again.
+    fail_unsupported(&args)?;
+    time_policy(&args)?;
     if args.flag("plan") {
-        return plan(&args);
+        return Ok(plan(&args)?);
     }
     let hash = match args.value("hash") {
         None => None,
@@ -840,43 +1132,88 @@ fn cmd_assemble(argv: &[OsString]) -> Result<()> {
     };
     let hash_path = args.path("write-hash");
     if hash_path.is_some() && hash.is_none() {
-        bail!(errno::EINVAL, "--write-hash needs --hash");
+        return Err(err!(errno::EINVAL, "--write-hash needs --hash").into());
     }
     if hash_path == Some(Path::new("-")) && manifest_to_stdout(&args) {
-        bail!(
+        return Err(err!(
             errno::EINVAL,
             "--write-manifest - and --write-hash - cannot both write to standard output"
-        );
+        )
+        .into());
     }
     let (path, paths) = match args.positional_paths().split_first() {
         Some((&i, s)) => (i, s.to_vec()),
-        None => bail!(errno::EINVAL, "assemble takes an IMAGE and SOURCE arguments"),
+        None => return Err(err!(errno::EINVAL, "assemble takes an IMAGE and a SOURCE").into()),
     };
-    let v = if paths.is_empty() {
+    let mut new = if paths.is_empty() {
         assemble_empty(&args, path)
     } else {
         assemble_filled(&args, path, &paths)
     }
-    .map_err(force_hint)?;
-    if let Some(m) = args.path("write-manifest") {
-        if let Err(e) = write_manifest(&v, m) {
-            return Err(unfinished(v, e));
+    .map_err(|failure| Failure::new(force_hint(failure.error), failure.leftovers))?;
+    // The image and the files written next to it get their names only once
+    // everything else succeeded, the hash of the file system included, so
+    // a failure before leaves none of them behind.
+    let digest = match write_outputs(&args, path, &mut new, hash, hash_path) {
+        Ok(digest) => digest,
+        Err(e) => {
+            let leftovers = new.abandon();
+            return Err(Failure::new(e, leftovers));
         }
+    };
+    let leftovers = new.link()?;
+    for line in leftovers.lines() {
+        eprintln!("ufat: {}", line);
     }
-    let layout = *v.layout();
-    v.close()?;
-    report_layout(path, &layout, args.flag("verbose"));
-    if let Some(hash) = hash {
-        let digest = hash.of(&open_image(&args, path, Access::ReadOnly)?, &mut |_| {})?;
-        match hash_path {
-            Some(p) if p != Path::new("-") => {
-                std::fs::write(p, format!("{}\n", digest)).with_context(|| format!("cannot write {}", p.display()))?
-            }
-            None if manifest_to_stdout(&args) => eprintln!("{}", digest),
-            _ => println!("{}", digest),
-        }
+    // Unlike a manifest, which streams, the hash is complete before the
+    // image gets its name, and printed only once it has it.
+    match digest {
+        Some(digest) if manifest_to_stdout(&args) => eprintln!("{}", digest),
+        Some(digest) => writeln!(std::io::stdout().lock(), "{}", digest).with_context(|| "cannot write the hash")?,
+        None => {}
     }
     Ok(())
+}
+
+/// Writes what `assemble` writes about the file system it made in the
+/// image `path`: the manifest of `--write-manifest`, and the hash of
+/// `--hash`, which is taken through the descriptor the file system was
+/// written through, once it is synced. Returns the hash where it is printed
+/// rather than written to `--write-hash`.
+fn write_outputs(
+    args: &Args,
+    path: &Path,
+    new: &mut NewVolume,
+    hash: Option<service::Hash>,
+    hash_path: Option<&Path>,
+) -> Result<Option<String>> {
+    match args.path("write-manifest") {
+        Some(m) if m != Path::new("-") => {
+            let out = new
+                .output(m)
+                .with_context(|| format!("cannot create {}", m.display()))?;
+            write_manifest_to(new.volume(), out, &m.display().to_string())?;
+        }
+        Some(m) => write_manifest(new.volume(), m)?,
+        None => {}
+    }
+    report_layout(path, new.volume().layout(), args.flag("verbose"));
+    let Some(hash) = hash else {
+        return Ok(None);
+    };
+    // The device of the volume covers the file system's own bytes, which
+    // with --minimize can end before --size does.
+    new.volume_mut().sync()?;
+    let digest = hash.of(new.volume().device(), &mut |_| {})?;
+    match hash_path {
+        Some(p) if p != Path::new("-") => {
+            let cannot = || format!("cannot write {}", p.display());
+            let mut out = new.output(p).with_context(cannot)?;
+            writeln!(out, "{}", digest).with_context(cannot)?;
+            Ok(None)
+        }
+        _ => Ok(Some(digest)),
+    }
 }
 
 /// The path of the parent directory of `path`, None for one at the root.
@@ -903,9 +1240,13 @@ fn ensure_dir(v: &mut Volume, path: &str, parents: bool, time: SystemTime) -> Re
 
 fn cmd_populate(argv: &[OsString]) -> Result<()> {
     let args = Args::parse(argv, &with(IMAGE_OPTIONS, FILL_VALUES), &with(FILL_FLAGS, &["parents"]))?;
+    // Bad values fail here, whatever the command goes on to do. What uses
+    // them takes them from args again.
+    fail_unsupported(&args)?;
+    time_policy(&args)?;
     let (image, paths) = match args.positional_paths().split_first() {
         Some((&i, s)) => (i, s.to_vec()),
-        None => bail!(errno::EINVAL, "populate takes an IMAGE and SOURCE arguments"),
+        None => bail!(errno::EINVAL, "populate takes an IMAGE and a SOURCE"),
     };
     let path = volume_path(args.last("path").unwrap_or(OsStr::new("/")))?;
     let (time, _) = stamp_time(&args)?;
@@ -927,7 +1268,7 @@ fn cmd_populate(argv: &[OsString]) -> Result<()> {
         }
         let options = CopyOptions {
             times: time_policy(&args)?,
-            replace: !args.flag("no-replace"),
+            name_collision: name_collision(&args),
             ..CopyOptions::default()
         };
         let mut v = open_volume(&args, image, Access::ReadWrite)?;
@@ -960,13 +1301,32 @@ fn cmd_populate(argv: &[OsString]) -> Result<()> {
         }
         return v.close();
     }
-    let sources = sources(&args, &paths, false)?;
-    check_sources(&args, &sources)?;
+    // A manifest goes to the root, so it is the one of the whole file
+    // system, which has to have the serial number and the label it names.
+    // The assembly checks that before it writes anything, and no serial
+    // number is derived, so the manifest is not hashed.
+    let mut source = Source::open(
+        &args,
+        &paths,
+        Sourcing::Write(ManifestUse::Write),
+        ManifestOperation::Populate,
+    )?;
+    source.check(&args)?;
     let mut v = open_volume(&args, image, Access::ReadWrite)?;
-    if !sources.trees.is_empty() {
+    if matches!(source, Source::Tree { .. }) {
         ensure_dir(&mut v, path, parents, time)?;
     }
-    fill(&mut v, &args, &sources)?;
+    if let Err(e) = source.fill(&mut v, &args) {
+        // Once something was written, the file system is left marked as not
+        // cleanly unmounted, as after a crash, with what was complete. A
+        // SOURCE refused before that, such as a manifest refused at its
+        // first object, leaves it as it was. An error of the close is not
+        // the one the user needs to hear about.
+        if v.is_writing() {
+            let _ = v.close_unfinished();
+        }
+        return Err(about_file_system(image)(e));
+    }
     if let Some(m) = args.path("write-manifest") {
         write_manifest(&v, m)?;
     }
@@ -1197,12 +1557,16 @@ fn cmd_manifest(argv: &[OsString]) -> Result<()> {
         bail!(errno::EINVAL, "manifest takes exactly one DIR");
     };
     let dir = host::open_dir(Path::new(dir))?;
-    let bytes = manifest::generate(dir.as_fd())?;
-    std::io::stdout().write_all(&bytes)?;
+    // A manifest is complete with its trailer. What is printed of a tree
+    // that cannot be listed to its end has none, and the exit status says
+    // that it failed.
+    let out = std::io::BufWriter::new(std::io::stdout().lock());
+    let report = HostTree::new(dir.as_fd()).write_manifest(out)?;
+    warn_about_manifest(&report, STDOUT_MANIFEST);
     Ok(())
 }
 
-fn run(argv: &[OsString]) -> Result<ExitCode> {
+fn run(argv: &[OsString]) -> std::result::Result<ExitCode, Failure> {
     let Some(command) = argv.first() else {
         eprint!("{}", USAGE);
         return Ok(ExitCode::FAILURE);
@@ -1227,11 +1591,11 @@ fn run(argv: &[OsString]) -> Result<ExitCode> {
         "remove" => cmd_remove(rest)?,
         "list" => cmd_list(rest)?,
         "describe" => cmd_describe(rest)?,
-        "check" => return cmd_check(rest),
+        "check" => return Ok(cmd_check(rest)?),
         "capabilities" => cmd_capabilities(rest)?,
         "cat" => cmd_cat(rest)?,
         "manifest" => cmd_manifest(rest)?,
-        other => bail!(errno::EINVAL, "unknown command '{}'", other),
+        other => return Err(err!(errno::EINVAL, "unknown command '{}'", other).into()),
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1249,8 +1613,12 @@ pub(crate) fn main() -> ExitCode {
     let argv: Vec<OsString> = std::env::args_os().skip(1).collect();
     match run(&argv) {
         Ok(code) => code,
-        Err(e) => {
-            eprintln!("ufat: {}", e);
+        Err(failure) => {
+            // What failed, then what that left behind.
+            eprintln!("ufat: {}", failure.error);
+            for line in failure.leftovers.lines() {
+                eprintln!("ufat: {}", line);
+            }
             ExitCode::FAILURE
         }
     }

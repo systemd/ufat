@@ -33,8 +33,9 @@ use crate::dirent::{
 use crate::errno::*;
 use crate::name::{
     fold_str, join_long_name, parse_long_name_entry, short_name_to_string, valid_short_char, Alias, LongNameEntry,
+    LFN_MAX_ENTRIES,
 };
-use crate::Result;
+use crate::{Detail, Error, NoSpaceReason, Result};
 
 /// Largest number of slots a directory may have: 2 MiB of entries. Linux
 /// refuses to create entries beyond that and EDK2 addresses slots with 16
@@ -54,12 +55,61 @@ type Map<K, V> = proofs::AssocMap<K, V>;
 pub(crate) struct DirEntry {
     /// The long name, if the entry has long name entries.
     pub(crate) long_name: Option<String>,
+    /// How `long_name` came out of the units the entry stores.
+    pub(crate) long_name_decoding: NameDecoding,
     /// The short entry.
     pub(crate) short: RawDirEntry,
     /// Slot index of the short entry.
     pub(crate) slot: usize,
-    /// Number of long name slots preceding the short entry.
-    pub(crate) long_slots: usize,
+    /// Number of long name slots preceding the short entry, at most
+    /// [`LFN_MAX_ENTRIES`]. A byte is enough, which leaves room for
+    /// `long_name_decoding` without making every entry the index keeps
+    /// larger.
+    pub(crate) long_slots: u8,
+}
+
+/// The long name slots of an entry fit into [`DirEntry::long_slots`].
+const _: () = assert!(
+    LFN_MAX_ENTRIES <= u8::MAX as usize,
+    "the long name slots of an entry do not fit into a byte"
+);
+
+/// How the text of a name came out of the units an entry stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NameDecoding {
+    /// The text is the name the entry stores.
+    Exact,
+    /// A unit of the long name is an unpaired surrogate, which no text
+    /// holds, and the text has U+FFFD in its place. It is not the name the
+    /// entry stores, and two such names can read the same.
+    Lossy,
+}
+
+/// The text of a long name and how it came out of the units of its long
+/// name slots.
+struct NameText {
+    text: String,
+    decoding: NameDecoding,
+}
+
+impl NameText {
+    /// Decodes the long name of the long name slots `units`, given in
+    /// sequence order. String::from_utf16() refuses exactly a name with an
+    /// unpaired surrogate, which then gets U+FFFD in place of the unit.
+    /// Every other name is decoded once.
+    fn decode(units: &[LongNameEntry]) -> NameText {
+        let name = join_long_name(units);
+        match String::from_utf16(&name) {
+            Ok(text) => NameText {
+                text,
+                decoding: NameDecoding::Exact,
+            },
+            Err(_) => NameText {
+                text: String::from_utf16_lossy(&name),
+                decoding: NameDecoding::Lossy,
+            },
+        }
+    }
 }
 
 impl DirEntry {
@@ -73,12 +123,12 @@ impl DirEntry {
 
     /// Index of the first slot the entry occupies.
     pub(crate) fn first_slot(&self) -> usize {
-        self.slot - self.long_slots
+        self.slot - usize::from(self.long_slots)
     }
 
     /// Number of slots the entry occupies.
     pub(crate) fn slot_count(&self) -> usize {
-        self.long_slots + 1
+        usize::from(self.long_slots) + 1
     }
 
     /// Whether this is the "." or ".." entry of a subdirectory.
@@ -543,18 +593,24 @@ impl Directory {
             }
             let short = RawDirEntry::from_bytes(raw);
             let mut long_name = None;
+            let mut long_name_decoding = NameDecoding::Exact;
             let mut long_slots = 0;
             if let Some((_, last)) = pending.last() {
                 if last.sequence == 1 && pending[0].1.checksum == short_name_checksum(&short.name) {
                     let units: Vec<LongNameEntry> = pending.iter().rev().map(|(_, l)| *l).collect();
-                    long_name = Some(String::from_utf16_lossy(&join_long_name(&units)));
-                    long_slots = pending.len();
+                    let NameText { text, decoding } = NameText::decode(&units);
+                    long_name = Some(text);
+                    long_name_decoding = decoding;
+                    // A set is complete with the slot of sequence number 1,
+                    // and numbers above LFN_MAX_ENTRIES do not parse.
+                    long_slots = pending.len() as u8;
                     pending.clear();
                 }
             }
             orphan(&mut pending, &mut free);
             entries.push(DirEntry {
                 long_name,
+                long_name_decoding,
                 short,
                 slot: i,
                 long_slots,
@@ -658,6 +714,29 @@ impl Directory {
         self.index.first_fit(count)
     }
 
+    /// The free slots at the end of the directory, which a cluster appended
+    /// to it continues.
+    pub(crate) fn free_at_end(&self) -> usize {
+        self.index
+            .holes
+            .last_key_value()
+            .filter(|&(&start, &len)| start + len == self.slots())
+            .map_or(0, |(_, &len)| len)
+    }
+
+    /// The error for a directory that would grow past [`MAX_SLOTS`] slots.
+    pub(crate) fn full() -> Error {
+        err!(
+            ENOSPC,
+            Detail::NoSpace {
+                reason: NoSpaceReason::DirectoryEntries,
+                path: None,
+            },
+            "directory is full, it cannot hold more than {} entries",
+            MAX_SLOTS
+        )
+    }
+
     /// Chooses the short name for an alias that needs a numeric tail: the
     /// candidate with the smallest tail no entry answers to, as mtools and
     /// Windows choose it. Candidates below a remembered hint are known to be
@@ -739,7 +818,12 @@ impl Directory {
             return;
         }
         units.reverse();
-        let long_name = (!long.is_empty()).then(|| String::from_utf16_lossy(&join_long_name(&units)));
+        let (long_name, long_name_decoding) = if long.is_empty() {
+            (None, NameDecoding::Exact)
+        } else {
+            let NameText { text, decoding } = NameText::decode(&units);
+            (Some(text), decoding)
+        };
         if let Some((shape, next)) = self.index.pending_tail.take() {
             if fold_str(&short_name_to_string(short)) == shape.candidate(next - 1) {
                 self.index.tails.insert(shape, next);
@@ -747,9 +831,12 @@ impl Directory {
         }
         self.index.insert(DirEntry {
             long_name,
+            long_name_decoding,
             short: *short,
             slot: start + long.len(),
-            long_slots: long.len(),
+            // Placed, the set is well formed: its first slot has the
+            // sequence number long.len(), at most LFN_MAX_ENTRIES.
+            long_slots: long.len() as u8,
         });
         #[cfg(any(test, kani))]
         self.check_index();
@@ -976,6 +1063,11 @@ mod proofs {
             .collect()
     }
 
+    /// `String::from_utf16` as [`narrow_lossy`]: every name decodes.
+    fn narrow(units: &[u16]) -> std::result::Result<String, std::string::FromUtf16Error> {
+        Ok(narrow_lossy(units))
+    }
+
     const SLOTS: usize = 4;
 
     /// A directory of four slots in one cluster, with concrete slot kinds
@@ -1026,6 +1118,7 @@ mod proofs {
     #[kani::unwind(20)]
     #[kani::stub(crate::name::fold_str, ascii_fold)]
     #[kani::stub(std::string::String::from_utf16_lossy, narrow_lossy)]
+    #[kani::stub(std::string::String::from_utf16, narrow)]
     fn index_follows_writes_and_deletes() {
         let mut d = shaped_directory();
         d.check_index();
@@ -1104,6 +1197,42 @@ mod tests {
         s.nt_flags = alias.case_flags;
         d.write_entry(start, &lfn, &s);
         short_name
+    }
+
+    /// The free slots at the end, which a cluster appended continues:
+    /// free slots before an entry do not count, nor do reserved ones.
+    #[test]
+    fn free_at_end() {
+        let name = |i: usize| {
+            let mut n = [b' '; SHORT_NAME_SIZE];
+            n[..3].copy_from_slice(format!("F{:02}", i).as_bytes());
+            n
+        };
+        let at = |d: &Directory, slot: usize| d.entries().into_iter().find(|e| e.slot == slot).unwrap();
+        let mut d = dir();
+        assert_eq!(d.free_at_end(), 16);
+        for i in 0..13 {
+            d.write_entry(i, &[], &short(&name(i), ATTR_ARCHIVE));
+        }
+        assert_eq!(d.free_at_end(), 3);
+        assert_eq!(d.find_free_run(3), Some(13));
+        assert_eq!(d.find_free_run(4), None);
+        let e = at(&d, 5);
+        d.delete(&e);
+        assert_eq!(d.free_at_end(), 3);
+        assert!(d.reserve(13, 3));
+        assert_eq!(d.free_at_end(), 0);
+        assert!(d.release_reservation(13));
+        assert_eq!(d.free_at_end(), 3);
+        d.append_cluster(3);
+        assert_eq!(d.free_at_end(), 19);
+        for i in 13..32 {
+            d.write_entry(i, &[], &short(&name(i), ATTR_ARCHIVE));
+        }
+        assert_eq!(d.free_at_end(), 0);
+        let e = at(&d, 31);
+        d.delete(&e);
+        assert_eq!(d.free_at_end(), 1);
     }
 
     #[test]

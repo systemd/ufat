@@ -34,13 +34,16 @@ use fat::boot::BootSector;
 use fat::device::{Access, Device};
 use fat::dirent::{self, short_name_checksum, RawDirEntry, ATTR_ARCHIVE, DIR_ENTRY_SIZE, ENTRY_DELETED, ENTRY_END};
 use fat::fat::{Entry, Fat, BAD_CLUSTER, END_OF_CHAIN_MIN, ENTRY_MASK, ENTRY_SIZE, FREE};
-use fat::format::{self, FormatOptions};
+use fat::format::{self, FormatOptions, VolumeId};
 use fat::fsck::{self, ProblemKind, Severity};
 use fat::layout::{Layout, FIRST_CLUSTER};
-use fat::name::{join_long_name, parse_long_name_entry, short_name_to_string, LongNameEntry};
-use fat::sha256;
+use fat::manifest::Sha256;
+use fat::name::{
+    join_long_name, parse_long_name_entry, short_name_to_string, LongNameEntry, LFN_MAX_ENTRIES, LFN_UNITS_PER_ENTRY,
+    MAX_LONG_NAME,
+};
 use fat::time::FatTimestamp;
-use fat::volume::Volume;
+use fat::volume::{NameCollision, Volume};
 
 /// Subsets enumerated per epoch before the generator samples instead.
 /// UFAT_CRASH_FULL=1 lifts the cap.
@@ -52,6 +55,12 @@ const SEED: u64 = 20261107;
 const TIME: u64 = 1_700_000_000;
 /// Failures of one kind shown in the summary, at most.
 const SHOWN_PER_KIND: usize = 3;
+/// The serial number the volume is formatted with, the one the scenario
+/// sets first, before anything else is written, and the one it sets at its
+/// end, as an assembly from a manifest does.
+const FORMAT_SERIAL: u32 = 0x4352_5348;
+const FIRST_SERIAL: u32 = 0x4649_5253;
+const FINAL_SERIAL: u32 = 0x5345_5249;
 
 fn fixed_time() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(TIME)
@@ -134,15 +143,24 @@ fn read_trace(path: &Path) -> Vec<Record> {
 enum Op {
     /// `create_dir_all`.
     Mkdir(String),
+    /// `create_dir`, and whether its parent grows a cluster for the entry,
+    /// which the harness checks.
+    CreateDir {
+        path: String,
+        grows: bool,
+    },
     /// A file written `chunk` bytes per write call, replacing an existing
     /// file of that name or not.
     Write {
         path: String,
         data: Vec<u8>,
-        replace: bool,
+        collision: NameCollision,
         chunk: usize,
     },
     Remove(String),
+    /// `set_volume_id`: the serial number in the boot sector and its
+    /// backup.
+    Serial(u32),
     /// `close`: the marks go back, FSInfo gets its counts, fsync.
     Close,
 }
@@ -151,19 +169,28 @@ impl Op {
     fn describe(&self) -> String {
         match self {
             Op::Mkdir(p) => format!("mkdir {}", p),
+            Op::CreateDir { path, grows } => format!(
+                "create_dir {}{}",
+                path,
+                if *grows { ", growing its parent" } else { "" }
+            ),
             Op::Write {
                 path,
                 data,
-                replace,
+                collision,
                 chunk,
             } => format!(
                 "{} {} ({} bytes, {} per write)",
-                if *replace { "replace" } else { "write" },
+                match collision {
+                    NameCollision::Replace => "replace",
+                    NameCollision::Fail => "write",
+                },
                 path,
                 data.len(),
                 chunk
             ),
             Op::Remove(p) => format!("remove {}", p),
+            Op::Serial(id) => format!("serial {}", VolumeId(*id)),
             Op::Close => "close".to_string(),
         }
     }
@@ -171,7 +198,9 @@ impl Op {
     fn replaces(&self) -> Option<&str> {
         match self {
             Op::Write {
-                path, replace: true, ..
+                path,
+                collision: NameCollision::Replace,
+                ..
             } => Some(path),
             _ => None,
         }
@@ -180,52 +209,97 @@ impl Op {
 
 /// A tree with long names, files replaced within one directory cluster and
 /// across two, a directory grown past its first cluster, a removed file
-/// whose slots are reused, nested directories. BOOTX64.EFI is written in
-/// small pieces so that its epoch holds many writes; the kernel names take
-/// four slots each.
+/// whose slots are reused, nested directories, directories made with and
+/// without their parent growing for them, and a serial number set first
+/// and last. BOOTX64.EFI is written in small pieces so that its epoch
+/// holds many writes; the kernel names take four slots each.
 fn scenario(slots_per_cluster: usize) -> Vec<Op> {
     let mut rng = Rng(SEED);
     let mut ops: Vec<Op> = Vec::new();
     let whole = 1 << 20;
-    let mut file = |ops: &mut Vec<Op>, path: &str, len: usize, replace: bool, chunk: usize| {
+    let mut file = |ops: &mut Vec<Op>, path: &str, len: usize, collision: NameCollision, chunk: usize| {
         ops.push(Op::Write {
             path: path.to_string(),
             data: rng.bytes(len),
-            replace,
+            collision,
             chunk,
         });
     };
     let kernel = |n: usize| format!("/EFI/Linux/linux-6.12.{}-200.fc41.x86_64+3.efi", n);
+    // A serial number set before anything else is written. set_volume_id()
+    // begins the session itself, so the marks of the session go down before
+    // the serial number does.
+    ops.push(Op::Serial(FIRST_SERIAL));
     ops.push(Op::Mkdir("/EFI/BOOT".into()));
-    file(&mut ops, "/EFI/BOOT/BOOTX64.EFI", 70_000, false, 4096);
+    file(&mut ops, "/EFI/BOOT/BOOTX64.EFI", 70_000, NameCollision::Fail, 4096);
     ops.push(Op::Mkdir("/EFI/Linux".into()));
     // More clusters than a 512 byte FAT sector has entries go to a file
     // before /EFI/Linux grows. So with 512 byte sectors the FAT entries of
     // its first cluster and of the one it grows by are in different
     // sectors.
-    file(&mut ops, "/EFI/BOOT/mmx64.efi", 300_000, false, whole);
+    file(&mut ops, "/EFI/BOOT/mmx64.efi", 300_000, NameCollision::Fail, whole);
     // Enough long names to grow the directory past its first cluster.
     let kernels = slots_per_cluster / 4 + 2;
     for i in 0..kernels {
-        file(&mut ops, &kernel(i + 1), 1500 + 700 * i, false, whole);
+        file(&mut ops, &kernel(i + 1), 1500 + 700 * i, NameCollision::Fail, whole);
     }
     ops.push(Op::Mkdir("/loader/entries".into()));
-    file(&mut ops, "/loader/entries/fedora.conf", 300, false, whole);
-    file(&mut ops, "/loader/loader.conf", 40, false, whole);
-    file(&mut ops, "/loader/random-seed", 32, false, whole);
-    file(&mut ops, "/loader/entries.srel", 5, false, whole);
-    file(&mut ops, "/EFI/BOOT/BOOTX64.EFI", 72_000, true, 4096);
+    file(&mut ops, "/loader/entries/fedora.conf", 300, NameCollision::Fail, whole);
+    file(&mut ops, "/loader/loader.conf", 40, NameCollision::Fail, whole);
+    file(&mut ops, "/loader/random-seed", 32, NameCollision::Fail, whole);
+    file(&mut ops, "/loader/entries.srel", 5, NameCollision::Fail, whole);
+    file(&mut ops, "/EFI/BOOT/BOOTX64.EFI", 72_000, NameCollision::Replace, 4096);
     ops.push(Op::Remove(kernel(4)));
-    file(&mut ops, "/loader/loader.conf", 60, true, whole);
+    file(&mut ops, "/loader/loader.conf", 60, NameCollision::Replace, whole);
     // The new entry goes into the slots the removed kernel left, which
     // straddle a sector boundary with 512 byte sectors.
-    file(&mut ops, &kernel(3), 5000, true, whole);
+    file(&mut ops, &kernel(3), 5000, NameCollision::Replace, whole);
     ops.push(Op::Mkdir("/EFI/systemd/drop-ins/deep".into()));
-    file(&mut ops, "/EFI/systemd/systemd-bootx64.efi", 9000, false, whole);
-    file(&mut ops, &kernel(kernels + 1), 2048, false, whole);
+    file(
+        &mut ops,
+        "/EFI/systemd/systemd-bootx64.efi",
+        9000,
+        NameCollision::Fail,
+        whole,
+    );
+    file(&mut ops, &kernel(kernels + 1), 2048, NameCollision::Fail, whole);
     // Now the only room is in the directory's second cluster: the old
     // entry's deletion and the new entry are two cluster writes.
-    file(&mut ops, &kernel(2), 4000, true, whole);
+    file(&mut ops, &kernel(2), 4000, NameCollision::Replace, whole);
+    // A directory made where its parent has room, and one made in /full
+    // after empty files with long names fill the first cluster of /full to
+    // its last slot, so that /full grows for the entry. The new cluster of
+    // /full is zeroed and synced before the new directory's cluster is
+    // allocated and written, and the entry comes last.
+    ops.push(Op::CreateDir {
+        path: "/loader/keys".into(),
+        grows: false,
+    });
+    ops.push(Op::Mkdir("/full".into()));
+    let mut free = slots_per_cluster - 2;
+    let mut n = 0;
+    while free > 0 {
+        // A name in k slots: k - 1 long name slots of LFN_UNITS_PER_ENTRY
+        // characters each, MAX_LONG_NAME characters at most, and the short
+        // entry. A name in one slot is a short name.
+        let k = free.min(LFN_MAX_ENTRIES + 1);
+        let name = if k == 1 {
+            format!("F{}", n)
+        } else {
+            let prefix = format!("fill-{}-", n);
+            let len = (LFN_UNITS_PER_ENTRY * (k - 1)).min(MAX_LONG_NAME);
+            format!("{}{}", prefix, "x".repeat(len - prefix.len()))
+        };
+        file(&mut ops, &format!("/full/{}", name), 0, NameCollision::Fail, whole);
+        free -= k;
+        n += 1;
+    }
+    ops.push(Op::CreateDir {
+        path: "/full/sub".into(),
+        grows: true,
+    });
+    // The serial number an assembly from a manifest knows at its end.
+    ops.push(Op::Serial(FINAL_SERIAL));
     ops.push(Op::Close);
     ops
 }
@@ -270,8 +344,8 @@ fn join(dir: &str, name: &str) -> String {
     }
 }
 
-fn hash_of(data: &[u8]) -> [u8; 32] {
-    sha256::digest(data)
+fn hash_of(data: &[u8]) -> [u8; Sha256::SIZE] {
+    Sha256::digest(data).into()
 }
 
 /// The tree the scenario means to leave after `ops`.
@@ -287,6 +361,9 @@ fn simulate(ops: &[Op]) -> Tree {
                     tree.insert(cur.clone(), Node::Dir);
                 }
             }
+            Op::CreateDir { path, .. } => {
+                tree.insert(path.clone(), Node::Dir);
+            }
             Op::Write { path, data, .. } => {
                 tree.insert(
                     path.clone(),
@@ -299,7 +376,7 @@ fn simulate(ops: &[Op]) -> Tree {
             Op::Remove(path) => {
                 tree.remove(path);
             }
-            Op::Close => {}
+            Op::Serial(_) | Op::Close => {}
         }
     }
     tree
@@ -309,7 +386,7 @@ fn show_node(node: Option<&Node>) -> String {
     match node {
         None => "absent".into(),
         Some(Node::Dir) => "directory".into(),
-        Some(Node::File { size, hash }) => format!("{} bytes {}", size, &sha256::to_hex(hash)[..12]),
+        Some(Node::File { size, hash }) => format!("{} bytes {}", size, &Sha256::from(*hash).to_string()[..12]),
     }
 }
 
@@ -601,7 +678,7 @@ impl Harness {
         let options = FormatOptions {
             sector_size: Some(cfg.sector_size),
             cluster_size: Some(cfg.cluster_size),
-            volume_id: 0x4352_5348,
+            volume_id: FORMAT_SERIAL,
             label: Some("ESP".into()),
             timestamp: Some(fixed_time()),
             allow_small: true,
@@ -616,24 +693,31 @@ impl Harness {
             v.device().trace_note(&op.describe()).unwrap();
             match op {
                 Op::Mkdir(path) => v.create_dir_all(path, fixed_time()).unwrap(),
+                Op::CreateDir { path, .. } => v.create_dir(path, fixed_time()).unwrap(),
                 Op::Write {
                     path,
                     data,
-                    replace,
+                    collision,
                     chunk,
                 } => {
-                    let mut w = v.create_file(path, fixed_time(), *replace).unwrap();
+                    let mut w = v.create_file(path, fixed_time(), *collision).unwrap();
                     for piece in data.chunks(*chunk) {
                         w.write_all(piece).unwrap();
                     }
                     w.finish().unwrap();
                 }
                 Op::Remove(path) => v.remove_file(path).unwrap(),
+                Op::Serial(id) => v.set_volume_id(VolumeId(*id)).unwrap(),
                 Op::Close => {}
             }
         }
         v.close().unwrap();
         let final_image = std::fs::read(img.path()).unwrap();
+        // Both boot sectors have the serial number the scenario set.
+        let boot = BootSector::parse(&final_image).unwrap();
+        let backup = usize::from(boot.backup_boot_sector) * usize::from(boot.bytes_per_sector);
+        let backup = BootSector::parse(&final_image[backup..]).unwrap();
+        assert_eq!((boot.volume_id, backup.volume_id), (FINAL_SERIAL, FINAL_SERIAL));
         let records = read_trace(trace.path());
 
         // The format is the pre-state: its records must turn the stale
@@ -798,6 +882,22 @@ impl Harness {
                     chains.insert(e.path.clone(), e.chain.clone());
                 }
             }
+            if let Some(Op::CreateDir { path, grows }) = j.checked_sub(1).map(|k| &self.ops[k]) {
+                let parent = parent_of(path);
+                let clusters = |owners: &HashMap<u32, (String, bool)>| {
+                    owners.values().filter(|(p, dir)| *dir && p == parent).count()
+                };
+                let (before, after) = (clusters(&self.boundaries[j - 1].owners), clusters(&owners));
+                assert_eq!(
+                    after > before,
+                    *grows,
+                    "{}: {} has {} clusters before and {} after",
+                    self.boundary_name(j),
+                    parent,
+                    before,
+                    after
+                );
+            }
             self.legit.extend(raw.referenced());
             self.boundaries.push(Boundary {
                 tree,
@@ -847,7 +947,7 @@ impl Harness {
             format!(" ({} sectors)", sectors)
         };
         let region = if w.offset < l.fat_offset(0) {
-            if w.offset == 0 {
+            if w.offset < self.ss {
                 "boot sector".to_string()
             } else {
                 format!("reserved sector {}", w.offset / self.ss)
@@ -987,6 +1087,7 @@ const ACCEPT_BEHIND_MARKER: &str = "a short entry behind the end marker of a par
 const ACCEPT_DUPLICATE: &str = "both versions of a replaced file in a partly written directory";
 const ACCEPT_ALIAS: &str = "a file listed under its alias in a partly written directory";
 const ACCEPT_REPLACED_ABSENT: &str = "a replaced file absent";
+const ACCEPT_BACKUP_SERIAL: &str = "the backup boot sector a serial number behind or ahead";
 
 struct Verdict {
     failure: Option<Failure>,
@@ -1274,6 +1375,10 @@ impl<'a> Worker<'a> {
         let partial_dirs = h.partial_directories(pieces);
         let torn_dir = |dir: &str| partial_dirs.iter().any(|d| d == dir);
         let replaced: BTreeSet<&str> = in_flight.iter().filter_map(|op| op.replaces()).collect();
+        // The serial number goes into the backup boot sector and the boot
+        // sector one after the other, while the boot sector says that the
+        // volume is being written.
+        let serial_in_flight = in_flight.iter().any(|op| matches!(op, Op::Serial(_)));
         let versions_of = |path: &str| -> BTreeSet<Option<Node>> {
             (lo..=hi).map(|j| h.boundaries[j].tree.get(path).cloned()).collect()
         };
@@ -1303,6 +1408,7 @@ impl<'a> Worker<'a> {
                 return (bad, accepted);
             }
         };
+        let marked = report.problems.iter().any(|p| p.kind == ProblemKind::DirtyFlag);
         for p in &report.problems {
             let msg = p.to_string();
             let path = p.path.as_deref().unwrap_or("");
@@ -1340,6 +1446,9 @@ impl<'a> Worker<'a> {
                 Severity::Warning if p.kind == ProblemKind::FatCopyDiffers => Some(ACCEPT_FAT_COPIES),
                 Severity::Warning if p.kind == ProblemKind::LostClusters => Some(ACCEPT_LOST),
                 Severity::Warning if p.kind == ProblemKind::FsinfoFreeCount => Some(ACCEPT_FSINFO),
+                Severity::Warning if p.kind == ProblemKind::BackupBootSectorDiffers && serial_in_flight && marked => {
+                    Some(ACCEPT_BACKUP_SERIAL)
+                }
                 Severity::Warning => None,
             };
             match rule {

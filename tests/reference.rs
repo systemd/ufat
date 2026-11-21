@@ -16,7 +16,7 @@ use fat::device::{Access, Device};
 use fat::format::{self, FormatOptions};
 use fat::host;
 use fat::populate::{CopyOptions, TimePolicy};
-use fat::volume::Volume;
+use fat::volume::{NameCollision, Volume};
 
 /// A source tree resolved once, the way the tool resolves its arguments.
 fn source(path: &Path) -> OwnedFd {
@@ -128,14 +128,21 @@ fn populate(image: &Path, source: &Path, sector_size: u32, cluster_size: Option<
     v.copy_tree(self::source(source).as_fd(), "/", &CopyOptions::default())
         .unwrap();
     // Some churn: a deleted file and a replaced one.
-    v.create_file("/deleted.tmp", UNIX_EPOCH + Duration::from_secs(1_700_000_000), false)
-        .unwrap()
-        .finish()
-        .unwrap();
+    v.create_file(
+        "/deleted.tmp",
+        UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        NameCollision::Fail,
+    )
+    .unwrap()
+    .finish()
+    .unwrap();
     v.remove_file("/deleted.tmp").unwrap();
     let readme = host::open_file(&source.join("readme.txt")).unwrap();
-    v.copy_file(readme.as_fd(), "/readme.txt", &CopyOptions::default())
-        .unwrap();
+    let replace = CopyOptions {
+        name_collision: NameCollision::Replace,
+        ..CopyOptions::default()
+    };
+    v.copy_file(readme.as_fd(), "/readme.txt", &replace).unwrap();
     v.close().unwrap();
 }
 
@@ -342,7 +349,7 @@ fn matches_mtools_byte_for_byte() {
             "/",
             &CopyOptions {
                 times: TimePolicy::Preserve,
-                replace: true,
+                name_collision: NameCollision::Replace,
                 follow_symlinks: false,
             },
         )
@@ -386,7 +393,11 @@ fn planner_is_exact() {
             ..FormatOptions::default()
         };
         let mut plan = fat::plan::Plan::new(fat::plan::PlanOptions::from_format_options(&options, None).unwrap());
-        plan.add_tree(source(tree.path()).as_fd(), "/", false).unwrap();
+        let no_links = CopyOptions {
+            follow_symlinks: false,
+            ..CopyOptions::default()
+        };
+        plan.add_tree(source(tree.path()).as_fd(), "/", &no_links).unwrap();
         let estimate = plan.estimate().unwrap();
         estimate.apply(&mut options);
 
@@ -482,18 +493,25 @@ fn matches_sha256sum() {
     assert_eq!(expected.len(), files.len());
     for (name, data) in &files {
         assert_eq!(
-            fat::sha256::to_hex(&fat::sha256::digest(data)),
+            fat::manifest::Sha256::digest(data).to_string(),
             expected[name],
             "{}",
             name
         );
     }
     let dir = source(tree.path());
-    let manifest = fat::manifest::parse(&fat::manifest::generate(dir.as_fd()).unwrap()).unwrap();
+    let mut bytes = Vec::new();
+    fat::manifest::HostTree::new(dir.as_fd())
+        .write_manifest(&mut bytes)
+        .unwrap();
     let mut hashed = 0;
-    for entry in &manifest.entries {
-        if let (Some(name), Some(hash)) = (&entry.name, &entry.sha256) {
-            assert_eq!(fat::sha256::to_hex(hash), expected[name], "{}", name);
+    for object in fat::manifest::Reader::open(&bytes[..]).unwrap() {
+        let fat::manifest::Object::File(entry) = object.unwrap() else {
+            continue;
+        };
+        if let Some(hash) = &entry.sha256 {
+            let name = entry.name.as_str();
+            assert_eq!(hash.to_string(), expected[name], "{}", name);
             hashed += 1;
         }
     }
@@ -621,7 +639,7 @@ fn an_assembled_tree_comes_back_through_mtools() {
     let img = image.0.to_str().unwrap();
 
     let out = std::process::Command::new(&ufat)
-        .args(["assemble", "--create", "--verbose", img, src])
+        .args(["assemble", "--create", "--minimize", "--verbose", img, src])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -714,12 +732,15 @@ fn fsck_fat_sees_a_failed_assemble() {
     std::fs::write(manifest.path(), run(&ufat, &["manifest", src], &[])).unwrap();
     // b.txt changes after the manifest was written and keeps its size.
     std::fs::write(tree.path().join("b.txt"), b"SECOND").unwrap();
+    // An image that is there already: nothing would be left of one made for
+    // the assembly.
     let image = Temp::new(".img");
+    std::fs::write(&image.0, b"").unwrap();
     let img = image.0.to_str().unwrap();
     let out = std::process::Command::new(&ufat)
         .args([
             "assemble",
-            "--create",
+            "--minimize",
             "--manifest",
             manifest.0.to_str().unwrap(),
             img,

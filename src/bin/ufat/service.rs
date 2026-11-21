@@ -27,20 +27,24 @@ use fat::format::{self, FormatOptions, VolumeId};
 use fat::fsck::{self, Problem};
 use fat::host;
 use fat::layout::{self, LayoutParams, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE, MIN_CLUSTERS, MIN_SECTOR_SIZE};
-use fat::manifest::volume::{Fields, WriteReport};
-use fat::manifest::{AssembleOptions, AssembleReport, DirectorySource, Manifest, StreamSource};
+use fat::manifest::{
+    AssembleFlags, AssembleOptions, AssembleReport, DirectorySource, Features, Finalize, Order, PinnedDirectory,
+    SerialSource, Sha256Context, StreamSource, WriteReport,
+};
 use fat::plan::{Plan, PlanOptions};
 use fat::populate::{CopyOptions, CopyReport, TimePolicy};
 use fat::probe::Prober;
 use fat::progress::Progress;
-use fat::sha256::Sha256;
-use fat::sha512::Sha512;
-use fat::volume::{Metadata, Volume};
+use fat::sha512::Sha512Context;
+use fat::volume::{Metadata, NameCollision, Volume};
 use fat::{CorruptPlace, Detail, NoSpaceReason, NotFat32Reason, UnsupportedKind};
 use json::{Object, Value};
 use varlink::{Activation, Call, Connection, Info, Reply, Server, Service};
 
-use crate::util;
+use crate::util::{
+    self, ImageFlags, ManifestInput, ManifestOperation, ManifestUse, PlanOutcome, SerialDerivation, SizeMode,
+    SizeRequest,
+};
 
 /// The interface description, served verbatim.
 pub(crate) const INTERFACE: &str = include_str!("../../../docs/org.uapi-group.FileSystem.varlink");
@@ -118,19 +122,20 @@ fn invalid(parameter: &str) -> Failure {
     Failure::Invalid(parameter.to_string())
 }
 
-/// Turns the error of a passed descriptor that cannot be used, found when
-/// it is vetted or when it is read or written (see [`host::PassedStream`]),
-/// into the interface's error for it, naming the parameter; anything else
-/// passes through.
+/// Turns the error of a passed descriptor that cannot be used into the
+/// interface's error for it, naming `parameter` where the error names no
+/// parameter itself: the vetting of the image does not, nor does a manifest
+/// refused for a plan. The errors of the passed streams and their vetting
+/// name theirs, see [`host::passed_stream`], and [`map_error`] maps them.
+/// Anything else passes through.
 fn bad(parameter: &str) -> impl Fn(fat::Error) -> Failure + '_ {
     move |e| {
-        if matches!(e.detail(), Some(Detail::Descriptor { .. })) {
-            Failure::BadDescriptor {
-                parameter: parameter.to_string(),
-                error: e,
-            }
-        } else {
-            Failure::Other(e)
+        let Some(&Detail::Descriptor { parameter: named, .. }) = e.detail() else {
+            return Failure::Other(e);
+        };
+        Failure::BadDescriptor {
+            parameter: named.unwrap_or(parameter).to_string(),
+            error: e,
         }
     }
 }
@@ -253,9 +258,14 @@ fn map_error(e: &fat::Error) -> varlink::Error {
             optional(&mut o, "block", *cluster);
             interface_error("Corrupt", o)
         }
-        // A descriptor problem is reported by the method that knows which
-        // parameter it came with, see `bad`; one without is a plain errno.
-        Detail::Descriptor { .. } => varlink::Error::system(e.errno()),
+        // A descriptor problem that names the parameter it came with is
+        // that parameter's. One that names none is named by the method that
+        // knows it, see `bad`, or is a plain errno.
+        Detail::Descriptor {
+            parameter: Some(parameter),
+            ..
+        } => bad_file_descriptor(parameter, e),
+        Detail::Descriptor { parameter: None, .. } => varlink::Error::system(e.errno()),
         Detail::Manifest {
             problem,
             record,
@@ -268,17 +278,10 @@ fn map_error(e: &fat::Error) -> varlink::Error {
             optional(&mut o, "field", field.as_deref());
             interface_error("InvalidManifest", o)
         }
-        Detail::Source {
-            name,
-            problem,
-            size,
-            expected,
-        } => {
-            let mut o = json::object! { "name" => name.as_str(), "reason" => problem.as_str() };
-            optional(&mut o, "sizeBytes", *size);
-            optional(&mut o, "expectedSizeBytes", *expected);
-            interface_error("SourceMismatch", o)
-        }
+        Detail::Source { name, problem } => interface_error(
+            "SourceMismatch",
+            json::object! { "name" => name.as_str(), "reason" => problem.as_str() },
+        ),
         Detail::Content {
             name,
             problem,
@@ -300,22 +303,32 @@ fn map_error(e: &fat::Error) -> varlink::Error {
             "EntryNotValid",
             json::object! { "name" => name.as_str(), "reason" => problem.as_str() },
         ),
+        Detail::FileSystemMismatch { field, expected, found } => {
+            let mut o = json::object! { "field" => field.as_str() };
+            optional(&mut o, "expected", expected.as_deref());
+            optional(&mut o, "found", found.as_deref());
+            interface_error("FileSystemMismatch", o)
+        }
         Detail::InvalidOption(name) => varlink::Error::invalid_parameter(option_name(name)),
     }
+}
+
+/// BadFileDescriptor for the error `e` of the descriptor passed as
+/// `parameter`.
+fn bad_file_descriptor(parameter: &str, e: &fat::Error) -> varlink::Error {
+    let (problem, flags) = match e.detail() {
+        Some(Detail::Descriptor { problem, flags, .. }) => (problem.as_str(), *flags),
+        _ => ("wrongType", None),
+    };
+    let mut o = json::object! { "parameter" => parameter, "reason" => problem };
+    optional(&mut o, "flags", flags);
+    interface_error("BadFileDescriptor", o)
 }
 
 fn fail(f: Failure) -> varlink::Error {
     match f {
         Failure::Invalid(parameter) => varlink::Error::invalid_parameter(&parameter),
-        Failure::BadDescriptor { parameter, error } => {
-            let (problem, flags) = match error.detail() {
-                Some(Detail::Descriptor { problem, flags }) => (problem.as_str(), *flags),
-                _ => ("wrongType", None),
-            };
-            let mut o = json::object! { "parameter" => parameter, "reason" => problem };
-            optional(&mut o, "flags", flags);
-            interface_error("BadFileDescriptor", o)
-        }
+        Failure::BadDescriptor { parameter, error } => bad_file_descriptor(&parameter, &error),
         Failure::TooSmall { minimal, actual } => interface_error(
             "TooSmall",
             json::object! {
@@ -340,7 +353,17 @@ fn fail(f: Failure) -> varlink::Error {
 /// The error of the fit, as a failure of the call.
 fn fit_error(e: util::FitError) -> Failure {
     match e {
+        util::FitError::SizeRequired => Failure::SizeRequired,
         util::FitError::TooSmall { minimal, actual } => Failure::TooSmall { minimal, actual },
+        // Only the command line asks for SizeMode::Fit, with --fit and with
+        // --manifest without a SOURCE. The service makes no such call. This
+        // is the room that writing the content would run out of.
+        util::FitError::TooFewClusters(shortfall) => Failure::Other(
+            fat::Error::new(errno::ENOSPC, shortfall.to_string()).with(Detail::NoSpace {
+                reason: NoSpaceReason::Clusters,
+                path: None,
+            }),
+        ),
         util::FitError::Other(e) => Failure::Other(e),
     }
 }
@@ -584,8 +607,31 @@ struct Options {
     format: FormatOptions,
     /// `timestampUSec` as given; None when the current time stands in.
     time: Option<SystemTime>,
-    /// `force`: format the image whatever it holds.
-    force: bool,
+    /// `force`: what may be done to the image.
+    image: ImageFlags,
+    /// `minimize`: how large the file system is made.
+    size_mode: SizeMode,
+    /// `identifier` as given.
+    identifier: Option<VolumeId>,
+    /// `reproducible` as given: the image depends on the inputs only.
+    reproducible: bool,
+    /// Where the serial number comes from: the options, or a manifest that
+    /// names none, see [`Options::reconcile`].
+    serial: SerialSource,
+}
+
+impl Options {
+    /// Reconciles the serial number and the label of a file system made
+    /// from the manifest `manifest`, see
+    /// [`fat::manifest::VolumeIdentity::reconcile`]. The manifest is not
+    /// hashed any further where the serial number is not derived from it.
+    fn reconcile(&mut self, manifest: &mut ManifestInput) -> Outcome<()> {
+        self.serial = manifest.identity().reconcile(&mut self.format, self.identifier)?;
+        if self.serial == SerialSource::Given {
+            manifest.stop_hashing();
+        }
+        Ok(())
+    }
 }
 
 fn format_options(p: Option<Params<'_>>) -> Outcome<Options> {
@@ -601,7 +647,11 @@ fn format_options(p: Option<Params<'_>>) -> Outcome<Options> {
         return Ok(Options {
             format: o,
             time: None,
-            force: false,
+            image: ImageFlags::default(),
+            size_mode: SizeMode::Given,
+            identifier: None,
+            reproducible: false,
+            serial: SerialSource::Given,
         });
     };
     // What FAT has no notion of is refused, not ignored.
@@ -623,17 +673,15 @@ fn format_options(p: Option<Params<'_>>) -> Outcome<Options> {
     o.label = p.str("label").map(str::to_string);
     let time = p.time("timestampUSec")?;
     o.timestamp = Some(time.unwrap_or_else(util::now));
-    let identifier = p.str("identifier");
-    if p.bool("reproducible", false) {
-        if identifier.is_none() {
-            return Err(Failure::NotReproducible("identifierRequired"));
-        }
-        if time.is_none() {
-            return Err(Failure::NotReproducible("timestampRequired"));
-        }
+    // The identifier a reproducible file system needs can also come from a
+    // manifest, which only the content shows: Assemble checks it then.
+    let reproducible = p.bool("reproducible", false);
+    if reproducible && time.is_none() {
+        return Err(Failure::NotReproducible("timestampRequired"));
     }
+    let identifier = p.str("identifier").map(str::parse::<VolumeId>).transpose()?;
     o.volume_id = match identifier {
-        Some(id) => id.parse::<VolumeId>()?.0,
+        Some(identifier) => identifier.0,
         None => util::pick_volume_id(time.unwrap_or_else(util::now), o.label.as_deref(), time.is_some()),
     };
     o.zero_data_area = p.bool("zero", false);
@@ -650,10 +698,21 @@ fn format_options(p: Option<Params<'_>>) -> Outcome<Options> {
         o.hidden_sectors = v.u32("hiddenSectors")?;
         o.mkfs_fat_compat = v.bool("mkfsFatCompatible", false);
     }
+    let mut image = ImageFlags::default();
+    image.set(ImageFlags::FORCE, p.bool("force", false));
+    let size_mode = if p.bool("minimize", false) {
+        SizeMode::Minimize
+    } else {
+        SizeMode::Given
+    };
     Ok(Options {
         format: o,
         time,
-        force: p.bool("force", false),
+        image,
+        size_mode,
+        identifier,
+        reproducible,
+        serial: SerialSource::Given,
     })
 }
 
@@ -755,7 +814,7 @@ pub(crate) fn capabilities() -> fat::Result<Object> {
             "manifest",
             "writeManifest",
         ],
-        "sizeToFit" => "exact",
+        "sizeToFit" => "best",
         "minimalSizeBytes" => minimal,
         // 0xFFFFFFFF sectors of 512 bytes, the total sectors field's limit.
         "maximalSizeBytes" => u64::from(u32::MAX) * u64::from(MIN_SECTOR_SIZE),
@@ -781,21 +840,24 @@ pub(crate) fn capabilities() -> fat::Result<Object> {
         "nameLengthMax" => 255,
         "nameUnit" => "utf16Units",
         "fileSizeMaxBytes" => fat::volume::MAX_FILE_SIZE,
+        // A manifest has to declare the code point order, see
+        // ManifestInput::open.
+        "manifest" => json::object! { "order" => Order::CodePoint.as_str() },
     })
 }
 
 /// The hash of a file system as it is in its image, as `imageHash` asks
 /// for it.
 pub(crate) enum Hash {
-    Sha256(Sha256),
-    Sha512(Sha512),
+    Sha256(Sha256Context),
+    Sha512(Sha512Context),
 }
 
 impl Hash {
     pub(crate) fn new(algorithm: &str) -> Option<Hash> {
         match algorithm {
-            "sha256" => Some(Hash::Sha256(Sha256::new())),
-            "sha512" => Some(Hash::Sha512(Sha512::new())),
+            "sha256" => Some(Hash::Sha256(Sha256Context::default())),
+            "sha512" => Some(Hash::Sha512(Sha512Context::default())),
             _ => None,
         }
     }
@@ -809,8 +871,8 @@ impl Hash {
             let n = (device.len() - offset).min(HASH_STEP as u64) as usize;
             device.read_at(offset, &mut buf[..n])?;
             match &mut self {
-                Hash::Sha256(h) => h.update(&buf[..n]),
-                Hash::Sha512(h) => h.update(&buf[..n]),
+                Hash::Sha256(context) => context.update(&buf[..n]),
+                Hash::Sha512(context) => context.update(&buf[..n]),
             }
             offset += n as u64;
             progress(&Progress {
@@ -819,36 +881,56 @@ impl Hash {
             });
         }
         Ok(match self {
-            Hash::Sha256(h) => fat::sha256::to_hex(&h.finalize()),
-            Hash::Sha512(h) => fat::sha512::to_hex(&h.finalize()),
+            Hash::Sha256(context) => context.finalize().to_string(),
+            Hash::Sha512(context) => fat::sha512::to_hex(&context.finalize()),
         })
     }
 }
 
-/// The manifest sink: the descriptor and the fields the manifest carries.
+/// The manifest sink: the descriptor and what the manifest records.
 struct Sink {
     file: host::PassedStream,
-    fields: Fields,
+    features: Features,
 }
 
 impl Sink {
+    /// What separates the words in the name of a feature of UAPI.16, and
+    /// what stands for it in a value of the interface's ManifestFeature, as
+    /// systemd writes the values of enumerations: user-xattr is user_xattr.
+    const NAME_SEPARATOR: char = '-';
+    const VALUE_SEPARATOR: &'static str = "_";
+
+    /// The feature the value `value` of the interface's ManifestFeature
+    /// stands for.
+    fn feature(value: &str) -> Option<Features> {
+        Features::ALL
+            .names()
+            .find(|name| name.replace(Sink::NAME_SEPARATOR, Sink::VALUE_SEPARATOR) == value)
+            .and_then(|name| name.parse().ok())
+    }
+
     fn take(p: &Params<'_>, c: &mut Connection) -> Outcome<Sink> {
         let fd = required_fd(c, p, "fileDescriptor").map_err(|_| invalid("manifestSink"))?;
-        let file = host::passed_sink(fd).map_err(bad("manifestSink"))?;
-        let fields = match p.0.get("fields") {
-            None | Some(Value::Null) => Fields::default(),
-            Some(_) => Fields::from_names(p.strings("fields")?).ok_or_else(|| invalid("manifestSink"))?,
+        let file = host::passed_sink(fd, "manifestSink")?;
+        let features = match p.0.get("features") {
+            None | Some(Value::Null) => Features::DEFAULT,
+            Some(_) => p
+                .strings("features")?
+                .into_iter()
+                .try_fold(Features::NONE, |features, value| {
+                    Sink::feature(value).map(|feature| features | feature)
+                })
+                .ok_or_else(|| invalid("manifestSink"))?,
         };
-        Ok(Sink { file, fields })
+        Ok(Sink { file, features })
     }
 
     /// Writes the manifest of everything `volume` holds, telling `progress`
     /// what it covered so far.
     fn write(self, volume: &Volume, progress: &mut dyn FnMut(&Progress)) -> Outcome<WriteReport> {
         let root_time = volume.root_time()?;
-        let mut out = BufWriter::new(self.file);
-        fat::manifest::volume::write_with_progress(volume, root_time, self.fields, &mut out, progress)
-            .map_err(bad("manifestSink"))
+        let out = BufWriter::new(self.file);
+        Ok(volume.write_manifest_with_progress(root_time, self.features, out, progress)?)
     }
 }
 
@@ -860,11 +942,11 @@ enum Fill {
     /// One regular file, Populate only.
     File(host::PassedStream),
     /// A manifest with its files below a directory.
-    FromDirectory(Manifest, DirectorySource),
+    FromDirectory(ManifestInput, DirectorySource<PinnedDirectory>),
     /// A manifest with its files' contents in a stream.
-    FromStream(Manifest, host::PassedStream),
+    FromStream(ManifestInput, host::PassedStream),
     /// A manifest alone, enough for a plan.
-    ManifestOnly(Manifest),
+    ManifestOnly(ManifestInput),
 }
 
 /// Which method takes the content: what it may be depends on it.
@@ -910,7 +992,7 @@ impl Counts {
             files: r.files,
             directories: r.directories,
             bytes: r.bytes,
-            skipped: r.skipped.len() as u64,
+            skipped: r.skipped,
         }
     }
 
@@ -943,9 +1025,10 @@ fn refuse_skipped(skipped: &[PathBuf]) -> fat::Result<()> {
     }
 }
 
-/// The `Content` parameter, taken and vetted: every descriptor checked,
-/// the manifest parsed, the source verified against it, before any image
-/// is touched.
+/// The `Content` parameter, taken and vetted: every descriptor checked
+/// and the root file object of the manifest read, before any image is
+/// touched. The rest of the manifest is read while its content is
+/// written.
 struct Content {
     fill: Option<Fill>,
     /// The fixed or clamping time of the time policy, and the time of
@@ -965,22 +1048,31 @@ struct Content {
 }
 
 impl Content {
-    /// Takes the content's descriptors and reads its manifest. `time` is
-    /// the content's time, Assemble's `timestampUSec` or Populate's, the
-    /// current time when neither was given.
-    fn take(p: &Params<'_>, c: &mut Connection, time: SystemTime, taker: Taker) -> Outcome<Content> {
+    /// Takes the content's descriptors and reads the root file object of
+    /// its manifest, which is used as `manifest_use` says and hashed where
+    /// `derivation` says that a serial number may be derived from it.
+    /// `time` is the content's time, Assemble's `timestampUSec` or
+    /// Populate's, the current time when neither was given.
+    fn take(
+        p: &Params<'_>,
+        c: &mut Connection,
+        time: SystemTime,
+        taker: Taker,
+        manifest_use: ManifestUse,
+        derivation: SerialDerivation,
+    ) -> Outcome<Content> {
         let source = match fd_param(c, p, "sourceFileDescriptor")? {
             None => None,
-            Some(fd) => Some(host::passed_source(fd).map_err(bad("sourceFileDescriptor"))?),
+            Some(fd) => Some(host::passed_source(fd, "sourceFileDescriptor")?),
         };
         let mut check_validity = true;
         let manifest = match p.object("manifest") {
             None => None,
             Some(m) => {
                 let fd = required_fd(c, &m, "fileDescriptor").map_err(|_| invalid("manifest"))?;
-                let file = host::passed_stream(fd).map_err(bad("manifest"))?;
+                let file = host::passed_stream(fd, "manifest")?;
                 check_validity = m.bool("checkValidity", true);
-                Some(util::read_manifest(file).map_err(bad("manifest"))?)
+                Some(ManifestInput::open(file, manifest_use, derivation).map_err(bad("manifest"))?)
             }
         };
         let sink = match p.object("manifestSink") {
@@ -995,16 +1087,11 @@ impl Content {
         let fail_unsupported = p.str("unsupported") == Some("fail");
         // extendedAttributes, uid and gid are accepted and ignored: FAT
         // keeps none of them.
-        if fail_unsupported {
-            if let Some(m) = &manifest {
-                m.check_supported()?;
-            }
-        }
         let source_mtime = match &source {
             Some(host::PassedSource::Directory(dir)) => File::from(dir.try_clone()?).metadata()?.modified().ok(),
             _ => None,
         };
-        let manifest_mtime = manifest.as_ref().and_then(|m| m.root.mtime());
+        let manifest_mtime = manifest.as_ref().and_then(|m| m.root().inode.mtime());
         let fill = match (source, manifest) {
             (None, None) => None,
             // A manifest names files that have to come from somewhere,
@@ -1025,8 +1112,7 @@ impl Content {
                 // Symbolic links are followed, resolved below the source
                 // directory and never outside it; the interface has no
                 // switch for that.
-                let source = DirectorySource::new(dir).follow_symlinks(true);
-                source.verify(&m)?;
+                let source = DirectorySource::new(PinnedDirectory::new(dir).follow_symlinks(true));
                 Some(Fill::FromDirectory(m, source))
             }
             (Some(host::PassedSource::Stream(file)), Some(m)) => Some(Fill::FromStream(m, file)),
@@ -1035,7 +1121,9 @@ impl Content {
             fill,
             time,
             times,
-            replace: p.bool("replace", true),
+            // Neither method replaces a file that is there, or takes a name
+            // FAT does not tell apart from one that is, unless asked to.
+            replace: p.bool("replace", false),
             fail_unsupported,
             check_validity,
             sink,
@@ -1059,28 +1147,58 @@ impl Content {
         self.manifest_mtime.or(self.source_mtime)
     }
 
+    /// The manifest of the content, if it has one.
+    fn manifest(&self) -> Option<&ManifestInput> {
+        match &self.fill {
+            Some(Fill::FromDirectory(m, _) | Fill::FromStream(m, _) | Fill::ManifestOnly(m)) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// The manifest of the content, if it has one, to be read.
+    fn manifest_mut(&mut self) -> Option<&mut ManifestInput> {
+        match &mut self.fill {
+            Some(Fill::FromDirectory(m, _) | Fill::FromStream(m, _) | Fill::ManifestOnly(m)) => Some(m),
+            _ => None,
+        }
+    }
+
     /// Puts the content into `plan`, at the root. Under UnsupportedPolicy
     /// fail a tree with entries FAT cannot hold is refused here, before
-    /// anything is written.
-    fn plan(&self, plan: &mut Plan) -> fat::Result<()> {
-        match &self.fill {
+    /// anything is written. A manifest is read once more from its start,
+    /// and its hash is kept where it is wanted.
+    fn plan(&mut self, plan: &mut Plan) -> fat::Result<()> {
+        let (copy, flags) = (self.copy_options(), self.assemble_flags());
+        match &mut self.fill {
             Some(Fill::Tree(dir)) => {
-                let skipped = plan.add_tree(dir.as_fd(), "/", true)?;
+                let skipped = plan.add_tree(dir.as_fd(), "/", &copy)?;
                 if self.fail_unsupported {
                     refuse_skipped(&skipped)?;
                 }
+                Ok(())
             }
             Some(Fill::FromDirectory(m, _) | Fill::FromStream(m, _) | Fill::ManifestOnly(m)) => {
-                plan.add_manifest(m)?;
+                m.plan(plan, flags).map(drop)
             }
-            Some(Fill::File(_)) | None => {
-                return Err(
-                    fat::Error::new(errno::EINVAL, "the content is not a tree or a manifest")
-                        .with(Detail::InvalidOption("content")),
-                )
-            }
+            Some(Fill::File(_)) | None => Err(fat::Error::new(
+                errno::EINVAL,
+                "the content is not a tree or a manifest",
+            )
+            .with(Detail::InvalidOption("content"))),
         }
-        Ok(())
+    }
+
+    /// Puts the content into `plan`, for a plan and nothing else. A
+    /// manifest is read on from its root file object, so it is read once.
+    /// Returns what the plan found in a manifest.
+    fn plan_once(mut self, plan: &mut Plan) -> fat::Result<Option<PlanOutcome>> {
+        let flags = self.assemble_flags();
+        match self.fill {
+            Some(Fill::FromDirectory(m, _) | Fill::FromStream(m, _) | Fill::ManifestOnly(m)) => {
+                m.plan_once(plan, flags).map(Some)
+            }
+            _ => self.plan(plan).map(|()| None),
+        }
     }
 
     /// Under UnsupportedPolicy fail, walks a tree that is to go below
@@ -1089,30 +1207,49 @@ impl Content {
     fn check_tree(&self, dest: &str) -> Outcome<()> {
         if let (true, Some(Fill::Tree(dir))) = (self.fail_unsupported, &self.fill) {
             let mut plan = Plan::new(PlanOptions::new(MIN_SECTOR_SIZE));
-            refuse_skipped(&plan.add_tree(dir.as_fd(), dest, true)?)?;
+            refuse_skipped(&plan.add_tree(dir.as_fd(), dest, &self.copy_options())?)?;
         }
         Ok(())
     }
 
+    /// How a copy of the tree, and its plan, take it: following symbolic
+    /// links, and replacing what is there with replace.
+    fn copy_options(&self) -> CopyOptions {
+        CopyOptions {
+            times: self.times,
+            name_collision: if self.replace {
+                NameCollision::Replace
+            } else {
+                NameCollision::Fail
+            },
+            follow_symlinks: true,
+        }
+    }
+
+    /// How an assembly of the manifest, and its plan, store its objects:
+    /// replacing what is there with replace, and leaving out what FAT
+    /// cannot store unless UnsupportedPolicy fail.
+    fn assemble_flags(&self) -> AssembleFlags {
+        AssembleFlags::NONE
+            .with(AssembleFlags::REPLACE, self.replace)
+            .with(AssembleFlags::SKIP_UNSUPPORTED, !self.fail_unsupported)
+    }
+
     /// Puts the content into the volume at `dest`: the directory a tree goes
     /// below, the path of one file. A manifest's tree goes below the root.
+    /// The manifest stays, read to its end.
     fn write_into(&mut self, v: &mut Volume, dest: &str, progress: &mut dyn FnMut(&Progress)) -> Outcome<Counts> {
-        let copy = CopyOptions {
-            times: self.times,
-            replace: self.replace,
-            follow_symlinks: true,
-        };
+        let copy = self.copy_options();
         let assembly = AssembleOptions {
             default_time: self.time,
-            replace: self.replace,
-            skip_unsupported: !self.fail_unsupported,
+            flags: self.assemble_flags(),
             now_usec: if self.check_validity {
                 Some(fat::time::to_usec(util::now()))
             } else {
                 None
             },
         };
-        Ok(match self.fill.take() {
+        Ok(match self.fill.as_mut() {
             None => Counts::default(),
             Some(Fill::Tree(dir)) => Counts::of_copy(&v.copy_tree_with_progress(dir.as_fd(), dest, &copy, progress)?),
             Some(Fill::File(file)) => Counts {
@@ -1120,13 +1257,17 @@ impl Content {
                 bytes: v.copy_file_with_progress(file.as_fd(), dest, &copy, progress)?,
                 ..Counts::default()
             },
-            Some(Fill::FromDirectory(m, mut source)) => {
-                Counts::of_assembly(&v.assemble_with_progress(&m, &mut source, &assembly, progress)?)
+            Some(Fill::FromDirectory(m, source)) => {
+                Counts::of_assembly(
+                    &v.assemble_with_observer(m.reader(), source, &assembly, &mut |p: &Progress| progress(p))?,
+                )
             }
-            Some(Fill::FromStream(m, mut file)) => Counts::of_assembly(
-                &v.assemble_with_progress(&m, &mut StreamSource::new(&mut file), &assembly, progress)
-                    .map_err(bad("sourceFileDescriptor"))?,
-            ),
+            Some(Fill::FromStream(m, file)) => Counts::of_assembly(&v.assemble_with_observer(
+                m.reader(),
+                &mut StreamSource::new(file),
+                &assembly,
+                &mut |p: &Progress| progress(p),
+            )?),
             // Never taken for a method that writes, see Content::take.
             Some(Fill::ManifestOnly(_)) => return Err(invalid("content")),
         })
@@ -1174,19 +1315,42 @@ impl FileSystemService {
             None => None,
             Some(a) => Some(Hash::new(a).ok_or_else(|| invalid("imageHash"))?),
         };
-        let options = format_options(p.object("options"))?;
+        let mut options = format_options(p.object("options"))?;
         let content_time = options.format.timestamp.unwrap_or_else(util::now);
-        let taker = if plan_only { Taker::Plan } else { Taker::Assemble };
-        let content = match p.object("content") {
+        // A plan alone reads a manifest once, on from its root file object.
+        // An assembly that sizes the file system to fit reads it for the
+        // plan from its start, and once more while its content is written.
+        let (taker, manifest_use, operation) = if plan_only {
+            (Taker::Plan, ManifestUse::PlanOnly, ManifestOperation::Plan)
+        } else {
+            (
+                Taker::Assemble,
+                options.size_mode.manifest_use(),
+                ManifestOperation::Assemble,
+            )
+        };
+        let mut content = match p.object("content") {
             None => None,
             Some(cp) => {
-                let content = Content::take(&cp, c, content_time, taker)?;
+                let derivation = operation.serial_derivation(options.identifier);
+                let content = Content::take(&cp, c, content_time, taker, manifest_use, derivation)?;
                 if matches!(content.shape(), Shape::Nothing) {
                     return Err(invalid("content"));
                 }
                 Some(content)
             }
         };
+        // A manifest gives the file system its serial number and its label,
+        // before it is planned or formatted: the serial number it names, or
+        // the one derived from it. Without a manifest a reproducible file
+        // system needs the identifier given.
+        match content.as_mut().and_then(Content::manifest_mut) {
+            Some(manifest) => options.reconcile(manifest)?,
+            None if options.reproducible && options.identifier.is_none() => {
+                return Err(Failure::NotReproducible("identifierRequired"));
+            }
+            None => {}
+        }
         match image {
             None => plan(options, content, c, more),
             Some(image) => assemble_image(image, options, content, hash, c, more),
@@ -1208,7 +1372,7 @@ impl FileSystemService {
             o.insert("files", w.files);
             o.insert("directories", w.directories);
             o.insert("bytes", w.bytes);
-            o.insert("omitted", w.omitted);
+            o.insert("omitted", w.omissions());
         }
         Ok(o)
     }
@@ -1221,7 +1385,18 @@ impl FileSystemService {
         let time = p.time("timestampUSec")?.unwrap_or_else(util::now);
         let mut content = match p.object("content") {
             None => None,
-            Some(cp) => Some(Content::take(&cp, c, time, Taker::Populate)?),
+            // A manifest goes into the file system only if that has the
+            // serial number and the label it names, which the assembly
+            // checks before it writes anything. No serial number is derived,
+            // so the manifest is not hashed.
+            Some(cp) => Some(Content::take(
+                &cp,
+                c,
+                time,
+                Taker::Populate,
+                ManifestUse::Write,
+                ManifestOperation::Populate.serial_derivation(None),
+            )?),
         };
         // A manifest names its paths from the root.
         if matches!(content.as_ref().map(Content::shape), Some(Shape::Manifest)) && path != "/" {
@@ -1239,12 +1414,28 @@ impl FileSystemService {
                             }
                         }
                     }
-                    _ => {
+                    Shape::Tree => {
                         ct.check_tree(path)?;
                         ensure_dir(&mut v, path, parents, time)?;
                     }
+                    // A manifest names its paths from the root, which is
+                    // there.
+                    Shape::Manifest | Shape::Nothing => {}
                 }
-                ct.write_into(&mut v, path, &mut |p| r.tick(p))?
+                match ct.write_into(&mut v, path, &mut |p| r.tick(p)) {
+                    Ok(counts) => counts,
+                    Err(e) => {
+                        // Once something was written, the filesystem is
+                        // left marked as not cleanly unmounted, as after a
+                        // crash, with what was complete. Content refused
+                        // before that, such as a manifest refused at its
+                        // first object, leaves it as it was.
+                        if v.is_writing() {
+                            let _ = v.close_unfinished();
+                        }
+                        return Err(e);
+                    }
+                }
             }
             // Nothing to put in: an empty directory at path.
             _ => {
@@ -1264,7 +1455,7 @@ impl FileSystemService {
             None => None,
             Some(sink) => {
                 let mut r = Reporter::start(c, more, "reading", Shown::PhaseOnly)?;
-                Some(sink.write(&v, &mut |p| r.tick(p))?.omitted)
+                Some(sink.write(&v, &mut |p| r.tick(p))?.omissions())
             }
         };
         v.close()?;
@@ -1369,8 +1560,17 @@ fn plan(mut options: Options, content: Option<Content>, c: &mut Connection, more
     // for the label, or to carry the root's time (see format_image).
     plan_options.label = true;
     let mut plan = Plan::new(plan_options);
-    if let Some(ct) = &content {
-        ct.plan(&mut plan)?;
+    let planned = match content {
+        Some(ct) => ct.plan_once(&mut plan)?,
+        None => None,
+    };
+    // The plan read the whole manifest, so the serial number derived from
+    // it is the one Assemble would give the file system.
+    if let Some(id) = options
+        .serial
+        .derived_serial(planned.and_then(|planned| planned.digest))?
+    {
+        options.format.volume_id = id.0;
     }
     let e = plan.estimate()?;
     e.apply(&mut options.format);
@@ -1385,21 +1585,21 @@ fn plan(mut options: Options, content: Option<Content>, c: &mut Connection, more
     optional(&mut d, "label", stored_label(&options.format)?);
     Ok(json::object! {
         "description" => d,
-        "exact" => true,
         "files" => e.files,
         "directories" => e.directories,
         "bytes" => e.bytes,
     })
 }
 
-/// Fills the file system Assemble formatted: the content copied, the root
-/// stamped with its time, the manifest of the result written. Returns the
-/// counts when there was content, the entries the manifest left out when
-/// one was written, and the description of the volume.
+/// Fills the file system Assemble formatted: the content copied, the
+/// serial number derived from a manifest given, the root stamped with its
+/// time, the manifest of the result written. Returns the counts when there
+/// was content, the entries the manifest left out when one was written, and
+/// the description of the volume.
 fn fill_image(
     volume: &mut Volume,
     content: Option<Content>,
-    time: Option<SystemTime>,
+    options: &Options,
     c: &mut Connection,
     more: bool,
 ) -> Outcome<(Option<Counts>, Option<u64>, Object)> {
@@ -1409,9 +1609,16 @@ fn fill_image(
     if let Some(mut ct) = content {
         let mut r = Reporter::start(c, more, "populating", Shown::EntriesAndBytes)?;
         counts = Some(ct.write_into(volume, "/", &mut |p| r.tick(p))?);
+        // The hash of a manifest is known once it is read to its end,
+        // whether it came through a pipe or in a regular file, read once
+        // more for minimize or not.
+        if let Some(manifest) = ct.manifest() {
+            manifest.stamp_serial(volume, options.serial)?;
+        }
         content_time = Some(ct.root_time());
         sink = ct.sink.take();
     }
+    let time = options.time;
     // The root directory's time, on the volume label entry: the timestamp
     // given, else what the content says about its root, else now. Without
     // content and without a timestamp the format left the entry, if any,
@@ -1428,24 +1635,26 @@ fn fill_image(
         None => None,
         Some(sink) => {
             let mut r = Reporter::start(c, more, "reading", Shown::PhaseOnly)?;
-            Some(sink.write(volume, &mut |p| r.tick(p))?.omitted)
+            Some(sink.write(volume, &mut |p| r.tick(p))?.omissions())
         }
     };
     Ok((counts, omitted, description(volume)?))
 }
 
 /// Assemble with mode assemble: the image written, filled with the content
-/// when there is one, sized to fit when no size is given. Everything that
-/// can be checked before the image is touched has been checked by now:
-/// the descriptors vetted, the manifest parsed and its source verified,
-/// the options validated. Without force in the options, an image that
-/// holds a file system, a partition table or other data is ImageNotEmpty.
-/// A call that fails after the format leaves the file system marked as not
-/// cleanly unmounted.
+/// when there is one. The file system takes the size given or the rest of
+/// the image, or with minimize the size the content needs. Everything that
+/// can be checked before the image is touched has been checked by now: the
+/// descriptors vetted, the root file object of a manifest read, the options
+/// validated. With minimize the content is planned before the image is
+/// touched. Without force in the options, an image that holds a file
+/// system, a partition table or other data is ImageNotEmpty. A call that
+/// fails after the format leaves the file system marked as not cleanly
+/// unmounted.
 fn assemble_image(
     image: Image,
     mut options: Options,
-    content: Option<Content>,
+    mut content: Option<Content>,
     hash: Option<Hash>,
     c: &mut Connection,
     more: bool,
@@ -1455,39 +1664,36 @@ fn assemble_image(
         None => None,
     };
     let (mut device, offset, size) = image.device(Access::ReadWrite)?;
-    let (mut volume, exact) = match &content {
-        Some(ct) => {
-            phase(c, more, "planning")?;
-            let (estimate, fit) = util::plan_fit(&mut device, offset, size, &mut options.format, true, &mut |plan| {
-                ct.plan(plan)
-            })
-            .map_err(fit_error)?;
-            if !options.force {
-                Prober::new().ensure_empty(&device, offset, Some(fit))?;
-            }
-            phase(c, more, "formatting")?;
-            let (volume, _) = util::format_fit(device, offset, fit, estimate, &options.format).map_err(fit_error)?;
-            (volume, size.is_none())
-        }
-        None => {
-            if !options.force {
-                Prober::new().ensure_empty(&device, offset, size)?;
-            }
-            // A regular file is grown to a size given. An image with no
-            // bytes in it has no size at all.
-            if let Some(s) = size {
-                util::size_image(&mut device, offset, s)?;
-            }
-            let device = device.window(offset, size)?;
-            if device.is_empty() {
-                return Err(Failure::SizeRequired);
-            }
-            check_block_size(&options.format, &device)?;
-            phase(c, more, "formatting")?;
-            (Volume::create(device, &options.format)?, false)
-        }
+    check_block_size(&options.format, &device)?;
+    // Without a plan a tree is walked here, so that under UnsupportedPolicy
+    // fail what FAT cannot hold is refused before the image is touched.
+    let mode = options.size_mode;
+    match (mode, &content) {
+        (SizeMode::Given, Some(ct)) => ct.check_tree("/")?,
+        (SizeMode::Given, None) => {}
+        (SizeMode::Fit | SizeMode::Minimize, _) => phase(c, more, "planning")?,
+    }
+    // A serial number derived from a manifest is given when its content is
+    // written, see fill_image.
+    let mut add = |plan: &mut Plan| match &mut content {
+        Some(ct) => ct.plan(plan),
+        None => Ok(()),
     };
-    let (counts, omitted, description) = match fill_image(&mut volume, content, options.time, c, more) {
+    let decision = util::decide_size(
+        &mut device,
+        offset,
+        size,
+        &mut options.format,
+        true,
+        SizeRequest::new(mode, &mut add),
+    )
+    .map_err(fit_error)?;
+    if !options.image.contains(ImageFlags::FORCE) {
+        Prober::new().ensure_empty(&device, offset, Some(decision.size))?;
+    }
+    phase(c, more, "formatting")?;
+    let mut volume = util::format_sized(device, offset, decision.size, &options.format)?;
+    let (counts, omitted, description) = match fill_image(&mut volume, content, &options, c, more) {
         Ok(filled) => filled,
         Err(e) => {
             // The file system is left marked as not cleanly unmounted, as
@@ -1500,7 +1706,7 @@ fn assemble_image(
     };
     let window = volume.device().len();
     volume.close()?;
-    let mut o = json::object! { "description" => description, "exact" => exact };
+    let mut o = json::object! { "description" => description };
     if let Some(counts) = counts {
         counts.put(&mut o);
     }

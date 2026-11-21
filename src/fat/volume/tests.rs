@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 //! Tests of the volume.
 use super::*;
+use crate::dirent::lfn_field;
 use crate::fat::{END_OF_CHAIN, ENTRY_SIZE};
 use crate::format::{self, FormatOptions};
 use crate::fsck;
 use crate::layout::FIRST_CLUSTER;
+use crate::name::{LFN_PADDING, LFN_TERMINATOR};
 use crate::test_util::{format_options, volume, TempImage};
+use crate::NameProblem;
 use std::io::{Read, Write};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -71,7 +74,7 @@ fn files_round_trip() {
         for (i, &size) in sizes.iter().enumerate() {
             let path = format!("/file{}.bin", i);
             let data: Vec<u8> = (0..size).map(|j| (j * 7 + i as u64) as u8).collect();
-            let mut w = v.create_file(&path, t(1_600_000_000), false).unwrap();
+            let mut w = v.create_file(&path, t(1_600_000_000), NameCollision::Fail).unwrap();
             // Write in odd sized pieces to exercise the pending buffer.
             for chunk in data.chunks(1000) {
                 w.write_all(chunk).unwrap();
@@ -98,8 +101,16 @@ fn files_round_trip() {
         let a = v.metadata("/file3.bin").unwrap().first_cluster;
         let b = v.metadata("/file4.bin").unwrap().first_cluster;
         assert_eq!(b, a + 1);
-        assert_eq!(v.create_file("/file1.bin", t(0), false).unwrap_err().errno(), EEXIST);
-        assert_eq!(v.create_file("/", t(0), false).unwrap_err().errno(), EEXIST);
+        assert_eq!(
+            v.create_file("/file1.bin", t(0), NameCollision::Fail)
+                .unwrap_err()
+                .errno(),
+            EEXIST
+        );
+        assert_eq!(
+            v.create_file("/", t(0), NameCollision::Fail).unwrap_err().errno(),
+            EEXIST
+        );
         assert_eq!(v.open_file("/missing").unwrap_err().errno(), ENOENT);
         assert_eq!(v.open_file("/").unwrap_err().errno(), EISDIR);
         v.remove_file("/file5.bin").unwrap();
@@ -116,12 +127,12 @@ fn files_round_trip() {
 fn replace_and_abort() {
     let (_img, mut v) = volume(8 << 20, 512, 512);
     let free = v.free_clusters();
-    let mut w = v.create_file("/a.txt", t(0), false).unwrap();
+    let mut w = v.create_file("/a.txt", t(0), NameCollision::Fail).unwrap();
     w.write_all(&[1u8; 2000]).unwrap();
     w.finish().unwrap();
     // Replacing goes through the case-insensitive match and creates the
     // entry anew under the new spelling.
-    let mut w = v.create_file("/A.TXT", t(0), true).unwrap();
+    let mut w = v.create_file("/A.TXT", t(0), NameCollision::Replace).unwrap();
     w.write_all(&[2u8; 100]).unwrap();
     w.finish().unwrap();
     assert_eq!(names(&v, "/"), vec!["A.TXT"]);
@@ -129,19 +140,109 @@ fn replace_and_abort() {
     assert_eq!(v.free_clusters(), free - 1);
     // Dropping an unfinished writer discards the file.
     {
-        let mut w = v.create_file("/b.txt", t(0), false).unwrap();
+        let mut w = v.create_file("/b.txt", t(0), NameCollision::Fail).unwrap();
         w.write_all(&[3u8; 5000]).unwrap();
     }
     assert_eq!(names(&v, "/"), vec!["A.TXT"]);
     assert_eq!(v.free_clusters(), free - 1);
-    let mut w = v.create_file("/c.txt", t(0), false).unwrap();
+    let mut w = v.create_file("/c.txt", t(0), NameCollision::Fail).unwrap();
     w.write_all(&[3u8; 5000]).unwrap();
     w.abort().unwrap();
     assert_eq!(names(&v, "/"), vec!["A.TXT"]);
     assert_eq!(v.free_clusters(), free - 1);
-    assert_eq!(v.create_file("/a.txt/x", t(0), false).unwrap_err().errno(), ENOTDIR);
+    assert_eq!(
+        v.create_file("/a.txt/x", t(0), NameCollision::Fail)
+            .unwrap_err()
+            .errno(),
+        ENOTDIR
+    );
     v.create_dir("/d", t(0)).unwrap();
-    assert_eq!(v.create_file("/d", t(0), true).unwrap_err().errno(), EISDIR);
+    assert_eq!(
+        v.create_file("/d", t(0), NameCollision::Replace).unwrap_err().errno(),
+        EISDIR
+    );
+}
+
+/// find_or_create_dir() makes a directory with the attributes it is given,
+/// or takes the one of the same name with the attributes it has, and with
+/// NameCollision::Replace one under a name FAT does not tell apart. With
+/// NameCollision::Fail that is a case collision, which comes first and
+/// names the entry that is there the way the volume spells its path. A
+/// file of such a name is ENOTDIR, and attribute bits that say what an
+/// entry is are EINVAL.
+#[test]
+fn directories_are_found_or_made() {
+    let (_img, mut v) = volume(8 << 20, 512, 512);
+    assert_eq!(
+        v.find_or_create_dir("/EFI", t(0), ATTR_HIDDEN, NameCollision::Fail)
+            .unwrap(),
+        DirectoryOrigin::Created
+    );
+    let efi = v.metadata("/EFI").unwrap();
+    assert_eq!(efi.attributes, ATTR_DIRECTORY | ATTR_HIDDEN);
+    // The dot entries are plain directories.
+    let dir = v.load_directory(efi.first_cluster).unwrap();
+    for e in dir.iter().filter(|e| e.is_dot()) {
+        assert_eq!(e.short.attr, ATTR_DIRECTORY);
+    }
+    v.create_file("/EFI/x", t(0), NameCollision::Fail)
+        .unwrap()
+        .finish()
+        .unwrap();
+    let existing = DirectoryOrigin::Existing {
+        attributes: ATTR_DIRECTORY | ATTR_HIDDEN,
+    };
+    assert_eq!(
+        v.find_or_create_dir("/EFI", t(0), ATTR_SYSTEM, NameCollision::Fail)
+            .unwrap(),
+        existing
+    );
+    assert_eq!(
+        v.find_or_create_dir("/efi/", t(0), NO_ATTRIBUTES, NameCollision::Replace)
+            .unwrap(),
+        existing
+    );
+    assert_eq!(v.metadata("/EFI").unwrap().attributes, ATTR_DIRECTORY | ATTR_HIDDEN);
+    let e = v
+        .find_or_create_dir("/new", t(0), ATTR_DIRECTORY, NameCollision::Fail)
+        .unwrap_err();
+    assert_eq!(
+        (e.errno(), e.detail()),
+        (EINVAL, Some(&Detail::InvalidOption("attributes")))
+    );
+    // The bits come before the path is looked up.
+    let e = v
+        .find_or_create_dir("/missing/d", t(0), ATTR_DIRECTORY, NameCollision::Fail)
+        .unwrap_err();
+    assert_eq!(e.errno(), EINVAL);
+    let e = v
+        .find_or_create_dir("/efi", t(0), NO_ATTRIBUTES, NameCollision::Fail)
+        .unwrap_err();
+    assert_eq!(e.errno(), EEXIST);
+    assert_eq!(
+        e.detail(),
+        Some(&Detail::Name {
+            name: "/efi".into(),
+            problem: NameProblem::CaseCollision,
+        })
+    );
+    assert_eq!(e.message(), "'/efi' and '/EFI' are names FAT cannot tell apart");
+    let e = v
+        .find_or_create_dir("/efi/X", t(0), NO_ATTRIBUTES, NameCollision::Fail)
+        .unwrap_err();
+    assert_eq!(e.message(), "'/efi/X' and '/EFI/x' are names FAT cannot tell apart");
+    for (path, collision, errno) in [
+        ("/EFI/x", NameCollision::Fail, ENOTDIR),
+        ("/EFI/x", NameCollision::Replace, ENOTDIR),
+        ("/EFI/X", NameCollision::Fail, EEXIST),
+        ("/EFI/X", NameCollision::Replace, ENOTDIR),
+        ("/missing/d", NameCollision::Fail, ENOENT),
+    ] {
+        let e = v.find_or_create_dir(path, t(0), NO_ATTRIBUTES, collision).unwrap_err();
+        assert_eq!(e.errno(), errno, "{} {:?}", path, collision);
+    }
+    assert_eq!(names(&v, "/"), vec!["EFI"]);
+    assert_eq!(names(&v, "/EFI"), vec!["x"]);
 }
 
 #[test]
@@ -155,7 +256,7 @@ fn short_and_long_names() {
         "longfilename2.txt",
         "ünïcödé",
     ] {
-        v.create_file(&format!("/{}", name), t(0), false)
+        v.create_file(&format!("/{}", name), t(0), NameCollision::Fail)
             .unwrap()
             .finish()
             .unwrap();
@@ -180,9 +281,22 @@ fn short_and_long_names() {
     // Lookups work through either name.
     assert_eq!(v.metadata("/LONGFI~2.TXT").unwrap().name, "longfilename2.txt");
     assert_eq!(v.metadata("/ÜNÏCÖDÉ").unwrap().name, "ünïcödé");
-    assert_eq!(v.create_file("/README.TXT", t(0), false).unwrap_err().errno(), EEXIST);
-    assert_eq!(v.create_file("/bad:name", t(0), false).unwrap_err().errno(), EINVAL);
-    assert_eq!(v.create_file("/a/../b", t(0), false).unwrap_err().errno(), EINVAL);
+    assert_eq!(
+        v.create_file("/README.TXT", t(0), NameCollision::Fail)
+            .unwrap_err()
+            .errno(),
+        EEXIST
+    );
+    assert_eq!(
+        v.create_file("/bad:name", t(0), NameCollision::Fail)
+            .unwrap_err()
+            .errno(),
+        EINVAL
+    );
+    assert_eq!(
+        v.create_file("/a/../b", t(0), NameCollision::Fail).unwrap_err().errno(),
+        EINVAL
+    );
 }
 
 #[test]
@@ -194,7 +308,7 @@ fn directory_growth() {
     // one) need 120 slots plus the dot entries, i.e. 8 clusters of 16
     // slots.
     for i in 0..40 {
-        v.create_file(&format!("/d/Mixed Case File {}.txt", i), t(0), false)
+        v.create_file(&format!("/d/Mixed Case File {}.txt", i), t(0), NameCollision::Fail)
             .unwrap()
             .finish()
             .unwrap();
@@ -219,31 +333,48 @@ fn growing_a_directory_without_space_changes_nothing() {
     v.create_dir("/sub", t(0)).unwrap();
     // The dots plus 14 one-slot entries fill the directory's cluster.
     for i in 0..14 {
-        v.create_file(&format!("/sub/F{}", i), t(0), false)
+        v.create_file(&format!("/sub/F{}", i), t(0), NameCollision::Fail)
             .unwrap()
             .finish()
             .unwrap();
     }
-    let mut w = v.create_file("/junk", t(0), false).unwrap();
+    let mut w = v.create_file("/junk", t(0), NameCollision::Fail).unwrap();
     w.write_all(&[b'A'; 512]).unwrap();
     w.finish().unwrap();
     let free = v.free_clusters();
-    let mut w = v.create_file("/fill", t(0), false).unwrap();
+    let mut w = v.create_file("/fill", t(0), NameCollision::Fail).unwrap();
     w.write_all(&vec![0u8; free as usize * 512]).unwrap();
     w.finish().unwrap();
     assert_eq!(v.free_clusters(), 0);
-    // Growing /sub needs a cluster there is not.
-    assert_eq!(v.create_file("/sub/F14", t(0), false).unwrap_err().errno(), ENOSPC);
+    // Growing /sub needs a cluster there is not. That is found before
+    // anything is written.
+    v.sync().unwrap();
+    let bytes = std::fs::read(img.path()).unwrap();
+    assert_eq!(
+        v.create_file("/sub/F14", t(0), NameCollision::Fail)
+            .unwrap_err()
+            .errno(),
+        ENOSPC
+    );
     assert_eq!(names(&v, "/sub").len(), 14);
-    // With one free cluster a new directory gets its own cluster but
+    assert_eq!(std::fs::read(img.path()).unwrap(), bytes);
+    assert!(!v.is_writing());
+    // With one free cluster a new directory could get its own cluster but
     // /sub cannot grow to hold its entry: nothing changes either.
     v.remove_file("/junk").unwrap();
     assert_eq!(v.free_clusters(), 1);
+    v.sync().unwrap();
+    let bytes = std::fs::read(img.path()).unwrap();
     assert_eq!(v.create_dir("/sub/d", t(0)).unwrap_err().errno(), ENOSPC);
     assert_eq!(v.free_clusters(), 1);
     assert_eq!(names(&v, "/sub").len(), 14);
+    assert_eq!(std::fs::read(img.path()).unwrap(), bytes);
+    assert!(!v.is_writing());
     // A file without contents only needs the directory to grow.
-    v.create_file("/sub/F14", t(0), false).unwrap().finish().unwrap();
+    v.create_file("/sub/F14", t(0), NameCollision::Fail)
+        .unwrap()
+        .finish()
+        .unwrap();
     assert_eq!(v.free_clusters(), 0);
     assert_eq!(names(&v, "/sub").len(), 15);
     v.close().unwrap();
@@ -253,15 +384,234 @@ fn growing_a_directory_without_space_changes_nothing() {
     assert_eq!(names(&v, "/sub").len(), 15);
 }
 
+/// A directory with every one of its MAX_SLOTS entry slots in use takes no
+/// more entries, and refusing one writes nothing. The directory is made on
+/// the image itself: one entry at a time would take too long.
+#[test]
+fn a_full_directory_refuses_before_it_writes() {
+    let cs = 4096;
+    let per_cluster = cs / DIR_ENTRY_SIZE;
+    let (img, mut v) = volume(8 << 20, 512, cs as u32);
+    v.create_dir("/d", t(0)).unwrap();
+    let d = v.metadata("/d").unwrap();
+    let more = u32::try_from(MAX_SLOTS / per_cluster - 1).unwrap();
+    let extent = v.allocate(more).unwrap();
+    assert_eq!(extent.count, more);
+    v.link(d.first_cluster, extent.first).unwrap();
+    let layout = *v.layout();
+    v.close().unwrap();
+    // The dot entries stay; every other slot gets a file of its own name.
+    let dev = img.device();
+    let chain = std::iter::once(d.first_cluster).chain(extent.first..extent.first + more);
+    for (i, cluster) in chain.enumerate() {
+        let offset = layout.cluster_offset(cluster).unwrap();
+        let mut data = vec![0u8; cs];
+        dev.read_at(offset, &mut data).unwrap();
+        for (j, slot) in data.chunks_exact_mut(DIR_ENTRY_SIZE).enumerate() {
+            let n = i * per_cluster + j;
+            if n < 2 {
+                continue;
+            }
+            let mut name = [b' '; SHORT_NAME_SIZE];
+            name[..8].copy_from_slice(format!("{:08X}", n).as_bytes());
+            let mut entry = RawDirEntry {
+                name,
+                attr: ATTR_ARCHIVE,
+                ..RawDirEntry::default()
+            };
+            entry.set_times(FatTimestamp::from_system_time(t(0)));
+            slot.copy_from_slice(&entry.to_bytes());
+        }
+        dev.write_at(offset, &data).unwrap();
+    }
+    drop(dev);
+    let mut v = Volume::open(img.device()).unwrap();
+    let bytes = std::fs::read(img.path()).unwrap();
+    assert_eq!(v.read_dir("/d").unwrap().len(), MAX_SLOTS - 2);
+    for e in [
+        v.create_file("/d/x", t(0), NameCollision::Fail).map(drop).unwrap_err(),
+        v.create_dir("/d/y", t(0)).unwrap_err(),
+        v.create_dir_all("/d/y/z", t(0)).unwrap_err(),
+    ] {
+        assert_eq!(e.errno(), ENOSPC);
+        assert!(
+            matches!(
+                e.detail(),
+                Some(Detail::NoSpace {
+                    reason: NoSpaceReason::DirectoryEntries,
+                    ..
+                })
+            ),
+            "{:?}",
+            e
+        );
+    }
+    assert_eq!(std::fs::read(img.path()).unwrap(), bytes);
+    assert!(!v.is_writing());
+}
+
+/// growth_for() counts the clusters free_run() appends from the free
+/// slots at the end, which the first cluster appended continues, and
+/// refuses growth past MAX_SLOTS slots but not growth up to it.
+#[test]
+fn growth_for_continues_the_free_slots_at_the_end() {
+    let cs = 512;
+    let per_cluster = cs / DIR_ENTRY_SIZE;
+    let (_img, v) = volume(1 << 20, 512, cs as u32);
+    // A directory of `clusters` clusters whose first `used` slots hold
+    // entries, with nothing after them.
+    let dir = |clusters: usize, used: usize| {
+        let mut data = vec![0u8; clusters * cs];
+        for (n, slot) in data.chunks_exact_mut(DIR_ENTRY_SIZE).take(used).enumerate() {
+            let mut name = [b' '; SHORT_NAME_SIZE];
+            name[..8].copy_from_slice(format!("{:08X}", n).as_bytes());
+            let entry = RawDirEntry {
+                name,
+                attr: ATTR_ARCHIVE,
+                ..RawDirEntry::default()
+            };
+            slot.copy_from_slice(&entry.to_bytes());
+        }
+        let first = FIRST_CLUSTER;
+        Directory::new((first..first + clusters as u32).collect(), data, cs).unwrap()
+    };
+    let full = |e: Error| {
+        e.errno() == ENOSPC
+            && matches!(
+                e.detail(),
+                Some(Detail::NoSpace {
+                    reason: NoSpaceReason::DirectoryEntries,
+                    ..
+                })
+            )
+    };
+    // Four slots free at the end: the first cluster appended continues them.
+    let d = dir(2, 2 * per_cluster - 4);
+    assert_eq!(d.free_at_end(), 4);
+    assert_eq!(v.growth_for(&d, 5).unwrap(), 1);
+    assert_eq!(v.growth_for(&d, 4 + per_cluster).unwrap(), 1);
+    assert_eq!(v.growth_for(&d, 5 + per_cluster).unwrap(), 2);
+    // None free at the end: every slot of the run is a new one.
+    let d = dir(2, 2 * per_cluster);
+    assert_eq!(d.free_at_end(), 0);
+    assert_eq!(v.growth_for(&d, per_cluster).unwrap(), 1);
+    assert_eq!(v.growth_for(&d, per_cluster + 1).unwrap(), 2);
+    // A cluster short of MAX_SLOTS: growing up to it is fine, past it not.
+    let most = MAX_SLOTS / per_cluster;
+    let d = dir(most - 1, (most - 1) * per_cluster - 4);
+    assert_eq!(d.free_at_end(), 4);
+    assert_eq!(v.growth_for(&d, 4 + per_cluster).unwrap(), 1);
+    assert!(full(v.growth_for(&d, 5 + per_cluster).unwrap_err()));
+    // At MAX_SLOTS the free slots at the end still take a run that fits
+    // them, and nothing longer.
+    let d = dir(most, MAX_SLOTS - 4);
+    assert_eq!(d.find_free_run(4), Some(MAX_SLOTS - 4));
+    assert!(full(v.growth_for(&d, 5).unwrap_err()));
+}
+
+/// An entry that continues the free slots at the end of a directory needs
+/// the clusters past them only, and exactly that many free clusters do.
+/// One less refuses it before anything is written.
+#[test]
+fn growing_from_the_free_slots_at_the_end_takes_the_clusters_it_needs() {
+    let (img, mut v) = volume(1 << 20, 512, 512);
+    v.create_dir("/d", t(0)).unwrap();
+    // The dots and 13 one-slot entries leave the last slot of /d free.
+    for i in 0..13 {
+        v.create_file(&format!("/d/F{}", i), t(0), NameCollision::Fail)
+            .unwrap()
+            .finish()
+            .unwrap();
+    }
+    let d = v.metadata("/d").unwrap();
+    assert_eq!(v.load_directory(d.first_cluster).unwrap().free_at_end(), 1);
+    let free = v.free_clusters();
+    let mut w = v.create_file("/fill", t(0), NameCollision::Fail).unwrap();
+    w.write_all(&vec![0u8; (free as usize - 1) * 512]).unwrap();
+    w.finish().unwrap();
+    assert_eq!(v.free_clusters(), 1);
+    v.sync().unwrap();
+    let bytes = std::fs::read(img.path()).unwrap();
+    // A name of two slots needs a cluster for /d, and a directory of that
+    // name one more for itself.
+    assert_eq!(v.create_dir("/d/abcdefghi", t(0)).unwrap_err().errno(), ENOSPC);
+    assert_eq!(std::fs::read(img.path()).unwrap(), bytes);
+    assert!(!v.is_writing());
+    // A file of that name takes the one, and its entry starts in the last
+    // slot of the first cluster.
+    v.create_file("/d/abcdefghi", t(0), NameCollision::Fail)
+        .unwrap()
+        .finish()
+        .unwrap();
+    assert_eq!(v.free_clusters(), 0);
+    let dir = v.load_directory(d.first_cluster).unwrap();
+    assert_eq!(dir.chain().len(), 2);
+    let e = dir.entries().into_iter().find(|e| e.name() == "abcdefghi").unwrap();
+    assert_eq!(e.first_slot(), 15);
+    v.close().unwrap();
+    let r = fsck::check(&img.device()).unwrap();
+    assert_eq!(r.errors(), 0, "{:?}", r.problems);
+}
+
+/// create_dir_all() walks through directories whatever their names, such
+/// as " x", which Linux writes and ufat does not, and checks only the
+/// names of the directories it creates.
+#[test]
+fn create_dir_all_walks_through_names_it_would_not_write() {
+    let (img, mut v) = volume(1 << 20, 512, 512);
+    v.create_dir("/abcdefghij", t(0)).unwrap();
+    let root = v.boot.root_cluster;
+    let first_slot = v
+        .load_directory(root)
+        .unwrap()
+        .entries()
+        .into_iter()
+        .find(|e| e.name() == "abcdefghij")
+        .unwrap()
+        .first_slot();
+    let layout = *v.layout();
+    v.close().unwrap();
+    // Its one long name slot gets the name " x".
+    let at = layout.cluster_offset(root).unwrap() + (first_slot * DIR_ENTRY_SIZE) as u64;
+    let dev = img.device();
+    let mut slot = [0u8; DIR_ENTRY_SIZE];
+    dev.read_at(at, &mut slot).unwrap();
+    let units = [u16::from(b' '), u16::from(b'x'), LFN_TERMINATOR]
+        .into_iter()
+        .chain(std::iter::repeat(LFN_PADDING));
+    let offsets = [lfn_field::NAME1, lfn_field::NAME2, lfn_field::NAME3]
+        .into_iter()
+        .flat_map(|field| field.step_by(2));
+    for (off, unit) in offsets.zip(units) {
+        slot[off..off + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    dev.write_at(at, &slot).unwrap();
+    drop(dev);
+    let mut v = Volume::open(img.device()).unwrap();
+    assert_eq!(names(&v, "/"), vec![" x"]);
+    assert_eq!(LongName::new(" x").unwrap_err().errno(), EINVAL);
+    v.create_dir_all("/ x/y/z", t(0)).unwrap();
+    assert!(v.metadata("/ x/y/z").unwrap().is_dir);
+    // A name it creates is checked, before anything is written.
+    v.sync().unwrap();
+    let bytes = std::fs::read(img.path()).unwrap();
+    assert_eq!(v.create_dir_all("/ x/y/ w/v", t(0)).unwrap_err().errno(), EINVAL);
+    assert_eq!(std::fs::read(img.path()).unwrap(), bytes);
+    assert!(!v.is_writing());
+    v.close().unwrap();
+    let r = fsck::check(&img.device()).unwrap();
+    assert_eq!(r.errors(), 0, "{:?}", r.problems);
+}
+
 #[test]
 fn a_failed_write_discards_the_file() {
     let (img, mut v) = volume(1 << 20, 512, 512);
     let free = v.free_clusters();
-    let mut w = v.create_file("/big", t(0), false).unwrap();
+    let mut w = v.create_file("/big", t(0), NameCollision::Fail).unwrap();
     let e = w.write_all(&vec![0x5a; (free as usize + 5) * 512]).unwrap_err();
-    assert_eq!(crate::Error::from(e).errno(), ENOSPC);
+    assert_eq!(Error::from(e).errno(), ENOSPC);
     // From here on the writer refuses to pretend.
-    assert_eq!(crate::Error::from(w.write_all(b"more").unwrap_err()).errno(), EIO);
+    assert_eq!(Error::from(w.write_all(b"more").unwrap_err()).errno(), EIO);
     assert_eq!(w.finish().unwrap_err().errno(), EIO);
     assert_eq!(v.metadata("/big").unwrap_err().errno(), ENOENT);
     assert_eq!(v.free_clusters(), free);
@@ -283,7 +633,10 @@ fn the_label_is_not_a_name() {
     assert_eq!(v.label().unwrap().as_deref(), Some("EFI"));
     assert_eq!(v.metadata("/EFI").unwrap_err().errno(), ENOENT);
     v.create_dir_all("/EFI/BOOT", t(0)).unwrap();
-    v.create_file("/efi.txt", t(0), false).unwrap().finish().unwrap();
+    v.create_file("/efi.txt", t(0), NameCollision::Fail)
+        .unwrap()
+        .finish()
+        .unwrap();
     assert_eq!(names(&v, "/"), vec!["EFI", "efi.txt"]);
     assert_eq!(v.label().unwrap().as_deref(), Some("EFI"));
     v.close().unwrap();
@@ -294,20 +647,20 @@ fn the_label_is_not_a_name() {
 #[test]
 fn replacing_keeps_the_old_file_until_the_new_one_is_complete() {
     let (_img, mut v) = volume(1 << 20, 512, 512);
-    let mut w = v.create_file("/EFI.efi", t(0), false).unwrap();
+    let mut w = v.create_file("/EFI.efi", t(0), NameCollision::Fail).unwrap();
     w.write_all(&[7u8; 3000]).unwrap();
     w.finish().unwrap();
     let free = v.free_clusters();
     // A replacement that is dropped half way leaves the old file alone.
     {
-        let mut w = v.create_file("/efi.EFI", t(1), true).unwrap();
+        let mut w = v.create_file("/efi.EFI", t(1), NameCollision::Replace).unwrap();
         w.write_all(&[8u8; 1000]).unwrap();
     }
     assert_eq!(names(&v, "/"), vec!["EFI.efi"]);
     assert_eq!(v.metadata("/EFI.efi").unwrap().size, 3000);
     assert_eq!(v.free_clusters(), free);
     // So does one that is aborted.
-    let mut w = v.create_file("/efi.EFI", t(1), true).unwrap();
+    let mut w = v.create_file("/efi.EFI", t(1), NameCollision::Replace).unwrap();
     w.write_all(&[8u8; 1000]).unwrap();
     w.abort().unwrap();
     assert_eq!(names(&v, "/"), vec!["EFI.efi"]);
@@ -321,7 +674,7 @@ fn replacing_keeps_the_old_file_until_the_new_one_is_complete() {
         (e.first_slot(), e.slot)
     };
     let old = slot_of(&v, "efi.efi");
-    let mut w = v.create_file("/efi.EFI", t(1), true).unwrap();
+    let mut w = v.create_file("/efi.EFI", t(1), NameCollision::Replace).unwrap();
     w.write_all(&[8u8; 1000]).unwrap();
     w.finish().unwrap();
     assert_eq!(names(&v, "/"), vec!["efi.EFI"]);
@@ -331,7 +684,7 @@ fn replacing_keeps_the_old_file_until_the_new_one_is_complete() {
     assert!(!v.load_directory(root).unwrap().has_reservations());
     // A spelling that needs a long name no longer fits into the one slot
     // and goes elsewhere; the old entry is deleted after it.
-    let mut w = v.create_file("/Efi.efi", t(1), true).unwrap();
+    let mut w = v.create_file("/Efi.efi", t(1), NameCollision::Replace).unwrap();
     w.write_all(&[9u8; 500]).unwrap();
     w.finish().unwrap();
     assert_eq!(names(&v, "/"), vec!["Efi.efi"]);
@@ -341,7 +694,7 @@ fn replacing_keeps_the_old_file_until_the_new_one_is_complete() {
     // And back to one slot. Deleting the two slots of the long form leaves
     // the deleted slot before them as the end of the directory, so the new
     // entry goes there and the directory is compact again.
-    let mut w = v.create_file("/EFI.EFI", t(1), true).unwrap();
+    let mut w = v.create_file("/EFI.EFI", t(1), NameCollision::Replace).unwrap();
     w.write_all(&[10u8; 500]).unwrap();
     w.finish().unwrap();
     assert_eq!(slot_of(&v, "efi.efi"), (1, 1));
@@ -356,7 +709,10 @@ fn replacing_keeps_the_old_file_until_the_new_one_is_complete() {
 fn a_damaged_directory_is_read_but_not_written() {
     let (img, mut v) = volume(1 << 20, 512, 512);
     v.create_dir("/d", t(0)).unwrap();
-    v.create_file("/d/x", t(0), false).unwrap().finish().unwrap();
+    v.create_file("/d/x", t(0), NameCollision::Fail)
+        .unwrap()
+        .finish()
+        .unwrap();
     let d = v.metadata("/d").unwrap();
     let layout = *v.layout();
     v.close().unwrap();
@@ -369,17 +725,31 @@ fn a_damaged_directory_is_read_but_not_written() {
         )
         .unwrap();
     let mut v = Volume::open(img.device()).unwrap();
+    let bytes = std::fs::read(img.path()).unwrap();
     // Reading stops at the marker, like Linux.
     assert_eq!(names(&v, "/d"), vec!["x"]);
     assert!(v.metadata("/d/x").is_ok());
-    // Writing is refused in every form.
-    assert_eq!(v.create_file("/d/y", t(0), false).unwrap_err().errno(), EUCLEAN);
+    // Writing is refused in every form, before anything is written: the
+    // directory's entry in the root does not get the time its dot entries
+    // cannot.
+    assert_eq!(
+        v.create_file("/d/y", t(0), NameCollision::Fail).unwrap_err().errno(),
+        EUCLEAN
+    );
     assert_eq!(v.create_dir("/d/sub", t(0)).unwrap_err().errno(), EUCLEAN);
+    assert_eq!(v.create_dir_all("/d/sub/deeper", t(0)).unwrap_err().errno(), EUCLEAN);
+    assert_eq!(v.set_times("/d/x", t(1_700_000_000)).unwrap_err().errno(), EUCLEAN);
+    assert_eq!(v.set_times("/d", t(1_700_000_000)).unwrap_err().errno(), EUCLEAN);
+    assert_eq!(v.set_attributes("/d/x", ATTR_HIDDEN).unwrap_err().errno(), EUCLEAN);
+    assert_eq!(std::fs::read(img.path()).unwrap(), bytes);
+    assert!(!v.is_writing());
     assert_eq!(v.remove_file("/d/x").unwrap_err().errno(), EUCLEAN);
-    assert_eq!(v.set_times("/d/x", t(1)).unwrap_err().errno(), EUCLEAN);
     assert_eq!(names(&v, "/d"), vec!["x"]);
     // The rest of the volume is still usable.
-    v.create_file("/ok", t(0), false).unwrap().finish().unwrap();
+    v.create_file("/ok", t(0), NameCollision::Fail)
+        .unwrap()
+        .finish()
+        .unwrap();
     assert_eq!(names(&v, "/"), vec!["d", "ok"]);
 }
 
@@ -387,7 +757,10 @@ fn a_damaged_directory_is_read_but_not_written() {
 fn set_times() {
     let (_img, mut v) = volume(1 << 20, 512, 512);
     v.create_dir("/d", t(0)).unwrap();
-    v.create_file("/d/f", t(0), false).unwrap().finish().unwrap();
+    v.create_file("/d/f", t(0), NameCollision::Fail)
+        .unwrap()
+        .finish()
+        .unwrap();
     v.set_times("/d/f", t(1_700_000_000)).unwrap();
     v.set_times("/d", t(1_600_000_000)).unwrap();
     assert_eq!(v.metadata("/d/f").unwrap().modified, t(1_700_000_000));
@@ -416,6 +789,14 @@ fn set_times() {
     }
     assert_eq!(v.set_times("/", t(0)).unwrap_err().errno(), EINVAL);
     assert_eq!(v.set_times("/missing", t(0)).unwrap_err().errno(), ENOENT);
+    // The time an entry has already is not written.
+    v.sync().unwrap();
+    v.set_times("/d", t(1_600_000_000)).unwrap();
+    v.set_times("/d/f", t(1_700_000_000)).unwrap();
+    assert!(!v.is_writing());
+    v.set_times("/d", t(1_700_000_000)).unwrap();
+    assert!(v.is_writing());
+    assert_eq!(v.metadata("/d").unwrap().modified, t(1_700_000_000));
 }
 
 #[test]
@@ -436,7 +817,10 @@ fn garbage_beyond_the_last_fat_entry_is_ignored() {
     }
     let mut v = Volume::open(dev).unwrap();
     assert_eq!(v.free_clusters(), free);
-    v.create_file("/f", t(0), false).unwrap().finish().unwrap();
+    v.create_file("/f", t(0), NameCollision::Fail)
+        .unwrap()
+        .finish()
+        .unwrap();
     v.close().unwrap();
     let r = fsck::check(&img.device()).unwrap();
     assert_eq!(r.errors(), 0, "{:?}", r.problems);
@@ -492,7 +876,11 @@ fn reproducible() {
         v.create_dir_all("/EFI/Linux", t(1_700_000_000)).unwrap();
         for i in 0..5 {
             let mut w = v
-                .create_file(&format!("/EFI/Linux/kernel-{}.efi", i), t(1_700_000_000 + i), false)
+                .create_file(
+                    &format!("/EFI/Linux/kernel-{}.efi", i),
+                    t(1_700_000_000 + i),
+                    NameCollision::Fail,
+                )
                 .unwrap();
             w.write_all(&vec![i as u8; 777 * (i as usize + 1)]).unwrap();
             w.finish().unwrap();
@@ -554,10 +942,10 @@ fn durable_mode_runs_the_same_operations() {
     assert!(!v.durable(), "an image file is not durable by default");
     v.set_durable(true);
     v.create_dir_all("/a/b", t(0)).unwrap();
-    let mut w = v.create_file("/a/b/f", t(0), false).unwrap();
+    let mut w = v.create_file("/a/b/f", t(0), NameCollision::Fail).unwrap();
     w.write_all(b"data").unwrap();
     w.finish().unwrap();
-    let mut w = v.create_file("/a/b/f", t(0), true).unwrap();
+    let mut w = v.create_file("/a/b/f", t(0), NameCollision::Replace).unwrap();
     w.write_all(b"newer").unwrap();
     w.finish().unwrap();
     v.remove_file("/a/b/f").unwrap();
@@ -573,14 +961,14 @@ fn durable_mode_runs_the_same_operations() {
 #[test]
 fn a_damaged_file_is_not_replaced() {
     let (img, mut v) = volume(1 << 20, 512, 512);
-    let mut w = v.create_file("/f", t(0), false).unwrap();
+    let mut w = v.create_file("/f", t(0), NameCollision::Fail).unwrap();
     w.write_all(&[7u8; 2000]).unwrap();
     w.finish().unwrap();
     let first = v.metadata("/f").unwrap().first_cluster;
     // The chain runs into a free cluster after its first one.
     v.link(first, 0).unwrap();
     let free = v.free_clusters();
-    let mut w = v.create_file("/f", t(1), true).unwrap();
+    let mut w = v.create_file("/f", t(1), NameCollision::Replace).unwrap();
     w.write_all(&[8u8; 1000]).unwrap();
     let e = w.finish().unwrap_err();
     assert_eq!(e.errno(), EUCLEAN, "{}", e);
@@ -611,9 +999,12 @@ fn open_files_keep_their_slots() {
         n
     };
     // An entry behind a reservation on zero slots.
-    let mut a = v.begin_file("/a", t(0), false).unwrap();
+    let mut a = v.begin_file("/a", t(0), NameCollision::Fail).unwrap();
     v.write_file_data(&mut a, b"aaa").unwrap();
-    v.create_file("/b", t(0), false).unwrap().finish().unwrap();
+    v.create_file("/b", t(0), NameCollision::Fail)
+        .unwrap()
+        .finish()
+        .unwrap();
     assert_eq!(sorted(&v), vec!["b"]);
     let root = v.boot.root_cluster;
     assert_eq!(v.load_directory(root).unwrap().entries().len(), 2, "label and b");
@@ -621,19 +1012,25 @@ fn open_files_keep_their_slots() {
     assert_eq!(sorted(&v), vec!["a", "b"]);
     // The same with the reservation given up: a deleted slot stays, not
     // an end marker.
-    let c = v.begin_file("/c", t(0), false).unwrap();
-    v.create_file("/d", t(0), false).unwrap().finish().unwrap();
+    let c = v.begin_file("/c", t(0), NameCollision::Fail).unwrap();
+    v.create_file("/d", t(0), NameCollision::Fail)
+        .unwrap()
+        .finish()
+        .unwrap();
     v.abort_file(c).unwrap();
     assert_eq!(sorted(&v), vec!["a", "b", "d"]);
-    v.create_file("/e", t(0), false).unwrap().finish().unwrap();
+    v.create_file("/e", t(0), NameCollision::Fail)
+        .unwrap()
+        .finish()
+        .unwrap();
     assert_eq!(sorted(&v), vec!["a", "b", "d", "e"]);
     // A replacement whose old entry is last: deleting it moves the end of
     // the directory back over a deleted slot that another open file has
     // reserved; the new entry must go into the old slots instead.
     v.remove_file("/d").unwrap();
-    let mut w = v.begin_file("/w", t(0), false).unwrap();
+    let mut w = v.begin_file("/w", t(0), NameCollision::Fail).unwrap();
     v.write_file_data(&mut w, b"w").unwrap();
-    let mut z = v.create_file("/e", t(1), true).unwrap();
+    let mut z = v.create_file("/e", t(1), NameCollision::Replace).unwrap();
     z.write_all(b"ee").unwrap();
     z.finish().unwrap();
     v.finish_file(w).unwrap();
@@ -651,10 +1048,10 @@ fn open_files_keep_their_slots() {
 fn lookups_keep_the_slots_of_open_files() {
     let (img, mut v) = volume(1 << 20, 512, 512);
     v.create_dir("/d", t(0)).unwrap();
-    let mut x = v.create_file("/d/x", t(0), false).unwrap();
+    let mut x = v.create_file("/d/x", t(0), NameCollision::Fail).unwrap();
     x.write_all(b"xx").unwrap();
     x.finish().unwrap();
-    let mut a = v.begin_file("/d/a", t(0), false).unwrap();
+    let mut a = v.begin_file("/d/a", t(0), NameCollision::Fail).unwrap();
     v.write_file_data(&mut a, b"aaa").unwrap();
     let mut s = String::new();
     v.open_file("/d/x").unwrap().read_to_string(&mut s).unwrap();
@@ -675,20 +1072,23 @@ fn a_failed_begin_keeps_the_slots_of_open_files() {
     let (img, mut v) = volume(1 << 20, 512, 512);
     v.create_dir("/d", t(0)).unwrap();
     // A whole cluster is written right away, so finishing a needs none.
-    let mut a = v.begin_file("/d/a", t(0), false).unwrap();
+    let mut a = v.begin_file("/d/a", t(0), NameCollision::Fail).unwrap();
     v.write_file_data(&mut a, &[b'a'; 512]).unwrap();
     // The dots, a's slot and 13 more entries fill the cluster of /d.
     for i in 0..13 {
-        v.create_file(&format!("/d/f{}", i), t(0), false)
+        v.create_file(&format!("/d/f{}", i), t(0), NameCollision::Fail)
             .unwrap()
             .finish()
             .unwrap();
     }
     let free = v.free_clusters();
-    let mut fill = v.create_file("/fill", t(0), false).unwrap();
+    let mut fill = v.create_file("/fill", t(0), NameCollision::Fail).unwrap();
     fill.write_all(&vec![0u8; free as usize * 512]).unwrap();
     fill.finish().unwrap();
-    assert_eq!(v.create_file("/d/b", t(0), false).unwrap_err().errno(), ENOSPC);
+    assert_eq!(
+        v.create_file("/d/b", t(0), NameCollision::Fail).unwrap_err().errno(),
+        ENOSPC
+    );
     v.finish_file(a).unwrap();
     assert_eq!(v.metadata("/d/a").unwrap().size, 512);
     v.close().unwrap();
@@ -702,17 +1102,20 @@ fn a_failed_begin_keeps_the_slots_of_open_files() {
 fn reservations_survive_a_reread_of_the_directory() {
     let (img, mut v) = volume(1 << 20, 512, 512);
     v.create_dir("/d", t(0)).unwrap();
-    let mut a = v.begin_file("/d/a", t(0), false).unwrap();
+    let mut a = v.begin_file("/d/a", t(0), NameCollision::Fail).unwrap();
     v.write_file_data(&mut a, b"aaa").unwrap();
     v.forget_directory(v.metadata("/d").unwrap().first_cluster);
     // b must not land in the slots kept for a.
-    v.create_file("/d/b", t(0), false).unwrap().finish().unwrap();
+    v.create_file("/d/b", t(0), NameCollision::Fail)
+        .unwrap()
+        .finish()
+        .unwrap();
     v.finish_file(a).unwrap();
     let mut n = names(&v, "/d");
     n.sort();
     assert_eq!(n, ["a", "b"]);
     // An aborted file gives its slots back for good.
-    let c = v.begin_file("/d/c", t(0), false).unwrap();
+    let c = v.begin_file("/d/c", t(0), NameCollision::Fail).unwrap();
     v.abort_file(c).unwrap();
     assert!(v.dirs.borrow().reserved.is_empty());
     v.close().unwrap();
@@ -727,7 +1130,7 @@ fn reading_files_does_not_reread_their_directory() {
     let (_img, mut v) = volume(1 << 20, 512, 512);
     v.create_dir("/d", t(0)).unwrap();
     for i in 0..20 {
-        v.create_file(&format!("/d/f{}", i), t(0), false)
+        v.create_file(&format!("/d/f{}", i), t(0), NameCollision::Fail)
             .unwrap()
             .finish()
             .unwrap();
@@ -755,13 +1158,13 @@ fn durable_mode_puts_a_barrier_before_every_publishing_write() {
     let syncs = || counter.load(Ordering::SeqCst);
     let before = syncs();
     // A new file: chain, barrier, entry.
-    let mut w = v.create_file("/f", t(0), false).unwrap();
+    let mut w = v.create_file("/f", t(0), NameCollision::Fail).unwrap();
     w.write_all(b"data").unwrap();
     w.finish().unwrap();
     assert_eq!(syncs() - before, 1);
     // Replacing it: chain, barrier, entry, barrier, old chain freed.
     let before = syncs();
-    let mut w = v.create_file("/f", t(0), true).unwrap();
+    let mut w = v.create_file("/f", t(0), NameCollision::Replace).unwrap();
     w.write_all(b"newer").unwrap();
     w.finish().unwrap();
     assert_eq!(syncs() - before, 2);
@@ -777,14 +1180,17 @@ fn durable_mode_puts_a_barrier_before_every_publishing_write() {
     // cluster is synced before the FAT links it, then the file's barrier.
     let before = syncs();
     for i in 0..14 {
-        v.create_file(&format!("/g{}", i), t(0), false)
+        v.create_file(&format!("/g{}", i), t(0), NameCollision::Fail)
             .unwrap()
             .finish()
             .unwrap();
     }
     assert_eq!(syncs() - before, 14);
     let before = syncs();
-    v.create_file("/g14", t(0), false).unwrap().finish().unwrap();
+    v.create_file("/g14", t(0), NameCollision::Fail)
+        .unwrap()
+        .finish()
+        .unwrap();
     assert_eq!(syncs() - before, 2, "growing the directory adds a barrier");
     v.close().unwrap();
 }
@@ -808,7 +1214,7 @@ fn the_volume_is_marked_dirty_while_written() {
     assert_eq!(std::fs::read(img.path()).unwrap(), bytes, "reading marks nothing");
     // While a file is being written the marks are on disk: the boot
     // sector bit, bit 27 of FAT entry 1 in every copy, unknown counts.
-    let mut w = v.create_file("/f", t(0), false).unwrap();
+    let mut w = v.create_file("/f", t(0), NameCollision::Fail).unwrap();
     w.write_all(b"data").unwrap();
     let bytes = std::fs::read(img.path()).unwrap();
     assert_ne!(bytes[field::NT_FLAGS] & NT_FLAG_DIRTY, 0);
@@ -836,9 +1242,87 @@ fn the_volume_is_marked_dirty_while_written() {
     );
 }
 
+/// What the volume refuses before it would write leaves it as it was: a
+/// name FAT cannot store, one that is too long, one that is taken or is a
+/// directory, one FAT does not tell apart from a name that is there, a
+/// parent that is missing, attributes that cannot be set. Nothing is
+/// marked, and the image does not change. A directory that is there is no
+/// write either.
+#[test]
+fn refusals_leave_the_volume_unmarked() {
+    let (img, mut v) = volume(1 << 20, 512, 512);
+    v.create_dir("/d", t(0)).unwrap();
+    v.create_file("/f", t(0), NameCollision::Fail)
+        .unwrap()
+        .finish()
+        .unwrap();
+    v.sync().unwrap();
+    let bytes = std::fs::read(img.path()).unwrap();
+    let long = format!("/{}", "x".repeat(256));
+    let long_below_missing = format!("/missing/{}", "x".repeat(256));
+    for (e, errno) in [
+        (v.create_dir("/a:b", t(0)), EINVAL),
+        (v.create_dir("/d", t(0)), EEXIST),
+        (v.create_dir("/missing/x", t(0)), ENOENT),
+        (v.create_dir(&long, t(0)), ENAMETOOLONG),
+        (v.create_dir_all("/d/a:b", t(0)), EINVAL),
+        (v.create_dir_all("/f/x", t(0)), ENOTDIR),
+        (v.create_dir_all("/missing/a:b", t(0)), EINVAL),
+        (v.create_dir_all(&long_below_missing, t(0)), ENAMETOOLONG),
+        (v.create_file("/d", t(0), NameCollision::Replace).map(drop), EISDIR),
+        (v.create_file("/f", t(0), NameCollision::Fail).map(drop), EEXIST),
+        (v.create_file("/a:b", t(0), NameCollision::Replace).map(drop), EINVAL),
+        (
+            v.create_file(&long, t(0), NameCollision::Replace).map(drop),
+            ENAMETOOLONG,
+        ),
+        (v.create_file("/F", t(0), NameCollision::Fail).map(drop), EEXIST),
+        (v.create_file("/D", t(0), NameCollision::Fail).map(drop), EEXIST),
+        (
+            v.find_or_create_dir("/D", t(0), NO_ATTRIBUTES, NameCollision::Fail)
+                .map(drop),
+            EEXIST,
+        ),
+        (
+            v.find_or_create_dir("/f", t(0), NO_ATTRIBUTES, NameCollision::Replace)
+                .map(drop),
+            ENOTDIR,
+        ),
+        (
+            v.find_or_create_dir("/new", t(0), ATTR_VOLUME_ID, NameCollision::Fail)
+                .map(drop),
+            EINVAL,
+        ),
+        (v.set_attributes("/", ATTR_HIDDEN), EINVAL),
+        (v.set_attributes("/missing", ATTR_HIDDEN), ENOENT),
+        (v.set_attributes("/f", ATTR_DIRECTORY), EINVAL),
+    ] {
+        assert_eq!(e.unwrap_err().errno(), errno);
+    }
+    // Directories that are there are no write either.
+    v.create_dir_all("/d", t(0)).unwrap();
+    v.create_dir_all("/", t(0)).unwrap();
+    for (path, collision) in [("/d", NameCollision::Fail), ("/D", NameCollision::Replace)] {
+        let origin = v.find_or_create_dir(path, t(0), NO_ATTRIBUTES, collision).unwrap();
+        assert!(
+            matches!(origin, DirectoryOrigin::Existing { .. }),
+            "{} {:?}",
+            path,
+            origin
+        );
+    }
+    // The image is read while the volume is open: closing it would put back
+    // marks a refusal set. A writing session lasts until the volume is
+    // synced, so is_writing() covers every refusal above as well.
+    assert_eq!(std::fs::read(img.path()).unwrap(), bytes);
+    assert!(!v.is_writing());
+    assert_eq!(v.metadata("/missing").unwrap_err().errno(), ENOENT);
+}
+
 /// A volume closed unfinished keeps the marks of a writing session, as a
 /// crash would leave them, and what was written before is on disk. One
-/// that nothing was written to since it was opened gets the marks too.
+/// that nothing was written to since it was opened gets the marks too. A
+/// volume is being written from its first write on, until it is synced.
 #[test]
 fn a_volume_closed_unfinished_stays_marked() {
     use crate::boot::{field, FsInfo, FSINFO_SIZE, FSINFO_UNKNOWN, NT_FLAG_DIRTY};
@@ -846,11 +1330,16 @@ fn a_volume_closed_unfinished_stays_marked() {
         let (img, mut v) = volume(1 << 20, 512, 512);
         let layout = *v.layout();
         let fsinfo = usize::from(v.boot_sector().fsinfo_sector) * layout.sector_size as usize;
+        assert!(!v.is_writing());
         if written {
-            let mut w = v.create_file("/f", t(0), false).unwrap();
+            let mut w = v.create_file("/f", t(0), NameCollision::Fail).unwrap();
             w.write_all(b"data").unwrap();
             w.finish().unwrap();
+            v.sync().unwrap();
+            assert!(!v.is_writing());
+            v.create_dir("/d", t(0)).unwrap();
         }
+        assert_eq!(v.is_writing(), written);
         v.close_unfinished().unwrap();
         let bytes = std::fs::read(img.path()).unwrap();
         assert_ne!(bytes[field::NT_FLAGS] & NT_FLAG_DIRTY, 0);
@@ -875,7 +1364,10 @@ fn a_volume_closed_unfinished_stays_marked() {
 #[test]
 fn remove_tree() {
     let (img, mut v) = volume(1 << 20, 512, 512);
-    v.create_file("/keep", t(0), false).unwrap().finish().unwrap();
+    v.create_file("/keep", t(0), NameCollision::Fail)
+        .unwrap()
+        .finish()
+        .unwrap();
     let free = v.free_clusters();
     v.create_dir_all("/a/b/c", t(0)).unwrap();
     v.create_dir("/a/d", t(0)).unwrap();
@@ -885,14 +1377,14 @@ fn remove_tree() {
         .into_iter()
         .enumerate()
     {
-        let mut w = v.create_file(path, t(0), false).unwrap();
+        let mut w = v.create_file(path, t(0), NameCollision::Fail).unwrap();
         w.write_all(&vec![i as u8; 700 * (i + 1)]).unwrap();
         w.finish().unwrap();
         files += 1;
     }
     // Enough long names to take /a/b/c past its first cluster.
     for i in 0..20 {
-        v.create_file(&format!("/a/b/c/Mixed Case File {}.txt", i), t(0), false)
+        v.create_file(&format!("/a/b/c/Mixed Case File {}.txt", i), t(0), NameCollision::Fail)
             .unwrap()
             .finish()
             .unwrap();
@@ -950,7 +1442,10 @@ fn root_time() {
     let mut v = Volume::open(img.device()).unwrap();
     assert_eq!(v.root_time().unwrap(), None);
     assert_eq!(v.label().unwrap(), None);
-    v.create_file("/f", t(0), false).unwrap().finish().unwrap();
+    v.create_file("/f", t(0), NameCollision::Fail)
+        .unwrap()
+        .finish()
+        .unwrap();
     // Modification times go in two second steps.
     v.set_root_time(t(1_700_000_001)).unwrap();
     assert_eq!(v.root_time().unwrap(), Some(t(1_700_000_000)));
@@ -1011,6 +1506,75 @@ fn root_time() {
     assert_eq!(v.root_time().unwrap(), Some(t(1_650_000_000)));
 }
 
+/// The label is the root directory's label entry, as Windows, EDK2, GRUB
+/// and blkid read it. A label only in the boot sector, which Windows leaves
+/// there when it removes the label, is none. Stamping the root's time makes
+/// a label entry with the boot sector's label, which is the label then.
+#[test]
+fn the_label_is_the_one_of_the_root_directory() {
+    let img = TempImage::new(1 << 20);
+    let unlabelled = FormatOptions {
+        label: None,
+        ..format_options(512, 512)
+    };
+    format::format(&img.device(), &unlabelled).unwrap();
+    img.device()
+        .write_at(boot::field::VOLUME_LABEL.start as u64, b"ESP        ")
+        .unwrap();
+    let mut v = Volume::open(img.device()).unwrap();
+    assert_eq!(v.boot_sector().volume_label, *b"ESP        ");
+    assert_eq!(v.label().unwrap(), None);
+    assert_eq!(v.label_bytes().unwrap(), None);
+    v.set_root_time(t(1_700_000_000)).unwrap();
+    assert_eq!(v.label().unwrap().as_deref(), Some("ESP"));
+    let entries = v.load_directory(v.boot.root_cluster).unwrap();
+    let label = entries.iter().find(|e| e.short.is_volume_label()).unwrap();
+    assert_eq!(label.short.name, *b"ESP        ");
+    v.close().unwrap();
+}
+
+/// set_times() writes the dot entries of a directory where only they
+/// differ: its entry has the time already and its "." and ".." do not.
+#[test]
+fn set_times_writes_dot_entries_that_differ() {
+    let (img, mut v) = volume(1 << 20, 512, 512);
+    v.create_dir("/e", t(0)).unwrap();
+    let e = v.metadata("/e").unwrap();
+    let layout = *v.layout();
+    v.close().unwrap();
+    // The dot entries get another time on the image.
+    let offset = layout.cluster_offset(e.first_cluster).unwrap();
+    let dev = img.device();
+    for slot in 0..2u64 {
+        let at = offset + slot * DIR_ENTRY_SIZE as u64;
+        let mut bytes = [0u8; DIR_ENTRY_SIZE];
+        dev.read_at(at, &mut bytes).unwrap();
+        let mut dot = RawDirEntry::from_bytes(&bytes);
+        dot.set_times(FatTimestamp::from_system_time(t(1_600_000_000)));
+        dev.write_at(at, &dot.to_bytes()).unwrap();
+    }
+    drop(dev);
+    let mut v = Volume::open(img.device()).unwrap();
+    v.set_times("/e", t(0)).unwrap();
+    assert!(v.is_writing());
+    let expected = FatTimestamp::from_system_time(t(0));
+    let dots: Vec<DirEntry> = v
+        .load_directory(e.first_cluster)
+        .unwrap()
+        .entries()
+        .into_iter()
+        .filter(|entry| entry.is_dot())
+        .collect();
+    assert_eq!(dots.len(), 2);
+    for dot in dots {
+        assert_eq!(
+            (dot.short.write_date, dot.short.write_time),
+            (expected.date, expected.time)
+        );
+    }
+    assert_eq!(v.metadata("/e").unwrap().modified, e.modified);
+}
+
 #[test]
 fn the_label_entry_grows_a_full_root() {
     let img = TempImage::new(1 << 20);
@@ -1022,7 +1586,7 @@ fn the_label_entry_grows_a_full_root() {
     let mut v = Volume::open(img.device()).unwrap();
     // Sixteen one-slot entries fill the root's cluster.
     for i in 0..16 {
-        v.create_file(&format!("/F{}", i), t(0), false)
+        v.create_file(&format!("/F{}", i), t(0), NameCollision::Fail)
             .unwrap()
             .finish()
             .unwrap();
@@ -1045,7 +1609,10 @@ fn the_label_entry_grows_a_full_root() {
 fn set_attributes() {
     let (img, mut v) = volume(1 << 20, 512, 512);
     v.create_dir("/d", t(0)).unwrap();
-    v.create_file("/d/f", t(0), false).unwrap().finish().unwrap();
+    v.create_file("/d/f", t(0), NameCollision::Fail)
+        .unwrap()
+        .finish()
+        .unwrap();
     assert_eq!(v.metadata("/d/f").unwrap().attributes, ATTR_ARCHIVE);
     assert_eq!(v.metadata("/d").unwrap().attributes, ATTR_DIRECTORY);
     // The four bits are replaced as a whole: the archive bit goes unless it
@@ -1082,7 +1649,7 @@ fn set_attributes() {
     v.set_attributes("/d/f", 0).unwrap();
     assert_eq!(v.metadata("/d/f").unwrap().attributes, 0);
     // A writer sets them for the entry it is going to write.
-    let mut w = v.create_file("/d/g", t(0), false).unwrap();
+    let mut w = v.create_file("/d/g", t(0), NameCollision::Fail).unwrap();
     assert_eq!(w.set_attributes(ATTR_DIRECTORY).unwrap_err().errno(), EINVAL);
     w.set_attributes(ATTR_SYSTEM | ATTR_ARCHIVE).unwrap();
     w.finish().unwrap();
@@ -1104,4 +1671,85 @@ fn set_attributes() {
     );
     assert_eq!(v.metadata("/d/f").unwrap().attributes, 0);
     assert_eq!(v.metadata("/d/g").unwrap().attributes, ATTR_SYSTEM | ATTR_ARCHIVE);
+}
+
+/// The serial numbers in the boot sector and in its backup of the volume
+/// in `img`, and the NT flags of the boot sector, as they are on disk. The
+/// file is read past the volume, which holds the image open.
+fn serials_on_disk(img: &TempImage) -> (u32, u32, u8) {
+    let bytes = std::fs::read(img.path()).unwrap();
+    let boot = BootSector::parse(&bytes).unwrap();
+    let ss = usize::from(boot.bytes_per_sector);
+    let backup = BootSector::parse(&bytes[usize::from(boot.backup_boot_sector) * ss..]).unwrap();
+    (boot.volume_id, backup.volume_id, boot.nt_flags)
+}
+
+#[test]
+fn the_serial_number_is_set_in_both_boot_sectors() {
+    let (img, mut v) = volume(8 << 20, 512, 512);
+    assert_eq!(serials_on_disk(&img), (0x1234_abcd, 0x1234_abcd, 0));
+    let mut w = v.create_file("/a", t(1_500_000_000), NameCollision::Fail).unwrap();
+    w.write_all(b"data").unwrap();
+    w.finish().unwrap();
+    v.set_volume_id(VolumeId(0x5678_9abc)).unwrap();
+    assert_eq!(v.boot_sector().volume_id, 0x5678_9abc);
+    // Both copies have it while the volume is written, which it says.
+    assert_eq!(serials_on_disk(&img), (0x5678_9abc, 0x5678_9abc, NT_FLAG_DIRTY));
+    v.close().unwrap();
+    // Closing marks the volume clean and keeps the new serial number.
+    assert_eq!(serials_on_disk(&img), (0x5678_9abc, 0x5678_9abc, 0));
+    // The test volume is small, which is worth a warning of its own.
+    let report = fsck::check(&img.device()).unwrap();
+    assert!(
+        report
+            .problems
+            .iter()
+            .all(|p| p.kind == fsck::ProblemKind::BelowMinimumClusters),
+        "{:?}",
+        report.problems
+    );
+    let v = Volume::open(img.device()).unwrap();
+    assert_eq!(v.boot_sector().volume_id, 0x5678_9abc);
+    assert_eq!(v.label().unwrap().as_deref(), Some("TEST"));
+    drop(v);
+    // On its own it is a session of its own, with the marks of one, and on
+    // a volume left unfinished they stay.
+    let mut v = Volume::open(img.device()).unwrap();
+    v.set_volume_id(VolumeId(1)).unwrap();
+    v.close_unfinished().unwrap();
+    assert_eq!(serials_on_disk(&img), (1, 1, NT_FLAG_DIRTY));
+    // In durable mode too, which flushes around the two writes.
+    let mut v = Volume::open(img.device()).unwrap();
+    v.set_durable(true);
+    v.set_volume_id(VolumeId(2)).unwrap();
+    v.close().unwrap();
+    assert_eq!(serials_on_disk(&img), (2, 2, NT_FLAG_DIRTY));
+}
+
+#[test]
+fn a_volume_without_a_backup_boot_sector_gets_the_serial_number_once() {
+    let img = TempImage::new(8 << 20);
+    let options = FormatOptions {
+        reserved_sectors: 2,
+        ..format_options(512, 512)
+    };
+    format::format(&img.device(), &options).unwrap();
+    let mut v = Volume::open(img.device()).unwrap();
+    assert_eq!(v.boot_sector().backup_boot_sector, 0);
+    let mut before = std::fs::read(img.path()).unwrap();
+    v.set_volume_id(VolumeId(0x0bad_cafe)).unwrap();
+    v.close().unwrap();
+    let after = std::fs::read(img.path()).unwrap();
+    // The serial number changed, and nothing else of the boot sector.
+    before[boot::field::VOLUME_ID].copy_from_slice(&0x0bad_cafe_u32.to_le_bytes());
+    assert_eq!(after[..BOOT_SECTOR_SIZE], before[..BOOT_SECTOR_SIZE]);
+    let report = fsck::check(&img.device()).unwrap();
+    assert!(
+        report.problems.iter().all(|p| matches!(
+            p.kind,
+            fsck::ProblemKind::NoBackupBootSector | fsck::ProblemKind::BelowMinimumClusters
+        )),
+        "{:?}",
+        report.problems
+    );
 }

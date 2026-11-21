@@ -1957,6 +1957,7 @@ mod tests {
     use crate::name::LFN_LAST_ENTRY;
     use crate::test_util::{volume, TempImage};
     use crate::time::FatTimestamp;
+    use crate::volume::NameCollision;
     use std::io::Write;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -1969,12 +1970,16 @@ mod tests {
         v.create_dir_all("/EFI/Linux", t(1_700_000_000)).unwrap();
         for i in 0..3 {
             let mut w = v
-                .create_file(&format!("/EFI/Linux/kernel {}.efi", i), t(1_700_000_000), false)
+                .create_file(
+                    &format!("/EFI/Linux/kernel {}.efi", i),
+                    t(1_700_000_000),
+                    NameCollision::Fail,
+                )
                 .unwrap();
             w.write_all(&vec![i as u8; 2000 + i * 300]).unwrap();
             w.finish().unwrap();
         }
-        v.create_file("/empty", t(1_700_000_000), false)
+        v.create_file("/empty", t(1_700_000_000), NameCollision::Fail)
             .unwrap()
             .finish()
             .unwrap();
@@ -2288,7 +2293,10 @@ mod tests {
         // A subdirectory whose ".." entry was deleted.
         let (img, mut v) = volume(1 << 20, 512, 512);
         v.create_dir("/sub", t(0)).unwrap();
-        v.create_file("/sub/F", t(0), false).unwrap().finish().unwrap();
+        v.create_file("/sub/F", t(0), NameCollision::Fail)
+            .unwrap()
+            .finish()
+            .unwrap();
         let sub = v.metadata("/sub").unwrap().first_cluster;
         let layout = *v.layout();
         v.close().unwrap();

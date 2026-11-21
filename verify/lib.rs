@@ -9,6 +9,23 @@
 #[cfg(kani)]
 extern crate libc;
 
+// error.rs names the problems of a manifest with uapi16::Problem. The
+// proofs read no manifest, so this crate stands in for uapi16 with a
+// Problem of its own, and Kani needs neither uapi16 nor the crates below
+// it.
+extern crate self as uapi16;
+
+/// What error.rs takes of `uapi16::Problem`: a type that has no value here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Problem {}
+
+impl Problem {
+    /// Never called: there is no problem to name.
+    pub const fn as_str(self) -> &'static str {
+        match self {}
+    }
+}
+
 #[macro_use]
 #[path = "../src/fat/error.rs"]
 mod error;

@@ -19,8 +19,8 @@ compile_error!("ufat supports Linux only");
 #[macro_use]
 mod error;
 pub use error::{
-    ContentProblem, Context, CorruptPlace, DescriptorProblem, Detail, Error, IdentifierProblem, LabelProblem,
-    ManifestProblem, NameProblem, NoSpaceReason, NotFat32Reason, Result, SourceProblem, UnsupportedKind,
+    ContentProblem, Context, CorruptPlace, DescriptorProblem, Detail, Error, FileSystemField, IdentifierProblem,
+    LabelProblem, ManifestProblem, NameProblem, NoSpaceReason, NotFat32Reason, Result, SourceProblem, UnsupportedKind,
     ValidityProblem,
 };
 
@@ -42,7 +42,6 @@ pub mod plan;
 pub mod populate;
 pub mod probe;
 pub mod progress;
-pub mod sha256;
 pub mod sha512;
 mod sys;
 #[cfg(test)]

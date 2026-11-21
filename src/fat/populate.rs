@@ -13,10 +13,10 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::errno::*;
-use crate::host::{walk_tree, FromStart};
+use crate::host::{walk_tree, FromStart, HostEntry, UnnamableEntry};
 use crate::progress::Progress;
 use crate::sys;
-use crate::volume::{Volume, MAX_FILE_SIZE};
+use crate::volume::{NameCollision, Volume, MAX_FILE_SIZE, NO_ATTRIBUTES};
 use crate::Detail;
 use crate::{Context, Error, Result};
 
@@ -51,9 +51,13 @@ impl TimePolicy {
 pub struct CopyOptions {
     /// Timestamp handling.
     pub times: TimePolicy,
-    /// Replace files that already exist in the volume instead of failing
-    /// with EEXIST.
-    pub replace: bool,
+    /// What the copy does with an entry the volume holds under a name it
+    /// writes, or under a name FAT does not tell apart from it:
+    /// [`NameCollision::Fail`], the default, fails with EEXIST, and
+    /// [`NameCollision::Replace`] replaces a file and takes a directory as
+    /// the one of that name. A directory of the same name takes the
+    /// entries either way.
+    pub name_collision: NameCollision,
     /// Follow symbolic links in the source tree instead of skipping them.
     pub follow_symlinks: bool,
 }
@@ -62,7 +66,7 @@ impl Default for CopyOptions {
     fn default() -> Self {
         CopyOptions {
             times: TimePolicy::Preserve,
-            replace: true,
+            name_collision: NameCollision::Fail,
             follow_symlinks: false,
         }
     }
@@ -121,9 +125,16 @@ impl Read for Counted<'_> {
 
 impl Volume {
     /// Copies the contents of `source` into a new file at `dest` and returns
-    /// how many bytes it copied.
-    pub fn write_file(&mut self, dest: &str, source: &mut dyn Read, time: SystemTime, replace: bool) -> Result<u64> {
-        let mut file = self.begin_file(dest, time, replace).map_err(|e| e.at_path(dest))?;
+    /// how many bytes it copied. `collision` says what happens to an entry
+    /// the volume holds under that name, see [`Volume::begin_file`].
+    pub fn write_file(
+        &mut self,
+        dest: &str,
+        source: &mut dyn Read,
+        time: SystemTime,
+        collision: NameCollision,
+    ) -> Result<u64> {
+        let mut file = self.begin_file(dest, time, collision).map_err(|e| e.at_path(dest))?;
         // The volume keeps one copy buffer, allocated on first use; the
         // file token lets us hold it while the file is open.
         let mut buf = std::mem::take(&mut self.copy_buffer);
@@ -212,7 +223,7 @@ impl Volume {
             done,
             progress,
         };
-        self.write_file(dest, &mut counted, time, options.replace)
+        self.write_file(dest, &mut counted, time, options.name_collision)
     }
 
     /// Copies the tree below the open directory `source` into the directory
@@ -241,15 +252,10 @@ impl Volume {
         }
         let mut report = CopyReport::default();
         self.create_dir_all(dest, options.times.resolve(source_mtime(&md)))?;
-        walk_tree(source, dest, options.follow_symlinks, &mut |target, entry| {
+        let mut visit = |target: &str, entry: &HostEntry| -> Result<bool> {
             if entry.is_dir() {
                 let time = options.times.resolve(source_mtime(&entry.metadata));
-                match self.metadata(target) {
-                    Ok(m) if m.is_dir => {}
-                    Ok(_) => bail!(ENOTDIR, "'{}' exists in the volume and is not a directory", target),
-                    Err(e) if e.errno() == ENOENT => self.create_dir(target, time)?,
-                    Err(e) => return Err(e),
-                }
+                self.find_or_create_dir(target, time, NO_ATTRIBUTES, options.name_collision)?;
                 report.directories += 1;
                 progress(&report.progress());
                 Ok(true)
@@ -265,7 +271,8 @@ impl Volume {
                 report.skipped.push(entry.path.clone());
                 Ok(false)
             }
-        })?;
+        };
+        walk_tree(source, dest, options.follow_symlinks, UnnamableEntry::Fail, &mut visit)?;
         Ok(report)
     }
 }

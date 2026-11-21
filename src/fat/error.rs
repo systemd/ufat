@@ -10,6 +10,8 @@
 
 use std::fmt;
 
+use uapi16::Problem;
+
 use crate::errno::{EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOMEM, ENOTDIR, ENOTEMPTY};
 
 /// What is wrong with a name inside a volume.
@@ -27,6 +29,9 @@ pub enum NameProblem {
     TrailingSpaceOrDot,
     /// More than 255 UTF-16 units, or a path longer than PATH_MAX.
     TooLong,
+    /// The directory has an entry whose name FAT does not tell apart from
+    /// this one, as it does not tell `A` from `a`.
+    CaseCollision,
 }
 
 impl NameProblem {
@@ -39,6 +44,7 @@ impl NameProblem {
             NameProblem::LeadingSpace => "leadingSpace",
             NameProblem::TrailingSpaceOrDot => "trailingSpaceOrDot",
             NameProblem::TooLong => "tooLong",
+            NameProblem::CaseCollision => "caseCollision",
         }
     }
 }
@@ -50,9 +56,16 @@ pub enum LabelProblem {
     TooLong,
     /// A character a FAT label cannot hold: a non-printable or non-ASCII
     /// one, one of `* ? . , ; : / \ | + = < > [ ] "`, or a leading space.
+    /// A label that a volume has to report as it is, such as the one a
+    /// manifest names, cannot end with a space either, since FAT pads a
+    /// label with spaces.
     InvalidCharacter,
     /// The file system has no label at all; unused on FAT.
     NotSupported,
+    /// A label the file system stores for no label: on FAT the blank one
+    /// and `NO NAME`. Refused where a volume has to report the label as it
+    /// is, such as the one a manifest names.
+    Reserved,
 }
 
 impl LabelProblem {
@@ -62,6 +75,7 @@ impl LabelProblem {
             LabelProblem::TooLong => "tooLong",
             LabelProblem::InvalidCharacter => "invalidCharacter",
             LabelProblem::NotSupported => "notSupported",
+            LabelProblem::Reserved => "reserved",
         }
     }
 }
@@ -211,110 +225,39 @@ impl DescriptorProblem {
     }
 }
 
-/// What is wrong with a UAPI.16 manifest.
+/// What is wrong with a UAPI.16 manifest, the reason of an
+/// `InvalidManifest` error of the Varlink interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManifestProblem {
-    /// A record is not valid JSON.
-    NotJson,
-    /// A record is not a JSON object.
-    NotObject,
-    /// A record is not UTF-8.
-    NotUtf8,
-    /// A record contains a NUL byte.
-    NulByte,
-    /// A record does not start with the record separator.
-    RecordSeparator,
-    /// A record is larger than the parser accepts.
-    RecordTooLarge,
-    /// The manifest holds no object at all.
-    Empty,
-    /// The trailer object is missing.
-    NoTrailer,
-    /// Data follows the trailer object.
-    DataAfterTrailer,
-    /// A file object follows a signature object.
-    FileAfterSignature,
-    /// The media type is missing on the first object, is not a string, or
-    /// is not one the parser knows.
-    MediaType,
-    /// The first object has a name.
-    FirstHasName,
-    /// The first object is not a directory.
-    FirstNotDirectory,
-    /// An object after the first has no name.
-    NoName,
-    /// A name is not a normalized relative path.
-    InvalidName,
-    /// Two objects carry the same name, or names FAT folds together.
-    DuplicateName,
-    /// An inode type the parser does not know.
-    UnknownType,
-    /// A field is of the wrong JSON type or shape, named by `field`.
-    FieldType,
-    /// A field's value is out of range, named by `field`.
-    FieldRange,
-    /// A field that the object's inode type does not permit, named by
-    /// `field`.
-    FieldNotPermitted,
-    /// Two fields contradict each other, the first named by `field`.
-    Contradiction,
-    /// A contents entry: not an object, more than one of file, url and
-    /// literal, a URL that is not http or https, a literal that is not
-    /// Base64, an encoding that is not permitted, or too many entries.
-    Contents,
-    /// A malformed signature object.
-    Signature,
-    /// A malformed extendedAttributes object.
-    ExtendedAttributes,
-    /// A regular file without a size whose contents would have to be
-    /// streamed.
+    /// What the specification does not permit in a manifest, named by the
+    /// problem the [`uapi16`] crate has for it.
+    Malformed(Problem),
+    /// A regular file without a size, where the size has to be known: to
+    /// plan the size of a volume, or to take the contents from a stream.
     NoSize,
 }
 
 impl ManifestProblem {
-    /// The value as the Varlink interface spells it.
+    /// The value as the Varlink interface spells it, which is
+    /// [`Problem::as_str`] for a problem of the [`uapi16`] crate.
     pub fn as_str(self) -> &'static str {
         match self {
-            ManifestProblem::NotJson => "notJson",
-            ManifestProblem::NotObject => "notObject",
-            ManifestProblem::NotUtf8 => "notUtf8",
-            ManifestProblem::NulByte => "nulByte",
-            ManifestProblem::RecordSeparator => "recordSeparator",
-            ManifestProblem::RecordTooLarge => "recordTooLarge",
-            ManifestProblem::Empty => "empty",
-            ManifestProblem::NoTrailer => "noTrailer",
-            ManifestProblem::DataAfterTrailer => "dataAfterTrailer",
-            ManifestProblem::FileAfterSignature => "fileAfterSignature",
-            ManifestProblem::MediaType => "mediaType",
-            ManifestProblem::FirstHasName => "firstHasName",
-            ManifestProblem::FirstNotDirectory => "firstNotDirectory",
-            ManifestProblem::NoName => "noName",
-            ManifestProblem::InvalidName => "invalidName",
-            ManifestProblem::DuplicateName => "duplicateName",
-            ManifestProblem::UnknownType => "unknownType",
-            ManifestProblem::FieldType => "fieldType",
-            ManifestProblem::FieldRange => "fieldRange",
-            ManifestProblem::FieldNotPermitted => "fieldNotPermitted",
-            ManifestProblem::Contradiction => "contradiction",
-            ManifestProblem::Contents => "contents",
-            ManifestProblem::Signature => "signature",
-            ManifestProblem::ExtendedAttributes => "extendedAttributes",
+            ManifestProblem::Malformed(problem) => problem.as_str(),
             ManifestProblem::NoSize => "noSize",
         }
     }
 }
 
 /// How a file below the source directory fails to be what the manifest
-/// describes, found before anything is written.
+/// describes, found when it is opened to be copied. A file too short for
+/// the contents the manifest says it holds, or not of the size the manifest
+/// gives for it, is found while it is copied, see [`ContentProblem::Size`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceProblem {
     /// The file is not there.
     Missing,
     /// It is not a regular file.
     NotRegular,
-    /// Its size is not what the manifest says, or too short for the
-    /// offset and size asked for.
-    Size,
 }
 
 impl SourceProblem {
@@ -323,7 +266,6 @@ impl SourceProblem {
         match self {
             SourceProblem::Missing => "missing",
             SourceProblem::NotRegular => "notRegular",
-            SourceProblem::Size => "size",
         }
     }
 }
@@ -331,12 +273,16 @@ impl SourceProblem {
 /// How file contents fail to match the manifest while being copied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContentProblem {
-    /// Not as many bytes as the manifest says.
+    /// Not as many bytes as the manifest says, or in a file of the source
+    /// that is too short for them or not of the size the manifest gives for
+    /// it.
     Size,
     /// Not the SHA-256 hash the manifest says.
     Hash,
     /// The stream ended before the file was complete.
     StreamEnded,
+    /// The file of the source they are in changed while it was read.
+    SourceChanged,
 }
 
 impl ContentProblem {
@@ -346,6 +292,7 @@ impl ContentProblem {
             ContentProblem::Size => "size",
             ContentProblem::Hash => "hash",
             ContentProblem::StreamEnded => "streamEnded",
+            ContentProblem::SourceChanged => "sourceChanged",
         }
     }
 }
@@ -353,10 +300,6 @@ impl ContentProblem {
 /// What a manifest asks for that cannot be done.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnsupportedKind {
-    /// Contents to be fetched from a URL.
-    Url,
-    /// Contents in an encoding, named by `value`.
-    Encoding,
     /// Contents at an offset into a streamed source.
     Offset,
     /// Contents only available through a transport, named by `value`.
@@ -371,8 +314,6 @@ impl UnsupportedKind {
     /// The value as the Varlink interface spells it.
     pub fn as_str(self) -> &'static str {
         match self {
-            UnsupportedKind::Url => "url",
-            UnsupportedKind::Encoding => "encoding",
             UnsupportedKind::Offset => "offset",
             UnsupportedKind::Transport => "transport",
             UnsupportedKind::SubManifest => "subManifest",
@@ -399,6 +340,30 @@ impl ValidityProblem {
             ValidityProblem::Revoked => "revoked",
             ValidityProblem::NotYetValid => "notYetValid",
             ValidityProblem::Expired => "expired",
+        }
+    }
+}
+
+/// The field of the root file object of a manifest that names the volume
+/// the manifest is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileSystemField {
+    /// `fatSerial`: the volume serial number.
+    FatSerial,
+    /// `fsUUID`, whose first eight hex digits give the serial number of a
+    /// volume whose manifest has no `fatSerial`.
+    FsUuid,
+    /// `fsLabel`: the label.
+    FsLabel,
+}
+
+impl FileSystemField {
+    /// The field as a manifest and the Varlink interface spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileSystemField::FatSerial => "fatSerial",
+            FileSystemField::FsUuid => "fsUUID",
+            FileSystemField::FsLabel => "fsLabel",
         }
     }
 }
@@ -482,6 +447,10 @@ pub enum Detail {
         problem: DescriptorProblem,
         /// The offending status flags, when that is the problem.
         flags: Option<i32>,
+        /// The parameter the descriptor was passed as, where its vetting or
+        /// a read or write of it knows that name, as host::passed_stream()
+        /// and the stream it returns do.
+        parameter: Option<&'static str>,
     },
     /// The manifest is malformed.
     Manifest {
@@ -495,18 +464,16 @@ pub enum Detail {
         field: Option<String>,
     },
     /// A file the manifest names is not below the source directory as the
-    /// manifest describes it, found before anything is written.
+    /// manifest describes it: missing, or not a regular file.
     Source {
         /// The entry's name, exactly as its record in the manifest has it.
         name: String,
         /// What is wrong.
         problem: SourceProblem,
-        /// The size found, when sizes are the problem.
-        size: Option<u64>,
-        /// The size the manifest says, when sizes are the problem.
-        expected: Option<u64>,
     },
-    /// File contents do not match the manifest.
+    /// File contents do not match the manifest, found while they are
+    /// copied: a file below the source directory that is too short for
+    /// them among them, or one that changed while it was read.
     Content {
         /// The entry's name, exactly as its record in the manifest has it.
         name: String,
@@ -514,7 +481,8 @@ pub enum Detail {
         problem: ContentProblem,
         /// The size found, when sizes are the problem.
         size: Option<u64>,
-        /// The size the manifest says, when sizes are the problem.
+        /// The size the manifest says, when sizes are the problem: for a
+        /// part of a file, the size the file needs to hold it.
         expected: Option<u64>,
     },
     /// The manifest asks for something that cannot be done.
@@ -533,9 +501,39 @@ pub enum Detail {
         /// Why it is not valid.
         problem: ValidityProblem,
     },
+    /// What the root file object of a manifest says about the volume does
+    /// not match the volume the manifest's content goes into, or the serial
+    /// number or label given for a volume made from the manifest.
+    FileSystemMismatch {
+        /// The field of the root file object the expected value comes from.
+        field: FileSystemField,
+        /// What the manifest says, None for no label. A serial number is
+        /// written `XXXX-XXXX`, the one derived from `fsUUID` as well.
+        expected: Option<String>,
+        /// What the volume has or what was given, None for no label.
+        found: Option<String>,
+    },
     /// An option the caller gave is not valid, named as the Varlink
     /// interface spells it.
     InvalidOption(&'static str),
+}
+
+impl Detail {
+    /// The detail of a volume that is not the one a manifest names in
+    /// `field`: the manifest says `expected`, and the volume has `found`,
+    /// or `found` was given for a volume made from the manifest. None is
+    /// no label.
+    pub(crate) fn file_system_mismatch(
+        field: FileSystemField,
+        expected: Option<impl fmt::Display>,
+        found: Option<impl fmt::Display>,
+    ) -> Detail {
+        Detail::FileSystemMismatch {
+            field,
+            expected: expected.map(|value| value.to_string()),
+            found: found.map(|value| value.to_string()),
+        }
+    }
 }
 
 /// An error with an errno value, a description of what went wrong and the
@@ -554,6 +552,17 @@ struct Inner {
 }
 
 impl Error {
+    /// The error for the path `path` when its directory holds the entry
+    /// at the path `existing`, whose name FAT does not tell apart from the
+    /// last name of `path`, as it does not tell `A` from `a`.
+    pub(crate) fn case_collision(path: &str, existing: &str) -> Error {
+        let message = format!("'{}' and '{}' are names FAT cannot tell apart", path, existing);
+        Error::new(EEXIST, message).with(Detail::Name {
+            name: path.to_string(),
+            problem: NameProblem::CaseCollision,
+        })
+    }
+
     /// Creates an error from a positive errno value and a message.
     pub fn new(errno: i32, message: impl Into<String>) -> Self {
         Error(Box::new(Inner {
@@ -608,21 +617,6 @@ impl Error {
         self
     }
 
-    /// Fills in the record index and the object's name of a manifest
-    /// error that lacks them.
-    #[must_use]
-    pub fn in_record(mut self, index: u64, object: Option<&str>) -> Self {
-        if let Some(Detail::Manifest { record, name, .. }) = &mut self.0.detail {
-            if record.is_none() {
-                *record = Some(index);
-            }
-            if name.is_none() {
-                *name = object.map(str::to_string);
-            }
-        }
-        self
-    }
-
     /// The message describing this error.
     pub fn message(&self) -> &str {
         &self.0.message
@@ -646,21 +640,45 @@ impl fmt::Debug for Error {
     }
 }
 
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        // An io::Error wrapping one of our own errors comes back unchanged.
-        if let Some(inner) = e.get_ref().and_then(|i| i.downcast_ref::<Error>()) {
-            return inner.clone();
+/// The errno of an [`std::io::Error`], and an error of ours it carries.
+pub(crate) trait IoErrorExt {
+    /// The error of ours the error carries, such as the one a passed
+    /// stream fails with when it was made non-blocking during the call
+    /// (host::PassedStream).
+    fn own_error(&self) -> Option<&Error>;
+
+    /// The errno the error stands for: that of an error of ours it
+    /// carries, the one the system gave, or the one that fits its kind.
+    fn errno(&self) -> i32;
+}
+
+impl IoErrorExt for std::io::Error {
+    fn own_error(&self) -> Option<&Error> {
+        self.get_ref().and_then(|inner| inner.downcast_ref::<Error>())
+    }
+
+    fn errno(&self) -> i32 {
+        if let Some(own) = self.own_error() {
+            return own.errno();
         }
-        let errno = match e.raw_os_error() {
+        match self.raw_os_error() {
             Some(n) => n,
-            None => match e.kind() {
+            None => match self.kind() {
                 std::io::ErrorKind::InvalidInput => EINVAL,
                 std::io::ErrorKind::OutOfMemory => ENOMEM,
                 _ => EIO,
             },
-        };
-        Error::new(errno, e.to_string())
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        // An io::Error wrapping one of our own errors comes back unchanged.
+        if let Some(inner) = e.own_error() {
+            return inner.clone();
+        }
+        Error::new(e.errno(), e.to_string())
     }
 }
 

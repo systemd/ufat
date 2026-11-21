@@ -1,4 +1,4 @@
-{"mTimeNSec":1699999000000000000,"mediaType":"application/vnd.uapi.16.manifest"}
+{"features":["mtime","sha256","size"],"mTimeNSec":1699999000000000000,"mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}
 {"mTimeNSec":1699999000000000000,"name":"EFI","type":"dir"}
 {"mTimeNSec":1699999000000000000,"name":"EFI/BOOT","type":"dir"}
 {"mTimeNSec":1700000000000000000,"name":"EFI/BOOT/BOOTX64.EFI","sha256":"608047e995ccddf55441b8ed783ac49c780b9a911aa655f47d3a4c174748f86b","size":4096}

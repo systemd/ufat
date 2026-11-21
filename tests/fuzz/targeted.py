@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mutate  # noqa: E402
 
 RS = b"\x1e"
-ROOT = b'{"mediaType":"application/vnd.uapi.16.manifest"}\n'
+ROOT = b'{"mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}\n'
 TRAILER = b'{"mediaType":"application/vnd.uapi.16.trailer"}\n'
 
 
@@ -37,11 +37,12 @@ class Probes:
         self.seed_img = os.path.join(seeds, "images", "ufat-512s-512c-2M.img")
         self.small_tree = os.path.join(seeds, "trees", "small")
 
-    def run(self, name, argv, stdin=None, env=None, expect_exit=None, timeout=None):
+    def run(self, name, argv, stdin=None, env=None, expect_exit=None, timeout=None, stdin_pipe=False):
         """Runs argv and records a defect unless it exits with one of
-        expect_exit: 0 or 1, for fsck the fsck(8) codes 0, 4 and 8."""
+        expect_exit: 0 or 1, for fsck the fsck(8) codes 0, 4 and 8. With
+        stdin_pipe the file stdin comes through a pipe."""
         err = os.path.join(self.work, "stderr.txt")
-        res = mutate.run_local(argv, stdin_path=stdin, timeout=timeout or self.timeout, stderr_path=err, env=env)
+        res = mutate.run_local(argv, stdin_path=stdin, timeout=timeout or self.timeout, stderr_path=err, env=env, stdin_pipe=stdin_pipe)
         res["cmd"] = argv[1]
         if expect_exit is None:
             expect_exit = mutate.clean_exits(argv[1])
@@ -69,7 +70,7 @@ class Probes:
         for t in ["18446744073709551615", "9223372036854775808", "9223372036854775807", "-1", "1e3", "4354819199", "99999999999999999"]:
             self.run("populate --timestamp %s" % t, [self.ufat, "populate", "--timestamp", t, "--path", "/t" + t[:3], img])
         for t in ["18446744073709551615", "9223372036854775808", "abc", "", " 1700000000", "1700000000.5"]:
-            self.run("populate SOURCE_DATE_EPOCH=%r" % t, [self.ufat, "populate", img, self.small_tree], env={"SOURCE_DATE_EPOCH": t})
+            self.run("populate SOURCE_DATE_EPOCH=%r" % t, [self.ufat, "populate", "--replace", img, self.small_tree], env={"SOURCE_DATE_EPOCH": t})
         for t in ["18446744073709551615", "9223372036854775808"]:
             self.run("assemble --timestamp %s" % t, [self.ufat, "assemble", "--create", "--size", "40M", "--timestamp", t, os.path.join(self.work, "ts.img")])
             self.run("assemble --plan SOURCE_DATE_EPOCH=%s" % t, [self.ufat, "assemble", "--plan", self.small_tree], env={"SOURCE_DATE_EPOCH": t})
@@ -163,7 +164,7 @@ class Probes:
                 open(os.path.join(tree, "f%d" % i), "wb").close()
             img = os.path.join(self.work, "big-%d.img" % n)
             self.run("populate %d files in one dir" % n, [self.ufat, "assemble", "--create", "--fit", tree, img], timeout=60)
-            self.run("populate %d files in one dir (2)" % n, [self.ufat, "populate", img, tree], timeout=300)
+            self.run("populate %d files in one dir (2)" % n, [self.ufat, "populate", "--replace", img, tree], timeout=300)
             shutil.rmtree(tree)
 
     def manifests(self):
@@ -180,7 +181,7 @@ class Probes:
             "i128 overflow": [b'{"name":"x","size":170141183460469231731687303715884105728}\n'],
             "size u64 max": [b'{"name":"x","size":18446744073709551615}\n'],
             "size 2^32": [b'{"name":"x","size":4294967296}\n'],
-            "size 2^32-1 x 300": [b'{"name":"f%d","size":4294967295}\n' % i for i in range(300)],
+            "size 2^32-1 x 300": [b'{"name":"f%03d","size":4294967295}\n' % i for i in range(300)],
             "mtime u64 max": [b'{"name":"x","size":0,"mTimeNSec":18446744073709551615}\n'],
             "validSince u64 max": [b'{"name":"x","size":0,"validSinceUSec":18446744073709551615}\n'],
             "offset u64 max": [b'{"name":"x","size":0,"contents":[{"file":"x","offset":18446744073709551615}]}\n'],
@@ -229,16 +230,25 @@ class Probes:
             self.run("manifest %s: plan" % name, [self.ufat, "assemble", "--plan", "--manifest", m], timeout=60)
             if os.path.exists(img):
                 os.unlink(img)
-            self.run("manifest %s: assemble" % name, [self.ufat, "assemble", "--create", "--manifest", m, img, src], timeout=120)
+            self.run("manifest %s: assemble" % name, [self.ufat, "assemble", "--create", "--minimize", "--manifest", m, img, src], timeout=120)
             if os.path.exists(img):
                 os.unlink(img)
-            self.run("manifest %s: assemble from a stream" % name, [self.ufat, "assemble", "--create", "--manifest", m, img, "-"], stdin=os.devnull, timeout=120)
+            self.run("manifest %s: assemble from a stream" % name, [self.ufat, "assemble", "--create", "--minimize", "--manifest", m, img, "-"], stdin=os.devnull, timeout=120)
+            if os.path.exists(img):
+                os.unlink(img)
+            # Into a size given nothing is planned: the manifest is read
+            # while the volume is written, also through a pipe.
+            self.run("manifest %s: assemble into a size given" % name, [self.ufat, "assemble", "--create", "--size", mutate.SIZE_GIVEN, "--manifest", m, img, src], timeout=120)
+            if os.path.exists(img):
+                os.unlink(img)
+            self.run("manifest %s: assemble through a pipe" % name, [self.ufat, "assemble", "--create", "--size", mutate.SIZE_GIVEN, "--manifest", "-", img, src],
+                     stdin=m, stdin_pipe=True, timeout=120)
             if os.path.exists(img):
                 os.unlink(img)
         # Not a manifest at all.
         for name, data in [("empty", b""), ("rs only", RS), ("rs x 1M", RS * (1 << 20)), ("root only", RS + ROOT), ("4 MiB garbage", bytes(range(256)) * (16 * 1024)),
                            ("binary zeros", b"\0" * 100000), ("utf8 bom", b"\xef\xbb\xbf" + manifest([])), ("CRLF", manifest([]).replace(b"\n", b"\r\n")),
-                           ("nul in record", RS + b'{"name":"a\x00"}' + RS + TRAILER), ("huge valid", manifest([b'{"name":"f%d","size":0}\n' % i for i in range(60000)]))]:
+                           ("nul in record", RS + b'{"name":"a\x00"}' + RS + TRAILER), ("huge valid", manifest([b'{"name":"f%05d","size":0}\n' % i for i in range(60000)]))]:
             m = os.path.join(self.work, "probe.Uapi16Manifest")
             with open(m, "wb") as f:
                 f.write(data)

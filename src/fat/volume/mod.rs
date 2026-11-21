@@ -25,20 +25,21 @@ use crate::boot::{
     self, BootSector, FsInfo, BOOT_SECTOR_SIZE, FSINFO_SIZE, FSINFO_UNKNOWN, LABEL_SIZE, NO_NAME, NT_FLAG_DIRTY,
 };
 use crate::device::Device;
-use crate::dir::{DirEntry, Directory, MAX_SLOTS};
+use crate::dir::{DirEntry, Directory, NameDecoding, MAX_SLOTS};
 use crate::dirent::{
     short_name_checksum, RawDirEntry, ATTR_ARCHIVE, ATTR_DIRECTORY, ATTR_HIDDEN, ATTR_READ_ONLY, ATTR_SYSTEM,
     ATTR_VOLUME_ID, DIR_ENTRY_SIZE, DOTDOT_NAME, DOT_NAME, ENTRY_DELETED, ENTRY_E5_ESCAPE, ENTRY_END, SHORT_NAME_SIZE,
 };
 use crate::errno::*;
 use crate::fat::{Entry, Extent, Fat, FatStore, CACHE_BYTES, ENTRY1_CLEAN_SHUTDOWN};
+use crate::format::VolumeId;
 use crate::layout::Layout;
 use crate::name::{fold_str, long_name_entries, short_name_to_string, Alias, LongName};
-use crate::path::components;
+use crate::path::{components, SEPARATOR};
 use crate::probe::Prober;
 use crate::time::FatTimestamp;
 use crate::Result;
-use crate::{Detail, NoSpaceReason, NotFat32Reason};
+use crate::{CorruptPlace, Detail, Error, NoSpaceReason, NotFat32Reason};
 
 mod file;
 #[cfg(test)]
@@ -75,6 +76,36 @@ pub struct Metadata {
     pub attributes: u8,
     /// First cluster, 0 for empty files.
     pub(crate) first_cluster: u32,
+    /// How `name` came out of the units the entry stores. A short name
+    /// always comes out as the entry stores it.
+    pub(crate) name_decoding: NameDecoding,
+}
+
+/// What creating a file or a directory does where its name collides with
+/// an entry the volume holds: one of the same name, or one whose name FAT
+/// does not tell apart from it, as it does not tell `A` from `a`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameCollision {
+    /// Fail with EEXIST, for an entry of another spelling with
+    /// [`crate::NameProblem::CaseCollision`]. A directory of the same name
+    /// is no collision for [`Volume::find_or_create_dir`], which takes it.
+    Fail,
+    /// Take what is there: a file is replaced, and a directory under a name
+    /// of another spelling is the directory of this name.
+    Replace,
+}
+
+/// The directory [`Volume::find_or_create_dir`] makes sure is there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectoryOrigin {
+    /// The volume had none, and it was made with the attributes it was
+    /// given.
+    Created,
+    /// It was there already.
+    Existing {
+        /// The attributes of its entry.
+        attributes: u8,
+    },
 }
 
 /// Where a path led: the root, or an entry and the first cluster of the
@@ -82,6 +113,26 @@ pub struct Metadata {
 enum Located {
     Root,
     Entry { parent: u32, entry: DirEntry },
+}
+
+/// What a new entry is for, which decides the clusters allocated with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NewEntry {
+    /// A file. Its clusters come as its data is written.
+    File,
+    /// A directory. Its first cluster, which holds its "." and ".."
+    /// entries, comes with its entry.
+    Directory,
+}
+
+impl NewEntry {
+    /// The clusters allocated along with the entry.
+    fn clusters(self) -> u32 {
+        match self {
+            NewEntry::File => 0,
+            NewEntry::Directory => 1,
+        }
+    }
 }
 
 /// A placed, not yet written entry: its slot and its names.
@@ -184,7 +235,8 @@ pub struct Volume {
     /// Something has been written since open() or the last sync(): the
     /// volume carries its dirty marks, see [`Volume::begin_write`].
     writing: bool,
-    /// Closed with [`Volume::close_unfinished`]: the marks stay.
+    /// Closed with [`Volume::close_unfinished`] or given up with
+    /// [`Volume::abandon`]: dropping it writes nothing, so the marks stay.
     unfinished: bool,
     layout: Layout,
     fat: Fat,
@@ -215,7 +267,10 @@ fn writable(dir: &Directory) -> Result<()> {
 /// The attributes a caller may set on an entry: the four DOS bits a file or
 /// a directory carries. The others say what the entry is and are not for
 /// setting.
-const SETTABLE_ATTRIBUTES: u8 = ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_ARCHIVE;
+pub(crate) const SETTABLE_ATTRIBUTES: u8 = ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_ARCHIVE;
+
+/// None of the [`SETTABLE_ATTRIBUTES`].
+pub(crate) const NO_ATTRIBUTES: u8 = 0;
 
 /// Refuses attribute bits outside [`SETTABLE_ATTRIBUTES`].
 fn check_attributes(attributes: u8) -> Result<()> {
@@ -230,8 +285,10 @@ fn check_attributes(attributes: u8) -> Result<()> {
     Ok(())
 }
 
-/// Whether a label field says the volume has no label: `NO NAME`, which
-/// mkfs.fat and Windows put there, or blanks.
+/// Whether the name of a label entry says that the volume has no label:
+/// blanks, or `NO NAME`, which the boot sector holds for no label, and
+/// which [`Volume::set_root_time`] copies from there into the entry it
+/// makes.
 fn is_no_name(label: &[u8; LABEL_SIZE]) -> bool {
     *label == NO_NAME || label.iter().all(|&b| b == b' ')
 }
@@ -315,6 +372,16 @@ impl Volume {
     /// Whether writes that publish new state are preceded by a flush.
     pub fn durable(&self) -> bool {
         self.durable
+    }
+
+    /// Whether the volume is being written: something was written to it
+    /// since open() or the last sync(), so that it carries the marks of a
+    /// volume that was not cleanly unmounted until sync() or close() puts
+    /// back what was there before. A caller that failed before anything was
+    /// written leaves the volume as it was by not closing it with
+    /// [`Volume::close_unfinished`].
+    pub fn is_writing(&self) -> bool {
+        self.writing
     }
 
     /// Marks the volume as being written, once per session. Linux and
@@ -432,23 +499,23 @@ impl Volume {
         u64::from(self.fat.free_count()) * u64::from(self.layout.cluster_size())
     }
 
-    /// The volume label, from the root directory entry or else from the
-    /// boot sector. None when the volume has no label: `NO NAME` and a
-    /// blank label mean none, to us as to blkid and mtools.
+    /// The volume label: the name of the root directory's label entry,
+    /// where Windows, EDK2, GRUB and blkid read it. The copy in the boot
+    /// sector counts for nothing, as it does for them. None when there is
+    /// no such entry, or when it is blank or says `NO NAME`. blkid shows a
+    /// blank entry as no label as well, but an entry `NO NAME` as the label
+    /// `NO NAME`.
     pub fn label(&self) -> Result<Option<String>> {
         Ok(self.label_bytes()?.map(|raw| crate::format::decode_label(&raw)))
     }
 
     /// The volume label as stored on disk, eleven space padded bytes in the
-    /// OEM code page: the root directory's label entry if there is one, else
-    /// the boot sector's. None when that says `NO NAME` or is blank, which
-    /// is how a volume without a label is written.
+    /// OEM code page: the name of the root directory's label entry. None
+    /// when there is no such entry, or when it is blank or says `NO NAME`,
+    /// see [`Volume::label`].
     pub fn label_bytes(&self) -> Result<Option<[u8; LABEL_SIZE]>> {
-        let label = match self.label_entry()? {
-            Some(e) => e.short.name,
-            None => self.boot.volume_label,
-        };
-        Ok(Some(label).filter(|l| !is_no_name(l)))
+        let label = self.label_entry()?.map(|e| e.short.name);
+        Ok(label.filter(|l| !is_no_name(l)))
     }
 
     /// The root directory's volume label entry, if there is one.
@@ -484,11 +551,13 @@ impl Volume {
 
     /// Sets the root directory's time on the volume label entry, creating
     /// the entry when there is none. A new entry carries the boot sector's
-    /// label, `NO NAME` when the volume has none, so the label the volume
-    /// reports stays what it was, see [`Volume::label`]. The time is stored
-    /// as on any entry: the modification time in two second steps, the
-    /// creation time in hundredths. The entry is one slot written in place,
-    /// so a crash leaves the old time or the new one.
+    /// label, `NO NAME` when that is blank or zeroed. So a volume without a
+    /// label keeps none, and a volume whose boot sector holds a label that
+    /// its root directory does not, as another tool can leave it, gets that
+    /// label, see [`Volume::label`]. The time is stored as on any entry: the
+    /// modification time in two second steps, the creation time in
+    /// hundredths. The entry is one slot written in place, so a crash
+    /// leaves the old time or the new one.
     pub fn set_root_time(&mut self, time: SystemTime) -> Result<()> {
         self.begin_write()?;
         let t = FatTimestamp::from_system_time(time);
@@ -519,6 +588,40 @@ impl Volume {
         })
     }
 
+    /// Sets the volume serial number to `id`, in the boot sector and in its
+    /// backup, for a serial number that is known only once the volume is
+    /// written, such as the one derived from a manifest.
+    ///
+    /// The two copies are written while the volume carries the marks of a
+    /// session, see [`Volume::begin_write`]: the backup first, then the
+    /// boot sector that readers go by. In durable mode a flush before them
+    /// makes the marks reach the device first, and one after them makes
+    /// both copies reach it before [`Volume::close`] takes the marks away.
+    /// So a crash in between leaves a volume marked as not cleanly
+    /// unmounted, with the old or the new serial number in each copy, as
+    /// nothing orders the two writes against each other on the device, and
+    /// fsck reports a backup that differs along with the marks. Each copy
+    /// is four bytes within one sector, written in place, so a crash
+    /// leaves the old serial number in it or the new one.
+    pub fn set_volume_id(&mut self, id: VolumeId) -> Result<()> {
+        self.begin_write()?;
+        self.commit_barrier()?;
+        let field = boot::field::VOLUME_ID;
+        let bytes = id.0.to_le_bytes();
+        let backup = u64::from(self.boot.backup_boot_sector);
+        if backup != 0 {
+            let offset = backup * u64::from(self.layout.sector_size) + field.start as u64;
+            self.device.write_at(offset, &bytes)?;
+        }
+        self.device.write_at(field.start as u64, &bytes)?;
+        self.commit_barrier()?;
+        // What close() puts back into the boot sector has the new serial
+        // number too.
+        self.boot_raw[field].copy_from_slice(&bytes);
+        self.boot.volume_id = id.0;
+        Ok(())
+    }
+
     /// Reads a directory from disk, past the cache. Operations go through
     /// [`Volume::take_directory`]; this is for looking at what is on disk.
     pub(crate) fn load_directory(&self, first_cluster: u32) -> Result<Directory> {
@@ -529,7 +632,13 @@ impl Volume {
         let Some(chain) = self.fat.chain_bounded(&self.store(), first_cluster, max_clusters)? else {
             bail!(
                 EUCLEAN,
-                "directory at cluster {} spans more than the {} clusters a directory can have",
+                Detail::Corrupt {
+                    place: CorruptPlace::Directory,
+                    field: None,
+                    path: None,
+                    cluster: Some(first_cluster),
+                },
+                "the chain of the directory at cluster {} loops or is longer than the {} clusters a directory can have",
                 first_cluster,
                 max_clusters
             );
@@ -640,10 +749,19 @@ impl Volume {
     /// Descends from the root along `comps`, which must all be directories,
     /// and returns the first cluster of the directory reached.
     fn walk(&self, comps: &[&str]) -> Result<u32> {
+        self.walk_with(comps, |_| {})
+    }
+
+    /// [`Volume::walk`], handing `visit` the entry of every directory it
+    /// descends into.
+    fn walk_with(&self, comps: &[&str], mut visit: impl FnMut(&DirEntry)) -> Result<u32> {
         let mut cluster = self.boot.root_cluster;
         for (i, name) in comps.iter().enumerate() {
             cluster = match self.with_directory(cluster, |dir| Ok(Self::find(dir, name)))? {
-                Some(e) if e.short.is_directory() => e.short.first_cluster,
+                Some(e) if e.short.is_directory() => {
+                    visit(&e);
+                    e.short.first_cluster
+                }
                 Some(_) => {
                     let p = format!("/{}", comps[..=i].join("/"));
                     bail!(ENOTDIR, Detail::Path(p.clone()), "'{}' is not a directory", p);
@@ -655,6 +773,28 @@ impl Volume {
             };
         }
         Ok(cluster)
+    }
+
+    /// The path of the directory `dir` as the volume spells the names on
+    /// it: "/efi" is "/EFI" where the volume holds EFI, and the root is "".
+    fn stored_path(&self, dir: &str) -> Result<String> {
+        let mut stored = String::new();
+        self.walk_with(&components(dir)?, |entry| {
+            stored.push(SEPARATOR);
+            stored.push_str(&entry.name());
+        })?;
+        Ok(stored)
+    }
+
+    /// The error of a case collision of `path` with `existing`, the entry
+    /// its directory holds under a name FAT does not tell apart from the
+    /// last name of `path`. It names `existing` by its path as the volume
+    /// spells it.
+    fn case_collision(&self, path: &str, existing: &DirEntry) -> Error {
+        match self.stored_path(crate::path::parent(path)) {
+            Ok(dir) => Error::case_collision(path, &crate::path::join(&dir, &existing.name())),
+            Err(e) => e,
+        }
     }
 
     fn locate(&self, path: &str) -> Result<Located> {
@@ -699,6 +839,7 @@ impl Volume {
             created: entry.short.create_timestamp().to_system_time(),
             attributes: entry.short.attr,
             first_cluster: entry.short.first_cluster,
+            name_decoding: entry.long_name_decoding,
         }
     }
 
@@ -714,6 +855,7 @@ impl Volume {
                 created: FatTimestamp::EPOCH.to_system_time(),
                 attributes: ATTR_DIRECTORY,
                 first_cluster: self.boot.root_cluster,
+                name_decoding: NameDecoding::Exact,
             }),
             Located::Entry { entry, .. } => Ok(Self::metadata_of(&entry)),
         }
@@ -722,7 +864,22 @@ impl Volume {
     /// Lists the directory at `path`, in on-disk order, without the dot
     /// entries and the volume label.
     pub fn read_dir(&self, path: &str) -> Result<Vec<Metadata>> {
-        self.with_directory(self.directory_at(path)?, |dir| {
+        self.read_dir_at(self.directory_at(path)?, |_| Ok(()))
+    }
+
+    /// Lists the directory whose chain starts at `first_cluster`, as
+    /// [`Volume::read_dir`] lists the one at a path. A walk of the tree
+    /// takes the cluster from the entry it found, where a lookup by name
+    /// could find another entry of the same name on a damaged volume.
+    /// `chain` is shown the clusters of the directory first, and an error
+    /// it returns is the listing's.
+    pub(crate) fn read_dir_at(
+        &self,
+        first_cluster: u32,
+        chain: impl FnOnce(&[u32]) -> Result<()>,
+    ) -> Result<Vec<Metadata>> {
+        self.with_directory(first_cluster, |dir| {
+            chain(dir.chain())?;
             Ok(dir
                 .iter()
                 .filter(|e| !e.is_dot() && !e.short.is_volume_label())
@@ -738,15 +895,7 @@ impl Volume {
     fn grow_directory(&mut self, dir: &mut Directory) -> Result<()> {
         let per_cluster = self.layout.cluster_size() as usize / DIR_ENTRY_SIZE;
         if dir.slots() + per_cluster > MAX_SLOTS {
-            bail!(
-                ENOSPC,
-                Detail::NoSpace {
-                    reason: NoSpaceReason::DirectoryEntries,
-                    path: None,
-                },
-                "directory is full, it cannot hold more than {} entries",
-                MAX_SLOTS
-            );
+            return Err(Directory::full());
         }
         let cluster = self.allocate(1)?.first;
         let zeros = vec![0u8; self.layout.cluster_size() as usize];
@@ -782,11 +931,36 @@ impl Volume {
         }
     }
 
+    /// The clusters [`Volume::free_run`] adds to `dir` for a run of `count`
+    /// free slots where it has none. Fails where that takes the directory
+    /// past [`MAX_SLOTS`]. Nothing is written.
+    fn growth_for(&self, dir: &Directory, count: usize) -> Result<usize> {
+        // No run of `count` fits, so fewer slots are free at the end, and
+        // the clusters appended continue them.
+        let per_cluster = self.layout.cluster_size() as usize / DIR_ENTRY_SIZE;
+        let clusters = count.saturating_sub(dir.free_at_end()).div_ceil(per_cluster);
+        if dir.slots() + clusters * per_cluster > MAX_SLOTS {
+            return Err(Directory::full());
+        }
+        Ok(clusters)
+    }
+
     /// Picks the short name for `name`, builds its long name entries and
     /// finds room for them in `dir`, growing it as needed. `replacing` is an
-    /// entry about to be replaced, whose names do not count as taken.
-    /// Nothing is written yet.
-    fn place_entry(&mut self, dir: &mut Directory, name: &LongName, replacing: Option<&DirEntry>) -> Result<Placement> {
+    /// entry about to be replaced, whose names do not count as taken. The
+    /// clusters allocated with a `new` entry have to be free as well.
+    ///
+    /// What refuses the entry is checked before anything is written: a
+    /// damaged directory, a name that is taken, no short name left, a full
+    /// directory and too few free clusters. Only then does the volume begin
+    /// a write and grow the directory. The entry itself is not written.
+    fn place_entry(
+        &mut self,
+        dir: &mut Directory,
+        name: &LongName,
+        replacing: Option<&DirEntry>,
+        new: NewEntry,
+    ) -> Result<Placement> {
         writable(dir)?;
         if dir.name_taken(&name.folded(), replacing) {
             bail!(EEXIST, "'{}' exists", name.as_str());
@@ -812,7 +986,20 @@ impl Volume {
         } else {
             (alias.name, Vec::new())
         };
-        let start = self.free_run(dir, long.len() + 1)?;
+        let count = long.len() + 1;
+        let free = dir.find_free_run(count);
+        let growth = match free {
+            Some(_) => 0,
+            None => self.growth_for(dir, count)?,
+        };
+        if (self.free_clusters() as usize) < growth + new.clusters() as usize {
+            return Err(Fat::no_free_clusters());
+        }
+        self.begin_write()?;
+        let start = match free {
+            Some(start) => start,
+            None => self.free_run(dir, count)?,
+        };
         Ok(Placement {
             start,
             name: short,
@@ -843,14 +1030,24 @@ impl Volume {
         Ok(())
     }
 
-    /// Creates the directory `name` in `parent`, writes both and returns the
-    /// new directory, which matches the disk. On failure `parent` may hold
-    /// an entry that was never written, which keeps it out of the cache.
-    fn make_directory(&mut self, parent: &mut Directory, name: &LongName, time: SystemTime) -> Result<Directory> {
+    /// Creates the directory `name` in `parent` with the read-only, hidden,
+    /// system and archive attributes `attributes`, writes both and returns
+    /// the new directory, which matches the disk. On failure `parent` may
+    /// hold an entry that was never written, which keeps it out of the
+    /// cache.
+    fn make_directory(
+        &mut self,
+        parent: &mut Directory,
+        name: &LongName,
+        time: SystemTime,
+        attributes: u8,
+    ) -> Result<Directory> {
         let t = FatTimestamp::from_system_time(time);
-        // The new directory's cluster is allocated before anything else is
-        // touched, so that running out of space changes nothing.
-        let cluster = self.allocate(1)?.first;
+        // place_entry() checks the parent first, also that a cluster is
+        // free for the new directory, so a refusal writes nothing. The
+        // cluster is allocated once the parent made room.
+        let placement = self.place_entry(parent, name, None, NewEntry::Directory)?;
+        let cluster = self.allocate(NewEntry::Directory.clusters())?.first;
         let result = (|| {
             let cs = self.layout.cluster_size() as usize;
             let mut data = vec![0u8; cs];
@@ -873,9 +1070,8 @@ impl Volume {
             data[..DIR_ENTRY_SIZE].copy_from_slice(&dot.to_bytes());
             data[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE].copy_from_slice(&dotdot.to_bytes());
             self.device.write_at(self.layout.cluster_offset(cluster)?, &data)?;
-            let placement = self.place_entry(parent, name, None)?;
             let mut entry = RawDirEntry {
-                attr: ATTR_DIRECTORY,
+                attr: ATTR_DIRECTORY | attributes,
                 first_cluster: cluster,
                 ..RawDirEntry::default()
             };
@@ -896,29 +1092,83 @@ impl Volume {
         result
     }
 
-    /// Creates a directory. Its parent must exist.
+    /// Creates a directory. Its parent must exist. Nothing is written for
+    /// a directory that is refused: a name FAT cannot store or one that is
+    /// too long, a parent that is missing, damaged or full, too few free
+    /// clusters, or a name the parent holds.
     pub fn create_dir(&mut self, path: &str, time: SystemTime) -> Result<()> {
-        self.begin_write()?;
         let (parent, name) = self.locate_parent(path)?;
         let child = self.with_directory_mut(parent, |vol, parent| {
             if Self::find(parent, name.as_str()).is_some() {
                 bail!(EEXIST, Detail::Path(path.to_string()), "'{}' exists", path);
             }
-            vol.make_directory(parent, &name, time).map_err(|e| e.at_path(path))
+            vol.make_directory(parent, &name, time, NO_ATTRIBUTES)
+                .map_err(|e| e.at_path(path))
         })?;
         self.keep_directory(child);
         Ok(())
     }
 
+    /// Makes sure there is a directory at `path` for content to go into, as
+    /// a copy or an assembly finds one or makes one with `time` and the
+    /// read-only, hidden, system and archive attributes `attributes`, and
+    /// says which. A directory of the same name is that one, and it keeps
+    /// its attributes. One under a name FAT does not tell apart from the
+    /// last name of `path` is that one with [`NameCollision::Replace`], and
+    /// a case collision with [`NameCollision::Fail`], which comes before
+    /// anything else about the entry. A file of that name fails with
+    /// ENOTDIR. The parent has to exist. Other attribute bits fail with
+    /// EINVAL, as for [`Volume::set_attributes`]. Only making a directory
+    /// writes to the volume, and nothing is written for one that is
+    /// refused, as with [`Volume::create_dir`].
+    pub fn find_or_create_dir(
+        &mut self,
+        path: &str,
+        time: SystemTime,
+        attributes: u8,
+        collision: NameCollision,
+    ) -> Result<DirectoryOrigin> {
+        check_attributes(attributes)?;
+        let (parent, name) = self.locate_parent(path)?;
+        self.with_directory_mut(parent, |vol, parent| {
+            let Some(existing) = Self::find(parent, name.as_str()) else {
+                let child = vol
+                    .make_directory(parent, &name, time, attributes)
+                    .map_err(|e| e.at_path(path))?;
+                vol.keep_directory(child);
+                return Ok(DirectoryOrigin::Created);
+            };
+            if collision == NameCollision::Fail && existing.name() != name.as_str() {
+                return Err(vol.case_collision(path, &existing));
+            }
+            if !existing.short.is_directory() {
+                bail!(
+                    ENOTDIR,
+                    Detail::Path(path.to_string()),
+                    "'{}' exists in the volume and is not a directory",
+                    path
+                );
+            }
+            Ok(DirectoryOrigin::Existing {
+                attributes: existing.short.attr,
+            })
+        })
+    }
+
     /// Creates a directory and any missing parents. Existing directories
-    /// along the way are fine.
+    /// along the way are fine, whatever their names. The path is walked to
+    /// the first directory that is missing without writing anything, and
+    /// the names of the directories to create are checked before the first
+    /// of them is, so a name FAT cannot store or one that is too long
+    /// writes nothing. Nothing is written either when every directory is
+    /// there.
     pub fn create_dir_all(&mut self, path: &str, time: SystemTime) -> Result<()> {
-        self.begin_write()?;
         let comps = components(path)?;
         let mut cluster = self.boot.root_cluster;
+        let mut there = 0;
         for (i, c) in comps.iter().enumerate() {
-            cluster = self.with_directory_mut(cluster, |vol, dir| match Self::find(dir, c) {
-                Some(e) if e.short.is_directory() => Ok(e.short.first_cluster),
+            match self.with_directory(cluster, |dir| Ok(Self::find(dir, c)))? {
+                Some(e) if e.short.is_directory() => cluster = e.short.first_cluster,
                 Some(_) => {
                     let p = format!("/{}", comps[..=i].join("/"));
                     bail!(
@@ -928,43 +1178,78 @@ impl Volume {
                         p
                     );
                 }
-                None => {
-                    let name = LongName::new(c)?;
-                    let child = vol
-                        .make_directory(dir, &name, time)
-                        .map_err(|e| e.at_path(&format!("/{}", comps[..=i].join("/"))))?;
-                    let first = child.first_cluster();
-                    vol.keep_directory(child);
-                    Ok(first)
-                }
+                None => break,
+            }
+            there = i + 1;
+        }
+        let names = comps[there..]
+            .iter()
+            .copied()
+            .map(LongName::new)
+            .collect::<Result<Vec<_>>>()?;
+        for (i, name) in (there..).zip(&names) {
+            cluster = self.with_directory_mut(cluster, |vol, dir| {
+                let child = vol
+                    .make_directory(dir, name, time, NO_ATTRIBUTES)
+                    .map_err(|e| e.at_path(&format!("/{}", comps[..=i].join("/"))))?;
+                let first = child.first_cluster();
+                vol.keep_directory(child);
+                Ok(first)
             })?;
         }
         Ok(())
     }
 
     /// Sets the modification and creation time of a file or directory. A
-    /// directory's "." and ".." entries follow along.
+    /// directory's "." and ".." entries follow along. Only what changes is
+    /// written, so setting the time an entry has leaves the volume as it
+    /// was. A damaged directory where something would change is refused
+    /// before anything is written.
     pub fn set_times(&mut self, path: &str, time: SystemTime) -> Result<()> {
-        self.begin_write()?;
         let Located::Entry { parent, entry } = self.locate(path)? else {
             bail!(EINVAL, "the root directory has no timestamps");
         };
         let t = FatTimestamp::from_system_time(time);
         let mut raw = entry.short;
         raw.set_times(t);
-        self.with_directory(parent, |parent| {
-            writable(parent)?;
-            parent.set_slot(entry.slot, &raw.to_bytes());
-            self.save_directory(parent)
-        })?;
-        if raw.is_directory() {
+        let entry_changes = raw != entry.short;
+        if entry_changes {
+            self.with_directory(parent, |parent| writable(parent))?;
+        }
+        // The dot entries whose times change, with what they become.
+        let dots: Vec<(usize, RawDirEntry)> = if raw.is_directory() {
             self.with_directory(raw.first_cluster, |dir| {
-                writable(dir)?;
-                let dots: Vec<DirEntry> = dir.iter().filter(|e| e.is_dot()).cloned().collect();
-                for dot in dots {
-                    let mut d = dot.short;
-                    d.set_times(t);
-                    dir.set_slot(dot.slot, &d.to_bytes());
+                let dots: Vec<(usize, RawDirEntry)> = dir
+                    .iter()
+                    .filter(|e| e.is_dot())
+                    .filter_map(|dot| {
+                        let mut d = dot.short;
+                        d.set_times(t);
+                        (d != dot.short).then_some((dot.slot, d))
+                    })
+                    .collect();
+                if !dots.is_empty() {
+                    writable(dir)?;
+                }
+                Ok(dots)
+            })?
+        } else {
+            Vec::new()
+        };
+        if !entry_changes && dots.is_empty() {
+            return Ok(());
+        }
+        self.begin_write()?;
+        if entry_changes {
+            self.with_directory(parent, |parent| {
+                parent.set_slot(entry.slot, &raw.to_bytes());
+                self.save_directory(parent)
+            })?;
+        }
+        if !dots.is_empty() {
+            self.with_directory(raw.first_cluster, |dir| {
+                for &(slot, d) in &dots {
+                    dir.set_slot(slot, &d.to_bytes());
                 }
                 self.save_directory(dir)
             })?;
@@ -978,9 +1263,10 @@ impl Volume {
     /// again. Any other bit is refused with EINVAL. Works for files and
     /// directories; the root has no entry and is refused. The entry is
     /// rewritten in place, so a crash leaves the old attributes or the new.
+    /// Nothing is written for a call that is refused, also not for an entry
+    /// in a damaged directory.
     pub fn set_attributes(&mut self, path: &str, attributes: u8) -> Result<()> {
         check_attributes(attributes)?;
-        self.begin_write()?;
         let Located::Entry { parent, entry } = self.locate(path)? else {
             bail!(
                 EINVAL,
@@ -988,10 +1274,11 @@ impl Volume {
                 "the root directory has no attributes"
             );
         };
+        self.with_directory(parent, |parent| writable(parent))?;
         let mut raw = entry.short;
         raw.attr = (raw.attr & !SETTABLE_ATTRIBUTES) | attributes;
+        self.begin_write()?;
         self.with_directory(parent, |parent| {
-            writable(parent)?;
             parent.set_slot(entry.slot, &raw.to_bytes());
             self.save_directory(parent)
         })
@@ -1092,6 +1379,15 @@ impl Volume {
         self.begin_write()?;
         self.flush()?;
         self.device.sync()
+    }
+
+    /// Gives up a volume whose contents are not complete without writing
+    /// anything more: what was written stays as it is, the marks it carries
+    /// while it is written included, and nothing is synced. This is for a
+    /// caller that throws the image away, such as a new file that never
+    /// gets its name, see [`crate::host::NewFile`].
+    pub fn abandon(mut self) {
+        self.unfinished = true;
     }
 }
 

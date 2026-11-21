@@ -13,10 +13,11 @@
 use std::fs::File;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileExt, FileTypeExt};
 use std::path::Path;
 
 use crate::errno::*;
+use crate::host::{Naming, NewFile};
 use crate::sys;
 use crate::{Context, Error, Result};
 
@@ -46,10 +47,10 @@ pub struct Device {
     offset: u64,
     len: u64,
     block_device: bool,
-    /// The directory and the name of a file [`Device::create`] made, kept
-    /// so that [`Device::remove_if_created`] can take it away again while
-    /// nothing has been written to it.
-    created_in: Option<(OwnedFd, Vec<u8>)>,
+    /// The file [`Device::create`] made, until [`Device::take_created`]
+    /// hands it over to get its name. A device that keeps it gives it up
+    /// when it is dropped.
+    created: Option<NewFile>,
     /// How often the data was synced, for the tests of the write order.
     #[cfg(test)]
     pub(crate) syncs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -82,42 +83,57 @@ impl Device {
         Device::open_pinned(pinned.as_fd(), &path.display(), access)
     }
 
-    /// Creates the regular file `path` for a new image, open for writing,
-    /// or opens the regular file or block device of that name when one
-    /// exists already, the way systemd's openat_report_new() does: the
-    /// parent directory is looked up once, the file is created relative to
-    /// it with O_CREAT|O_EXCL|O_NOFOLLOW so that nothing is ever created
-    /// through a symbolic link, and an existing file is opened like
-    /// [`Device::open`] does (a dangling symbolic link in its place is
-    /// ELOOP).
+    /// Makes a new regular file for an image that is to be named `path`,
+    /// open for writing, or opens the regular file or block device of that
+    /// name when one exists, the way [`Device::open`] does. The parent
+    /// directory is looked up once, and the name is looked up in it. A
+    /// dangling symbolic link in its place is ELOOP, so that nothing is ever
+    /// created through one. A new file is made as a [`NewFile`] that does
+    /// not take the place of another file: it has no name, or a temporary
+    /// one, and gets `path` only from [`NewFile::link`] once the image is
+    /// complete, after [`Device::take_created`] handed it over. Until then
+    /// nothing is under that name, so a command that fails, is killed or
+    /// crashes leaves nothing there, and a file that takes the name
+    /// meanwhile is never replaced. A file system that can neither rename
+    /// without replacing nor make hard links gets the file under `path`
+    /// right away, the last resort of [`NewFile`].
     pub fn create(path: &Path) -> Result<Device> {
         let failed = || format!("failed to create {}", path.display());
         let (parent, name) = crate::host::open_parent(path).with_context(failed)?;
-        let name = name.as_bytes();
-        let created = sys::create_file_at(parent.as_fd(), name, 0o666);
-        match created {
-            Ok(file) => {
-                let mut device = Device::lock_and_wrap(file, &path.display(), Access::ReadWrite)?;
-                device.created_in = Some((parent, name.to_vec()));
+        let pinned = match sys::pin_name(parent.as_fd(), name.as_bytes(), false) {
+            Ok(pinned) => Some(pinned),
+            // Nothing of that name, or a dangling symbolic link, which
+            // following it reports as missing too.
+            Err(e) if e.raw_os_error() == Some(ENOENT) => match sys::pin_entry(parent.as_fd(), name.as_bytes()) {
+                Ok(entry) if sys::fstat(entry.as_fd())?.file_type().is_symlink() => {
+                    bail!(ELOOP, "{} is a dangling symbolic link", path.display())
+                }
+                // There since the lookup before.
+                Ok(entry) => Some(entry),
+                Err(e) if e.raw_os_error() == Some(ENOENT) => None,
+                Err(e) => return Err(e).with_context(failed),
+            },
+            Err(e) => return Err(e).with_context(failed),
+        };
+        if let Some(pinned) = pinned {
+            return Device::open_pinned(pinned.as_fd(), &path.display(), Access::ReadWrite);
+        }
+        let new = NewFile::create_in(parent, name, path, Naming::Exclusive).with_context(failed)?;
+        // A descriptor of its own for the device. It shares the open file
+        // description with the new file's, and so the lock the new file took
+        // and the device takes again, which stays as long as the new file is
+        // held.
+        let device = new
+            .file()
+            .try_clone()
+            .map_err(Error::from)
+            .and_then(|file| Device::lock_and_wrap(file, &path.display(), Access::ReadWrite));
+        match device {
+            Ok(mut device) => {
+                device.created = Some(new);
                 Ok(device)
             }
-            Err(e) if e.raw_os_error() == Some(EEXIST) => {
-                let pinned = match sys::pin_name(parent.as_fd(), name, false) {
-                    Ok(p) => p,
-                    Err(e) if e.raw_os_error() == Some(ENOENT) => {
-                        // Gone again, or a dangling symbolic link, which
-                        // O_NOFOLLOW would have reported as ELOOP.
-                        let entry = sys::pin_entry(parent.as_fd(), name).with_context(failed)?;
-                        if sys::fstat(entry.as_fd())?.file_type().is_symlink() {
-                            bail!(ELOOP, "{} is a dangling symbolic link", path.display());
-                        }
-                        return Err(e).with_context(failed);
-                    }
-                    Err(e) => return Err(e).with_context(failed),
-                };
-                Device::open_pinned(pinned.as_fd(), &path.display(), Access::ReadWrite)
-            }
-            Err(e) => Err(e).with_context(failed),
+            Err(e) => Err(new.given_up(e.context(failed()))),
         }
     }
 
@@ -184,7 +200,7 @@ impl Device {
             offset: 0,
             len,
             block_device,
-            created_in: None,
+            created: None,
             #[cfg(test)]
             syncs: Default::default(),
             #[cfg(ufat_trace)]
@@ -277,31 +293,11 @@ impl Device {
         Ok(())
     }
 
-    /// Removes the file [`Device::create`] made, if this device is one, and
-    /// closes it. A caller that learns before the first write that it has
-    /// no use for the image after all, because the content does not fit the
-    /// size it was given or a source cannot be read, takes back what it
-    /// created so that a failed command leaves nothing behind. The name is
-    /// looked up in the directory the file was created in and unlinked only
-    /// while it still refers to this file; something else of that name is
-    /// left alone. Returns whether a file was removed.
-    pub fn remove_if_created(self) -> Result<bool> {
-        let Some((parent, name)) = &self.created_in else {
-            return Ok(false);
-        };
-        let ours = sys::fstat(self.file.as_fd())?;
-        let entry = match sys::pin_entry(parent.as_fd(), name) {
-            Ok(entry) => entry,
-            Err(e) if e.raw_os_error() == Some(ENOENT) => return Ok(false),
-            Err(e) => return Err(e.into()),
-        };
-        let there = sys::fstat(entry.as_fd())?;
-        if (there.dev(), there.ino()) != (ours.dev(), ours.ino()) {
-            return Ok(false);
-        }
-        sys::unlink_at(parent.as_fd(), name)
-            .with_context(|| "failed to remove the image created for the file system")?;
-        Ok(true)
+    /// Hands over the new file [`Device::create`] made, if it made one: to
+    /// get its name once the image is complete, or to be given up without
+    /// it. The device goes on working with the file either way.
+    pub fn take_created(&mut self) -> Option<NewFile> {
+        self.created.take()
     }
 
     /// Length of the window in bytes.
@@ -490,9 +486,22 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::{LinkError, Linked, Removal};
     use crate::test_util::{TempDir, TempImage};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    /// The names in the directory `dir`, sorted.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
 
     #[test]
     fn locks_keep_writers_apart() {
@@ -545,26 +554,37 @@ mod tests {
         );
     }
 
-    /// Creating an image makes a new file, opens an existing one as it is
-    /// and never goes through a symbolic link to create something.
+    /// Creating an image makes a new file, which gets its name when it is
+    /// linked, opens an existing one as it is and never goes through a
+    /// symbolic link to create something.
     #[test]
     fn create_makes_or_opens_a_file() {
         let tmp = TempDir::new("create");
         let dir = tmp.path();
-        let mut dev = Device::create(&dir.join("new.img")).unwrap();
+        let path = dir.join("new.img");
+        let mut dev = Device::create(&path).unwrap();
         assert_eq!(dev.len(), 0);
         dev.grow(8192).unwrap();
         assert_eq!(dev.len(), 8192);
         dev.write_at(0, b"kept").unwrap();
+        assert!(!path.exists());
+        Linked::sync_directories(&[dev.take_created().unwrap().link().unwrap()]).unwrap();
+        assert!(dev.take_created().is_none());
+        // The device goes on with the file it named, and keeps its lock.
+        dev.write_at(4, b"more").unwrap();
+        assert_eq!(Device::open(&path, Access::ReadOnly).unwrap_err().errno(), EBUSY);
         drop(dev);
-        // Existing: opened, not truncated, not grown when large enough.
-        let mut dev = Device::create(&dir.join("new.img")).unwrap();
+        assert_eq!(names_in(dir), ["new.img"]);
+        // Existing: opened, not truncated, not grown when large enough, and
+        // nothing new to hand over.
+        let mut dev = Device::create(&path).unwrap();
+        assert!(dev.take_created().is_none());
         assert_eq!(dev.len(), 8192);
         dev.grow(4096).unwrap();
         assert_eq!(dev.len(), 8192);
-        let mut back = [0u8; 4];
+        let mut back = [0u8; 8];
         dev.read_at(0, &mut back).unwrap();
-        assert_eq!(&back, b"kept");
+        assert_eq!(&back, b"keptmore");
         drop(dev);
         // Through a link to an existing file: fine. A dangling link: ELOOP,
         // and nothing is created where it points.
@@ -584,6 +604,50 @@ mod tests {
             .window(4096, None)
             .unwrap();
         assert_eq!(dev.grow(1 << 20).unwrap_err().errno(), EINVAL);
+    }
+
+    /// A new image that does not get its name leaves nothing behind,
+    /// whatever was written to it, whether the device keeps the new file or
+    /// hands it over. The lock of the device stays while the new file is
+    /// held, after the device is gone as well.
+    #[test]
+    fn a_new_image_without_its_name_leaves_nothing() {
+        let tmp = TempDir::new("unnamed");
+        let dir = tmp.path();
+        let path = dir.join("a.img");
+        let mut dev = Device::create(&path).unwrap();
+        dev.grow(4096).unwrap();
+        dev.write_at(0, b"half").unwrap();
+        drop(dev);
+        assert!(names_in(dir).is_empty());
+        let mut dev = Device::create(&path).unwrap();
+        dev.grow(4096).unwrap();
+        let created = dev.take_created().unwrap();
+        drop(dev);
+        let file = PathBuf::from(format!("/proc/self/fd/{}", created.file().as_raw_fd()));
+        assert_eq!(Device::open(&file, Access::ReadOnly).unwrap_err().errno(), EBUSY);
+        assert_eq!(created.discard().unwrap(), Removal::Removed);
+        assert!(names_in(dir).is_empty());
+    }
+
+    /// A name that something else took while the image was made is left
+    /// as it is: the image does not get it (EEXIST).
+    #[test]
+    fn a_name_taken_meanwhile_stays_as_it_is() {
+        let tmp = TempDir::new("taken");
+        let dir = tmp.path();
+        let path = dir.join("a.img");
+        let mut dev = Device::create(&path).unwrap();
+        dev.grow(4096).unwrap();
+        std::fs::write(&path, b"theirs").unwrap();
+        let LinkError::Unnamed { error, file } = dev.take_created().unwrap().link().unwrap_err() else {
+            panic!("the image got the name");
+        };
+        assert_eq!(error.errno(), EEXIST);
+        drop(dev);
+        assert_eq!(file.discard().unwrap(), Removal::Removed);
+        assert_eq!(std::fs::read(&path).unwrap(), b"theirs");
+        assert_eq!(names_in(dir), ["a.img"]);
     }
 
     #[test]

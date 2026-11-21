@@ -5,145 +5,44 @@
 //! This is the manifest the Varlink interface's `ManifestSink` receives
 //! from Assemble, Populate and Describe, see
 //! docs/org.uapi-group.FileSystem.varlink. It says what the volume stores
-//! as the volume stores it:
-//! times at FAT's 2 s, the read-only attribute as `readOnly`, and no mode,
-//! owner, device numbers, hardlinks or extended attributes, since FAT has
-//! no notion of them. A field the file system has no notion of is left out
-//! and not counted; what FAT keeps and the manifest could not record is
-//! counted in the report's `omitted`.
+//! as the volume stores it: times at FAT's 2 s, the read-only attribute as
+//! `readOnly`, the hidden, system and archive attributes as flags when
+//! asked for, and no mode, owner, device numbers, hardlinks, extended
+//! attributes or inode flags, since FAT has no notion of them. A feature
+//! the file system has no notion of is not recorded and not counted; what
+//! FAT keeps and the manifest could not record goes into the report: the
+//! entries in `omitted`, the label in `omitted_label`.
 //!
-//! The order is the specification's: the root object first, every
-//! directory's entries right after it, sorted by the bytes of their names
-//! and never in on-disk order, the trailer last. Keys inside an object are
-//! sorted and the records carry no whitespace, as `systemd-manifest`
-//! writes them. Like `systemd-manifest` and the host tree generator, the
-//! writer leaves out the inode type on the root object and on regular
-//! files, where the specification implies it. So with the same fields, the
-//! manifest of a volume is the one they write for the tree the volume was
+//! The order is the specification's code point order: the root object
+//! first, every directory's entries right after it, sorted by the bytes of
+//! their names and never in on-disk order, the trailer last. The records
+//! are what the `uapi16` crate writes, as `systemd-manifest` writes them:
+//! keys sorted, no whitespace, no inode type on the root object and on
+//! regular files. So with the same features the manifest of a volume is
+//! the one the host tree generator writes for the tree the volume was
 //! filled from, apart from what FAT changes on the way: FAT keeps times at
-//! 2 s, and a read-only file gets `readOnly`.
+//! 2 s, a read-only file gets `readOnly`, and the root object names the
+//! volume with `fatSerial` and `fsLabel`. The manifest always lists
+//! `read-only`, `fat-serial` and `fs-label`.
 
-use std::collections::HashSet;
 use std::io::Write;
 use std::time::SystemTime;
 
-use json::Object;
+use uapi16::{
+    FatSerial, Features, FileObject, Finalize, InodeType, Name, Order, RootObject, Sha256, Sha256Context, Writer,
+};
 
-use super::generate::{time_nsec, write_record};
-use super::{valid_name, FILENAME, MEDIA_TYPE, TRAILER_MEDIA_TYPE};
-use crate::dirent::ATTR_READ_ONLY;
+use super::DosAttributes;
+use crate::dir::NameDecoding;
 use crate::errno::*;
+use crate::fat::BitSet;
+use crate::format::{decode_label, encode_exact_label};
 use crate::progress::Progress;
-use crate::sha256::{self, Sha256, DIGEST_SIZE};
-use crate::volume::Volume;
+use crate::volume::{Metadata, Volume};
 use crate::{CorruptPlace, Detail, Result};
 
-/// The per-file fields a written manifest carries: systemd-manifest's
-/// vocabulary, the names its `--field=` and repart's `--manifest-fields=`
-/// take, as the Varlink interface's `ManifestField` spells them. The inode
-/// type is always given, and `readOnly` is written where the attribute is
-/// set, which no field governs. FAT has no mode, owner, symbolic links,
-/// device nodes, hardlinks, extended attributes or user and group names,
-/// so of these only `size`, `hash` and `mtime` change what the volume
-/// writer puts out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Fields {
-    /// `mode`: the access mode.
-    pub mode: bool,
-    /// `uid`: the owning user.
-    pub uid: bool,
-    /// `gid`: the owning group.
-    pub gid: bool,
-    /// `size`: the size of regular files.
-    pub size: bool,
-    /// `hash`: the SHA-256 of regular files.
-    pub hash: bool,
-    /// `symlink`: the target of symbolic links.
-    pub symlink: bool,
-    /// `device`: the numbers of device nodes.
-    pub device: bool,
-    /// `hardlink`: the hardlink group token.
-    pub hardlink: bool,
-    /// `mtime`: the modification time.
-    pub mtime: bool,
-    /// `userXattr`: the extended attributes of the user namespace.
-    pub user_xattr: bool,
-    /// `userName`: the owning user's name.
-    pub user_name: bool,
-    /// `groupName`: the owning group's name.
-    pub group_name: bool,
-}
-
-impl Default for Fields {
-    /// systemd's default set: everything but `mtime`, `userName` and
-    /// `groupName`.
-    fn default() -> Fields {
-        Fields {
-            mode: true,
-            uid: true,
-            gid: true,
-            size: true,
-            hash: true,
-            symlink: true,
-            device: true,
-            hardlink: true,
-            mtime: false,
-            user_xattr: true,
-            user_name: false,
-            group_name: false,
-        }
-    }
-}
-
-impl Fields {
-    /// No field at all: the manifest carries the names and the inode types,
-    /// and `readOnly` where the attribute is set.
-    pub fn none() -> Fields {
-        Fields {
-            mode: false,
-            uid: false,
-            gid: false,
-            size: false,
-            hash: false,
-            symlink: false,
-            device: false,
-            hardlink: false,
-            mtime: false,
-            user_xattr: false,
-            user_name: false,
-            group_name: false,
-        }
-    }
-
-    /// The fields named with the interface's names: `mode`, `uid`, `gid`,
-    /// `size`, `hash`, `symlink`, `device`, `hardlink`, `mtime`,
-    /// `userXattr`, `userName` and `groupName`. None when a name is not one
-    /// of them.
-    pub fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<Fields> {
-        let mut fields = Fields::none();
-        for name in names {
-            match name {
-                "mode" => fields.mode = true,
-                "uid" => fields.uid = true,
-                "gid" => fields.gid = true,
-                "size" => fields.size = true,
-                "hash" => fields.hash = true,
-                "symlink" => fields.symlink = true,
-                "device" => fields.device = true,
-                "hardlink" => fields.hardlink = true,
-                "mtime" => fields.mtime = true,
-                "userXattr" => fields.user_xattr = true,
-                "userName" => fields.user_name = true,
-                "groupName" => fields.group_name = true,
-                _ => return None,
-            }
-        }
-        Some(fields)
-    }
-}
-
 /// What a written manifest covers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WriteReport {
     /// Regular files listed.
     pub files: u64,
@@ -151,15 +50,31 @@ pub struct WriteReport {
     pub directories: u64,
     /// Bytes of the regular files listed.
     pub bytes: u64,
-    /// What the volume holds that the manifest could not record: entries
-    /// whose names a manifest cannot carry, a directory with everything
-    /// below it counting once. A field FAT has no notion of is not an
-    /// omission. A manifest with omissions does not describe the whole
-    /// volume, which is what repart refuses.
+    /// The entries of the tree or the volume that the manifest could not
+    /// record: entries whose names a manifest cannot carry, a directory
+    /// with everything below it counting once. A feature the file system
+    /// has no notion of is not an omission. A manifest with omissions does
+    /// not describe all of it, and repart refuses such a manifest of a
+    /// volume.
     pub omitted: u64,
+    /// The label of the volume where the manifest leaves it out: one that a
+    /// volume made from the manifest would not get, which only other tools
+    /// write. It is an omission as well, but not an entry.
+    pub omitted_label: Option<String>,
+    /// Regular files of a host tree that changed while they were read for
+    /// their hash. The manifest has the size and the hash of what was
+    /// read, which need not be what the file holds now. A volume does not
+    /// change while its manifest is written.
+    pub changed: u64,
 }
 
 impl WriteReport {
+    /// Everything the manifest leaves out, as one count: the entries in
+    /// `omitted` and a label in `omitted_label`.
+    pub fn omissions(&self) -> u64 {
+        self.omitted + u64::from(self.omitted_label.is_some())
+    }
+
     /// What the manifest covers so far, as a progress callback hears it.
     fn progress(&self) -> Progress {
         Progress {
@@ -170,145 +85,301 @@ impl WriteReport {
     }
 }
 
-/// Writes the UAPI.16 manifest of everything the volume holds to `out`:
-/// the root object, one object per entry, the trailer. `root_time` is the
-/// time the root object carries when `fields.mtime` is on: the root
-/// directory of a FAT volume has no entry of its own and so no time, the
-/// caller passes the one it knows, the source directory's or the label
-/// entry's. Each record goes out in one write and `out` is flushed at the
-/// end, so a descriptor wants a `BufWriter` around it.
-///
-/// Names the manifest cannot carry are left out, with everything below
-/// them. The names the specification reserves in the top level for the
-/// manifest itself and its signatures (`Uapi16Manifest`,
-/// `Uapi16Manifest.*`) are left out silently, as `systemd-manifest` leaves
-/// them out; any other, a component of more than 255 bytes of UTF-8 for
-/// instance, which FAT stores in UTF-16 but no manifest reader takes, is
-/// counted in the report's `omitted`.
-pub fn write(
-    volume: &Volume,
-    root_time: Option<SystemTime>,
-    fields: Fields,
-    out: &mut dyn Write,
-) -> Result<WriteReport> {
-    write_with_progress(volume, root_time, fields, out, &mut |_| {})
-}
+impl Volume {
+    /// What the manifest of a FAT volume records whatever it is asked for:
+    /// the read-only attribute, which every entry has set or cleared, and
+    /// the serial number and the label, which name the volume.
+    const ALWAYS_RECORDED_FEATURES: Features = Features::READ_ONLY
+        .union(Features::FAT_SERIAL)
+        .union(Features::FS_LABEL);
 
-/// [`write`], telling `progress` what the manifest covers so far after
-/// every entry and every chunk of a file it reads for the hash.
-pub fn write_with_progress(
-    volume: &Volume,
-    root_time: Option<SystemTime>,
-    fields: Fields,
-    out: &mut dyn Write,
-    progress: &mut dyn FnMut(&Progress),
-) -> Result<WriteReport> {
-    let root = volume.metadata("/")?;
-    let mut writer = Writer {
-        volume,
-        fields,
-        out,
-        report: WriteReport::default(),
-        buf: vec![0u8; volume.layout().cluster_size() as usize],
-        seen: HashSet::from([root.first_cluster]),
-        progress,
-    };
-    // The root object is a directory by definition and carries no type.
-    let mut top = Object::new();
-    top.insert("mediaType", MEDIA_TYPE);
-    if fields.mtime {
-        if let Some(nsec) = root_time.and_then(time_nsec) {
-            top.insert("mTimeNSec", nsec);
-        }
+    /// What the manifest of a FAT volume can record: sizes, hashes, times,
+    /// the read-only attribute and the hidden, system and archive
+    /// attributes, the serial number and the label, and that there are no
+    /// symbolic links, device nodes, hardlinks, extended attributes or
+    /// inode flags.
+    const MANIFEST_FEATURES: Features = Features::SIZE
+        .union(Features::SHA256)
+        .union(Features::MTIME)
+        .union(Features::READ_ONLY)
+        .union(Features::FAT_SERIAL)
+        .union(Features::FS_LABEL)
+        .union(Features::SYMLINK)
+        .union(Features::DEVICE)
+        .union(Features::HARDLINK)
+        .union(Features::USER_XATTR)
+        .union(Features::FLAG_HIDDEN)
+        .union(Features::FLAG_SYSTEM)
+        .union(Features::FLAG_ARCHIVE)
+        .union(Features::FLAG_APPEND_ONLY)
+        .union(Features::FLAG_IMMUTABLE)
+        .union(Features::FLAG_NO_ATIME)
+        .union(Features::FLAG_NO_COW)
+        .union(Features::FLAG_NO_DUMP);
+
+    /// Writes the UAPI.16 manifest of everything the volume holds to `out`:
+    /// the root object, one object per entry, the trailer. `root_time` is
+    /// the time the root object carries when `features` has
+    /// [`Features::MTIME`]: the root directory of a FAT volume has no entry
+    /// of its own and so no time, the caller passes the one it knows, the
+    /// source directory's or the label entry's. Each record goes out in
+    /// one write and `out` is flushed at the end, so a descriptor wants a
+    /// `BufWriter` around it.
+    ///
+    /// The manifest records what `features` asks for and FAT has a notion
+    /// of. Of the features only [`Features::SIZE`], [`Features::SHA256`],
+    /// [`Features::MTIME`] and the flags of the hidden, system and archive
+    /// attributes add fields: a flag is written on a file or a directory
+    /// that has the attribute, and cleared where it is not written. FAT has
+    /// no symbolic links, device nodes, hardlinks, extended attributes and
+    /// inode flags, so the manifest records that it has none of them where
+    /// `features` asks for them. FAT has no mode, owner or user and group
+    /// names, so the manifest does not record them. It always records the
+    /// read-only attribute, which every entry has set or cleared:
+    /// `readOnly` is written where it is set, and an entry without it is
+    /// not read-only. The manifest lists its features, and declares the
+    /// code point ordering its objects are in.
+    ///
+    /// The root object names the volume, whatever `features` asks for: its
+    /// serial number as `fatSerial`, and its label as `fsLabel` when it has
+    /// one. The manifest lists `fat-serial` and `fs-label`, and without
+    /// `fsLabel` it says that the volume has no label. A volume made from
+    /// the manifest gets the same serial number and label again, and the
+    /// content of the manifest goes into this volume and no other.
+    ///
+    /// Names the manifest cannot carry are left out, with everything below
+    /// them. The names the specification reserves in the top level for the
+    /// manifest itself and its signatures (`Uapi16Manifest`,
+    /// `Uapi16Manifest.*`) are left out silently, as `systemd-manifest`
+    /// leaves them out; any other, one with a noncharacter or an unpaired
+    /// surrogate for instance, which FAT stores but no manifest has, is
+    /// counted in the report's `omitted`. A label that a volume made from
+    /// the manifest would not have, see [`encode_exact_label`], which only
+    /// other tools write, is left out as well and named in the report's
+    /// `omitted_label`: the manifest does not list `fs-label` then.
+    /// Names that FAT takes for one, such as `README.TXT` and `readme.txt`,
+    /// are two names to a manifest, and each is listed with what its entry
+    /// holds.
+    ///
+    /// What only a damaged volume has fails with EUCLEAN: a cluster that
+    /// belongs to two entries, or twice to one, as in a loop or a
+    /// cross-link, a directory whose chain is longer than a directory can
+    /// be, an entry that points at a cluster the volume does not have, a
+    /// chain that runs into a free, bad or invalid entry, a file whose
+    /// chain is shorter than the file, and two entries of the same name in
+    /// a directory. The walk lists a directory from the first cluster its
+    /// entry names and reads a file the same way, never by path. It keeps
+    /// one bit for every cluster of the volume, set for every cluster of a
+    /// directory it lists and of a file it reads for the hash, and ends
+    /// where it reaches a cluster a second time. So it lists no directory
+    /// and reads no file twice, and takes time in proportion to the size of
+    /// the volume. It reads files only for [`Features::SHA256`], and only
+    /// then finds what is wrong with their chains.
+    pub fn write_manifest(
+        &self,
+        root_time: Option<SystemTime>,
+        features: Features,
+        out: impl Write,
+    ) -> Result<WriteReport> {
+        self.write_manifest_with_progress(root_time, features, out, &mut |_| {})
     }
-    write_record(writer.out, top)?;
-    writer.directory("/", "")?;
-    write_record(writer.out, json::object! { "mediaType" => TRAILER_MEDIA_TYPE })?;
-    writer.out.flush()?;
-    Ok(writer.report)
+
+    /// [`Volume::write_manifest`], telling `progress` what the manifest
+    /// covers so far after every entry and every chunk of a file it reads
+    /// for the hash.
+    pub fn write_manifest_with_progress(
+        &self,
+        root_time: Option<SystemTime>,
+        features: Features,
+        out: impl Write,
+        progress: &mut dyn FnMut(&Progress),
+    ) -> Result<WriteReport> {
+        let top = self.metadata("/")?;
+        let mut features = (features | Volume::ALWAYS_RECORDED_FEATURES) & Volume::MANIFEST_FEATURES;
+        // The label goes in where a volume made from the manifest gets the
+        // same label field, so that the manifest goes into this volume
+        // again. Only other tools write one that it does not, and without
+        // fs-label listed the manifest says nothing about it.
+        let stored = self.label_bytes()?;
+        let label = stored.map(|raw| decode_label(&raw));
+        let carried = label
+            .as_deref()
+            .is_none_or(|label| encode_exact_label(label).ok() == stored);
+        if !carried {
+            features = features.without(Features::FS_LABEL);
+        }
+        // The root object is a directory by definition and carries no type.
+        let mut root = RootObject::default();
+        root.features = Some(features);
+        root.order = Some(Order::CodePoint);
+        if let Some(time) = root_time.filter(|_| features.contains(Features::MTIME)) {
+            root.inode.set_mtime(time);
+        }
+        root.file_system.fat_serial = Some(FatSerial(self.boot_sector().volume_id));
+        let (label, omitted_label) = if carried { (label, None) } else { (None, label) };
+        root.file_system.label = label;
+        let mut listing = Listing {
+            volume: self,
+            features,
+            writer: Writer::begin(out, &root)?,
+            report: WriteReport {
+                omitted_label,
+                ..WriteReport::default()
+            },
+            buf: vec![0u8; self.layout().cluster_size() as usize],
+            claimed: BitSet::new(self.layout().max_cluster() as usize + 1),
+            progress,
+        };
+        let entries = listing.list("/", top.first_cluster)?;
+        listing.directory("/", &Name::ROOT, entries)?;
+        listing.writer.finish()?;
+        Ok(listing.report)
+    }
 }
 
-/// Whether `name`, relative to the root, is one the specification reserves
-/// in the top level for the manifest itself and its signatures.
-fn reserved(name: &str) -> bool {
-    name == FILENAME || name.strip_prefix(FILENAME).is_some_and(|rest| rest.starts_with('.'))
-}
-
-struct Writer<'a> {
+/// The manifest of a volume while it is written.
+struct Listing<'a, W: Write> {
     volume: &'a Volume,
-    fields: Fields,
-    out: &'a mut dyn Write,
+    /// What the manifest records.
+    features: Features,
+    writer: Writer<W>,
     report: WriteReport,
     /// One cluster, the most one read of a file returns.
     buf: Vec<u8>,
-    /// First clusters of the root and of every directory written so far. A
-    /// directory reached twice is a cross-linked or looping tree; without
-    /// the check a loop would run until the path limit.
-    seen: HashSet<u32>,
+    /// The clusters the walk read so far, one bit for every cluster of the
+    /// volume: those of every directory it listed and of every file it
+    /// read for the hash. On a damaged volume a cluster can belong to two
+    /// entries, or twice to one, through a loop or a cross-link, and a walk
+    /// that read it again would list a directory or read a file as often
+    /// as there are paths to it: in a loop without end, and in a chain of
+    /// cross-linked directories twice as often per level.
+    claimed: BitSet,
     progress: &'a mut dyn FnMut(&Progress),
 }
 
-impl Writer<'_> {
-    /// Writes the entries of the directory at `path` inside the volume,
-    /// whose name in the manifest is `prefix` (empty for the root), sorted
-    /// by the bytes of their names, each directory followed by what is
-    /// below it.
-    fn directory(&mut self, path: &str, prefix: &str) -> Result<()> {
-        let mut entries = self.volume.read_dir(path)?;
-        entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+impl<W: Write> Listing<'_, W> {
+    /// Notes that the walk read `cluster` for the entry at `path`, a
+    /// directory or a file as `place` says. A cluster it read before
+    /// belongs to two entries, or twice to one, and fails with EUCLEAN.
+    fn claim(&mut self, path: &str, place: CorruptPlace, cluster: u32) -> Result<()> {
+        // The clusters of chains are valid, below the number of FAT entries
+        // the set was made for.
+        let bit = cluster as usize;
+        if self.claimed.contains(bit) {
+            bail!(
+                EUCLEAN,
+                Detail::Corrupt {
+                    place,
+                    field: None,
+                    path: Some(path.to_string()),
+                    cluster: Some(cluster),
+                },
+                "'{}' is at cluster {}, which the walk reached before, the volume is cross-linked or loops",
+                path,
+                cluster
+            );
+        }
+        self.claimed.insert(bit);
+        Ok(())
+    }
+
+    /// The entries of the directory at `path` inside the volume, whose
+    /// first cluster is `first_cluster`, sorted by the bytes of their
+    /// names, without those whose names have an unpaired surrogate, which
+    /// are counted as omitted. Every cluster of the directory is claimed. A
+    /// first cluster the volume does not have fails with EUCLEAN, and so do
+    /// two entries of the same name.
+    fn list(&mut self, path: &str, first_cluster: u32) -> Result<Vec<Metadata>> {
+        if !self.volume.layout().valid_cluster(first_cluster) {
+            bail!(
+                EUCLEAN,
+                Detail::Corrupt {
+                    place: CorruptPlace::Directory,
+                    field: None,
+                    path: Some(path.to_string()),
+                    cluster: Some(first_cluster),
+                },
+                "'{}' is a directory at cluster {}, which the volume does not have",
+                path,
+                first_cluster
+            );
+        }
+        let volume = self.volume;
+        let mut entries = volume
+            .read_dir_at(first_cluster, |chain| {
+                chain
+                    .iter()
+                    .try_for_each(|&cluster| self.claim(path, CorruptPlace::Directory, cluster))
+            })
+            .map_err(|e| e.at_path(path))?;
+        // A long name with an unpaired surrogate has no spelling a manifest
+        // takes. The listing shows it with U+FFFD in its place, which two
+        // such names can share, so it is left out before names are compared.
+        let listed = entries.len();
+        entries.retain(|md| md.name_decoding == NameDecoding::Exact);
+        self.report.omitted += (listed - entries.len()) as u64;
+        entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        // Sorted, two entries of the same name are next to each other. Names
+        // that FAT takes for one, such as "AAAA" and "aaaa", are two names
+        // to a manifest, and each is listed with what its own entry holds.
+        if let Some(pair) = entries.windows(2).find(|pair| pair[0].name == pair[1].name) {
+            let path = crate::path::join(path, &pair[1].name);
+            bail!(
+                EUCLEAN,
+                Detail::Corrupt {
+                    place: CorruptPlace::Directory,
+                    field: None,
+                    path: Some(path.clone()),
+                    cluster: Some(first_cluster),
+                },
+                "'{}' is in its directory twice, the directory is damaged",
+                path
+            );
+        }
+        Ok(entries)
+    }
+
+    /// Writes `entries`, the entries of the directory at `path` inside the
+    /// volume as [`Listing::list`] returned them, whose name in the
+    /// manifest is `prefix` (the root's for the root), each directory
+    /// followed by what is below it. A directory is listed before its own
+    /// record goes out, so that a damaged one ends the manifest before it.
+    fn directory(&mut self, path: &str, prefix: &Name, entries: Vec<Metadata>) -> Result<()> {
         for md in &entries {
-            let name = if prefix.is_empty() {
-                md.name.clone()
-            } else {
-                format!("{}/{}", prefix, md.name)
-            };
-            let path = format!("/{}", name);
-            if !valid_name(&name) || path.len() > crate::path::MAX_PATH {
-                if !reserved(&name) {
-                    self.report.omitted += 1;
-                }
+            let path = crate::path::join(path, &md.name);
+            // A name that is reserved for the manifest, which only a name
+            // at the top can be, is left out and is no omission.
+            if prefix.is_root() && Name::is_reserved(&md.name) {
                 continue;
             }
-            let mut o = Object::new();
-            o.insert("name", name.as_str());
+            let name = match prefix.join(&md.name) {
+                Ok(name) if path.len() <= crate::path::MAX_PATH => name,
+                _ => {
+                    self.report.omitted += 1;
+                    continue;
+                }
+            };
             // A regular file is what an object without a type is.
-            if md.is_dir {
-                o.insert("type", "dir");
-            }
-            if md.attributes & ATTR_READ_ONLY != 0 {
-                o.insert("readOnly", true);
-            }
-            if self.fields.mtime {
-                if let Some(nsec) = time_nsec(md.modified) {
-                    o.insert("mTimeNSec", nsec);
-                }
+            let mut object = FileObject::new(name);
+            DosAttributes::new(md.attributes).record_in(&mut object, self.features);
+            if self.features.contains(Features::MTIME) {
+                object.inode.set_mtime(md.modified);
             }
             if md.is_dir {
-                if !self.seen.insert(md.first_cluster) {
-                    bail!(
-                        EUCLEAN,
-                        Detail::Corrupt {
-                            place: CorruptPlace::Directory,
-                            field: None,
-                            path: Some(path.clone()),
-                            cluster: Some(md.first_cluster),
-                        },
-                        "'{}' is a directory reached before, the directory tree is cross-linked or loops",
-                        path
-                    );
-                }
-                write_record(self.out, o)?;
+                let below = self.list(&path, md.first_cluster)?;
+                object.inode_type = InodeType::Directory;
+                self.writer.file(&object)?;
                 self.report.directories += 1;
                 (self.progress)(&self.report.progress());
-                self.directory(&path, &name)?;
+                self.directory(&path, &object.name, below)?;
             } else {
-                if self.fields.size {
-                    o.insert("size", md.size);
+                if self.features.contains(Features::SIZE) {
+                    object.size = Some(md.size);
                 }
-                if self.fields.hash {
-                    o.insert("sha256", sha256::to_hex(&self.hash(&path)?));
+                if self.features.contains(Features::SHA256) {
+                    object.sha256 = Some(self.hash(&path, md)?);
                 }
-                write_record(self.out, o)?;
+                self.writer.file(&object)?;
                 self.report.files += 1;
                 self.report.bytes += md.size;
                 (self.progress)(&self.report.progress());
@@ -317,17 +388,28 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// The SHA-256 of the file at `path`, read from the volume.
-    fn hash(&mut self, path: &str) -> Result<[u8; DIGEST_SIZE]> {
-        let mut file = self.volume.begin_read(path)?;
-        let mut hasher = Sha256::new();
+    /// The SHA-256 of the file at `path` inside the volume, read from the
+    /// first cluster its entry `md` names for the size the entry gives.
+    /// Every cluster it reads is claimed.
+    fn hash(&mut self, path: &str, md: &Metadata) -> Result<Sha256> {
+        let mut file = self
+            .volume
+            .begin_read_at(md.first_cluster, md.size)
+            .map_err(|e| e.at_path(path))?;
+        let mut context = Sha256Context::default();
         let mut done = self.report.progress();
         loop {
-            let n = self.volume.read_file_data(&mut file, &mut self.buf)?;
+            let n = self
+                .volume
+                .read_file_data(&mut file, &mut self.buf)
+                .map_err(|e| e.at_path(path))?;
             if n == 0 {
-                return Ok(hasher.finalize());
+                return Ok(context.finalize());
             }
-            hasher.update(&self.buf[..n]);
+            // A read ends at the end of a cluster and the buffer holds one,
+            // so every read is of a cluster of its own.
+            self.claim(path, CorruptPlace::Chain, file.cluster())?;
+            context.update(&self.buf[..n]);
             done.bytes += n as u64;
             (self.progress)(&done);
         }
@@ -337,21 +419,27 @@ impl Writer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{self, Entry, InodeType, Manifest, RECORD_SEPARATOR};
+    use crate::dirent::ATTR_READ_ONLY;
+    use crate::manifest::HostTree;
     use crate::populate::CopyOptions;
     use crate::test_util::{volume, TempDir, TempImage};
+    use crate::volume::NameCollision;
+    use json::Object;
     use std::os::fd::AsFd;
     use std::time::{Duration, UNIX_EPOCH};
+    use uapi16::{Digest, DosFlags, InodeFlags, Object as ManifestObject, Reader, RECORD_SEPARATOR};
 
     fn t(secs: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(secs)
     }
 
-    /// Creates a file with `data`.
+    /// Creates a file with `data`, read-only as `read_only` says.
     fn put(v: &mut Volume, path: &str, data: &[u8], time: SystemTime, read_only: bool) {
-        let mut w = v.create_file(path, time, false).unwrap();
+        let mut w = v.create_file(path, time, NameCollision::Fail).unwrap();
         w.write_all(data).unwrap();
-        w.set_read_only(read_only);
+        if read_only {
+            w.set_attributes(w.attributes() | ATTR_READ_ONLY).unwrap();
+        }
         w.finish().unwrap();
     }
 
@@ -427,9 +515,9 @@ mod tests {
         tmp
     }
 
-    fn written(v: &Volume, root_time: Option<SystemTime>, fields: Fields) -> (Vec<u8>, WriteReport) {
+    fn written(v: &Volume, root_time: Option<SystemTime>, features: Features) -> (Vec<u8>, WriteReport) {
         let mut out = Vec::new();
-        let report = write(v, root_time, fields, &mut out).unwrap();
+        let report = v.write_manifest(root_time, features, &mut out).unwrap();
         (out, report)
     }
 
@@ -457,18 +545,44 @@ mod tests {
             .collect()
     }
 
-    fn names(m: &Manifest) -> Vec<&str> {
-        m.entries.iter().map(|e| e.name.as_deref().unwrap()).collect()
+    /// A manifest a volume wrote as the tests look at it: the root file
+    /// object and the others.
+    struct WrittenManifest {
+        root: RootObject,
+        entries: Vec<FileObject>,
     }
 
-    fn entry<'a>(m: &'a Manifest, name: &str) -> &'a Entry {
-        m.entries.iter().find(|e| e.name.as_deref() == Some(name)).unwrap()
+    impl WrittenManifest {
+        /// Reads the manifest `bytes` to its end with the reader of the
+        /// `uapi16` crate, which requires the code point order.
+        fn read(bytes: &[u8]) -> WrittenManifest {
+            let reader = Reader::open(bytes).unwrap();
+            reader.root().require_order(Order::CodePoint).unwrap();
+            let root = reader.root().clone();
+            let mut entries = Vec::new();
+            for object in reader {
+                if let ManifestObject::File(object) = object.unwrap() {
+                    entries.push(*object);
+                }
+            }
+            WrittenManifest { root, entries }
+        }
+
+        /// The names of the file objects, in the order of the manifest.
+        fn names(&self) -> Vec<&str> {
+            self.entries.iter().map(|e| e.name.as_str()).collect()
+        }
+
+        /// The file object of the name `name`.
+        fn entry(&self, name: &str) -> &FileObject {
+            self.entries.iter().find(|e| e.name == name).unwrap()
+        }
     }
 
     #[test]
     fn writes_what_the_volume_holds() {
         let (_img, v) = populated();
-        let (bytes, report) = written(&v, None, Fields::default());
+        let (bytes, report) = written(&v, None, Features::DEFAULT);
         assert_eq!(
             report,
             WriteReport {
@@ -476,15 +590,16 @@ mod tests {
                 directories: 4,
                 bytes: 7 + 5000 + 10 + 7,
                 omitted: 0,
+                omitted_label: None,
+                changed: 0,
             }
         );
-        let m = manifest::parse(&bytes).unwrap();
-        assert_eq!(names(&m), NAMES);
+        let m = WrittenManifest::read(&bytes);
+        assert_eq!(m.names(), NAMES);
         use InodeType::{Directory as D, Regular as R};
         let types: Vec<InodeType> = m.entries.iter().map(|e| e.inode_type).collect();
         assert_eq!(types, [R, D, D, R, R, D, R, R, D]);
-        assert_eq!(m.root.inode_type, D);
-        assert_eq!(m.root.mtime_nsec, None);
+        assert_eq!(m.root.inode.mtime_nsec, None);
         for (name, data) in [
             ("B.txt", &b"upper B"[..]),
             ("EFI/BOOT/BOOTX64.EFI", &boot_data()),
@@ -492,48 +607,52 @@ mod tests {
             ("_notes/empty", b""),
             ("a.txt", b"lower a"),
         ] {
-            let e = entry(&m, name);
+            let e = m.entry(name);
             assert_eq!(e.size, Some(data.len() as u64), "{}", name);
-            assert_eq!(e.sha256, Some(sha256::digest(data)), "{}", name);
+            assert_eq!(e.sha256, Some(Sha256::digest(data)), "{}", name);
         }
-        assert_eq!(entry(&m, "_notes/empty").sha256, Some(sha256::EMPTY));
+        assert_eq!(m.entry("_notes/empty").sha256, Some(Sha256::EMPTY));
         for name in ["EFI", "EFI/BOOT", "_notes", "zz"] {
-            assert_eq!((entry(&m, name).size, entry(&m, name).sha256), (None, None), "{}", name);
+            assert_eq!((m.entry(name).size, m.entry(name).sha256), (None, None), "{}", name);
         }
-        let boot = entry(&m, "EFI/BOOT/BOOTX64.EFI");
-        assert_eq!(boot.read_only, Some(true));
-        assert!(boot.is_read_only());
-        for e in m
+        // The manifest records the read-only attribute, so what it does not
+        // mark read-only is not.
+        let boot = m.entry("EFI/BOOT/BOOTX64.EFI");
+        assert_eq!(boot.inode.read_only, Some(true));
+        assert!(boot.inode.is_read_only());
+        for e in m.entries.iter().filter(|e| e.name != "EFI/BOOT/BOOTX64.EFI") {
+            assert_eq!(e.inode.read_only, Some(false), "{:?}", e.name);
+            assert!(!e.inode.is_read_only());
+        }
+        assert!(m
             .entries
             .iter()
-            .filter(|e| e.name.as_deref() != Some("EFI/BOOT/BOOTX64.EFI"))
-        {
-            assert_eq!(e.read_only, None, "{:?}", e.name);
-            assert!(!e.is_read_only());
-        }
-        assert!(m.entries.iter().all(|e| e.mtime_nsec.is_none() && e.mode.is_none()));
+            .all(|e| e.inode.mtime_nsec.is_none() && e.inode.mode.is_none()));
 
         // The raw records: the root object, one per entry, the trailer. As
         // systemd-manifest writes them, the root object and the regular
         // files carry no type, and FAT has no extended attributes to list.
+        // The empty file has no hash, which its size implies, as the
+        // specification recommends.
         let recs = records(&bytes);
         assert_eq!(recs.len(), 1 + NAMES.len() + 1);
-        assert_eq!(recs[0].0, r#"{"mediaType":"application/vnd.uapi.16.manifest"}"#);
+        assert_eq!(
+            recs[0].0,
+            concat!(
+                r#"{"fatSerial":"1234-ABCD","#,
+                r#""features":["device","fat-serial","fs-label","hardlink","read-only","sha256","size","symlink"],"#,
+                r#""fsLabel":"TEST","mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}"#
+            )
+        );
         assert_eq!(recs[2].0, r#"{"name":"EFI","type":"dir"}"#);
         assert_eq!(
             recs[4].0,
             format!(
                 r#"{{"name":"EFI/BOOT/BOOTX64.EFI","readOnly":true,"sha256":"{}","size":5000}}"#,
-                sha256::to_hex(&sha256::digest(&boot_data()))
+                Sha256::digest(&boot_data())
             )
         );
-        assert_eq!(
-            recs[7].0,
-            format!(
-                r#"{{"name":"_notes/empty","sha256":"{}","size":0}}"#,
-                sha256::to_hex(&sha256::EMPTY)
-            )
-        );
+        assert_eq!(recs[7].0, r#"{"name":"_notes/empty","size":0}"#);
         assert_eq!(recs[10].0, r#"{"mediaType":"application/vnd.uapi.16.trailer"}"#);
         for ((text, o), e) in recs[1..=NAMES.len()].iter().zip(&m.entries) {
             assert_eq!(
@@ -562,14 +681,21 @@ mod tests {
     }
 
     #[test]
-    fn fields_govern_what_is_written() {
+    fn features_govern_what_is_written() {
         let (_img, v) = populated();
-        // Nothing but names and the types of directories, and the attribute
-        // no field governs.
-        let (bytes, report) = written(&v, Some(t(1_600_000_000)), Fields::none());
+        // Nothing but names, the types of directories, the read-only
+        // attribute and what names the volume, which the manifest always
+        // records.
+        let (bytes, report) = written(&v, Some(t(1_600_000_000)), Features::NONE);
         assert_eq!((report.files, report.directories, report.bytes), (5, 4, 5024));
         let recs = records(&bytes);
-        assert_eq!(recs[0].0, r#"{"mediaType":"application/vnd.uapi.16.manifest"}"#);
+        assert_eq!(
+            recs[0].0,
+            concat!(
+                r#"{"fatSerial":"1234-ABCD","features":["fat-serial","fs-label","read-only"],"fsLabel":"TEST","#,
+                r#""mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}"#
+            )
+        );
         assert_eq!(recs[1].0, r#"{"name":"B.txt"}"#);
         assert_eq!(recs[2].0, r#"{"name":"EFI","type":"dir"}"#);
         assert_eq!(recs[4].0, r#"{"name":"EFI/BOOT/BOOTX64.EFI","readOnly":true}"#);
@@ -583,138 +709,138 @@ mod tests {
             };
             assert_eq!(keys, expected, "{}", text);
         }
-        let m = manifest::parse(&bytes).unwrap();
-        assert_eq!(names(&m), NAMES);
-        assert_eq!(m.root.mtime_nsec, None);
+        let m = WrittenManifest::read(&bytes);
+        assert_eq!(m.names(), NAMES);
+        assert_eq!(m.root.inode.mtime_nsec, None);
         assert!(m.entries.iter().all(|e| e.size.is_none() && e.sha256.is_none()));
 
         // Sizes without hashes, hashes without sizes. The empty file's hash
         // alone still tells the reader its size.
-        let (bytes, _) = written(&v, None, Fields::from_names(["size"]).unwrap());
-        let m = manifest::parse(&bytes).unwrap();
-        assert_eq!(entry(&m, "a.txt").size, Some(7));
-        assert_eq!(entry(&m, "a.txt").sha256, None);
-        let (bytes, _) = written(&v, None, Fields::from_names(["hash"]).unwrap());
-        let m = manifest::parse(&bytes).unwrap();
-        assert_eq!(entry(&m, "a.txt").size, None);
-        assert_eq!(entry(&m, "a.txt").sha256, Some(sha256::digest(b"lower a")));
-        assert_eq!(entry(&m, "_notes/empty").size, Some(0));
+        let (bytes, _) = written(&v, None, Features::from_names(["size"]).unwrap());
+        let m = WrittenManifest::read(&bytes);
+        assert_eq!(m.entry("a.txt").size, Some(7));
+        assert_eq!(m.entry("a.txt").sha256, None);
+        let (bytes, _) = written(&v, None, Features::from_names(["sha256"]).unwrap());
+        let m = WrittenManifest::read(&bytes);
+        assert_eq!(m.entry("a.txt").size, None);
+        assert_eq!(m.entry("a.txt").sha256, Some(Sha256::digest(b"lower a")));
+        assert_eq!(m.entry("_notes/empty").size, Some(0));
         assert!(!records(&bytes)[7].1.contains_key("size"));
 
         // Times: the stored ones, which FAT keeps at 2 s, and the root's
         // only when the caller has one.
-        let fields = Fields {
-            mtime: true,
-            ..Fields::none()
-        };
-        let (bytes, _) = written(&v, None, fields);
-        let m = manifest::parse(&bytes).unwrap();
-        assert_eq!(m.root.mtime_nsec, None);
+        let features = Features::MTIME;
+        let (bytes, _) = written(&v, None, features);
+        let m = WrittenManifest::read(&bytes);
+        assert_eq!(m.root.inode.mtime_nsec, None);
         for e in &m.entries {
-            let stored = v.metadata(&e.path()).unwrap().modified;
-            assert_eq!(e.mtime(), Some(stored), "{}", e.path());
+            let stored = v.metadata(&format!("/{}", e.name)).unwrap().modified;
+            assert_eq!(e.inode.mtime(), Some(stored), "{}", e.name);
         }
         assert_eq!(
-            entry(&m, "EFI/BOOT/BOOTX64.EFI").mtime_nsec,
+            m.entry("EFI/BOOT/BOOTX64.EFI").inode.mtime_nsec,
             Some(1_700_000_002 * 1_000_000_000)
         );
-        assert_eq!(entry(&m, "zz").mtime_nsec, Some(1_700_000_000 * 1_000_000_000));
+        assert_eq!(m.entry("zz").inode.mtime_nsec, Some(1_700_000_000 * 1_000_000_000));
         let root_time = t(1_600_000_000) + Duration::from_nanos(5);
-        let (bytes, _) = written(&v, Some(root_time), fields);
-        let m = manifest::parse(&bytes).unwrap();
-        assert_eq!(m.root.mtime_nsec, Some(1_600_000_000_000_000_005));
-        assert_eq!(m.root.mtime(), Some(root_time));
+        let (bytes, _) = written(&v, Some(root_time), features);
+        let m = WrittenManifest::read(&bytes);
+        assert_eq!(m.root.inode.mtime_nsec, Some(1_600_000_000_000_000_005));
+        assert_eq!(m.root.inode.mtime(), Some(root_time));
         assert_eq!(
             records(&bytes)[0].0,
-            r#"{"mTimeNSec":1600000000000000005,"mediaType":"application/vnd.uapi.16.manifest"}"#
+            concat!(
+                r#"{"fatSerial":"1234-ABCD","features":["fat-serial","fs-label","mtime","read-only"],"#,
+                r#""fsLabel":"TEST","mTimeNSec":1600000000000000005,"#,
+                r#""mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}"#
+            )
         );
-        // Without the field the caller's time is not written either.
-        let (bytes, _) = written(&v, Some(root_time), Fields::default());
-        assert_eq!(manifest::parse(&bytes).unwrap().root.mtime_nsec, None);
+        // Without the feature the caller's time is not written either.
+        let (bytes, _) = written(&v, Some(root_time), Features::DEFAULT);
+        assert_eq!(WrittenManifest::read(&bytes).root.inode.mtime_nsec, None);
     }
 
     #[test]
-    fn fields_from_names() {
-        let all = [
-            "mode",
-            "uid",
-            "gid",
-            "size",
-            "hash",
-            "symlink",
-            "device",
-            "hardlink",
-            "mtime",
-            "userXattr",
-            "userName",
-            "groupName",
-        ];
+    fn records_the_flags_and_what_fat_has_none_of() {
+        let (_img, v) = populated();
+        // Asked for everything, the manifest lists what FAT records:
+        // sizes, hashes, times, the read-only attribute and the other DOS
+        // attributes, the serial number and the label of the volume, and
+        // that it has no symbolic links, device nodes,
+        // hardlinks, extended attributes and inode flags. Modes, owners and
+        // their names are not listed.
+        let (bytes, _) = written(&v, None, Features::ALL);
+        let m = WrittenManifest::read(&bytes);
         assert_eq!(
-            Fields::from_names(all).unwrap(),
-            Fields {
-                mode: true,
-                uid: true,
-                gid: true,
-                size: true,
-                hash: true,
-                symlink: true,
-                device: true,
-                hardlink: true,
-                mtime: true,
-                user_xattr: true,
-                user_name: true,
-                group_name: true,
-            }
-        );
-        assert_eq!(Fields::from_names(Vec::<&str>::new()).unwrap(), Fields::none());
-        // systemd's default set.
-        assert_eq!(
-            Fields::from_names([
-                "mode",
-                "uid",
-                "gid",
-                "size",
-                "hash",
-                "symlink",
+            m.root.features.unwrap().names().collect::<Vec<_>>(),
+            [
                 "device",
-                "hardlink",
-                "userXattr"
-            ])
-            .unwrap(),
-            Fields::default()
-        );
-        assert_eq!(
-            Fields::from_names(["size", "hash", "mtime", "size"]).unwrap(),
-            Fields {
-                size: true,
-                hash: true,
-                mtime: true,
-                ..Fields::none()
-            }
-        );
-        for bad in [
-            &["sha256"][..],
-            &["size", "user_xattr"],
-            &["Mode"],
-            &[""],
-            &[
-                "mode",
-                "uid",
-                "gid",
-                "size",
-                "hash",
-                "symlink",
-                "device",
+                "fat-serial",
+                "flag-append-only",
+                "flag-archive",
+                "flag-hidden",
+                "flag-immutable",
+                "flag-no-atime",
+                "flag-no-cow",
+                "flag-no-dump",
+                "flag-system",
+                "fs-label",
                 "hardlink",
                 "mtime",
-                "userXattr",
-                "userName",
-                "groupName",
-                "type",
-            ],
-        ] {
-            assert_eq!(Fields::from_names(bad.iter().copied()), None, "{:?}", bad);
+                "read-only",
+                "sha256",
+                "size",
+                "symlink",
+                "user-xattr"
+            ]
+        );
+        // The inode flags are cleared everywhere, the root's too, and the
+        // DOS attributes are what the entries have: every file the volume
+        // made has the archive attribute, a directory has not.
+        let inode_flags = [
+            InodeFlags::APPEND_ONLY,
+            InodeFlags::IMMUTABLE,
+            InodeFlags::NO_ATIME,
+            InodeFlags::NO_COW,
+            InodeFlags::NO_DUMP,
+        ];
+        for flag in inode_flags {
+            assert_eq!(m.root.inode.flags.get(flag), Some(false), "{:?}", flag);
+            assert!(
+                m.entries.iter().all(|e| e.inode.flags.get(flag) == Some(false)),
+                "{:?}",
+                flag
+            );
         }
+        for e in &m.entries {
+            let archive = e.inode_type == InodeType::Regular;
+            assert_eq!(e.dos_flags.get(DosFlags::ARCHIVE), Some(archive), "{}", e.name);
+            assert_eq!(e.dos_flags.get(DosFlags::HIDDEN), Some(false), "{}", e.name);
+            assert_eq!(e.dos_flags.get(DosFlags::SYSTEM), Some(false), "{}", e.name);
+        }
+        let records = records(&bytes);
+        assert_eq!(
+            records[1].0,
+            format!(
+                r#"{{"flagArchive":true,"mTimeNSec":1700000000000000000,"name":"B.txt","sha256":"{}","size":7}}"#,
+                Sha256::digest(b"upper B")
+            )
+        );
+        assert_eq!(
+            records[2].0,
+            r#"{"mTimeNSec":1700000000000000000,"name":"EFI","type":"dir"}"#
+        );
+        // A read-only file has its other attributes as well.
+        assert_eq!(
+            records[4].0,
+            format!(
+                concat!(
+                    r#"{{"flagArchive":true,"mTimeNSec":1700000002000000000,"#,
+                    r#""name":"EFI/BOOT/BOOTX64.EFI","readOnly":true,"sha256":"{}","size":5000}}"#
+                ),
+                Sha256::digest(&boot_data())
+            )
+        );
     }
 
     #[test]
@@ -724,16 +850,130 @@ mod tests {
         let (_img, mut v) = volume(8 << 20, 512, 512);
         let copied = v.copy_tree(dir.as_fd(), "/", &CopyOptions::default()).unwrap();
         assert_eq!((copied.files, copied.directories), (5, 4));
-        // The generator writes the fields size, hash and mtime. With the
-        // tree's own time for the root and times FAT keeps as they are, the
-        // two manifests are the same bytes.
-        let host = manifest::generate(dir.as_fd()).unwrap();
+        // The generator records sizes, hashes and times. With the tree's own
+        // time for the root and times FAT keeps as they are, the two
+        // manifests are the same bytes, but for what the manifest of a
+        // volume always records: the read-only attribute, and the serial
+        // number and the label of the volume, which a tree does not have.
+        let mut host = Vec::new();
+        let host_report = HostTree::new(dir.as_fd()).write_manifest(&mut host).unwrap();
+        let host = String::from_utf8(host).unwrap();
+        let listed = r#"{"features":["mtime","sha256","size"],"#;
+        assert!(host.contains(listed), "{}", host);
+        let host = host.replacen(
+            listed,
+            concat!(
+                r#"{"fatSerial":"1234-ABCD","#,
+                r#""features":["fat-serial","fs-label","mtime","read-only","sha256","size"],"fsLabel":"TEST","#
+            ),
+            1,
+        );
         let root_time = std::fs::metadata(tree.path()).unwrap().modified().unwrap();
-        let fields = Fields::from_names(["size", "hash", "mtime"]).unwrap();
-        let (bytes, report) = written(&v, Some(root_time), fields);
-        assert_eq!(String::from_utf8_lossy(&bytes), String::from_utf8_lossy(&host));
-        assert_eq!(names(&manifest::parse(&bytes).unwrap()), NAMES);
+        let features = Features::from_names(["size", "sha256", "mtime"]).unwrap();
+        let (bytes, report) = written(&v, Some(root_time), features);
+        assert_eq!(String::from_utf8_lossy(&bytes), host);
+        assert_eq!(WrittenManifest::read(&bytes).names(), NAMES);
         assert_eq!((report.files, report.directories, report.bytes), (5, 4, copied.bytes));
+        assert_eq!(report, host_report);
+    }
+
+    #[test]
+    fn names_the_volume() {
+        use crate::dirent::{self, ATTR_VOLUME_ID, DIR_ENTRY_SIZE};
+        use crate::format::{format, FormatOptions};
+        use crate::manifest::{ManifestLabel, VolumeIdentity};
+        use crate::test_util::format_options;
+        // The serial number and the label with their features, whatever the
+        // features asked for say, and no UUID, which FAT does not have. The
+        // manifest goes into the volume it names.
+        let (img, v) = populated();
+        let (bytes, report) = written(&v, None, Features::NONE);
+        let m = WrittenManifest::read(&bytes);
+        assert_eq!(m.root.file_system.fat_serial, Some(FatSerial(0x1234_abcd)));
+        assert_eq!(m.root.file_system.label.as_deref(), Some("TEST"));
+        assert_eq!(m.root.file_system.uuid, None);
+        assert!(m
+            .root
+            .features
+            .unwrap()
+            .contains(Features::FAT_SERIAL | Features::FS_LABEL));
+        assert_eq!(report.omitted, 0);
+        VolumeIdentity::from_root(&m.root).check(&v).unwrap();
+        // A label that a volume made from the manifest would not have, which
+        // ufat does not write but another tool may, is left out and counted,
+        // and the manifest does not list fs-label then: one with a control
+        // character, one beyond ASCII, one with a character mkfs.fat refuses
+        // or a space in front, and one whose last character the volume
+        // reads as padding.
+        let root = v.boot_sector().root_cluster;
+        let offset = v.layout().cluster_offset(root).unwrap();
+        let mut cluster = vec![0u8; v.layout().cluster_size() as usize];
+        v.close().unwrap();
+        img.device().read_at(offset, &mut cluster).unwrap();
+        let slot = cluster
+            .chunks(DIR_ENTRY_SIZE)
+            .position(|e| e[dirent::field::ATTR] == ATTR_VOLUME_ID)
+            .unwrap();
+        let name_at = offset + (slot * DIR_ENTRY_SIZE + dirent::field::NAME.start) as u64;
+        for (raw, label) in [
+            (b"\x01EST       ", "\u{1}EST"),
+            (b"\x85EST       ", "\u{85}EST"),
+            (b"\xe9TE        ", "\u{e9}TE"),
+            (b"A.B        ", "A.B"),
+            (b"A+B        ", "A+B"),
+            (b" X         ", " X"),
+            (b"ESP\xa0       ", "ESP"),
+        ] {
+            img.device().write_at(name_at, raw).unwrap();
+            let v = Volume::open(img.device()).unwrap();
+            assert_eq!(v.label().unwrap().as_deref(), Some(label));
+            let (bytes, report) = written(&v, None, Features::NONE);
+            let m = WrittenManifest::read(&bytes);
+            assert_eq!(m.root.file_system.fat_serial, Some(FatSerial(0x1234_abcd)));
+            assert_eq!(
+                (
+                    m.root.file_system.label.as_deref(),
+                    report.omitted,
+                    report.omitted_label.as_deref()
+                ),
+                (None, 0, Some(label)),
+                "{:?}",
+                label
+            );
+            assert_eq!(report.omissions(), 1);
+            assert!(!m.root.features.unwrap().contains(Features::FS_LABEL), "{:?}", label);
+            assert_eq!(VolumeIdentity::from_root(&m.root).label(), &ManifestLabel::Unrecorded);
+            v.close().unwrap();
+        }
+        // A volume without a label names none: the manifest lists fs-label
+        // and has no fsLabel.
+        let img = TempImage::new(8 << 20);
+        let options = FormatOptions {
+            label: None,
+            ..format_options(512, 512)
+        };
+        format(&img.device(), &options).unwrap();
+        let v = Volume::open(img.device()).unwrap();
+        let (bytes, _) = written(&v, None, Features::NONE);
+        let m = WrittenManifest::read(&bytes);
+        assert_eq!(m.root.file_system.label, None);
+        assert_eq!(VolumeIdentity::from_root(&m.root).label(), &ManifestLabel::Unlabeled);
+        VolumeIdentity::from_root(&m.root).check(&v).unwrap();
+        assert!(records(&bytes)[0]
+            .0
+            .starts_with(r#"{"fatSerial":"1234-ABCD","features":["fat-serial","fs-label","read-only"],"mediaType""#));
+        // Nor does one with a label in its boot sector only, which is no
+        // label to blkid, Windows and EDK2, who read the root directory.
+        drop(v);
+        img.device()
+            .write_at(crate::boot::field::VOLUME_LABEL.start as u64, b"ESP        ")
+            .unwrap();
+        let v = Volume::open(img.device()).unwrap();
+        let (bytes, report) = written(&v, None, Features::NONE);
+        let m = WrittenManifest::read(&bytes);
+        assert_eq!((m.root.file_system.label.as_deref(), report.omissions()), (None, 0));
+        assert_eq!(VolumeIdentity::from_root(&m.root).label(), &ManifestLabel::Unlabeled);
+        VolumeIdentity::from_root(&m.root).check(&v).unwrap();
     }
 
     #[test]
@@ -747,9 +987,9 @@ mod tests {
         put(&mut v, "/Uapi16Manifest2", b"kept", t0, false);
         v.create_dir("/sub", t0).unwrap();
         put(&mut v, "/sub/Uapi16Manifest", b"kept", t0, false);
-        let (bytes, report) = written(&v, None, Fields::default());
-        let m = manifest::parse(&bytes).unwrap();
-        assert_eq!(names(&m), ["Uapi16Manifest2", "sub", "sub/Uapi16Manifest"]);
+        let (bytes, report) = written(&v, None, Features::DEFAULT);
+        let m = WrittenManifest::read(&bytes);
+        assert_eq!(m.names(), ["Uapi16Manifest2", "sub", "sub/Uapi16Manifest"]);
         assert_eq!(
             report,
             WriteReport {
@@ -757,25 +997,91 @@ mod tests {
                 directories: 1,
                 bytes: 8,
                 omitted: 0,
+                omitted_label: None,
+                changed: 0,
             }
         );
 
-        // A name of 100 three-byte characters is 100 UTF-16 units, which
-        // FAT stores, but 300 bytes of UTF-8, more than a manifest
-        // component may have. Such entries are left out and counted, a
-        // directory with everything below it as one.
+        // FAT stores a noncharacter such as U+FDD0, a manifest has none.
+        // Such entries are left out and counted, a directory with
+        // everything below it as one.
+        let odd = "a\u{fdd0}";
+        v.create_dir(&format!("/{}", odd), t0).unwrap();
+        put(&mut v, &format!("/{}/inside", odd), b"x", t0, false);
+        put(&mut v, &format!("/sub/{}", odd), b"y", t0, false);
+        // A name of 100 three-byte characters is 300 bytes of UTF-8. A
+        // manifest does not limit its components.
         let long: String = std::iter::repeat_n('\u{20ac}', 100).collect();
-        v.create_dir(&format!("/{}", long), t0).unwrap();
-        put(&mut v, &format!("/{}/inside", long), b"x", t0, false);
-        put(&mut v, &format!("/sub/{}", long), b"y", t0, false);
-        let (bytes, report) = written(&v, None, Fields::default());
-        let m = manifest::parse(&bytes).unwrap();
-        assert_eq!(names(&m), ["Uapi16Manifest2", "sub", "sub/Uapi16Manifest"]);
-        assert_eq!((report.files, report.directories, report.omitted), (2, 1, 2));
+        put(&mut v, &format!("/sub/{}", long), b"z", t0, false);
+        let (bytes, report) = written(&v, None, Features::DEFAULT);
+        let m = WrittenManifest::read(&bytes);
+        let carried = format!("sub/{}", long);
+        assert_eq!(
+            m.names(),
+            ["Uapi16Manifest2", "sub", "sub/Uapi16Manifest", carried.as_str()]
+        );
+        assert_eq!((report.files, report.directories, report.omitted), (3, 1, 2));
+    }
+
+    /// The slot of the entry of the directory cluster `cluster` that
+    /// `matches`, from its 32 bytes.
+    fn slot_of(cluster: &[u8], matches: impl Fn(&[u8]) -> bool) -> usize {
+        use crate::dirent::DIR_ENTRY_SIZE;
+        (0..cluster.len() / DIR_ENTRY_SIZE)
+            .find(|&i| matches(&cluster[i * DIR_ENTRY_SIZE..(i + 1) * DIR_ENTRY_SIZE]))
+            .unwrap()
+    }
+
+    /// Points the directory entry at the byte `entry` of the image `dev` at
+    /// the cluster `cluster`: the high and the low half of its first
+    /// cluster.
+    fn set_first_cluster(dev: &crate::device::Device, entry: u64, cluster: u32) {
+        use crate::dirent;
+        dev.write_at(
+            entry + dirent::field::FIRST_CLUSTER_HI.start as u64,
+            &((cluster >> u16::BITS) as u16).to_le_bytes(),
+        )
+        .unwrap();
+        dev.write_at(
+            entry + dirent::field::FIRST_CLUSTER_LO.start as u64,
+            &(cluster as u16).to_le_bytes(),
+        )
+        .unwrap();
+    }
+
+    /// The 8.3 name of every short entry of the directory whose chain
+    /// starts at `first_cluster`, and the byte of the image it is at.
+    fn short_entries(v: &Volume, first_cluster: u32) -> Vec<([u8; 11], u64)> {
+        use crate::dirent::DIR_ENTRY_SIZE;
+        let dir = v.load_directory(first_cluster).unwrap();
+        let cs = v.layout().cluster_size() as usize;
+        dir.iter()
+            .map(|e| {
+                let at = e.slot * DIR_ENTRY_SIZE;
+                let cluster = dir.chain()[at / cs];
+                (
+                    e.short.name,
+                    v.layout().cluster_offset(cluster).unwrap() + (at % cs) as u64,
+                )
+            })
+            .collect()
+    }
+
+    /// Sets the entry of `cluster` to `value` in every copy of the FAT of
+    /// the image `dev`.
+    fn set_fat_entry(dev: &crate::device::Device, layout: &crate::layout::Layout, cluster: u32, value: u32) {
+        use crate::fat::ENTRY_SIZE;
+        for copy in 0..layout.fats {
+            dev.write_at(
+                layout.fat_offset(copy) + u64::from(cluster) * ENTRY_SIZE as u64,
+                &value.to_le_bytes(),
+            )
+            .unwrap();
+        }
     }
 
     #[test]
-    fn a_cross_linked_directory_tree_is_refused() {
+    fn a_looping_directory_tree_is_refused() {
         use crate::bytes::le16_at;
         use crate::dirent::{self, ATTR_DIRECTORY, DIR_ENTRY_SIZE};
 
@@ -788,38 +1094,25 @@ mod tests {
         let offset = v.layout().cluster_offset(a.first_cluster).unwrap();
         let mut cluster = vec![0u8; v.layout().cluster_size() as usize];
         v.close().unwrap();
-        // Point the entry of "b" inside "a" back at "a". The first cluster
-        // of an entry is split over a high and a low half; the entry is the
-        // directory one, not a dot entry, that refers to b's cluster.
+        // Point the entry of "b" inside "a" back at "a", the directory
+        // above it. The first cluster of an entry is split over a high and
+        // a low half; the entry is the directory one, not a dot entry, that
+        // refers to b's cluster.
         let dev = img.device();
         dev.read_at(offset, &mut cluster).unwrap();
-        let slot = (0..cluster.len() / DIR_ENTRY_SIZE)
-            .find(|&i| {
-                let e = &cluster[i * DIR_ENTRY_SIZE..(i + 1) * DIR_ENTRY_SIZE];
-                let first = (u32::from(le16_at(e, dirent::field::FIRST_CLUSTER_HI)) << u16::BITS)
-                    | u32::from(le16_at(e, dirent::field::FIRST_CLUSTER_LO));
-                !e[dirent::field::NAME].starts_with(b".")
-                    && e[dirent::field::ATTR] & ATTR_DIRECTORY != 0
-                    && first == b.first_cluster
-            })
-            .unwrap();
-        // Where that entry is in the image: slot `slot` of the cluster at
-        // `offset`.
-        let at = offset + (slot * DIR_ENTRY_SIZE) as u64;
-        dev.write_at(
-            at + dirent::field::FIRST_CLUSTER_HI.start as u64,
-            &((a.first_cluster >> u16::BITS) as u16).to_le_bytes(),
-        )
-        .unwrap();
-        dev.write_at(
-            at + dirent::field::FIRST_CLUSTER_LO.start as u64,
-            &(a.first_cluster as u16).to_le_bytes(),
-        )
-        .unwrap();
+        let slot = slot_of(&cluster, |e| {
+            let first = (u32::from(le16_at(e, dirent::field::FIRST_CLUSTER_HI)) << u16::BITS)
+                | u32::from(le16_at(e, dirent::field::FIRST_CLUSTER_LO));
+            !e[dirent::field::NAME].starts_with(b".")
+                && e[dirent::field::ATTR] & ATTR_DIRECTORY != 0
+                && first == b.first_cluster
+        });
+        // That entry is slot `slot` of the cluster at `offset`.
+        set_first_cluster(&dev, offset + (slot * DIR_ENTRY_SIZE) as u64, a.first_cluster);
         drop(dev);
         let v = Volume::open(img.device()).unwrap();
         let mut out = Vec::new();
-        let e = write(&v, None, Fields::none(), &mut out).unwrap_err();
+        let e = v.write_manifest(None, Features::NONE, &mut out).unwrap_err();
         assert_eq!(e.errno(), EUCLEAN);
         assert!(
             matches!(
@@ -838,5 +1131,523 @@ mod tests {
         let recs = records(&out);
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[1].0, r#"{"name":"a","type":"dir"}"#);
+    }
+
+    /// Two entries of one name are a damaged directory, not a manifest
+    /// that names a file twice. The directory is listed before its own
+    /// record goes out, so the manifest ends before it.
+    #[test]
+    fn a_name_twice_in_a_directory_is_refused() {
+        use crate::dirent::{self, DIR_ENTRY_SIZE};
+
+        let (img, mut v) = volume(8 << 20, 512, 512);
+        let t0 = t(1_700_000_000);
+        v.create_dir("/d", t0).unwrap();
+        // Names of the 8.3 form in one case have no long name, so the short
+        // name is all there is to change.
+        put(&mut v, "/d/a.txt", b"a", t0, false);
+        put(&mut v, "/d/b.txt", b"b", t0, false);
+        let d = v.metadata("/d").unwrap();
+        let offset = v.layout().cluster_offset(d.first_cluster).unwrap();
+        let mut cluster = vec![0u8; v.layout().cluster_size() as usize];
+        v.close().unwrap();
+        let dev = img.device();
+        dev.read_at(offset, &mut cluster).unwrap();
+        let slot = slot_of(&cluster, |e| &e[dirent::field::NAME] == b"B       TXT");
+        dev.write_at(
+            offset + (slot * DIR_ENTRY_SIZE + dirent::field::NAME.start) as u64,
+            b"A",
+        )
+        .unwrap();
+        drop(dev);
+        let v = Volume::open(img.device()).unwrap();
+        assert_eq!(v.read_dir("/d").unwrap().len(), 2);
+        let mut out = Vec::new();
+        let e = v.write_manifest(None, Features::NONE, &mut out).unwrap_err();
+        assert_eq!(e.errno(), EUCLEAN);
+        assert!(
+            matches!(
+                e.detail(),
+                Some(Detail::Corrupt {
+                    place: CorruptPlace::Directory,
+                    path: Some(p),
+                    cluster: Some(c),
+                    ..
+                }) if p == "/d/a.txt" && *c == d.first_cluster
+            ),
+            "{:?}",
+            e
+        );
+        assert_eq!(records(&out).len(), 1);
+    }
+
+    /// A directory at a cluster the volume does not have, 0 or one past its
+    /// last, is damage, found before anything is read from that cluster.
+    #[test]
+    fn a_directory_at_a_cluster_the_volume_lacks_is_refused() {
+        use crate::dirent::{self, DIR_ENTRY_SIZE};
+
+        let (img, mut v) = volume(8 << 20, 512, 512);
+        v.create_dir("/d", t(1_700_000_000)).unwrap();
+        let root = v.metadata("/").unwrap();
+        let offset = v.layout().cluster_offset(root.first_cluster).unwrap();
+        let past = v.layout().max_cluster() + 1;
+        let mut cluster = vec![0u8; v.layout().cluster_size() as usize];
+        v.close().unwrap();
+        img.device().read_at(offset, &mut cluster).unwrap();
+        let slot = slot_of(&cluster, |e| &e[dirent::field::NAME] == b"D          ");
+        let entry = offset + (slot * DIR_ENTRY_SIZE) as u64;
+        for lacking in [0, past] {
+            set_first_cluster(&img.device(), entry, lacking);
+            let v = Volume::open(img.device()).unwrap();
+            let mut out = Vec::new();
+            let e = v.write_manifest(None, Features::NONE, &mut out).unwrap_err();
+            assert_eq!(e.errno(), EUCLEAN);
+            assert!(
+                matches!(
+                    e.detail(),
+                    Some(Detail::Corrupt {
+                        place: CorruptPlace::Directory,
+                        path: Some(p),
+                        cluster: Some(c),
+                        ..
+                    }) if p == "/d" && *c == lacking
+                ),
+                "{:?}",
+                e
+            );
+            assert_eq!(records(&out).len(), 1);
+        }
+    }
+
+    /// A chain of directories each of which holds two entries, "x" and
+    /// "y", that point at the next directory: none of them is above itself,
+    /// and a walk that took both would list 2^40 paths for 40 levels. The
+    /// walk ends at the first directory it reaches a second time.
+    #[test]
+    fn a_cross_linked_chain_of_directories_is_refused() {
+        use crate::dirent::{self, DIR_ENTRY_SIZE};
+
+        const LEVELS: usize = 40;
+        let (img, mut v) = volume(8 << 20, 512, 512);
+        let t0 = t(1_700_000_000);
+        // /x/x/.../x, with a "y" next to every "x". Each "y" gets the first
+        // cluster of the "x" next to it: where the directory holding both
+        // is, and that cluster.
+        let mut path = String::new();
+        let mut links = Vec::new();
+        for _ in 0..LEVELS {
+            let holder = v.metadata(if path.is_empty() { "/" } else { &path }).unwrap();
+            v.create_dir(&format!("{}/y", path), t0).unwrap();
+            path.push_str("/x");
+            v.create_dir(&path, t0).unwrap();
+            let x = v.metadata(&path).unwrap();
+            links.push((
+                v.layout().cluster_offset(holder.first_cluster).unwrap(),
+                x.first_cluster,
+            ));
+        }
+        let last = links.last().unwrap().1;
+        let mut cluster = vec![0u8; v.layout().cluster_size() as usize];
+        v.close().unwrap();
+        let dev = img.device();
+        for (offset, target) in links {
+            dev.read_at(offset, &mut cluster).unwrap();
+            let slot = slot_of(&cluster, |e| &e[dirent::field::NAME] == b"Y          ");
+            set_first_cluster(&dev, offset + (slot * DIR_ENTRY_SIZE) as u64, target);
+        }
+        drop(dev);
+        let v = Volume::open(img.device()).unwrap();
+        let mut out = Vec::new();
+        let e = v.write_manifest(None, Features::NONE, &mut out).unwrap_err();
+        assert_eq!(e.errno(), EUCLEAN);
+        let expected = format!("{}/y", "/x".repeat(LEVELS - 1));
+        assert!(
+            matches!(
+                e.detail(),
+                Some(Detail::Corrupt {
+                    place: CorruptPlace::Directory,
+                    path: Some(p),
+                    cluster: Some(c),
+                    ..
+                }) if *p == expected && *c == last
+            ),
+            "{:?}",
+            e
+        );
+        // The root and the chain of "x", each once.
+        assert_eq!(records(&out).len(), 1 + LEVELS);
+    }
+
+    /// "AAAA" and "aaaa" are two names to a manifest and one to FAT, which
+    /// Linux writes with some mount options. A lookup by name finds only
+    /// one of them, but the walk follows the cluster of each entry, so each
+    /// is listed with what it holds.
+    #[test]
+    fn names_that_fold_alike_are_listed_with_their_own_data() {
+        use crate::dirent;
+
+        let (img, mut v) = volume(8 << 20, 512, 512);
+        let t0 = t(1_700_000_000);
+        v.create_dir("/aaaa", t0).unwrap();
+        put(&mut v, "/aaaa/f1", b"1", t0, false);
+        put(&mut v, "/aaaa/f2", b"2", t0, false);
+        v.create_dir("/bbbb", t0).unwrap();
+        put(&mut v, "/bbbb/g", b"3", t0, false);
+        let root = v.metadata("/").unwrap();
+        // "bbbb" is a name of the 8.3 form in one case, a short entry
+        // "BBBB" whose case flags say lower case. It becomes "AAAA".
+        let (_, entry) = short_entries(&v, root.first_cluster)
+            .into_iter()
+            .find(|(name, _)| name == b"BBBB       ")
+            .unwrap();
+        v.close().unwrap();
+        let dev = img.device();
+        dev.write_at(entry + dirent::field::NAME.start as u64, b"AAAA").unwrap();
+        dev.write_at(entry + dirent::field::NT_FLAGS as u64, &[0]).unwrap();
+        drop(dev);
+        let v = Volume::open(img.device()).unwrap();
+        // A lookup of "/AAAA" finds "aaaa", the first of the two.
+        assert_eq!(v.read_dir("/AAAA").unwrap().len(), 2);
+        let (bytes, report) = written(&v, None, Features::SHA256);
+        let m = WrittenManifest::read(&bytes);
+        assert_eq!(m.names(), ["AAAA", "AAAA/g", "aaaa", "aaaa/f1", "aaaa/f2"]);
+        for (name, data) in [("AAAA/g", b"3"), ("aaaa/f1", b"1"), ("aaaa/f2", b"2")] {
+            assert_eq!(m.entry(name).sha256, Some(Sha256::digest(data)), "{}", name);
+        }
+        assert_eq!((report.files, report.directories, report.omitted), (3, 2, 0));
+    }
+
+    /// Directories whose chains run on into the chain of another one share
+    /// its clusters: here 200 empty directories run into the chain of "t",
+    /// which holds 1000 files. A walk that listed every directory it
+    /// reached in full would list these files 201 times. The walk ends at
+    /// the second directory that reaches the clusters of "t".
+    #[test]
+    fn directories_that_run_into_another_are_refused() {
+        use crate::dirent::{DIR_ENTRY_SIZE, ENTRY_DELETED};
+
+        const DIRS: usize = 200;
+        const FILES: usize = 1000;
+        let (img, mut v) = volume(8 << 20, 512, 512);
+        let t0 = t(1_700_000_000);
+        v.create_dir("/t", t0).unwrap();
+        for i in 0..FILES {
+            put(&mut v, &format!("/t/f{:04}", i), b"", t0, false);
+        }
+        let mut dirs = Vec::with_capacity(DIRS);
+        for i in 0..DIRS {
+            let path = format!("/d{:03}", i);
+            v.create_dir(&path, t0).unwrap();
+            dirs.push(v.metadata(&path).unwrap().first_cluster);
+        }
+        let target = v.metadata("/t").unwrap().first_cluster;
+        let layout = *v.layout();
+        v.close().unwrap();
+        let dev = img.device();
+        for &dir in &dirs {
+            // The slots after the dot entries are deleted instead of
+            // unused, so that the directory goes on in its next cluster,
+            // which is the first one of "t".
+            let offset = layout.cluster_offset(dir).unwrap();
+            for slot in 2..layout.cluster_size() as usize / DIR_ENTRY_SIZE {
+                dev.write_at(offset + (slot * DIR_ENTRY_SIZE) as u64, &[ENTRY_DELETED])
+                    .unwrap();
+            }
+            set_fat_entry(&dev, &layout, dir, target);
+        }
+        drop(dev);
+        let v = Volume::open(img.device()).unwrap();
+        assert_eq!(v.read_dir("/d199").unwrap().len(), FILES);
+        let mut out = Vec::new();
+        let e = v.write_manifest(None, Features::NONE, &mut out).unwrap_err();
+        assert_eq!(e.errno(), EUCLEAN);
+        assert!(
+            matches!(
+                e.detail(),
+                Some(Detail::Corrupt {
+                    place: CorruptPlace::Directory,
+                    path: Some(p),
+                    cluster: Some(c),
+                    ..
+                }) if p == "/d001" && *c == target
+            ),
+            "{:?}",
+            e
+        );
+        // The root, the first directory and the files of "t", which it
+        // lists as its own.
+        assert_eq!(records(&out).len(), 1 + 1 + FILES);
+    }
+
+    /// 1000 entries of files of 4 MiB on one chain: a walk that read every
+    /// file in full would hash 4 GiB. The walk ends at the first cluster
+    /// of the second file.
+    #[test]
+    fn files_on_one_chain_are_refused() {
+        use crate::dirent;
+
+        const FILES: usize = 1000;
+        const SIZE: usize = 4 << 20;
+        let (img, mut v) = volume(8 << 20, 512, 4096);
+        let t0 = t(1_700_000_000);
+        let data: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+        put(&mut v, "/f0000", &data, t0, false);
+        for i in 1..FILES {
+            put(&mut v, &format!("/f{:04}", i), b"", t0, false);
+        }
+        let first = v.metadata("/f0000").unwrap().first_cluster;
+        let root = v.metadata("/").unwrap();
+        let others: Vec<u64> = short_entries(&v, root.first_cluster)
+            .into_iter()
+            .filter(|(name, _)| name.starts_with(b"F") && !name.starts_with(b"F0000"))
+            .map(|(_, entry)| entry)
+            .collect();
+        assert_eq!(others.len(), FILES - 1);
+        v.close().unwrap();
+        let dev = img.device();
+        for entry in others {
+            set_first_cluster(&dev, entry, first);
+            dev.write_at(entry + dirent::field::SIZE.start as u64, &(SIZE as u32).to_le_bytes())
+                .unwrap();
+        }
+        drop(dev);
+        let v = Volume::open(img.device()).unwrap();
+        let mut out = Vec::new();
+        let e = v.write_manifest(None, Features::SHA256, &mut out).unwrap_err();
+        assert_eq!(e.errno(), EUCLEAN);
+        assert!(
+            matches!(
+                e.detail(),
+                Some(Detail::Corrupt {
+                    place: CorruptPlace::Chain,
+                    path: Some(p),
+                    cluster: Some(c),
+                    ..
+                }) if p == "/f0001" && *c == first
+            ),
+            "{:?}",
+            e
+        );
+        let recs = records(&out);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(
+            recs[1].0,
+            format!(r#"{{"name":"f0000","sha256":"{}"}}"#, Sha256::digest(&data))
+        );
+    }
+
+    /// A file whose chain ends before the file does, or that starts at a
+    /// cluster the volume does not have, is damage, found where the read
+    /// for the hash runs out of the chain.
+    #[test]
+    fn a_file_longer_than_its_chain_is_refused() {
+        use crate::dirent;
+        use crate::fat::Entry;
+
+        let (img, mut v) = volume(8 << 20, 512, 512);
+        put(&mut v, "/f", &boot_data(), t(1_700_000_000), false);
+        let f = v.metadata("/f").unwrap();
+        let mut last = f.first_cluster;
+        while let Entry::Next(next) = v.fat_entry(last).unwrap() {
+            last = next;
+        }
+        let root = v.metadata("/").unwrap();
+        let (_, entry) = short_entries(&v, root.first_cluster)
+            .into_iter()
+            .find(|(name, _)| name == b"F          ")
+            .unwrap();
+        let cs = u64::from(v.layout().cluster_size());
+        let past = v.layout().max_cluster() + 1;
+        v.close().unwrap();
+        // One byte more than the chain holds, and the size it has at a
+        // cluster that is not the volume's.
+        let longer = boot_data().len().div_ceil(cs as usize) as u64 * cs + 1;
+        for (first, size, found) in [(f.first_cluster, longer, last), (0, f.size, 0), (past, f.size, past)] {
+            let dev = img.device();
+            set_first_cluster(&dev, entry, first);
+            dev.write_at(entry + dirent::field::SIZE.start as u64, &(size as u32).to_le_bytes())
+                .unwrap();
+            drop(dev);
+            let v = Volume::open(img.device()).unwrap();
+            let mut out = Vec::new();
+            let e = v.write_manifest(None, Features::SHA256, &mut out).unwrap_err();
+            assert_eq!(e.errno(), EUCLEAN);
+            assert!(
+                matches!(
+                    e.detail(),
+                    Some(Detail::Corrupt {
+                        place: CorruptPlace::Chain,
+                        path: Some(p),
+                        cluster: Some(c),
+                        ..
+                    }) if p == "/f" && *c == found
+                ),
+                "{:?}",
+                e
+            );
+            assert_eq!(records(&out).len(), 1);
+        }
+    }
+
+    /// The read of the last cluster of a file looks at the FAT entry of
+    /// that cluster, which ends the chain or goes on: one that is free,
+    /// bad or no cluster at all is damage. The rest of a chain that goes on
+    /// past the file is not read.
+    #[test]
+    fn the_fat_entry_of_the_last_cluster_of_a_file_is_checked() {
+        use crate::dirent;
+        use crate::fat::{Entry, BAD_CLUSTER, END_OF_CHAIN, FREE};
+
+        let (img, mut v) = volume(8 << 20, 512, 512);
+        let data = boot_data();
+        put(&mut v, "/f", &data, t(1_700_000_000), false);
+        let f = v.metadata("/f").unwrap();
+        let mut last = f.first_cluster;
+        while let Entry::Next(next) = v.fat_entry(last).unwrap() {
+            last = next;
+        }
+        let root = v.metadata("/").unwrap();
+        let (_, entry) = short_entries(&v, root.first_cluster)
+            .into_iter()
+            .find(|(name, _)| name == b"F          ")
+            .unwrap();
+        let layout = *v.layout();
+        v.close().unwrap();
+        // 1 is no cluster: the first one is 2.
+        for value in [FREE, BAD_CLUSTER, 1] {
+            set_fat_entry(&img.device(), &layout, last, value);
+            let v = Volume::open(img.device()).unwrap();
+            let mut out = Vec::new();
+            let e = v.write_manifest(None, Features::SHA256, &mut out).unwrap_err();
+            assert_eq!(e.errno(), EUCLEAN);
+            assert!(
+                matches!(
+                    e.detail(),
+                    Some(Detail::Corrupt {
+                        place: CorruptPlace::Chain,
+                        path: Some(p),
+                        cluster: Some(c),
+                        ..
+                    }) if p == "/f" && *c == last
+                ),
+                "{:?}",
+                e
+            );
+            assert_eq!(records(&out).len(), 1);
+        }
+        // A file of one cluster on that chain is fine: its cluster goes on
+        // to the next one, and the broken end is never reached.
+        let cs = layout.cluster_size() as usize;
+        let dev = img.device();
+        dev.write_at(entry + dirent::field::SIZE.start as u64, &(cs as u32).to_le_bytes())
+            .unwrap();
+        drop(dev);
+        let v = Volume::open(img.device()).unwrap();
+        let (bytes, _) = written(&v, None, Features::SHA256);
+        assert_eq!(
+            WrittenManifest::read(&bytes).entry("f").sha256,
+            Some(Sha256::digest(&data[..cs]))
+        );
+        drop(v);
+        // And with the end of the chain where it was, all of it hashes.
+        set_fat_entry(&img.device(), &layout, last, END_OF_CHAIN);
+        let dev = img.device();
+        dev.write_at(
+            entry + dirent::field::SIZE.start as u64,
+            &(data.len() as u32).to_le_bytes(),
+        )
+        .unwrap();
+        drop(dev);
+        let v = Volume::open(img.device()).unwrap();
+        let (bytes, _) = written(&v, None, Features::SHA256);
+        assert_eq!(
+            WrittenManifest::read(&bytes).entry("f").sha256,
+            Some(Sha256::digest(&data))
+        );
+    }
+
+    /// A directory whose chain loops, here one whose FAT entry points at
+    /// itself, is longer than a directory can be. It fails with Corrupt
+    /// for the directory, which a client sees as such, and not with a
+    /// plain error.
+    #[test]
+    fn a_directory_whose_chain_loops_is_refused() {
+        let (img, mut v) = volume(8 << 20, 512, 512);
+        let t0 = t(1_700_000_000);
+        v.create_dir("/d", t0).unwrap();
+        put(&mut v, "/d/f", b"f", t0, false);
+        let d = v.metadata("/d").unwrap().first_cluster;
+        let layout = *v.layout();
+        v.close().unwrap();
+        set_fat_entry(&img.device(), &layout, d, d);
+        let v = Volume::open(img.device()).unwrap();
+        let mut out = Vec::new();
+        let e = v.write_manifest(None, Features::NONE, &mut out).unwrap_err();
+        assert_eq!(e.errno(), EUCLEAN);
+        assert!(
+            matches!(
+                e.detail(),
+                Some(Detail::Corrupt {
+                    place: CorruptPlace::Directory,
+                    path: Some(p),
+                    cluster: Some(c),
+                    ..
+                }) if p == "/d" && *c == d
+            ),
+            "{:?}",
+            e
+        );
+        assert_eq!(records(&out).len(), 1);
+    }
+
+    /// A long name with a unit that is an unpaired surrogate has no
+    /// spelling in a manifest. Two such names that differ only there read
+    /// as the same name with U+FFFD, and are no name twice: both are left
+    /// out and counted.
+    #[test]
+    fn names_with_an_unpaired_surrogate_are_left_out() {
+        use crate::dirent::{self, ATTR_LONG_NAME, DIR_ENTRY_SIZE};
+
+        let (img, mut v) = volume(8 << 20, 512, 512);
+        let t0 = t(1_700_000_000);
+        v.create_dir("/d", t0).unwrap();
+        // A '+' has no place in a short name, so each of these names is a
+        // long name of one long name entry.
+        put(&mut v, "/d/x+1", b"1", t0, false);
+        put(&mut v, "/d/x+2", b"2", t0, false);
+        put(&mut v, "/d/kept", b"k", t0, false);
+        let d = v.metadata("/d").unwrap();
+        let offset = v.layout().cluster_offset(d.first_cluster).unwrap();
+        let mut cluster = vec![0u8; v.layout().cluster_size() as usize];
+        v.close().unwrap();
+        let dev = img.device();
+        dev.read_at(offset, &mut cluster).unwrap();
+        // The third unit of the names, the digit, becomes a high surrogate
+        // that no low one follows, a different one in each name.
+        let third = dirent::lfn_field::NAME1.start + 2 * size_of::<u16>();
+        for (digit, surrogate) in [(b'1', 0xd800u16), (b'2', 0xd801)] {
+            let slot = slot_of(&cluster, |e| {
+                e[dirent::lfn_field::ATTR] == ATTR_LONG_NAME && e[third..third + 2] == [digit, 0]
+            });
+            dev.write_at(
+                offset + (slot * DIR_ENTRY_SIZE + third) as u64,
+                &surrogate.to_le_bytes(),
+            )
+            .unwrap();
+        }
+        drop(dev);
+        let v = Volume::open(img.device()).unwrap();
+        let lossy: Vec<String> = v
+            .read_dir("/d")
+            .unwrap()
+            .into_iter()
+            .filter(|md| md.name_decoding == NameDecoding::Lossy)
+            .map(|md| md.name)
+            .collect();
+        assert_eq!(lossy, ["x+\u{fffd}", "x+\u{fffd}"]);
+        let (bytes, report) = written(&v, None, Features::NONE);
+        assert_eq!(WrittenManifest::read(&bytes).names(), ["d", "d/kept"]);
+        assert_eq!((report.files, report.directories, report.omitted), (1, 1, 2));
     }
 }

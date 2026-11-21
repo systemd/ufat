@@ -66,7 +66,7 @@ Every method except `GetCapabilities` works on an `Image`:
 |---|---|
 | `fileDescriptor` | Index of the passed image file or block device. |
 | `offset` | Byte offset of the file system in the image. 0 by default. |
-| `size` | Size of the file system in bytes. The rest of the image by default. |
+| `size` | Size of the file system in bytes. The rest of the image by default. With `minimize`, the most the file system may take. |
 
 Paths inside the file system are absolute. `/` is the root. Times are
 microseconds since the UNIX epoch, in UTC.
@@ -96,7 +96,7 @@ The reply does not depend on the call. It is:
         "operations" : [ "plan", "assembleWithContent", "populate", "remove",
                          "list", "check", "label", "identifier", "reproducible",
                          "manifest", "writeManifest" ],
-        "sizeToFit" : "exact",
+        "sizeToFit" : "best",
         "minimalSizeBytes" : 34089472,
         "maximalSizeBytes" : 2199023255040,
         "sizeGranularityBytes" : 512,
@@ -117,7 +117,8 @@ The reply does not depend on the call. It is:
         "caseSensitive" : false,
         "nameLengthMax" : 255,
         "nameUnit" : "utf16Units",
-        "fileSizeMaxBytes" : 4294967295
+        "fileSizeMaxBytes" : 4294967295,
+        "manifest" : { "order" : "codepoint" }
       }
     }
 
@@ -126,8 +127,19 @@ What the fields mean for vfat:
 - `operations` lists what the implementation can do. `repair`,
   `features` and `discard` are missing. Asking for them fails with
   `OperationNotSupported`.
-- `sizeToFit` is `exact`. A plan gives the size the content needs, to the
-  sector.
+- `sizeToFit` is `best`. A plan gives the size the content needs, to the
+  sector. A plan does not compare names. Names that FAT does not tell
+  apart, such as `A.TXT` and `a.txt`, or `FOOBAR~1` and `FOO BAR`, whose
+  short name it is, are two names to it. Content with such names,
+  assembled with `replace`, leaves the clusters of every file that was
+  replaced free, and the plan of a directory close to the limit of 65536
+  entries can fail although the assembly would fit. With `replace` the
+  entries of a directory under two such names go into one directory. A
+  plan holds the entries under each name to the limit on their own, and
+  the assembly fails with `NoSpaceLeft` and reason `directoryEntries`
+  when they do not fit together. A file and a directory under two such
+  names pass a plan and fail the assembly, with `replace` or without it,
+  and so do names that an assembly without `replace` refuses.
 - `minimalSizeBytes` is the smallest volume: 65525 clusters of 512 bytes
   plus the reserved sectors and two FATs. With 4096 byte sectors the
   minimum is 269045760 bytes. `maximalSizeBytes` is 2^32 - 1 sectors of
@@ -147,6 +159,8 @@ What the fields mean for vfat:
   time does not. Times are stored as UTC.
 - Names are compared without regard to case and hold up to 255 UTF-16
   units. A file holds at most 4294967295 bytes.
+- `manifest` says that the root object of a manifest given as content has
+  to declare `"order": "codepoint"`, see "Content".
 
 ### Assemble
 
@@ -160,7 +174,8 @@ What the fields mean for vfat:
 
 Mode `assemble` creates the file system and copies the content into it,
 in one call. Mode `plan` computes the geometry and the size the content
-needs. It writes nothing.
+needs. It writes nothing. It reads a manifest once, from its start to
+its end, so the manifest can come through a pipe.
 
 Mode `assemble` does not format over what the image holds. It fails with
 `ImageNotEmpty` when the part of the image that it would format holds a
@@ -174,19 +189,25 @@ formats any image.
 
 How the image is sized:
 
-- With content and without `size`, a regular image file is grown to the
-  exact size the content needs. It is never shrunk.
-- With a `size`, the file system gets that size. Content that does not
-  fit fails with `TooSmall` before anything is written.
-- Without content, a regular image file is grown to `size`. An empty
-  image file without a `size` fails with `SizeRequired`.
-- A block device is never resized.
+- Without `minimize`, the file system gets `size`, or the rest of the
+  image behind `offset`, as mkfs.fat does. A regular image file is grown
+  to `size`. An empty image file without a `size` fails with
+  `SizeRequired`. A size too small for a FAT32 file system fails with
+  `NoSpaceLeft` and reason `volume` before anything is written, also a
+  `size` of 0 and an `offset` at the end of the image. The content is
+  written right away. Content that does not fit fails with `NoSpaceLeft`
+  while it is written.
+- With `minimize`, the file system is as small as the content allows. A
+  regular image file is grown to that size. Content that does not fit
+  `size` or the block device fails with `TooSmall` before anything is
+  written. The content is planned first. A manifest is read twice then,
+  so it has to be a regular file.
+- An image file is never shrunk, and a block device is never resized.
 
 The reply carries a `description` with the label and the serial number
 as stored, the sector size, the cluster size (`blockSize`), the size and
 the free space. With content, the counts `files`, `directories`, `bytes`
-and `skipped` follow, and with a `manifestSink` also `omitted`. `exact`
-is true when the size was computed to fit the content.
+and `skipped` follow, and with a `manifestSink` also `omitted`.
 
 Mode `plan` answers with `minimalSizeBytes` in place of `freeBytes`:
 
@@ -203,7 +224,6 @@ Mode `plan` answers with `minimalSizeBytes` in place of `freeBytes`:
         "minimalSizeBytes" : 34089472,
         "label" : "ESP"
       },
-      "exact" : true,
       "files" : 2,
       "directories" : 3,
       "bytes" : 5010
@@ -226,14 +246,15 @@ see "Passing file descriptors".
 
 | Option | Meaning |
 |---|---|
-| `label` | The volume label. Fails with `InvalidLabel` when it breaks the label rules. |
-| `identifier` | The volume serial number, as `XXXX-XXXX` or eight hex digits. Fails with `InvalidIdentifier` otherwise. Random by default. With `timestampUSec` it is derived from the time stamp and the label. |
+| `label` | The volume label. Fails with `InvalidLabel` when it breaks the label rules. With a manifest that names a label, or names none, it is the manifest's by default, and a different one fails with `FileSystemMismatch`. |
+| `identifier` | The volume serial number, as `XXXX-XXXX` or eight hex digits. Fails with `InvalidIdentifier` otherwise. Random by default. With `timestampUSec` it is derived from the time stamp and the label. With a manifest, it is the serial number the manifest names, and a different one fails with `FileSystemMismatch`. A manifest that names none gives one derived from its bytes. |
 | `timestampUSec` | The time stamp. It is the time of the root directory, the time `fixed` and `clamp` use, and the time of manifest entries without one. The current time by default. |
 | `sectorSize` | 512, 1024, 2048 or 4096. The logical block size of a block device by default, 512 for an image file. It must not be smaller than the device's logical block size. |
 | `blockSize` | The cluster size: a power of two from the sector size up to 32768, at most 128 sectors. Chosen from the volume size by default, like mkfs.fat does. |
 | `zero` | Overwrites the whole data area with zeros. Off by default. |
 | `force` | Formats the image whatever it holds. Off by default. |
-| `reproducible` | Makes the image depend on the inputs only. Requires `identifier` and `timestampUSec`, and fails with `NotReproducible` without them. Set `times` to `fixed` or `clamp` to make the file times reproducible too. |
+| `minimize` | Makes the file system as small as the content allows. Off by default. |
+| `reproducible` | Makes the image depend on the inputs only. Requires `timestampUSec`, and `identifier` unless the content is a manifest, and fails with `NotReproducible` without them. A manifest names the serial number or has it derived from its bytes. Set `times` to `fixed` or `clamp` to make the file times of a tree reproducible too. |
 | `discard` | `false` is accepted. `true` fails with `OperationNotSupported`. |
 | `enableFeatures`, `disableFeatures` | FAT has none. Setting them fails with `OperationNotSupported`. |
 | `vfat` | FAT32 options, see below. |
@@ -282,6 +303,11 @@ A tree is copied below `path`. A single file is stored at `path`. A
 manifest names its paths from the root, so with a manifest `path` has to
 be `/`. Without content, `Populate` creates an empty directory at `path`.
 With `parents`, an existing directory at `path` is accepted.
+
+Content that fails to go in leaves the file system marked as not cleanly
+unmounted, as after a crash, with what was complete, unless nothing was
+written yet. A manifest that is refused at its first object leaves the
+file system as it was.
 
 The reply carries the counts `files`, `directories`, `bytes` and
 `skipped`, and with a `manifestSink` also `omitted`.
@@ -383,10 +409,92 @@ what the content is:
 | Directory | given | The tree the manifest describes. File references are resolved below the directory. |
 | none | given | Only for `Assemble` in mode `plan`, which needs no data. |
 
-Other combinations fail with `InvalidParameter`. When a manifest's
-contents come from a directory, every file the manifest names is checked
-first. A file that is missing, not a regular file or of the wrong size
-fails the call with `SourceMismatch` before the image is changed.
+Other combinations fail with `InvalidParameter`.
+
+A manifest is read one record at a time, and what a record describes is
+written when the record comes. So a manifest of any size can come through
+a pipe, unless it is planned before its content is written: `Assemble` in
+mode `assemble` with `minimize` plans its content first, so there it has
+to be a regular file. A pipe fails with `BadFileDescriptor` and reason
+`wrongType` then. Mode `plan` reads the manifest once and takes a pipe.
+A plan keeps the path of the deepest open directory, and a count for
+each directory on that path, so the memory `Assemble` uses does not grow
+with the manifest.
+
+When the file contents come from a stream, the manifest and the stream
+are read in lockstep: a record of the manifest, then the contents of the
+file it describes, then the next record. A client that passes both as
+pipes has to write them at the same time, from two threads or with
+`poll()`. A client that writes all of the manifest before the contents
+can deadlock: it waits for room in the manifest pipe while the service
+waits for contents.
+
+The root object of a manifest has to declare `"order": "codepoint"`, and
+its objects have to be in that order. The manifests ufat writes are. A
+manifest without the declaration fails with `InvalidManifest` and reason
+`noOrder`, also when its objects are sorted. `systemd-manifest make` sorts
+its output this way, and declares it since systemd commit 330fab5e90,
+which is not in a release yet. An object out of order fails with reason
+`outOfOrder` or `misplaced`. A name that comes twice fails with reason
+`duplicateName` when it comes right after itself or right after the
+objects below the directory it names, and with reason `outOfOrder`
+otherwise.
+
+When a manifest's contents come from a directory, each file is looked up
+when it is copied. The contents are the part of the file that starts at
+the offset the manifest gives and is as long as the manifest says,
+whatever else the file holds. A file that is missing or not a regular
+file fails the call with `SourceMismatch`. A file that is too short for
+the contents, or not of the `originalSize` the manifest gives for it,
+fails with `ContentMismatch` and reason `size`. `sizeBytes` is the size of
+the file and `expectedSizeBytes` the size it needs. A file that changes
+while it is read fails with `ContentMismatch` and reason `sourceChanged`.
+
+Files of a manifest that share an `inodeToken` are hard links of one
+file. FAT has no hard links, so each of them becomes a copy.
+
+The flags `flagHidden`, `flagSystem` and `flagArchive` set or clear the
+hidden, system and archive attributes of a file or a directory, also of
+a directory that is there already. A flag that the manifest lists in
+`features` and an object leaves out clears the attribute: with
+`flag-archive` listed, a file without `flagArchive` has no archive
+attribute, which a new file has otherwise. `readOnly` sets or clears the
+read-only attribute the same way. An object without `readOnly` is not
+read-only, unless the manifest does not list `read-only` and the object
+has a `mode` that gives nobody write permission. FAT has no inode flags,
+so `flagAppendOnly`, `flagImmutable`, `flagNoAtime`, `flagNoCow` and
+`flagNoDump` are ignored.
+
+The root object of a manifest can name the file system it is for:
+`fatSerial` its serial number, `fsUUID` a UUID whose first eight hex
+digits give the serial number when there is no `fatSerial`, and
+`fsLabel` its label. A manifest that lists `fs-label` in `features` and
+has no `fsLabel` names a file system without a label, and so does an
+empty `fsLabel`. `Assemble` gives the file system that serial number and
+that label. An `identifier` or a `label` in the options that differs
+from the manifest's fails with `FileSystemMismatch`, where `found` is the
+option's value, and `expected` is absent where the manifest names no
+label. When neither the manifest nor the options name a serial number,
+it is derived from the manifest: the first four bytes of the SHA-256 hash
+of the manifest's bytes. So its digits are the first eight that
+`sha256sum` prints for the manifest, and a manifest gives the same serial
+number from a regular file and from a pipe, with `minimize` and without.
+Mode `plan` reports that serial number too.
+`Populate` checks the file system's serial number and label against what
+the manifest names and fails with `FileSystemMismatch` when they differ,
+where `found` is the file system's value, absent when it has no label.
+What the manifest does not name is not checked. Serial numbers are
+written `XXXX-XXXX`, the one derived from `fsUUID` as well.
+
+The label is the one the file system reports, as `blkid` shows it. FAT
+pads a label with spaces, and stores the blank label and `NO NAME` for
+no label. So for `Assemble` and `Populate` alike a manifest whose label
+ends with a space fails with `InvalidLabel` and reason
+`invalidCharacter`, and one whose label is blank or `NO NAME` with
+reason `reserved`, as one whose label FAT cannot store fails with
+`InvalidLabel`. The `label` option takes such a label as `mkfs.fat -n`
+does: it is padded with spaces, and a blank one or `NO NAME` is no
+label.
 
 Symbolic links below a source directory are followed. They are resolved
 below that directory and never lead out of it.
@@ -397,14 +505,23 @@ The other fields of `Content`:
 |---|---|
 | `manifest` | A UAPI.16 manifest: `fileDescriptor` names it. `checkValidity`, true by default, rejects revoked entries and entries outside their validity window with `EntryNotValid`. |
 | `times` | `preserve` keeps modification times. This is the default. `fixed` sets every entry to the time stamp. `clamp` keeps times up to the time stamp and sets later ones to it. |
-| `unsupported` | `skip`, the default, leaves out what FAT cannot store and counts it in `skipped`. `fail` fails with `ContentNotSupported` before anything is written. |
-| `replace` | Replaces existing files. True by default. With `false`, an existing file fails with `FileExists`. |
+| `unsupported` | `skip`, the default, leaves out what FAT cannot store and counts it in `skipped`. `fail` fails with `ContentNotSupported`: for a tree before anything is written, for a manifest when the object's record comes. |
+| `replace` | Replaces existing files, and takes a name FAT does not tell apart from one that exists as that name. False by default. With `false`, an existing file fails with `FileExists`, and a name FAT does not tell apart from an existing one, such as `a.txt` for `A.TXT`, fails with `InvalidName` and reason `caseCollision`. A directory that exists under the same name takes the entries in any case. |
 | `extendedAttributes`, `uid`, `gid` | Accepted and ignored. FAT stores none of them. |
 | `manifestSink` | Writes a UAPI.16 manifest of the whole volume after the content is in. |
 
 What FAT cannot store: sockets, FIFOs and device nodes in a tree, and
-manifest entries that need a `url`, an `encoding` or an `offset`, that
-refer to a sub-manifest, or that have an inode type FAT does not have.
+manifest entries whose contents are only at a `url` or in an `encoding`,
+that refer to a sub-manifest, or that have an inode type FAT does not
+have. With `skip`, a directory that is left out takes everything below it
+along, and each entry counts in `skipped`. A file larger than 4294967295
+bytes fails with `TooLarge` whatever `unsupported` says.
+
+Contents that start at an `offset` in their file can only come from a
+directory. A stream has the contents of each file and nothing else of it.
+So with a stream, an entry with an `offset` fails with
+`ContentNotSupported` and `what` set to `offset` when its record comes,
+whatever `unsupported` says.
 
 The sizes and SHA-256 hashes in a manifest are verified while the
 contents are copied. A mismatch fails with `ContentMismatch`.
@@ -412,21 +529,61 @@ contents are copied. A mismatch fails with `ContentMismatch`.
 A stream has to end after the last file. A stream that ends early fails
 with `ContentMismatch` and reason `streamEnded`, for the file it ended
 in. A stream with more data after the last file fails with
-`ContentMismatch` and reason `size`, for the last file.
+`ContentMismatch` and reason `size`, for the last file. That is found
+when the manifest has ended, and the last file is in the file system
+then.
 
 The `name` of `SourceMismatch` and `ContentMismatch` is the name of the
 file's record in the manifest, such as `loader/loader.conf`.
 
 A `ManifestSink` has a `fileDescriptor` open for writing and optional
-`fields`, the per-file fields in the vocabulary of systemd-manifest:
-`mode`, `uid`, `gid`, `size`, `hash`, `symlink`, `device`, `hardlink`,
-`mtime`, `userXattr`, `userName`, `groupName`. Without `fields`, the
-default set of systemd-manifest is used. FAT has a notion of `size`,
-`hash` and `mtime` only. The other fields are left out. An entry with
-the read-only attribute carries `readOnly`. The manifest describes the
-whole volume, including files that were there before the call. Entries
-whose names a manifest cannot carry are left out and counted in
-`omitted`.
+`features`, what the manifest records. The values are the names of the
+`features` field of UAPI.16 with `_` in place of `-`: `mode`, `uid`,
+`gid`, `user_name`, `group_name`, `size`, `sha256`, `symlink`, `device`,
+`hardlink`, `mtime`, `user_xattr`, `flag_hidden`, `flag_system`,
+`flag_archive`, `flag_append_only`, `flag_immutable`, `flag_no_atime`,
+`flag_no_cow`, `flag_no_dump`, `read_only`, `fs_uuid`, `fs_label`,
+`fat_serial`, `gpt_label`, `gpt_uuid`, `gpt_type_uuid`, `gpt_disk_uuid`,
+`gpt_flags`, `gpt_flag_no_auto` and `gpt_flag_grow_file_system`. Without
+`features`, the default set of UAPI.16 is used: `device`, `gid`,
+`hardlink`, `mode`, `sha256`, `size`, `symlink` and `uid`.
+
+FAT records `size`, `sha256`, `mtime` and the hidden, system and archive
+attributes as `flag_hidden`, `flag_system` and `flag_archive`. FAT has
+no symbolic links, device nodes, hard links, extended attributes or inode
+flags. When asked for them, the manifest lists them in `features` and so
+says that there are none. The manifest records the read-only attribute
+whether it is asked for or not, and lists `read-only` in `features`. An
+entry with the attribute carries `readOnly`, and an entry without
+`readOnly` does not have the attribute. FAT has no notion of modes,
+owners and their names, and the manifest does not record them, nor any
+of the other features. The root object declares `"order": "codepoint"`,
+so the manifest can be given as content again. The manifest names the
+volume as well, whether it is asked for or not, and lists `fat-serial`
+and `fs-label` in `features`: the root object has its serial number as
+`fatSerial`, and its label as `fsLabel` when it has one. So the manifest
+given to `Assemble` makes a file system with the same serial number and
+label, and given to `Populate` it goes into this volume only.
+
+The manifest describes the whole volume, including files that were there
+before the call. Entries whose names a manifest cannot carry are left out
+and counted in `omitted`. So is a label that a file system made from the
+manifest would not get, which only other tools write, and the manifest
+does not list `fs-label` then. Two entries whose names FAT takes for one,
+such as `README.TXT` and `readme.txt`, are both listed, each with what it
+holds.
+
+A damaged volume fails with `Corrupt`. `where` is `directory` when a
+directory shares a cluster with an entry read before, as in a loop of
+the tree or a cross-link, when the chain of a directory loops or is
+longer than a directory can be, when the entry of a subdirectory points
+at a cluster the volume does not have, or when a directory has two
+entries of the same name. `where` is `chain` when the chain of a
+directory or a file runs into a free, bad or invalid entry, when a file
+shares a cluster with an entry read before, when the chain of a file is
+shorter than the file, or when a file that is not empty starts at a
+cluster the volume does not have. Files are only read when the manifest
+records `sha256`.
 
 ## The more flag
 
@@ -436,7 +593,7 @@ reply. Without it, only the final reply is sent.
 
 | Method | Phases |
 |---|---|
-| `Assemble` | `planning` (with content), `formatting`, `populating` (with content), `reading` (with a `manifestSink`, and again with `imageHash`). Mode `plan` sends `planning` only. |
+| `Assemble` | `planning` (with `minimize`), `formatting`, `populating` (with content), `reading` (with a `manifestSink`, and again with `imageHash`). Mode `plan` sends `planning` only. |
 | `Describe` | `reading`, with a `manifestSink` only. |
 | `Populate` | `populating`, then `reading` with a `manifestSink`. |
 | `Remove` | `removing`, for a recursive removal only. |
@@ -459,7 +616,7 @@ Each parameter needs a descriptor of a certain kind:
 |---|---|
 | `image.fileDescriptor` | A regular file or a block device. Open read-write for `Assemble` in mode `assemble`, `Populate` and `Remove`. Read-only or read-write for `Describe`, `List` and `Check`. |
 | `content.sourceFileDescriptor` | A directory, a regular file or a pipe, open read-only. |
-| `content.manifest.fileDescriptor` | A regular file or a pipe, open read-only. A manifest of any size can be passed this way. |
+| `content.manifest.fileDescriptor` | A regular file or a pipe, open read-only. A manifest of any size can be passed this way. `Assemble` with `minimize` needs a regular file. |
 | `manifestSink.fileDescriptor` | A regular file or a pipe, open for writing. `O_APPEND` is allowed. |
 
 The service checks every descriptor before it uses it. The call fails
@@ -474,10 +631,12 @@ descriptor:
 - is not open read-write for a method that writes (`notReadWrite`),
 - is not open read-only for a source or a manifest (`notReadOnly`),
 - is not open for writing for a manifest sink (`notWritable`),
-- is not of the type the parameter needs (`wrongType`).
+- is not of the type the parameter needs (`wrongType`), also a manifest
+  on a pipe for `Assemble` with `minimize`.
 
-All descriptors are checked, and the manifest is read and verified,
-before the image is opened. A call that fails this way leaves the image
+All descriptors are checked, and the first record of a manifest is read,
+before the image is opened. With `minimize` the whole manifest is read
+before the image is changed. A call that fails this way leaves the image
 unchanged.
 
 A pipe that is made non-blocking during the call fails it with
@@ -505,27 +664,28 @@ The service returns no text. Every error is a name with typed fields.
 | `BadFileDescriptor` | A passed descriptor does not meet the requirements. | `parameter`, `reason`, `flags` |
 | `FileSystemTypeNotSupported` | A `fileSystemType` other than `vfat`. | `fileSystemType` |
 | `OperationNotSupported` | `discard`, features or `repair` were requested. | `operation` |
-| `SizeRequired` | `Assemble` without content into an empty file without a `size`. | none |
+| `SizeRequired` | `Assemble` without `minimize` into an empty file without a `size`. | none |
 | `NotFileSystem` | The image holds no FAT32 file system. | `reason` (`blank`, `foreignImageType`, `sectorSize`, `tooSmall`, `unknown`), `found`, `sectorSize` |
 | `ImageNotEmpty` | `Assemble` without `force` into an image that holds a file system, a partition table or other data. | `found` |
 | `Corrupt` | The file system is damaged where the operation needs it. | `where` (`superblock`, `allocation`, `chain`, `directory`), `field`, `path`, `block` |
-| `NoSpaceLeft` | The file system is full, or the cluster size leaves fewer than 65525 clusters. | `reason` (`blocks`, `directoryEntries`, `names`, `volume`), `path` |
-| `TooSmall` | The content does not fit the `size` given to `Assemble`. | `minimalSizeBytes`, `sizeBytes` |
+| `NoSpaceLeft` | The file system is full, or the size or the cluster size leaves fewer than 65525 clusters. | `reason` (`blocks`, `directoryEntries`, `names`, `volume`), `path` |
+| `TooSmall` | With `minimize`, the content does not fit the `size` given to `Assemble` or the block device. `minimalSizeBytes` is the smallest file system that holds it, `sizeBytes` that `size` or what the block device has behind `offset`. | `minimalSizeBytes`, `sizeBytes` |
 | `TooLarge` | A file is larger than FAT allows, or a volume has more clusters than FAT32 can address. | `path`, `sizeBytes`, `sizeMaxBytes` |
 | `NoSuchFile` | A path does not exist. | `path` |
 | `FileExists` | A file exists and `replace` is false, or a directory exists and `parents` is false. | `path` |
 | `NotADirectory` | A path component is a file. | `path` |
-| `IsADirectory` | `Populate` of a single file at a path that is a directory. | `path` |
+| `IsADirectory` | A file where the file system has a directory: under the same name, as for `Populate` of a single file at a path that is a directory, or with `replace` under a name FAT does not tell apart from the directory's. | `path` |
 | `DirectoryNotEmpty` | `Remove` of a directory with entries, without `recursive`. | `path` |
-| `InvalidName` | A name FAT cannot store. | `name`, `reason` (`empty`, `dotComponent`, `invalidCharacter`, `leadingSpace`, `trailingSpaceOrDot`, `tooLong`) |
-| `InvalidLabel` | A label that breaks the label rules. | `label`, `reason` (`tooLong`, `invalidCharacter`) |
+| `InvalidName` | A name FAT cannot store, or with `replace` false a name FAT does not tell apart from one that exists. | `name`, `reason` (`empty`, `dotComponent`, `invalidCharacter`, `leadingSpace`, `trailingSpaceOrDot`, `tooLong`, `caseCollision`) |
+| `InvalidLabel` | A label that breaks the label rules, or the label of a manifest that FAT would report another way. | `label`, `reason` (`tooLong`, `invalidCharacter`, `reserved`) |
 | `InvalidIdentifier` | A serial number that is not `XXXX-XXXX` or eight hex digits. | `identifier`, `reason` (`malformed`) |
-| `InvalidManifest` | The manifest cannot be parsed or is inconsistent. | `reason`, `record`, `name`, `field` |
-| `SourceMismatch` | A file the manifest names is missing from the source directory, not a regular file, or of the wrong size. | `name`, `reason` (`missing`, `notRegular`, `size`), `sizeBytes`, `expectedSizeBytes` |
-| `ContentMismatch` | Copied contents do not match the manifest. | `name`, `reason` (`size`, `hash`, `streamEnded`), `sizeBytes`, `expectedSizeBytes` |
-| `ContentNotSupported` | Content FAT cannot store, with `unsupported` set to `fail`. | `what` (`url`, `encoding`, `offset`, `transport`, `subManifest`, `inodeType`), `name`, `value` |
+| `InvalidManifest` | The manifest cannot be parsed or is inconsistent. A key twice in an object is reason `duplicateKey`. With reason `unlistedFeature`, `field` names the field of a feature the manifest does not list, such as `mTimeNSec`. | `reason`, `record`, `name`, `field` |
+| `SourceMismatch` | A file the manifest names is missing from the source directory, or not a regular file. | `name`, `reason` (`missing`, `notRegular`) |
+| `ContentMismatch` | Copied contents do not match the manifest, or a file of the source directory is too short for them or changed while it was read. | `name`, `reason` (`size`, `hash`, `streamEnded`, `sourceChanged`), `sizeBytes`, `expectedSizeBytes` |
+| `ContentNotSupported` | Content FAT cannot store, with `unsupported` set to `fail`. Contents at an `offset` that come from a stream. | `what` (`offset`, `subManifest`, `inodeType`, or `transport` for contents only at a URL or in an encoding, which `value` names), `name`, `value` |
 | `EntryNotValid` | A manifest entry is revoked or outside its validity window. | `name`, `reason` (`revoked`, `notYetValid`, `expired`) |
-| `NotReproducible` | `reproducible` without `identifier` or `timestampUSec`. | `reason` (`identifierRequired`, `timestampRequired`) |
+| `FileSystemMismatch` | The serial number or the label a manifest names is not the one of the file system `Populate` writes to, or not the `identifier` or `label` given to `Assemble`. | `field` (`fatSerial`, `fsUUID`, `fsLabel`), `expected`, `found` |
+| `NotReproducible` | `reproducible` without `timestampUSec`, or without `identifier` for content that is not a manifest. | `reason` (`identifierRequired`, `timestampRequired`) |
 | `ImageBusy` | The block device is mounted or claimed by another process. | none |
 | `io.systemd.System` | Any other failure, such as an I/O error. | `errno`, `errnoName` |
 
@@ -598,8 +758,8 @@ Notes:
 - Files below a passed directory are opened with the service's
   credentials. This is why only root and the service's own user may
   connect.
-- Memory use does not grow with the volume. 512M leaves room for several
-  connections.
+- Memory use does not grow with the volume or with a manifest. 512M
+  leaves room for several connections.
 - `DynamicUser=yes` works. Only root can then connect.
 - Do not set `LimitFSIZE=`. A write past the limit kills the process with
   SIGXFSZ.

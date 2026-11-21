@@ -23,6 +23,9 @@
 # name with typed fields and every finding of Check is a kind with its facts;
 # the client renders them in its own language.
 #
+# Sizes and times are 64-bit integers. They can be larger than 2^53, which a
+# JSON parser that keeps numbers as doubles cannot hold exactly.
+#
 # An implementation serves one filesystem type and is found the way mkfs
 # tools are found today: the executable mkfs.<type> speaks this interface
 # when it is started with a socket passed as LISTEN_FDS, so that
@@ -33,16 +36,16 @@ interface org.uapi-group.FileSystem
 # Where a filesystem lives: an image file or block device and the byte range
 # inside it. A block device written to is claimed exclusively while the call
 # runs, the way a mount claims it; a mounted device is refused with ImageBusy. A
-# regular file is grown to the size the filesystem needs when the call makes
-# one and no size is given; it is never shrunk.
+# regular file is grown to the size of a filesystem the call makes; it is never
+# shrunk.
 type Image(
 	# Index of the descriptor of the image file or block device
 	fileDescriptor: int,
 	# Byte offset of the filesystem inside the image, 0 by default
 	offset: ?int,
-	# Size of the filesystem in bytes, the rest of the image by default; with
-	# content and no size the filesystem is sized to fit when the
-	# implementation can (Capabilities.sizeToFit), else SizeRequired
+	# Size of the filesystem in bytes, the rest of the image by default; an
+	# empty image without a size is SizeRequired, unless FormatOptions.minimize
+	# is set. With FormatOptions.minimize the most the filesystem may take.
 	size: ?int
 )
 
@@ -76,13 +79,14 @@ type LabelRules(
 	charset: LabelCharset
 )
 
-# How well plan finds the smallest filesystem for given content.
+# How well plan finds the smallest filesystem for given content, in the
+# words of systemd-repart's Minimize=.
 type SizeToFit(
-	# An estimate that holds the content with room to spare (ext4, xfs)
-	estimate,
-	# The exact size, the filesystem full to the last block (vfat, erofs,
+	# A guess that holds the content with room to spare (ext4, xfs)
+	guess,
+	# The best size, the filesystem full to the last block (vfat, erofs,
 	# squashfs, btrfs)
-	exact
+	best
 )
 
 # A feature the filesystem can be made with or without, by its name in the
@@ -114,7 +118,8 @@ type TimeRules(
 # asked for and is not in it. A set is an array of an enum because Varlink
 # has no flags type.
 type Operation(
-	# Assemble with mode plan (Capabilities.sizeToFit says how exactly)
+	# Assemble with mode plan and with FormatOptions.minimize
+	# (Capabilities.sizeToFit says how well)
 	plan,
 	# Content at Assemble time
 	assembleWithContent,
@@ -190,7 +195,7 @@ type Capabilities(
 	readOnly: bool,
 	# What a caller can ask for; anything else is OperationNotSupported
 	operations: []Operation,
-	# Whether plan answers exactly or estimates; absent without plan
+	# Whether plan finds the best size or guesses; absent without plan
 	sizeToFit: ?SizeToFit,
 	# The smallest and largest filesystem the implementation makes, and the
 	# granularity sizes are rounded to
@@ -215,8 +220,22 @@ type Capabilities(
 	nameUnit: LengthUnit,
 	fileSizeMaxBytes: int,
 	# Features that can be turned on or off, if any
-	features: ?[]Feature
+	features: ?[]Feature,
+	# What a UAPI.16 manifest given as content has to be; absent unless
+	# manifest is among operations
+	manifest: ?ManifestCapabilities
 )
+
+# What an implementation requires of a UAPI.16 manifest given as content.
+type ManifestCapabilities(
+	# The order the root file object has to declare in its order field, and
+	# its file objects have to be in; absent when any order is taken
+	order: ?ManifestOrder
+)
+
+# An order of the file objects of a manifest, as the order field of UAPI.16
+# names it: codepoint, the code point order of their complete names.
+type ManifestOrder(codepoint)
 
 # How copied files get their timestamps: the source's, the given time, or
 # the source's clamped to the given time (SOURCE_DATE_EPOCH semantics).
@@ -231,29 +250,69 @@ type UnsupportedPolicy(
 	fail
 )
 
-# A per-file field of a manifest written back (ManifestSink.fields):
-# systemd-manifest's vocabulary, as its --field= and repart's
-# --manifest-fields= take it. The inode type is always written; the default
-# set is mode, uid, gid, size, hash, symlink, device, hardlink and
-# userXattr, mtime and the names are opt-in.
-type ManifestField(
+# A feature a manifest written through ManifestSink records: a value of the
+# features field of UAPI.16 with each "-" written as "_", the way systemd
+# writes the values of enumerations, so user-xattr is user_xattr. The inode
+# type is always written. The default set is UAPI.16's: device, gid,
+# hardlink, mode, sha256, size, symlink and uid.
+type ManifestFeature(
 	mode,
 	uid,
 	gid,
+	user_name,
+	group_name,
 	size,
-	hash,
+	sha256,
 	symlink,
 	device,
 	hardlink,
 	mtime,
-	userXattr,
-	userName,
-	groupName
+	user_xattr,
+	flag_hidden,
+	flag_system,
+	flag_archive,
+	flag_append_only,
+	flag_immutable,
+	flag_no_atime,
+	flag_no_cow,
+	flag_no_dump,
+	read_only,
+	fs_uuid,
+	fs_label,
+	fat_serial,
+	gpt_label,
+	gpt_uuid,
+	gpt_type_uuid,
+	gpt_disk_uuid,
+	gpt_flags,
+	gpt_flag_no_auto,
+	gpt_flag_grow_file_system
 )
 
 # A UAPI.16 manifest as content, read from a regular file or a pipe to its
-# end as a JSON text sequence. The files it names come from the source
-# directory, or back to back in manifest order from the source stream.
+# end as a JSON text sequence, record by record while its content is written.
+# Its root file object has to declare "order": "codepoint", which UAPI.16 asks
+# of a manifest made for creating a filesystem (uapi-group/specifications#255),
+# and its file objects are checked to be in that order while they are read. A
+# manifest that does not declare the order is InvalidManifest with reason
+# noOrder, also when its file objects are in it. The files it names come from
+# the source directory, or back to back in manifest order from the source
+# stream. A manifest and a source stream are read in lockstep, a record and
+# then the contents of the file it describes, so a client that passes both as
+# pipes writes to both at the same time. Assemble with FormatOptions.minimize
+# plans the content first: it reads the whole manifest before it writes and
+# needs it in a regular file; a pipe is BadFileDescriptor with reason wrongType
+# then. In mode plan the manifest is read once, and a pipe will do.
+#
+# The root file object's fsUUID, fsLabel and fatSerial name the filesystem
+# the manifest is for. One that lists fs-label in its features without
+# fsLabel names a filesystem without a label. Assemble gives the filesystem
+# that UUID or serial number and that label, which FormatOptions.identifier
+# and label have to agree with; a manifest that names no UUID or serial number
+# gives the filesystem one derived from the manifest's bytes. Populate checks
+# them against the filesystem, and a difference is FileSystemMismatch. The
+# label is the one the filesystem reports: a label the filesystem cannot store,
+# or would report as another one or as none, is InvalidLabel for both.
 type Manifest(
 	# Index of the descriptor, open read-only
 	fileDescriptor: int,
@@ -263,15 +322,21 @@ type Manifest(
 )
 
 # Where a UAPI.16 manifest is written: of the whole filesystem as an Assemble
-# or Populate call leaves it, or as Describe finds it, in the stored form,
-# entries sorted by name with a directory's entries right after it. Only
-# where writeManifest is among Capabilities.operations.
+# or Populate call leaves it, or as Describe finds it, in the stored form. Its
+# root file object lists what the manifest records in features and declares
+# the code point order its file objects are in, so the manifest can be given
+# as content again. Only where writeManifest is among Capabilities.operations.
 type ManifestSink(
 	# Index of the descriptor open for writing that receives the manifest
 	fileDescriptor: int,
-	# The fields the manifest carries, the default set when absent. A field
-	# the filesystem has no notion of is left out and not counted as omitted.
-	fields: ?[]ManifestField
+	# What the manifest records, UAPI.16's default set when absent. What the
+	# filesystem has no notion of is not recorded and not counted as omitted.
+	# Where the filesystem has none of what a feature describes, the manifest
+	# records that there is none, as for symbolic links, device nodes, hard
+	# links, extended attributes and inode flags on vfat. The manifest of vfat
+	# records the read-only attribute, the serial number and the label whether
+	# read_only, fat_serial and fs_label are asked for or not.
+	features: ?[]ManifestFeature
 )
 
 # What goes into a filesystem. The source descriptor's type decides what it
@@ -279,11 +344,10 @@ type ManifestSink(
 # a manifest, the contents of its files back to back, a pipe is such a
 # stream. With a manifest the tree is what the manifest describes: every
 # file it names is resolved below the source directory, symbolic links
-# followed and never leaving it, checked to be present with the size the
-# manifest says before anything is written, and its contents verified
-# against the manifest's sizes and SHA-256 hashes while copying. The root
-# directory takes the source directory's owner, mode and time where the
-# filesystem keeps them.
+# followed and never leaving it, and its contents verified against the
+# manifest's sizes and SHA-256 hashes while copying. The root directory takes
+# the source directory's owner, mode and time where the filesystem keeps
+# them.
 type Content(
 	# Index of the descriptor of the source: a directory, a regular file or
 	# a pipe, open read-only
@@ -294,7 +358,10 @@ type Content(
 	times: ?TimePolicy,
 	# What to do with what cannot be stored, skip by default
 	unsupported: ?UnsupportedPolicy,
-	# Replace files that exist, true by default
+	# Replace files that exist, and take a name the filesystem does not tell
+	# apart from an existing one as that name, false by default. Without it
+	# that is FileExists, or InvalidName with reason caseCollision. A
+	# directory that exists under the same name takes the entries either way
 	replace: ?bool,
 	# Copy extended attributes where the filesystem keeps them, true by default
 	extendedAttributes: ?bool,
@@ -329,9 +396,14 @@ type VfatOptions(
 # structs are honoured by their own implementation and refused by every
 # other.
 type FormatOptions(
-	# The volume label, within Capabilities.label
+	# The volume label, within Capabilities.label. With a manifest as content
+	# that names one, or names none, it has to agree, and it is the manifest's
+	# by default
 	label: ?string,
-	# The UUID or serial, as Capabilities.identifier says; random by default
+	# The UUID or serial, as Capabilities.identifier says; random by default.
+	# With a manifest as content that names one, it has to be that one, which
+	# it is by default. With a manifest that names none, it is derived from
+	# the manifest by default
 	identifier: ?string,
 	# The filesystem's time: stamped where the filesystem has one creation
 	# time or root time, and the fixed or clamping time for content; the
@@ -348,9 +420,13 @@ type FormatOptions(
 	zero: ?bool,
 	# Format the image whatever it holds, false by default
 	force: ?bool,
-	# Make the bytes a function of the inputs alone: requires identifier and
-	# timestampUSec and pins everything else the implementation knows to
-	# vary (seeds, worker counts, walk order)
+	# Make the filesystem the smallest that holds the content, false by
+	# default; Image.size is then the most it may take
+	minimize: ?bool,
+	# Make the bytes a function of the inputs alone: requires timestampUSec,
+	# and identifier unless the content is a UAPI.16 manifest, which names
+	# the identifier or has one derived from it, and pins everything else
+	# the implementation knows to vary (seeds, worker counts, walk order)
 	reproducible: ?bool,
 	# Features to turn on or off, by the names Capabilities.features lists
 	enableFeatures: ?[]string,
@@ -464,14 +540,14 @@ method GetCapabilities(
 # Lays out a filesystem and reports it. With mode assemble the image is
 # written: formatted, and filled with the content when there is one, in one
 # step, which is the only way for a read-only filesystem. With mode plan
-# nothing is written: the geometry, the size the content needs and whether
-# that size is exact are computed, from the content and the options, and
-# from the image's size when one is given. A regular image file without a
-# size is grown to the fit when content is given. With mode assemble, an
-# image that holds a filesystem, a partition table or other data that
-# formatting would destroy is refused with ImageNotEmpty, unless
-# FormatOptions.force is set. With offset and size, only that part of the
-# image counts. The reply contains the label and identifier as stored.
+# nothing is written: the geometry and the size the content needs are
+# computed, from the content and the options, and from the image's size
+# when one is given. With FormatOptions.minimize a regular image file is
+# grown to the size the content needs. With mode assemble, an image that
+# holds a filesystem, a partition table or other data that formatting would
+# destroy is refused with ImageNotEmpty, unless FormatOptions.force is set.
+# With offset and size, only that part of the image counts. The reply
+# contains the label and identifier as stored.
 # [Supports 'more' flag]: intermediate replies carry the phase and the
 # counts so far.
 method Assemble(
@@ -481,17 +557,15 @@ method Assemble(
 	mode: ?AssembleMode,
 	options: ?FormatOptions,
 	content: ?Content,
-	# Hash the filesystem as it is in the image after the call, all size bytes
-	# from offset: the written bytes and the rest, which the implementation
-	# knows to be zero when the call sized or zeroed the image, and reads back
-	# otherwise
+	# Hash the filesystem as it is in the image after the call, the bytes from
+	# offset to the end of the filesystem: the written bytes and the rest,
+	# which the implementation knows to be zero when the call sized or zeroed
+	# the image, and reads back otherwise
 	imageHash: ?HashAlgorithm
 ) -> (
 	# The step in progress, in intermediate replies only
 	phase: ?Phase,
 	description: ?Description,
-	# Whether the size is the exact minimum (plan, or assemble sized to fit)
-	exact: ?bool,
 	# What was written, when content was given
 	files: ?int,
 	directories: ?int,
@@ -623,7 +697,8 @@ error OperationNotSupported(operation: Operation)
 # A read-only filesystem is made with its content, and none was given.
 error ContentRequired()
 
-# The filesystem cannot be sized to fit and no size was given.
+# Nothing says how large the filesystem is to be: no size was given, the image
+# is empty, and FormatOptions.minimize is not set.
 error SizeRequired()
 
 # The image holds no filesystem of this type: nothing (blank), another
@@ -648,7 +723,10 @@ error Corrupt(where: CorruptPlace, field: ?string, path: ?string, block: ?int)
 type NoSpaceReason(blocks, directoryEntries, names, inodes, volume)
 error NoSpaceLeft(reason: NoSpaceReason, path: ?string)
 
-# The image is smaller than the content needs.
+# The image is smaller than the content needs: the smallest filesystem that
+# holds the content, minimalSizeBytes, is larger than sizeBytes, the Image.size
+# given with FormatOptions.minimize or what a block device has behind the
+# offset.
 error TooSmall(minimalSizeBytes: int, sizeBytes: int)
 
 # A file or the filesystem is larger than the filesystem allows.
@@ -665,33 +743,59 @@ error DirectoryNotEmpty(path: string)
 type NameProblem(empty, dotComponent, invalidCharacter, leadingSpace, trailingSpaceOrDot, tooLong, caseCollision)
 error InvalidName(name: string, reason: NameProblem)
 
-# The label does not fit the filesystem's rules.
-type LabelProblem(tooLong, invalidCharacter, notSupported)
+# The label does not fit the filesystem's rules. The label a manifest names is
+# the one the filesystem reports, so one the filesystem would report another
+# way is refused as well: on FAT one with a space at its end is
+# invalidCharacter, and the blank one and NO NAME, which FAT stores for no
+# label, are reserved.
+type LabelProblem(tooLong, invalidCharacter, notSupported, reserved)
 error InvalidLabel(label: string, reason: LabelProblem)
 
 # The identifier is not of the kind the filesystem carries or not well formed.
 type IdentifierProblem(malformed, wrongKind, notSupported, reserved)
 error InvalidIdentifier(identifier: string, reason: IdentifierProblem)
 
-# The manifest cannot be parsed or is inconsistent.
-type ManifestProblem(notJson, notObject, notUtf8, nulByte, recordSeparator, recordTooLarge, empty, noTrailer, dataAfterTrailer, fileAfterSignature, mediaType, firstHasName, firstNotDirectory, noName, invalidName, duplicateName, unknownType, fieldType, fieldRange, fieldNotPermitted, contradiction, contents, signature, extendedAttributes, noSize)
+# The manifest cannot be parsed or is inconsistent. record is the number of
+# the record, counting from 0, name the name of the file object and field the
+# field the problem is with: for unlistedFeature the field of a feature the
+# manifest does not list, such as mTimeNSec.
+type ManifestProblem(notJson, duplicateKey, invalidString, notObject, notUtf8, nulByte, recordSeparator, recordTooLarge, empty, noTrailer, dataAfterTrailer, fileAfterSignature, mediaType, firstHasName, firstNotDirectory, noOrder, noName, invalidName, duplicateName, misplaced, outOfOrder, unlistedFeature, noTarget, unknownType, fieldType, fieldRange, fieldNotPermitted, contradiction, contents, signature, extendedAttributes, noSize)
 error InvalidManifest(reason: ManifestProblem, record: ?int, name: ?string, field: ?string)
 
-# A file the manifest names is not below the source as described.
-type SourceProblem(missing, notRegular, size)
-error SourceMismatch(name: string, reason: SourceProblem, sizeBytes: ?int, expectedSizeBytes: ?int)
+# A file the manifest names is not below the source as described: it is
+# missing, or it is not a regular file.
+type SourceProblem(missing, notRegular)
+error SourceMismatch(name: string, reason: SourceProblem)
 
-# Contents do not match the manifest.
-type ContentProblem(size, hash, streamEnded)
+# Contents do not match the manifest, found while they are copied. A file of
+# the source that is too short for them, or not of the originalSize the
+# manifest gives for it, is reason size, with the size of the file in
+# sizeBytes and the size it needs in expectedSizeBytes. A file of the source
+# that changed while it was read is reason sourceChanged, without sizes.
+type ContentProblem(size, hash, streamEnded, sourceChanged)
 error ContentMismatch(name: string, reason: ContentProblem, sizeBytes: ?int, expectedSizeBytes: ?int)
 
-# Content the filesystem cannot hold, with UnsupportedPolicy fail.
+# Content the filesystem cannot hold, with UnsupportedPolicy fail. Also,
+# whatever the policy, contents that start at an offset in their file and
+# come from a stream: a stream has the contents of each file and nothing
+# else of it.
 type UnsupportedKind(url, encoding, offset, transport, subManifest, inodeType, ownership, extendedAttribute, hardlink, sparse, dosAttribute, inodeFlag, name, timestamp)
 error ContentNotSupported(name: ?string, what: UnsupportedKind, value: ?string)
 
 # A manifest entry is revoked or outside its validity window.
 type ValidityProblem(revoked, notYetValid, expired)
 error EntryNotValid(name: string, reason: ValidityProblem)
+
+# What the root file object of a manifest says about the filesystem does not
+# match: the filesystem Populate puts the manifest's content into, or the
+# identifier or label given to Assemble. field is the manifest's field the
+# expected value comes from: fatSerial, fsUUID or fsLabel. expected is what the
+# manifest names, absent where it names no label, and found is the
+# filesystem's value or the one given, absent where the filesystem has no
+# label. A serial number is written XXXX-XXXX, also the one derived from
+# fsUUID.
+type FileSystemField(fatSerial, fsUUID, fsLabel)
+error FileSystemMismatch(field: FileSystemField, expected: ?string, found: ?string)
 
 # The image is in use: mounted, or claimed by another process.
 error ImageBusy()

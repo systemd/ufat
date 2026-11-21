@@ -666,7 +666,7 @@ def dump_record(obj):
     return (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-ROOT_REC = b'{"mediaType":"application/vnd.uapi.16.manifest"}\n'
+ROOT_REC = b'{"mediaType":"application/vnd.uapi.16.manifest","order":"codepoint"}\n'
 TRAILER_REC = b'{"mediaType":"application/vnd.uapi.16.trailer"}\n'
 
 BIG_INTS = [0, 1, -1, 2 ** 31, 2 ** 32 - 1, 2 ** 32, 2 ** 63 - 1, 2 ** 63, 2 ** 64 - 1, 2 ** 64, 2 ** 127 - 1,
@@ -854,9 +854,14 @@ def mut_manifest_records(rng, records):
     elif how == "empty":
         recs = [rng.choice([b"", b"\n", b" ", b"\t\r\n"])] * rng.choice([1, 10, 1000])
     elif how == "many":
+        # In place of the seed's file objects, which could sort anywhere
+        # among them, and in code point order: the numbers zero padded, the
+        # deep names below their directories.
         n = rng.choice([200, 500, 1000, 2000, 10000])
-        body = rng.choice([b'{"name":"f%d","size":0}\n', b'{"name":"d%d","type":"dir"}\n', b'{"name":"f%d","size":1,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}\n', b'{"mediaType":"application/x-unknown","n":%d}\n', b'{"name":"a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/%d","size":0}\n'])
-        recs = [recs[0]] + [body % i for i in range(n)] + recs[1:]
+        deep = b"a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p"
+        body = rng.choice([b'{"name":"f%05d","size":0}\n', b'{"name":"d%05d","type":"dir"}\n', b'{"name":"f%05d","size":1,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}\n', b'{"mediaType":"application/x-unknown","n":%d}\n', b'{"name":"' + deep + b'/%05d","size":0}\n'])
+        dirs = [b'{"name":"%s","type":"dir"}\n' % deep[:i] for i in range(1, len(deep) + 1, 2)] if deep in body else []
+        recs = [recs[0]] + dirs + [body % i for i in range(n)] + [r for r in recs[1:] if b"trailer" in r]
     elif how == "sep":
         recs.insert(rng.randrange(len(recs) + 1), b'{"name":"s\x1ex","size":0}\n')
     elif how == "nul":
@@ -931,13 +936,37 @@ MEM_LIMIT_BYTES = 4_000_000 * 1024   # ulimit -v 4000000
 FSIZE_LIMIT = 1 << 30                # keep runaway images off the tmpfs
 
 
-def run_local(argv, stdin_path=None, timeout=5.0, stderr_path=None, cwd=None, env=None):
+def feed_pipe(path):
+    """A pipe with the bytes of the file at path in it, which the tool can
+    read once and not seek: returns its reading end and the process that
+    writes them. The writer is gone, or gets EPIPE, once the reading end
+    is closed everywhere."""
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(r)
+            with open(path, "rb") as f, os.fdopen(w, "wb") as out:
+                shutil.copyfileobj(f, out)
+        except BaseException:
+            pass
+        os._exit(0)
+    os.close(w)
+    return r, pid
+
+
+def run_local(argv, stdin_path=None, timeout=5.0, stderr_path=None, cwd=None, env=None, stdin_pipe=False):
     """Runs argv under the resource limits and returns a dict of outcome
     data: exit status or signal, wall time, peak RSS (ru_maxrss from
     wait4, the counter /usr/bin/time -v reports as the maximum resident set
-    size) and the stderr tail."""
+    size) and the stderr tail. With stdin_pipe the file at stdin_path comes
+    through a pipe."""
     err_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644) if stderr_path else os.open(os.devnull, os.O_WRONLY)
-    in_fd = os.open(stdin_path, os.O_RDONLY) if stdin_path else os.open(os.devnull, os.O_RDONLY)
+    feeder = None
+    if stdin_path and stdin_pipe:
+        in_fd, feeder = feed_pipe(stdin_path)
+    else:
+        in_fd = os.open(stdin_path, os.O_RDONLY) if stdin_path else os.open(os.devnull, os.O_RDONLY)
     out_fd = os.open(os.devnull, os.O_WRONLY)
     start = time.monotonic()
     pid = os.fork()
@@ -981,6 +1010,10 @@ def run_local(argv, stdin_path=None, timeout=5.0, stderr_path=None, cwd=None, en
         time.sleep(delay)
         delay = min(delay * 1.5, 0.01)
     elapsed = time.monotonic() - start
+    if feeder is not None:
+        # Whatever the tool left in the pipe is not needed any more.
+        os.kill(feeder, signal.SIGKILL)
+        os.waitpid(feeder, 0)
     res = {"secs": round(elapsed, 4), "rss_kb": ru.ru_maxrss, "timeout": timed_out}
     if os.WIFEXITED(status):
         res["exit"] = os.WEXITSTATUS(status)
@@ -1013,7 +1046,8 @@ def spawner_loop(rfd, wfd):
     wf = os.fdopen(wfd, "wb")
     for line in rf:
         req = json.loads(line)
-        res = run_local(req["argv"], req.get("stdin"), req.get("timeout", 5.0), req.get("stderr"), req.get("cwd"), req.get("env"))
+        res = run_local(req["argv"], req.get("stdin"), req.get("timeout", 5.0), req.get("stderr"), req.get("cwd"), req.get("env"),
+                        req.get("stdin_pipe", False))
         wf.write(json.dumps(res).encode("utf-8") + b"\n")
         wf.flush()
     os._exit(0)
@@ -1033,11 +1067,12 @@ def start_spawner():
     _SPAWNER = (os.fdopen(w1, "wb"), os.fdopen(r2, "rb"), pid)
 
 
-def run(argv, stdin_path=None, timeout=5.0, stderr_path=None, cwd=None, env=None):
+def run(argv, stdin_path=None, timeout=5.0, stderr_path=None, cwd=None, env=None, stdin_pipe=False):
     if _SPAWNER is None:
-        return run_local(argv, stdin_path, timeout, stderr_path, cwd, env)
+        return run_local(argv, stdin_path, timeout, stderr_path, cwd, env, stdin_pipe)
     w, r, _ = _SPAWNER
-    w.write(json.dumps({"argv": argv, "stdin": stdin_path, "timeout": timeout, "stderr": stderr_path, "cwd": cwd, "env": env}).encode("utf-8") + b"\n")
+    w.write(json.dumps({"argv": argv, "stdin": stdin_path, "timeout": timeout, "stderr": stderr_path, "cwd": cwd, "env": env,
+                        "stdin_pipe": stdin_pipe}).encode("utf-8") + b"\n")
     w.flush()
     line = r.readline()
     if not line:
@@ -1105,7 +1140,7 @@ def image_commands(ufat, img_path, seed_info, small_tree, rng):
         ("describe", [ufat, "describe", img_path], False),
         ("populate-dir", [ufat, "populate", "--path", rng.choice(["/new", "/EFI/new", "/new dir with long name", "/deep/er/new"]), img_path], True),
         ("remove", [ufat, "remove", img_path, rm_target], True),
-        ("populate", [ufat, "populate", img_path, small_tree], True),
+        ("populate", [ufat, "populate", "--replace", img_path, small_tree], True),
     ]
     if rng.random() < 0.2:
         cmds.append(("populate-parents", [ufat, "populate", "--parents", "--path", "/a/b/c/d/e/f", img_path], True))
@@ -1211,6 +1246,11 @@ def source_tree_for(seeds_dir, name):
     return os.path.join(seeds_dir, "trees", "esp")
 
 
+# The size of the file systems that take the size given: the smallest FAT32
+# volume with 512 byte clusters is about 33 MiB.
+SIZE_GIVEN = "64M"
+
+
 def worker_manifests(args):
     (indices, ufat, seed_paths, seeds_dir, out, timeout, mem_mb, base_seed, blob_path) = args
     work = os.path.join(out, "manifests-work", str(os.getpid()))
@@ -1235,19 +1275,23 @@ def worker_manifests(args):
         n = rng.choice([0, 1, 100, len(blob) // 2, len(blob), len(blob) - 1])
         with open(stream_path, "wb") as f:
             f.write(blob[:n])
+        # The size given takes no plan: the manifest is read while the
+        # volume is written, also when it comes through a pipe.
         cmds = [
-            ("plan", [ufat, "assemble", "--plan", "--manifest", m_path], None),
-            ("assemble", [ufat, "assemble", "--create", "--unsupported", "fail", "--manifest", m_path, img_path, source], None),
-            ("assemble-stream", [ufat, "assemble", "--create", "--manifest", m_path, img_path, "-"], stream_path),
+            ("plan", [ufat, "assemble", "--plan", "--manifest", m_path], None, False),
+            ("assemble", [ufat, "assemble", "--create", "--minimize", "--unsupported", "fail", "--manifest", m_path, img_path, source], None, False),
+            ("assemble-stream", [ufat, "assemble", "--create", "--minimize", "--manifest", m_path, img_path, "-"], stream_path, False),
+            ("assemble-sized", [ufat, "assemble", "--create", "--size", SIZE_GIVEN, "--unsupported", "fail", "--manifest", m_path, img_path, source], None, False),
+            ("assemble-pipe", [ufat, "assemble", "--create", "--size", SIZE_GIVEN, "--manifest", "-", img_path, source], m_path, True),
         ]
         if rng.random() < 0.3:
-            cmds.append(("assemble-skip", [ufat, "assemble", "--create", "--unsupported", "skip", "--no-check-validity", "--manifest", m_path, img_path, source], None))
-        for cmd_name, argv, stdin in cmds:
+            cmds.append(("assemble-skip", [ufat, "assemble", "--create", "--minimize", "--unsupported", "skip", "--no-check-validity", "--manifest", m_path, img_path, source], None, False))
+        for cmd_name, argv, stdin, stdin_pipe in cmds:
             try:
                 os.unlink(img_path)
             except FileNotFoundError:
                 pass
-            res = run(argv, stdin_path=stdin, timeout=timeout, stderr_path=err_path)
+            res = run(argv, stdin_path=stdin, timeout=timeout, stderr_path=err_path, stdin_pipe=stdin_pipe)
             res["cmd"] = cmd_name
             try:
                 res["image_size"] = os.stat(img_path).st_size
@@ -1261,7 +1305,7 @@ def worker_manifests(args):
             if kind:
                 sig = signature(cmd_name, kind, detail, res.get("stderr", ""))
                 saved = save_finding(out, sig, kind, detail, cmd_name, argv, res, variant, seed_name, None, desc, ".Uapi16Manifest",
-                                     extra={"stream_bytes": n if stdin else None})
+                                     extra={"stream_bytes": n if stdin == stream_path else None, "manifest_on_stdin": stdin == m_path})
                 findings.append((sig, kind, detail, cmd_name, seed_name, desc, saved))
     try:
         os.unlink(img_path)

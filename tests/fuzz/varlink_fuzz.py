@@ -501,8 +501,8 @@ def method_cases(rng, seeds, work, small_tree, img):
                          ({"sourceFileDescriptor": 0}, rw), ({"sourceFileDescriptor": 1}, [img, tree]),
                          ({"sourceFileDescriptor": 1, "unsupported": "fail"}, rw + [("/dev", "dir")]), ({"sourceFileDescriptor": 1, "uid": -1, "gid": 2 ** 40}, rw + [tree]),
                          ({"sourceFileDescriptor": 1, "manifestSink": {"fileDescriptor": 1}}, rw + [tree]),
-                         ({"sourceFileDescriptor": 1, "manifestSink": {"fileDescriptor": 2, "fields": ["bogus"]}}, rw + [tree, (sink_path, "wo")]),
-                         ({"sourceFileDescriptor": 1, "manifestSink": {"fileDescriptor": 2, "fields": ["size", "hash", "mtime"]}}, rw + [tree, (sink_path, "wo")]),
+                         ({"sourceFileDescriptor": 1, "manifestSink": {"fileDescriptor": 2, "features": ["bogus"]}}, rw + [tree, (sink_path, "wo")]),
+                         ({"sourceFileDescriptor": 1, "manifestSink": {"fileDescriptor": 2, "features": ["size", "sha256", "mtime"]}}, rw + [tree, (sink_path, "wo")]),
                          ({"sourceFileDescriptor": 1, "manifestSink": {"fileDescriptor": 2}}, rw + [tree, sink_path])]:
         content = dict(content)
         params = {"image": {"fileDescriptor": 0}, "path": content.pop("destination", "/"), "content": content}
@@ -510,6 +510,10 @@ def method_cases(rng, seeds, work, small_tree, img):
             params["timestampUSec"] = content.pop("timestampUSec")
         cases.append(("Populate-%s" % json.dumps({k: v for k, v in params.items() if k != "image"})[:40], [fdcall(IFACE + "Populate", params, fds)]))
     return cases
+
+
+# The size of the file systems that take the size given, 64 MiB.
+SIZE_GIVEN = 64 << 20
 
 
 def manifest_cases(rng, seeds, work, img, count):
@@ -533,8 +537,14 @@ def manifest_cases(rng, seeds, work, img, count):
             if rng.random() < 0.3:
                 content["unsupported"] = "skip"
                 content["manifest"]["checkValidity"] = False
-            params = {"image": {"fileDescriptor": 0}, "options": {}, "content": content}
-            cases.append(("Assemble-manifest[%s]" % desc[:40], [fdcall(IFACE + "Assemble", params, [(fimg, "rw"), mpath, (source, "dir")])],
+            # Half of them into a size given, which takes no plan: the
+            # manifest is read while the volume is written.
+            if rng.random() < 0.5:
+                image, options, label = {"fileDescriptor": 0}, {"minimize": True}, "Assemble-manifest"
+            else:
+                image, options, label = {"fileDescriptor": 0, "size": SIZE_GIVEN}, {}, "Assemble-sized"
+            params = {"image": image, "options": options, "content": content}
+            cases.append(("%s[%s]" % (label, desc[:40]), [fdcall(IFACE + "Assemble", params, [(fimg, "rw"), mpath, (source, "dir")])],
                           {"manifest": variant, "cleanup": fimg}))
         elif kind < 0.65:
             cases.append(("Plan-manifest[%s]" % desc[:40], [fdcall(IFACE + "Assemble", {"mode": "plan", "content": {"manifest": {"fileDescriptor": 0}}}, [mpath])],
@@ -544,7 +554,7 @@ def manifest_cases(rng, seeds, work, img, count):
             # directory: too short, too long, or just right by accident.
             blob = os.path.join(work, "case.blob")
             n = rng.choice([0, 1, 1000, 100000, 1 << 20])
-            params = {"image": {"fileDescriptor": 0}, "options": {}, "content": {"manifest": {"fileDescriptor": 1}, "sourceFileDescriptor": 2}}
+            params = {"image": {"fileDescriptor": 0}, "options": {"minimize": True}, "content": {"manifest": {"fileDescriptor": 1}, "sourceFileDescriptor": 2}}
             cases.append(("Assemble-stream[%s]" % desc[:40], [fdcall(IFACE + "Assemble", params, [(fimg, "rw"), mpath, blob])],
                           {"manifest": variant, "cleanup": fimg, "blob": bytes([0x5A]) * n, "blob_path": blob}))
     return cases
