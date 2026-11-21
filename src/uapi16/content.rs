@@ -494,6 +494,7 @@ pub trait ContentSource {
 
 /// Why a [`Directory`] does not hand out a file.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum OpenError {
     /// What the name names is not a regular file.
     NotRegular,

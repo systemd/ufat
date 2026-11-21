@@ -155,6 +155,9 @@ impl From<uapi16::Error> for Error {
                     uapi16::ValidityProblem::Revoked => (EKEYREVOKED, ValidityProblem::Revoked),
                     uapi16::ValidityProblem::NotYetValid => (EKEYEXPIRED, ValidityProblem::NotYetValid),
                     uapi16::ValidityProblem::Expired => (EKEYEXPIRED, ValidityProblem::Expired),
+                    // A reason this crate does not know of. The entry is not
+                    // to be used now all the same.
+                    _ => return Error::new(EKEYEXPIRED, e.to_string()),
                 };
                 Error::new(errno, e.to_string()).with(Detail::Validity { name: path, problem })
             }

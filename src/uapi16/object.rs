@@ -15,6 +15,7 @@ use crate::{Features, Name, Order, Sha256, STRING_RULES};
 
 /// The inode type of a file object, its `type` field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum InodeType {
     /// `reg`: a regular file.
     Regular,
@@ -151,6 +152,7 @@ impl fmt::Debug for Mode {
 
 /// The `validity` field of a file object.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Validity {
     /// `good`, and any value the specification adds later.
     #[default]
@@ -850,6 +852,7 @@ impl FileSystemIdentity {
 
 /// Where a contents object says the data is. It names at most one place.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Location {
     /// Neither `file`, `url` nor `literal` is given: the data is in the
     /// file of the object's own name, next to the manifest.

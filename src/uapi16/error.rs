@@ -227,6 +227,7 @@ pub enum UnsupportedContent {
 
 /// Why a file object must not be used now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ValidityProblem {
     /// Its `validity` is `revoked`.
     Revoked,
