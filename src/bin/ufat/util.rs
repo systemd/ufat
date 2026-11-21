@@ -1300,9 +1300,9 @@ mod tests {
     fn a_failure_after_the_image_got_its_name_syncs_its_directory() {
         // What a rename that may replace is: renameat() where there is one,
         // renameat2() without flags elsewhere.
-        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64"))]
         const RENAME: libc::c_long = libc::SYS_renameat;
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
         const RENAME: libc::c_long = libc::SYS_renameat2;
         let dir = TempDir::new("named");
         let (path, written) = (dir.0.join("a.img"), dir.0.join("a.manifest"));

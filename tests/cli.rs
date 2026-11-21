@@ -2268,8 +2268,9 @@ impl Refused {
         errno: libc::EIO,
     };
     /// Every renameat(), a rename that may replace, failing. glibc renames
-    /// with it on x86_64 and x86, where it is a system call of its own.
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    /// with it on x86_64, x86 and aarch64, where it is a system call of its
+    /// own.
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64"))]
     const RENAME: Refused = Refused {
         call: libc::SYS_renameat,
         flag: None,
@@ -2690,7 +2691,7 @@ fn assemble_in_a_directory_it_cannot_read() {
 /// A file written next to the image that cannot get its name, where the
 /// name exists and the rename onto it fails, takes its temporary name with
 /// it, also with O_TMPFILE. The image keeps its name.
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64"))]
 #[test]
 fn an_output_that_cannot_replace_leaves_no_temporary_name() {
     let _serial = common::serial();
