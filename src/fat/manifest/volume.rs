@@ -424,7 +424,7 @@ mod tests {
     use crate::populate::CopyOptions;
     use crate::test_util::{volume, TempDir, TempImage};
     use crate::volume::NameCollision;
-    use json::Object;
+    use serde_json::{Map, Value};
     use std::os::fd::AsFd;
     use std::time::{Duration, UNIX_EPOCH};
     use uapi16::{Digest, DosFlags, InodeFlags, Object as ManifestObject, Reader, RECORD_SEPARATOR};
@@ -524,7 +524,7 @@ mod tests {
     /// The records as text and as objects, to look at what the parser
     /// drops. Checks the frame on the way: one separator, one newline per
     /// record, keys sorted, no whitespace (none of the names here has any).
-    fn records(bytes: &[u8]) -> Vec<(String, Object)> {
+    fn records(bytes: &[u8]) -> Vec<(String, Map<String, Value>)> {
         let text = std::str::from_utf8(bytes).unwrap();
         assert!(text.starts_with(RECORD_SEPARATOR as char));
         text.split(RECORD_SEPARATOR as char)
@@ -532,11 +532,11 @@ mod tests {
             .map(|r| {
                 let r = r.strip_suffix('\n').unwrap();
                 assert!(!r.chars().any(char::is_whitespace), "{}", r);
-                let o = match json::parse(r).unwrap() {
-                    json::Value::Object(o) => o,
+                let o = match serde_json::from_str(r).unwrap() {
+                    Value::Object(o) => o,
                     other => panic!("{} is not an object", other),
                 };
-                let keys: Vec<&str> = o.keys().collect();
+                let keys: Vec<&str> = o.keys().map(String::as_str).collect();
                 let mut sorted = keys.clone();
                 sorted.sort_unstable();
                 assert_eq!(keys, sorted, "{}", r);
@@ -656,7 +656,7 @@ mod tests {
         assert_eq!(recs[10].0, r#"{"mediaType":"application/vnd.uapi.16.trailer"}"#);
         for ((text, o), e) in recs[1..=NAMES.len()].iter().zip(&m.entries) {
             assert_eq!(
-                o.get("type").and_then(json::Value::as_str),
+                o.get("type").and_then(Value::as_str),
                 (e.inode_type == D).then_some("dir"),
                 "{}",
                 text
@@ -700,8 +700,8 @@ mod tests {
         assert_eq!(recs[2].0, r#"{"name":"EFI","type":"dir"}"#);
         assert_eq!(recs[4].0, r#"{"name":"EFI/BOOT/BOOTX64.EFI","readOnly":true}"#);
         for (text, o) in &recs[1..=NAMES.len()] {
-            let keys: Vec<&str> = o.keys().filter(|k| *k != "readOnly").collect();
-            let name = o.get("name").and_then(json::Value::as_str).unwrap();
+            let keys: Vec<&str> = o.keys().map(String::as_str).filter(|k| *k != "readOnly").collect();
+            let name = o.get("name").and_then(Value::as_str).unwrap();
             let expected: &[&str] = if ["EFI", "EFI/BOOT", "_notes", "zz"].contains(&name) {
                 &["name", "type"]
             } else {

@@ -21,7 +21,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use common::{build_tree, find_program, first_difference, ufat, Temp};
 use fat::device::{Access, Device};
 use fat::volume::Volume;
-use varlink::{Client, Object, Response, Stream, Value};
+use varlink::{Client, Object, Response, Stream, UniqueKeys, Value};
 
 const INTERFACE: &str = include_str!("../docs/org.uapi-group.FileSystem.varlink");
 const IFACE: &str = "org.uapi-group.FileSystem";
@@ -179,7 +179,10 @@ fn connect_listening(ufat: &Path) -> (Child, Temp, Client) {
 }
 
 fn params(text: &str) -> Object {
-    json::parse(text).unwrap().as_object().unwrap().clone()
+    match UniqueKeys::parse(text).unwrap() {
+        Value::Object(o) => o,
+        other => panic!("{} is not an object", other),
+    }
 }
 
 fn reply(r: Response) -> Object {
@@ -2761,14 +2764,15 @@ fn describe_with_and_without_a_manifest() {
         &[img_ro.as_fd()],
     );
     assert_eq!(e.name, format!("{}.NotFileSystem", IFACE));
-    let e = error_of(
-        &mut c,
-        "Describe",
+    // -1 is no offset, and neither is -0, which is a float.
+    for image in [
         r#"{"image":{"fileDescriptor":0,"offset":-1}}"#,
-        &[img_ro.as_fd()],
-    );
-    assert_eq!(e.name, "org.varlink.service.InvalidParameter");
-    assert_eq!(str_of(&e.parameters, "parameter"), "image");
+        r#"{"image":{"fileDescriptor":0,"offset":-0}}"#,
+    ] {
+        let e = error_of(&mut c, "Describe", image, &[img_ro.as_fd()]);
+        assert_eq!(e.name, "org.varlink.service.InvalidParameter");
+        assert_eq!(str_of(&e.parameters, "parameter"), "image");
+    }
 }
 
 /// Describe of a volume with a directory whose chain loops answers
@@ -3256,7 +3260,7 @@ fn check_finds_damage() {
     let batches: Vec<usize> = replies
         .iter()
         .filter_map(|r| r.get("problems").and_then(Value::as_array))
-        .map(<[Value]>::len)
+        .map(Vec::len)
         .collect();
     assert!(batches.len() >= 2, "{} batches", batches.len());
     assert!(batches.iter().all(|&b| b <= 100));
@@ -3826,7 +3830,7 @@ fn varlinkctl_can_drive_us() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let v = json::parse(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    let v = UniqueKeys::parse(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(
         v.get("description").unwrap().get("label").unwrap().as_str(),
         Some("CTL")

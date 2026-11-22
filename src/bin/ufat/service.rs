@@ -38,7 +38,7 @@ use fat::progress::Progress;
 use fat::sha512::Sha512Context;
 use fat::volume::{Metadata, NameCollision, Volume};
 use fat::{CorruptPlace, Detail, NoSpaceReason, NotFat32Reason, UnsupportedKind};
-use json::{Object, Value};
+use varlink::{object, Object, Value};
 use varlink::{Activation, Call, Connection, Info, Reply, Server, Service};
 
 use crate::util::{
@@ -147,7 +147,7 @@ fn interface_error(name: &str, parameters: Object) -> varlink::Error {
 /// Adds `value` to `o` under `key` when there is one.
 fn optional<T: Into<Value>>(o: &mut Object, key: &str, value: Option<T>) {
     if let Some(v) = value {
-        o.insert(key, v);
+        o.insert(key.into(), v.into());
     }
 }
 
@@ -211,27 +211,27 @@ fn map_error(e: &fat::Error) -> varlink::Error {
                 errno::ENOTEMPTY => "DirectoryNotEmpty",
                 other => return varlink::Error::system(other),
             };
-            interface_error(name, json::object! { "path" => path.as_str() })
+            interface_error(name, object! { "path" => path.as_str() })
         }
         Detail::Name { name, problem } => interface_error(
             "InvalidName",
-            json::object! { "name" => name.as_str(), "reason" => problem.as_str() },
+            object! { "name" => name.as_str(), "reason" => problem.as_str() },
         ),
         Detail::Label { label, problem } => interface_error(
             "InvalidLabel",
-            json::object! { "label" => label.as_str(), "reason" => problem.as_str() },
+            object! { "label" => label.as_str(), "reason" => problem.as_str() },
         ),
         Detail::Identifier { identifier, problem } => interface_error(
             "InvalidIdentifier",
-            json::object! { "identifier" => identifier.as_str(), "reason" => problem.as_str() },
+            object! { "identifier" => identifier.as_str(), "reason" => problem.as_str() },
         ),
         Detail::TooLarge { path, size, maximum } => {
-            let mut o = json::object! { "sizeBytes" => *size, "sizeMaxBytes" => *maximum };
+            let mut o = object! { "sizeBytes" => *size, "sizeMaxBytes" => *maximum };
             optional(&mut o, "path", path.as_deref());
             interface_error("TooLarge", o)
         }
         Detail::NoSpace { reason, path } => {
-            let mut o = json::object! { "reason" => no_space_reason(*reason) };
+            let mut o = object! { "reason" => no_space_reason(*reason) };
             optional(&mut o, "path", path.as_deref());
             interface_error("NoSpaceLeft", o)
         }
@@ -240,19 +240,19 @@ fn map_error(e: &fat::Error) -> varlink::Error {
             found,
             sector_size,
         } => {
-            let mut o = json::object! { "reason" => not_file_system_reason(*reason) };
+            let mut o = object! { "reason" => not_file_system_reason(*reason) };
             optional(&mut o, "found", found.as_deref());
             optional(&mut o, "sectorSize", *sector_size);
             interface_error("NotFileSystem", o)
         }
-        Detail::NotEmpty { found } => interface_error("ImageNotEmpty", json::object! { "found" => found.as_str() }),
+        Detail::NotEmpty { found } => interface_error("ImageNotEmpty", object! { "found" => found.as_str() }),
         Detail::Corrupt {
             place,
             field,
             path,
             cluster,
         } => {
-            let mut o = json::object! { "where" => corrupt_place(*place) };
+            let mut o = object! { "where" => corrupt_place(*place) };
             optional(&mut o, "field", *field);
             optional(&mut o, "path", path.as_deref());
             optional(&mut o, "block", *cluster);
@@ -272,7 +272,7 @@ fn map_error(e: &fat::Error) -> varlink::Error {
             name,
             field,
         } => {
-            let mut o = json::object! { "reason" => problem.as_str() };
+            let mut o = object! { "reason" => problem.as_str() };
             optional(&mut o, "record", *record);
             optional(&mut o, "name", name.as_deref());
             optional(&mut o, "field", field.as_deref());
@@ -280,7 +280,7 @@ fn map_error(e: &fat::Error) -> varlink::Error {
         }
         Detail::Source { name, problem } => interface_error(
             "SourceMismatch",
-            json::object! { "name" => name.as_str(), "reason" => problem.as_str() },
+            object! { "name" => name.as_str(), "reason" => problem.as_str() },
         ),
         Detail::Content {
             name,
@@ -288,23 +288,23 @@ fn map_error(e: &fat::Error) -> varlink::Error {
             size,
             expected,
         } => {
-            let mut o = json::object! { "name" => name.as_str(), "reason" => problem.as_str() };
+            let mut o = object! { "name" => name.as_str(), "reason" => problem.as_str() };
             optional(&mut o, "sizeBytes", *size);
             optional(&mut o, "expectedSizeBytes", *expected);
             interface_error("ContentMismatch", o)
         }
         Detail::Unsupported { name, what, value } => {
-            let mut o = json::object! { "what" => what.as_str() };
+            let mut o = object! { "what" => what.as_str() };
             optional(&mut o, "name", name.as_deref());
             optional(&mut o, "value", value.as_deref());
             interface_error("ContentNotSupported", o)
         }
         Detail::Validity { name, problem } => interface_error(
             "EntryNotValid",
-            json::object! { "name" => name.as_str(), "reason" => problem.as_str() },
+            object! { "name" => name.as_str(), "reason" => problem.as_str() },
         ),
         Detail::FileSystemMismatch { field, expected, found } => {
-            let mut o = json::object! { "field" => field.as_str() };
+            let mut o = object! { "field" => field.as_str() };
             optional(&mut o, "expected", expected.as_deref());
             optional(&mut o, "found", found.as_deref());
             interface_error("FileSystemMismatch", o)
@@ -320,7 +320,7 @@ fn bad_file_descriptor(parameter: &str, e: &fat::Error) -> varlink::Error {
         Some(Detail::Descriptor { problem, flags, .. }) => (problem.as_str(), *flags),
         _ => ("wrongType", None),
     };
-    let mut o = json::object! { "parameter" => parameter, "reason" => problem };
+    let mut o = object! { "parameter" => parameter, "reason" => problem };
     optional(&mut o, "flags", flags);
     interface_error("BadFileDescriptor", o)
 }
@@ -331,18 +331,16 @@ fn fail(f: Failure) -> varlink::Error {
         Failure::BadDescriptor { parameter, error } => bad_file_descriptor(&parameter, &error),
         Failure::TooSmall { minimal, actual } => interface_error(
             "TooSmall",
-            json::object! {
+            object! {
                 "minimalSizeBytes" => minimal,
                 "sizeBytes" => actual,
             },
         ),
         Failure::Unsupported(operation) => {
-            interface_error("OperationNotSupported", json::object! { "operation" => operation })
+            interface_error("OperationNotSupported", object! { "operation" => operation })
         }
-        Failure::FileSystemType(t) => {
-            interface_error("FileSystemTypeNotSupported", json::object! { "fileSystemType" => t })
-        }
-        Failure::NotReproducible(reason) => interface_error("NotReproducible", json::object! { "reason" => reason }),
+        Failure::FileSystemType(t) => interface_error("FileSystemTypeNotSupported", object! { "fileSystemType" => t }),
+        Failure::NotReproducible(reason) => interface_error("NotReproducible", object! { "reason" => reason }),
         Failure::SizeRequired => interface_error("SizeRequired", Object::new()),
         Failure::Busy => interface_error("ImageBusy", Object::new()),
         Failure::ExpectedMore => varlink::Error::expected_more(),
@@ -371,7 +369,7 @@ fn fit_error(e: util::FitError) -> Failure {
 /// A finding of Check as the interface carries it: its class, its kind and
 /// the facts it has, with the interface's names (a cluster is a block).
 fn problem(p: &Problem) -> Object {
-    let mut o = json::object! {
+    let mut o = object! {
         "severity" => if p.severity == fsck::Severity::Error { "error" } else { "warning" },
         "class" => p.kind.class().as_str(),
         "kind" => p.kind.as_str(),
@@ -410,7 +408,7 @@ impl Params<'_> {
     fn u64(&self, key: &str) -> Outcome<Option<u64>> {
         match self.0.get(key) {
             None | Some(Value::Null) => Ok(None),
-            Some(Value::Int(i)) => u64::try_from(*i).map(Some).map_err(|_| invalid(key)),
+            Some(Value::Number(n)) => n.as_u64().map(Some).ok_or_else(|| invalid(key)),
             Some(Value::String(s)) => s.parse::<u64>().map(Some).map_err(|_| invalid(key)),
             Some(_) => Err(invalid(key)),
         }
@@ -474,7 +472,7 @@ fn check_type(p: &Params<'_>) -> Outcome<()> {
 /// Tells a client that asked for intermediate replies which step begins.
 fn phase(c: &mut Connection, more: bool, phase: &str) -> Outcome<()> {
     if more {
-        c.notify(json::object! { "phase" => phase })?;
+        c.notify(object! { "phase" => phase })?;
     }
     Ok(())
 }
@@ -511,7 +509,7 @@ impl<'c> Reporter<'c> {
     /// Enters `phase` and tells the caller, as [`phase`] does.
     fn start(connection: &'c mut Connection, more: bool, phase: &'static str, shown: Shown) -> Outcome<Reporter<'c>> {
         if more {
-            connection.notify(json::object! { "phase" => phase })?;
+            connection.notify(object! { "phase" => phase })?;
         }
         Ok(Reporter {
             connection,
@@ -529,13 +527,13 @@ impl<'c> Reporter<'c> {
         if !self.more || self.gone || self.last.elapsed() < PROGRESS_INTERVAL {
             return;
         }
-        let mut o = json::object! { "phase" => self.phase };
+        let mut o = object! { "phase" => self.phase };
         if self.shown != Shown::PhaseOnly {
-            o.insert("files", progress.files);
-            o.insert("directories", progress.directories);
+            o.insert("files".into(), progress.files.into());
+            o.insert("directories".into(), progress.directories.into());
         }
         if self.shown == Shown::EntriesAndBytes {
-            o.insert("bytes", progress.bytes);
+            o.insert("bytes".into(), progress.bytes.into());
         }
         self.gone = self.connection.notify(o).is_err();
         self.last = Instant::now();
@@ -748,7 +746,7 @@ fn stored_label(options: &FormatOptions) -> Outcome<Option<String>> {
 /// The file system as it is: the interface's `Description`.
 fn description(v: &Volume) -> Outcome<Object> {
     let l = v.layout();
-    let mut o = json::object! {
+    let mut o = object! {
         "fileSystemType" => FILE_SYSTEM_TYPE,
         "identifier" => VolumeId(v.boot_sector().volume_id).to_string(),
         "sectorSize" => l.sector_size,
@@ -763,7 +761,7 @@ fn description(v: &Volume) -> Outcome<Object> {
 /// A directory entry as the interface's `Entry`: FAT has names, an 8.3
 /// alias, sizes, two times and the DOS attributes, and nothing else.
 fn entry(m: &Metadata) -> Object {
-    let mut o = json::object! {
+    let mut o = object! {
         "name" => m.name.as_str(),
         "type" => if m.is_dir { "dir" } else { "reg" },
         "sizeBytes" => m.size,
@@ -782,7 +780,7 @@ fn entry(m: &Metadata) -> Object {
     .map(|(_, name)| *name)
     .collect();
     if !attributes.is_empty() {
-        o.insert("dosAttributes", attributes);
+        o.insert("dosAttributes".into(), attributes.into());
     }
     o
 }
@@ -796,7 +794,7 @@ pub(crate) fn capabilities() -> fat::Result<Object> {
     let minimal = layout::minimal(&params, MIN_CLUSTERS)?.size();
     let powers_of_two =
         |from: u32, to: u32| -> Vec<u32> { (0..).map(|i| from << i).take_while(|&s| s <= to).collect() };
-    Ok(json::object! {
+    Ok(object! {
         "fileSystemType" => FILE_SYSTEM_TYPE,
         "implementation" => "ufat",
         "version" => VERSION,
@@ -824,10 +822,10 @@ pub(crate) fn capabilities() -> fat::Result<Object> {
         // as the planner goes; larger clusters work on Linux but not
         // everywhere.
         "blockSizes" => powers_of_two(MIN_SECTOR_SIZE, MAX_CLUSTER_SIZE),
-        "label" => json::object! { "lengthMax" => 11, "unit" => "bytes", "charset" => "fat" },
+        "label" => object! { "lengthMax" => 11, "unit" => "bytes", "charset" => "fat" },
         "identifier" => "serial",
         "preserves" => vec!["dosAttributes"],
-        "times" => json::object! {
+        "times" => object! {
             "resolutionNSec" => 2_000_000_000u64,
             "minUSec" => fat::time::FAT_EPOCH as u64 * 1_000_000,
             "maxUSec" => fat::time::FAT_MAX as u64 * 1_000_000,
@@ -842,7 +840,7 @@ pub(crate) fn capabilities() -> fat::Result<Object> {
         "fileSizeMaxBytes" => fat::volume::MAX_FILE_SIZE,
         // A manifest has to declare the code point order, see
         // ManifestInput::open.
-        "manifest" => json::object! { "order" => Order::CodePoint.as_str() },
+        "manifest" => object! { "order" => Order::CodePoint.as_str() },
     })
 }
 
@@ -1000,10 +998,10 @@ impl Counts {
     /// relative to a directory the caller knows by descriptor only, and
     /// a list is as long as the caller's tree lets it be.
     fn put(&self, o: &mut Object) {
-        o.insert("files", self.files);
-        o.insert("directories", self.directories);
-        o.insert("bytes", self.bytes);
-        o.insert("skipped", self.skipped);
+        o.insert("files".into(), self.files.into());
+        o.insert("directories".into(), self.directories.into());
+        o.insert("bytes".into(), self.bytes.into());
+        o.insert("skipped".into(), self.skipped.into());
     }
 }
 
@@ -1303,7 +1301,7 @@ fn parent_of(path: &str) -> Option<&str> {
 impl FileSystemService {
     fn get_capabilities(&self, p: &Params<'_>) -> Outcome<Object> {
         check_type(p)?;
-        Ok(json::object! { "capabilities" => capabilities()? })
+        Ok(object! { "capabilities" => capabilities()? })
     }
 
     fn assemble(&self, p: &Params<'_>, c: &mut Connection, more: bool) -> Outcome<Object> {
@@ -1365,14 +1363,14 @@ impl FileSystemService {
             Some(s) => Some(Sink::take(&s, c)?),
         };
         let volume = image.open_volume(Access::ReadOnly)?;
-        let mut o = json::object! { "description" => description(&volume)? };
+        let mut o = object! { "description" => description(&volume)? };
         if let Some(sink) = sink {
             let mut r = Reporter::start(c, more, "reading", Shown::EntriesAndBytes)?;
             let w = sink.write(&volume, &mut |p| r.tick(p))?;
-            o.insert("files", w.files);
-            o.insert("directories", w.directories);
-            o.insert("bytes", w.bytes);
-            o.insert("omitted", w.omissions());
+            o.insert("files".into(), w.files.into());
+            o.insert("directories".into(), w.directories.into());
+            o.insert("bytes".into(), w.bytes.into());
+            o.insert("omitted".into(), w.omissions().into());
         }
         Ok(o)
     }
@@ -1488,7 +1486,7 @@ impl FileSystemService {
             (0, 1)
         };
         v.close()?;
-        Ok(json::object! { "files" => files, "directories" => directories })
+        Ok(object! { "files" => files, "directories" => directories })
     }
 
     fn list(&self, p: &Params<'_>, c: &mut Connection, more: bool) -> Outcome<Object> {
@@ -1498,7 +1496,7 @@ impl FileSystemService {
         let v = image.open_volume(Access::ReadOnly)?;
         let md = v.metadata(path)?;
         if !md.is_dir {
-            return Ok(json::object! { "entry" => entry(&md) });
+            return Ok(object! { "entry" => entry(&md) });
         }
         if !more {
             return Err(Failure::ExpectedMore);
@@ -1508,7 +1506,7 @@ impl FileSystemService {
         let entries = v.read_dir(path)?;
         let mut it = entries.iter().peekable();
         while let Some(m) = it.next() {
-            let o = json::object! { "entry" => entry(m) };
+            let o = object! { "entry" => entry(m) };
             if it.peek().is_none() {
                 return Ok(o);
             }
@@ -1527,7 +1525,7 @@ impl FileSystemService {
         let device = image.open(Access::ReadOnly)?;
         let mut r = Reporter::start(c, more, "checking", Shown::PhaseOnly)?;
         let report = fsck::check_with_progress(&device, &mut |p| r.tick(p))?;
-        let mut o = json::object! {
+        let mut o = object! {
             "errors" => report.errors(),
             "warnings" => report.warnings(),
             "repaired" => 0u64,
@@ -1540,11 +1538,11 @@ impl FileSystemService {
             // The findings in batches, the counts in the final reply.
             for batch in report.problems.chunks(PROBLEM_BATCH) {
                 let problems: Vec<Value> = batch.iter().map(|pr| Value::Object(problem(pr))).collect();
-                c.notify(json::object! { "problems" => problems })?;
+                c.notify(object! { "problems" => problems })?;
             }
         } else {
             let problems: Vec<Value> = report.problems.iter().map(|pr| Value::Object(problem(pr))).collect();
-            o.insert("problems", problems);
+            o.insert("problems".into(), problems.into());
         }
         Ok(o)
     }
@@ -1574,7 +1572,7 @@ fn plan(mut options: Options, content: Option<Content>, c: &mut Connection, more
     }
     let e = plan.estimate()?;
     e.apply(&mut options.format);
-    let mut d = json::object! {
+    let mut d = object! {
         "fileSystemType" => FILE_SYSTEM_TYPE,
         "identifier" => VolumeId(options.format.volume_id).to_string(),
         "sectorSize" => e.layout.sector_size,
@@ -1583,7 +1581,7 @@ fn plan(mut options: Options, content: Option<Content>, c: &mut Connection, more
         "minimalSizeBytes" => e.size(),
     };
     optional(&mut d, "label", stored_label(&options.format)?);
-    Ok(json::object! {
+    Ok(object! {
         "description" => d,
         "files" => e.files,
         "directories" => e.directories,
@@ -1706,7 +1704,7 @@ fn assemble_image(
     };
     let window = volume.device().len();
     volume.close()?;
-    let mut o = json::object! { "description" => description };
+    let mut o = object! { "description" => description };
     if let Some(counts) = counts {
         counts.put(&mut o);
     }
@@ -1714,7 +1712,7 @@ fn assemble_image(
     if let (Some(hash), Some(fd)) = (hash, reader) {
         let mut r = Reporter::start(c, more, "reading", Shown::PhaseOnly)?;
         let device = Device::from_passed(fd, Access::ReadOnly)?.window(offset, Some(window))?;
-        o.insert("imageHash", hash.of(&device, &mut |p| r.tick(p))?);
+        o.insert("imageHash".into(), hash.of(&device, &mut |p| r.tick(p))?.into());
     }
     Ok(o)
 }

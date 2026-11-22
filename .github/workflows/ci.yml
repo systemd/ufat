@@ -450,9 +450,16 @@ jobs:
       - name: Check the crates from outside the tree
         # Cargo.lock lists every dependency of every package, for all
         # targets and features, the build and test dependencies included.
-        # libc, lexopt, and sha2 with the crates it needs.
+        # libc, lexopt, sha2 and serde_json with the crates they need.
+        # serde_json and serde_core name serde and serde_derive for
+        # cfg(any()), which no target has, so that all three keep one
+        # version. So these two and the crates serde_derive needs are in
+        # Cargo.lock, and nothing builds them.
         env:
-          EXPECTED: block-buffer cfg-if cpufeatures crypto-common digest hybrid-array lexopt libc sha2 typenum
+          EXPECTED: >-
+            block-buffer cfg-if cpufeatures crypto-common digest equivalent foldhash hashbrown hybrid-array
+            indexmap itoa lexopt libc memchr proc-macro2 quote serde serde_core serde_derive serde_json sha2
+            syn typenum unicode-ident zmij
         run: |
           deps=$(cargo metadata --locked --format-version 1 |
             jq -r '.workspace_members as $m | .packages[] | select(.id as $i | $m | index($i) | not) | .name' |

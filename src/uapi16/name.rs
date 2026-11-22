@@ -7,8 +7,7 @@ use std::iter;
 use std::ops::Deref;
 use std::str::FromStr;
 
-use json::StringRules;
-
+use crate::strict::StringRules;
 use crate::{InodeType, FILENAME, STRING_RULES};
 
 /// What separates the components of a name.
@@ -55,14 +54,14 @@ const RULES: StringRules = STRING_RULES.without(StringRules::NO_NUL);
 /// name.
 ///
 /// ```
-/// use uapi16::{InvalidName, Name};
+/// use uapi16::{Name, NameProblem};
 ///
 /// let name = Name::new("EFI/BOOT")?;
 /// assert_eq!(name.join("BOOTX64.EFI")?, "EFI/BOOT/BOOTX64.EFI");
-/// assert_eq!("EFI//BOOT".parse::<Name>(), Err(InvalidName::EmptyComponent));
-/// assert_eq!(Name::new("../etc/passwd"), Err(InvalidName::ContainsDotComponent));
+/// assert_eq!("EFI//BOOT".parse::<Name>(), Err(NameProblem::EmptyComponent));
+/// assert_eq!(Name::new("../etc/passwd"), Err(NameProblem::ContainsDotComponent));
 /// assert!(Name::new("a/x")? < Name::new("a-b")?);
-/// # Ok::<(), InvalidName>(())
+/// # Ok::<(), NameProblem>(())
 /// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Name(String);
@@ -70,7 +69,7 @@ pub struct Name(String);
 /// Why a string is not the name of a file object, see [`Name`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-pub enum InvalidName {
+pub enum NameProblem {
     /// The string is empty. No file object has that name: [`Name::ROOT`]
     /// only stands in for the root file object, which has no name.
     Empty,
@@ -93,22 +92,22 @@ pub enum InvalidName {
     ContainsSeparator,
 }
 
-impl fmt::Display for InvalidName {
+impl fmt::Display for NameProblem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            InvalidName::Empty => f.write_str("name is empty"),
-            InvalidName::TooLong => write!(f, "name is longer than {} bytes", Name::MAX_LEN),
-            InvalidName::Reserved => f.write_str("name is reserved for the manifest"),
-            InvalidName::ContainsControlCharacter => f.write_str("name contains a control character"),
-            InvalidName::ContainsNoncharacter => f.write_str("name contains a noncharacter"),
-            InvalidName::EmptyComponent => f.write_str("name has an empty component"),
-            InvalidName::ContainsDotComponent => write!(f, "name contains a '{}' or '{}' component", CURRENT, PARENT),
-            InvalidName::ContainsSeparator => write!(f, "name component contains '{}'", SEPARATOR),
+            NameProblem::Empty => f.write_str("name is empty"),
+            NameProblem::TooLong => write!(f, "name is longer than {} bytes", Name::MAX_LEN),
+            NameProblem::Reserved => f.write_str("name is reserved for the manifest"),
+            NameProblem::ContainsControlCharacter => f.write_str("name contains a control character"),
+            NameProblem::ContainsNoncharacter => f.write_str("name contains a noncharacter"),
+            NameProblem::EmptyComponent => f.write_str("name has an empty component"),
+            NameProblem::ContainsDotComponent => write!(f, "name contains a '{}' or '{}' component", CURRENT, PARENT),
+            NameProblem::ContainsSeparator => write!(f, "name component contains '{}'", SEPARATOR),
         }
     }
 }
 
-impl std::error::Error for InvalidName {}
+impl std::error::Error for NameProblem {}
 
 impl Name {
     /// The name of the root file object: the empty one.
@@ -119,16 +118,16 @@ impl Name {
 
     /// Takes `name` as the name of a file object, if it is one. If it is
     /// not, the error says why.
-    pub fn new(name: impl Into<String>) -> Result<Name, InvalidName> {
+    pub fn new(name: impl Into<String>) -> Result<Name, NameProblem> {
         let name = name.into();
         if name.is_empty() {
-            return Err(InvalidName::Empty);
+            return Err(NameProblem::Empty);
         }
         if name.len() > Name::MAX_LEN {
-            return Err(InvalidName::TooLong);
+            return Err(NameProblem::TooLong);
         }
         if Name::is_reserved(&name) {
-            return Err(InvalidName::Reserved);
+            return Err(NameProblem::Reserved);
         }
         // The separator is neither a control character nor a noncharacter,
         // so the text of the components is checked all at once.
@@ -142,16 +141,16 @@ impl Name {
     /// The name of the entry `component` of the directory this name is
     /// the name of. Only the new component is looked at, so the names of
     /// a deep tree are cheap to make on the way down.
-    pub fn join(&self, component: &str) -> Result<Name, InvalidName> {
+    pub fn join(&self, component: &str) -> Result<Name, NameProblem> {
         if component.contains(SEPARATOR) {
-            return Err(InvalidName::ContainsSeparator);
+            return Err(NameProblem::ContainsSeparator);
         }
         if self.is_root() {
             return Name::new(component);
         }
         let len = self.0.len() + SEPARATOR.len_utf8() + component.len();
         if len > Name::MAX_LEN {
-            return Err(InvalidName::TooLong);
+            return Err(NameProblem::TooLong);
         }
         // In the order of Name::new(), so that a component is refused for
         // the reason the whole name would be refused for.
@@ -166,7 +165,7 @@ impl Name {
 
     /// Checks that `text` can be in a name: it has no control characters,
     /// and nothing that the strings of a manifest may not hold.
-    fn check_text(text: &str) -> Result<(), InvalidName> {
+    fn check_text(text: &str) -> Result<(), NameProblem> {
         // Every byte is looked at, not only those up to the first control
         // character, and with two comparisons instead of is_ascii_control(),
         // which the compiler turns into a branch. Without an early end and
@@ -175,10 +174,10 @@ impl Name {
             .bytes()
             .fold(false, |control, b| control | (b < SPACE) | (b == DELETE));
         if control {
-            return Err(InvalidName::ContainsControlCharacter);
+            return Err(NameProblem::ContainsControlCharacter);
         }
         if !RULES.admits(text) {
-            return Err(InvalidName::ContainsNoncharacter);
+            return Err(NameProblem::ContainsNoncharacter);
         }
         Ok(())
     }
@@ -186,12 +185,12 @@ impl Name {
     /// Checks the bytes `component` between two separators as a component
     /// as far as its shape goes: it is not empty, and it does not stand
     /// for a directory itself or for the one above it.
-    fn check_component(component: &[u8]) -> Result<(), InvalidName> {
+    fn check_component(component: &[u8]) -> Result<(), NameProblem> {
         if component.is_empty() {
-            return Err(InvalidName::EmptyComponent);
+            return Err(NameProblem::EmptyComponent);
         }
         if component == CURRENT.as_bytes() || component == PARENT.as_bytes() {
-            return Err(InvalidName::ContainsDotComponent);
+            return Err(NameProblem::ContainsDotComponent);
         }
         Ok(())
     }
@@ -344,25 +343,25 @@ impl fmt::Display for Name {
 }
 
 impl FromStr for Name {
-    type Err = InvalidName;
+    type Err = NameProblem;
 
-    fn from_str(name: &str) -> Result<Name, InvalidName> {
+    fn from_str(name: &str) -> Result<Name, NameProblem> {
         Name::new(name)
     }
 }
 
 impl TryFrom<String> for Name {
-    type Error = InvalidName;
+    type Error = NameProblem;
 
-    fn try_from(name: String) -> Result<Name, InvalidName> {
+    fn try_from(name: String) -> Result<Name, NameProblem> {
         Name::new(name)
     }
 }
 
 impl TryFrom<&str> for Name {
-    type Error = InvalidName;
+    type Error = NameProblem;
 
-    fn try_from(name: &str) -> Result<Name, InvalidName> {
+    fn try_from(name: &str) -> Result<Name, NameProblem> {
         Name::new(name)
     }
 }
@@ -420,31 +419,31 @@ mod tests {
             assert_eq!(String::from(parsed), name);
         }
         for (name, reason) in [
-            ("", InvalidName::Empty),
-            ("/", InvalidName::EmptyComponent),
-            ("/abs", InvalidName::EmptyComponent),
-            ("a/", InvalidName::EmptyComponent),
-            ("a//b", InvalidName::EmptyComponent),
-            (".", InvalidName::ContainsDotComponent),
-            ("..", InvalidName::ContainsDotComponent),
-            ("a/.", InvalidName::ContainsDotComponent),
-            ("a/..", InvalidName::ContainsDotComponent),
-            ("./a", InvalidName::ContainsDotComponent),
-            ("../a", InvalidName::ContainsDotComponent),
-            ("a/./b", InvalidName::ContainsDotComponent),
-            ("a/../b", InvalidName::ContainsDotComponent),
-            ("a\nb", InvalidName::ContainsControlCharacter),
-            ("a\0b", InvalidName::ContainsControlCharacter),
-            ("a/\u{1}", InvalidName::ContainsControlCharacter),
-            ("a\u{7f}", InvalidName::ContainsControlCharacter),
-            ("\u{fdd0}", InvalidName::ContainsNoncharacter),
-            ("a\u{fffe}", InvalidName::ContainsNoncharacter),
-            ("a/\u{10ffff}", InvalidName::ContainsNoncharacter),
-            ("Uapi16Manifest", InvalidName::Reserved),
-            ("Uapi16Manifest.", InvalidName::Reserved),
-            ("Uapi16Manifest.sig", InvalidName::Reserved),
-            ("Uapi16Manifest.gz", InvalidName::Reserved),
-            ("Uapi16Manifest.d/inside", InvalidName::Reserved),
+            ("", NameProblem::Empty),
+            ("/", NameProblem::EmptyComponent),
+            ("/abs", NameProblem::EmptyComponent),
+            ("a/", NameProblem::EmptyComponent),
+            ("a//b", NameProblem::EmptyComponent),
+            (".", NameProblem::ContainsDotComponent),
+            ("..", NameProblem::ContainsDotComponent),
+            ("a/.", NameProblem::ContainsDotComponent),
+            ("a/..", NameProblem::ContainsDotComponent),
+            ("./a", NameProblem::ContainsDotComponent),
+            ("../a", NameProblem::ContainsDotComponent),
+            ("a/./b", NameProblem::ContainsDotComponent),
+            ("a/../b", NameProblem::ContainsDotComponent),
+            ("a\nb", NameProblem::ContainsControlCharacter),
+            ("a\0b", NameProblem::ContainsControlCharacter),
+            ("a/\u{1}", NameProblem::ContainsControlCharacter),
+            ("a\u{7f}", NameProblem::ContainsControlCharacter),
+            ("\u{fdd0}", NameProblem::ContainsNoncharacter),
+            ("a\u{fffe}", NameProblem::ContainsNoncharacter),
+            ("a/\u{10ffff}", NameProblem::ContainsNoncharacter),
+            ("Uapi16Manifest", NameProblem::Reserved),
+            ("Uapi16Manifest.", NameProblem::Reserved),
+            ("Uapi16Manifest.sig", NameProblem::Reserved),
+            ("Uapi16Manifest.gz", NameProblem::Reserved),
+            ("Uapi16Manifest.d/inside", NameProblem::Reserved),
         ] {
             assert_eq!(Name::new(name), Err(reason), "{:?}", name);
             assert_eq!(name.parse::<Name>(), Err(reason), "{:?}", name);
@@ -458,20 +457,20 @@ mod tests {
     #[test]
     fn messages() {
         for (reason, text) in [
-            (InvalidName::Empty, "name is empty"),
-            (InvalidName::TooLong, "name is longer than 4095 bytes"),
-            (InvalidName::Reserved, "name is reserved for the manifest"),
+            (NameProblem::Empty, "name is empty"),
+            (NameProblem::TooLong, "name is longer than 4095 bytes"),
+            (NameProblem::Reserved, "name is reserved for the manifest"),
             (
-                InvalidName::ContainsControlCharacter,
+                NameProblem::ContainsControlCharacter,
                 "name contains a control character",
             ),
-            (InvalidName::ContainsNoncharacter, "name contains a noncharacter"),
-            (InvalidName::EmptyComponent, "name has an empty component"),
+            (NameProblem::ContainsNoncharacter, "name contains a noncharacter"),
+            (NameProblem::EmptyComponent, "name has an empty component"),
             (
-                InvalidName::ContainsDotComponent,
+                NameProblem::ContainsDotComponent,
                 "name contains a '.' or '..' component",
             ),
-            (InvalidName::ContainsSeparator, "name component contains '/'"),
+            (NameProblem::ContainsSeparator, "name component contains '/'"),
         ] {
             assert_eq!(reason.to_string(), text);
         }
@@ -482,21 +481,21 @@ mod tests {
         // The whole name is limited, its components are not on their own.
         let longest = "x".repeat(Name::MAX_LEN);
         assert!(Name::new(longest.as_str()).is_ok());
-        assert_eq!(Name::new(format!("{}x", longest)), Err(InvalidName::TooLong));
+        assert_eq!(Name::new(format!("{}x", longest)), Err(NameProblem::TooLong));
         let component = "y".repeat(1000);
         let deep = [component.as_str(); 4].join("/");
         assert!(Name::new(deep.as_str()).is_ok());
         let fits = format!("{}/{}", deep, "z".repeat(Name::MAX_LEN - deep.len() - 1));
         assert_eq!(fits.len(), Name::MAX_LEN);
         assert!(Name::new(fits.as_str()).is_ok());
-        assert_eq!(Name::new(format!("{}z", fits)), Err(InvalidName::TooLong));
+        assert_eq!(Name::new(format!("{}z", fits)), Err(NameProblem::TooLong));
         // The limit counts bytes, not characters.
         let euro = '\u{20ac}';
         assert_eq!(euro.len_utf8(), 3);
         assert!(Name::new(euro.to_string().repeat(Name::MAX_LEN / 3)).is_ok());
         assert_eq!(
             Name::new(euro.to_string().repeat(Name::MAX_LEN / 3 + 1)),
-            Err(InvalidName::TooLong)
+            Err(NameProblem::TooLong)
         );
     }
 
@@ -581,32 +580,32 @@ mod tests {
     /// Everything that makes `name` not a name by the definition of
     /// [`Name`], with every component and every character of it looked at
     /// on its own. Nothing if it is a name.
-    fn reasons(name: &str) -> Vec<InvalidName> {
+    fn reasons(name: &str) -> Vec<NameProblem> {
         let mut reasons = Vec::new();
         if name.is_empty() {
-            reasons.push(InvalidName::Empty);
+            reasons.push(NameProblem::Empty);
         }
         if name.len() > Name::MAX_LEN {
-            reasons.push(InvalidName::TooLong);
+            reasons.push(NameProblem::TooLong);
         }
         if Name::is_reserved(name) {
-            reasons.push(InvalidName::Reserved);
+            reasons.push(NameProblem::Reserved);
         }
         if name.chars().any(|c| c.is_ascii_control()) {
-            reasons.push(InvalidName::ContainsControlCharacter);
+            reasons.push(NameProblem::ContainsControlCharacter);
         }
         // The NUL character, which the strings of a manifest may not hold
         // either, is a control character.
         let noncharacter = |c: char| !c.is_ascii_control() && !STRING_RULES.admits(c.encode_utf8(&mut [0; 4]));
         if name.chars().any(noncharacter) {
-            reasons.push(InvalidName::ContainsNoncharacter);
+            reasons.push(NameProblem::ContainsNoncharacter);
         }
         for component in name.split(SEPARATOR) {
             if component.is_empty() {
-                reasons.push(InvalidName::EmptyComponent);
+                reasons.push(NameProblem::EmptyComponent);
             }
             if component == CURRENT || component == PARENT {
-                reasons.push(InvalidName::ContainsDotComponent);
+                reasons.push(NameProblem::ContainsDotComponent);
             }
         }
         reasons
@@ -665,11 +664,11 @@ mod tests {
         let name = format!("{}end", head);
         for at in 0..=name.len() {
             for (c, reason) in [
-                ('\0', Some(InvalidName::ContainsControlCharacter)),
-                ('\u{1f}', Some(InvalidName::ContainsControlCharacter)),
-                ('\u{7f}', Some(InvalidName::ContainsControlCharacter)),
-                ('\u{fdd0}', Some(InvalidName::ContainsNoncharacter)),
-                ('\u{10ffff}', Some(InvalidName::ContainsNoncharacter)),
+                ('\0', Some(NameProblem::ContainsControlCharacter)),
+                ('\u{1f}', Some(NameProblem::ContainsControlCharacter)),
+                ('\u{7f}', Some(NameProblem::ContainsControlCharacter)),
+                ('\u{fdd0}', Some(NameProblem::ContainsNoncharacter)),
+                ('\u{10ffff}', Some(NameProblem::ContainsNoncharacter)),
                 (' ', None),
                 ('\u{85}', None),
                 ('\u{e9}', None),
@@ -701,7 +700,7 @@ mod tests {
         assert!(Name::ROOT.is_root());
         assert_eq!(Name::ROOT, "");
         assert_eq!(Name::default(), Name::ROOT);
-        assert_eq!(Name::new(""), Err(InvalidName::Empty));
+        assert_eq!(Name::new(""), Err(NameProblem::Empty));
     }
 
     #[test]
@@ -762,7 +761,7 @@ mod tests {
                     format!("{}/{}", parent, component)
                 };
                 let expected = if component.contains(SEPARATOR) {
-                    Err(InvalidName::ContainsSeparator)
+                    Err(NameProblem::ContainsSeparator)
                 } else {
                     Name::new(whole)
                 };
@@ -778,11 +777,11 @@ mod tests {
         let room = Name::MAX_LEN - (deep.len() + 1);
         assert!(room > 0);
         assert_eq!(deep.join(&"y".repeat(room)).unwrap().len(), Name::MAX_LEN);
-        assert_eq!(deep.join(&"y".repeat(room + 1)), Err(InvalidName::TooLong));
+        assert_eq!(deep.join(&"y".repeat(room + 1)), Err(NameProblem::TooLong));
         // A component that is too long, and wrong in another way too, is
         // refused for its length, as the whole name is.
         let wrong = format!("{}\n", "y".repeat(room));
-        assert_eq!(deep.join(&wrong), Err(InvalidName::TooLong));
-        assert_eq!(Name::new(format!("{}/{}", deep, wrong)), Err(InvalidName::TooLong));
+        assert_eq!(deep.join(&wrong), Err(NameProblem::TooLong));
+        assert_eq!(Name::new(format!("{}/{}", deep, wrong)), Err(NameProblem::TooLong));
     }
 }

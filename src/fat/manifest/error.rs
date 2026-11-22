@@ -2,7 +2,7 @@
 //! The errors of the `uapi16` crate as errors of this one: with the errno
 //! and the detail a client of the Varlink interface is told.
 
-use uapi16::{ErrorKind, Field, Invalid, Problem, UnsupportedContent};
+use uapi16::{ErrorKind, Field, Problem, UnsupportedContent};
 
 use super::path_in_volume;
 use crate::errno::*;
@@ -152,9 +152,12 @@ impl From<uapi16::Error> for Error {
             }
             ErrorKind::NotValid(reason) => {
                 let (errno, problem) = match reason {
-                    Invalid::Revoked => (EKEYREVOKED, ValidityProblem::Revoked),
-                    Invalid::NotYetValid => (EKEYEXPIRED, ValidityProblem::NotYetValid),
-                    Invalid::Expired => (EKEYEXPIRED, ValidityProblem::Expired),
+                    uapi16::ValidityProblem::Revoked => (EKEYREVOKED, ValidityProblem::Revoked),
+                    uapi16::ValidityProblem::NotYetValid => (EKEYEXPIRED, ValidityProblem::NotYetValid),
+                    uapi16::ValidityProblem::Expired => (EKEYEXPIRED, ValidityProblem::Expired),
+                    // A reason this crate does not know of. The entry is not
+                    // to be used now all the same.
+                    _ => return Error::new(EKEYEXPIRED, e.to_string()),
                 };
                 Error::new(errno, e.to_string()).with(Detail::Validity { name: path, problem })
             }

@@ -5,7 +5,7 @@
 use std::io::{Read, Write};
 use std::os::fd::BorrowedFd;
 
-use uapi16::{Features, FileObject, Finalize, InodeType, InvalidName, Name, Order, RootObject, Sha256Context, Writer};
+use uapi16::{Features, FileObject, Finalize, InodeType, Name, Order, RootObject, Sha256Context, Writer};
 
 use super::WriteReport;
 use crate::host::{read_some, HostEntry, UnnamableEntry};
@@ -102,7 +102,7 @@ impl<W: Write> Listing<W> {
             Ok(name) => FileObject::new(name),
             // Only a name at the top can be one of the names reserved for
             // the manifest. It is no omission.
-            Err(InvalidName::Reserved) => return Ok(false),
+            Err(uapi16::NameProblem::Reserved) => return Ok(false),
             Err(_) => {
                 self.report.omitted += 1;
                 return Ok(false);

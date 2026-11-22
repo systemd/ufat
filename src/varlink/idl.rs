@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use json::{Object, Value};
+use crate::{Object, Value};
 
 /// A declared type.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -484,7 +484,7 @@ impl Interface {
             }
         }
         for key in params.keys() {
-            if !fields.iter().any(|f| f.name == key) {
+            if !fields.iter().any(|f| f.name == *key) {
                 return Err(key);
             }
         }
@@ -499,11 +499,11 @@ impl Interface {
             Type::Bool => matches!(value, Value::Bool(_)),
             // Integers beyond the JSON number range may arrive as strings.
             Type::Int => match value {
-                Value::Int(_) => true,
+                Value::Number(n) => n.is_i64() || n.is_u64(),
                 Value::String(s) => s.parse::<i128>().is_ok(),
                 _ => false,
             },
-            Type::Float => matches!(value, Value::Int(_) | Value::Float(_)),
+            Type::Float => matches!(value, Value::Number(_)),
             Type::String => matches!(value, Value::String(_)),
             Type::Object => matches!(value, Value::Object(_)),
             Type::Any => true,
@@ -528,6 +528,7 @@ impl Interface {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UniqueKeys;
 
     const EXAMPLE: &str = "\
 # A test interface
@@ -587,14 +588,22 @@ error Failed(reason: string)
         }
     }
 
+    /// The object `text` holds.
+    fn object(text: &str) -> Object {
+        match UniqueKeys::parse(text).unwrap() {
+            Value::Object(o) => o,
+            other => panic!("{} is not an object", other),
+        }
+    }
+
     #[test]
     fn validation() {
         let i = parse(EXAMPLE).unwrap();
         let run = &i.methods["Run"];
-        let ok = json::parse(r#"{"mode":"fast","entries":[{"name":"a","tags":[],"attrs":{"x":1}}]}"#).unwrap();
-        assert_eq!(i.validate(&run.input, ok.as_object().unwrap()), Ok(()));
-        let ok = json::parse(r#"{"mode":"slow","entries":null}"#).unwrap();
-        assert_eq!(i.validate(&run.input, ok.as_object().unwrap()), Ok(()));
+        let ok = object(r#"{"mode":"fast","entries":[{"name":"a","tags":[],"attrs":{"x":1}}]}"#);
+        assert_eq!(i.validate(&run.input, &ok), Ok(()));
+        let ok = object(r#"{"mode":"slow","entries":null}"#);
+        assert_eq!(i.validate(&run.input, &ok), Ok(()));
         for (text, field) in [
             (r#"{}"#, "mode"),
             (r#"{"mode":"medium"}"#, "mode"),
@@ -606,12 +615,15 @@ error Failed(reason: string)
             ),
             (r#"{"mode":"fast","options":5}"#, "options"),
         ] {
-            let v = json::parse(text).unwrap();
-            assert_eq!(i.validate(&run.input, v.as_object().unwrap()), Err(field), "{}", text);
+            assert_eq!(i.validate(&run.input, &object(text)), Err(field), "{}", text);
         }
         assert!(i.matches(&Type::Int, &Value::from("18446744073709551616")));
         assert!(!i.matches(&Type::Int, &Value::from("x")));
         assert!(i.matches(&Type::Float, &Value::from(1u32)));
+        // -0 is a float, and no integer.
+        let zero = UniqueKeys::parse("-0").unwrap();
+        assert!(!i.matches(&Type::Int, &zero));
+        assert!(i.matches(&Type::Float, &zero));
         assert!(!i.matches(&Type::Any, &Value::Null));
     }
 
